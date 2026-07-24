@@ -41,6 +41,33 @@ fn take_control_advances_epoch_and_rejects_stale_requests() {
 }
 
 #[test]
+fn normal_take_control_requires_an_idle_controller() {
+    let now = Instant::now();
+    let mut lease = LeaseManager::new(vec![1], now);
+
+    let decision = lease
+        .take_control(vec![2], 1, now + Duration::from_secs(1))
+        .expect("active controller does not exhaust the epoch");
+
+    assert!(
+        !matches!(decision, LeaseDecision::Publish(_)),
+        "normal typing must not displace an active controller"
+    );
+    assert_eq!(lease.state().controller_peer_id, vec![1]);
+    assert_eq!(lease.state().epoch, 1);
+}
+
+#[test]
+fn forced_take_control_replaces_an_active_controller() {
+    let now = Instant::now();
+    let mut lease = LeaseManager::new(vec![1], now);
+
+    assert!(
+        matches!(lease.force_take_control(vec![2], 1, now + Duration::from_secs(1)), Ok(LeaseDecision::Publish(state)) if state.controller_peer_id == vec![2] && state.epoch == 2)
+    );
+}
+
+#[test]
 fn epoch_exhaustion_is_an_error_not_a_wrap() {
     let now = Instant::now();
     let mut lease = LeaseManager::with_epoch_for_test(vec![1], u64::MAX, now);

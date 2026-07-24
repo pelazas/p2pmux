@@ -58,7 +58,7 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
         .await
         .expect("join pane");
     assert!(
-        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("lease timeout"), Some(GuestEvent::Lease(lease)) if lease.lease_epoch == 1)
+        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("lease timeout"), Some(GuestEvent::InitialLease(lease)) if lease.lease_epoch == 1)
     );
     assert!(
         matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenSnapshot(snapshot)) if snapshot.sequence == 1)

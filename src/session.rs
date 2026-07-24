@@ -70,6 +70,7 @@ pub enum GuestEvent {
         expected_base: Option<u64>,
         received_base: u64,
     },
+    InitialLease(ControlLease),
     Lease(ControlLease),
     Disconnected,
 }
@@ -78,7 +79,7 @@ pub enum GuestEvent {
 pub struct GuestControlSender {
     peer_id: Vec<u8>,
     pane_id: Vec<u8>,
-    take_control_tx: mpsc::Sender<u64>,
+    take_control_tx: mpsc::Sender<(u64, bool)>,
     input_tx: mpsc::Sender<(u64, Vec<u8>)>,
 }
 
@@ -89,9 +90,13 @@ pub enum ControlQueueError {
 }
 
 impl GuestControlSender {
-    pub fn try_take_control(&self, known_lease_epoch: u64) -> Result<(), ControlQueueError> {
+    pub fn try_take_control(
+        &self,
+        known_lease_epoch: u64,
+        force: bool,
+    ) -> Result<(), ControlQueueError> {
         self.take_control_tx
-            .try_send(known_lease_epoch)
+            .try_send((known_lease_epoch, force))
             .map_err(queue_error)
     }
 
@@ -544,7 +549,7 @@ pub async fn join_pane(
         let (input_tx, input_rx) = mpsc::channel(256);
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let pane_id = DEFAULT_PANE_ID.to_vec();
-        let _ = events_tx.try_send(GuestEvent::Lease(ControlLease {
+        let _ = events_tx.try_send(GuestEvent::InitialLease(ControlLease {
             pane_id: pane_id.clone(),
             controller_peer_id: host_peer_id.clone(),
             lease_epoch: 1,
@@ -698,7 +703,7 @@ async fn guest_lease_reader_task(
 
 async fn guest_control_writer_task(
     mut writer: crate::transport::FrameWriter,
-    mut take_control_rx: mpsc::Receiver<u64>,
+    mut take_control_rx: mpsc::Receiver<(u64, bool)>,
     mut input_rx: mpsc::Receiver<(u64, Vec<u8>)>,
     peer_id: Vec<u8>,
     pane_id: Vec<u8>,
@@ -706,7 +711,7 @@ async fn guest_control_writer_task(
     loop {
         tokio::select! {
             biased;
-            Some(known_lease_epoch) = take_control_rx.recv() => {
+            Some((known_lease_epoch, force)) = take_control_rx.recv() => {
                 let _ = writer.write_next(&Envelope {
                     version: PROTOCOL_VERSION,
                     sender_peer_id: peer_id.clone(),
@@ -714,6 +719,7 @@ async fn guest_control_writer_task(
                         pane_id: pane_id.clone(),
                         requester_peer_id: peer_id.clone(),
                         known_lease_epoch,
+                        force,
                     })),
                 }).await;
             }

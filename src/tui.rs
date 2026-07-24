@@ -151,6 +151,11 @@ fn is_ctrl_q(key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn is_ctrl_t(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(character) if character.eq_ignore_ascii_case(&'t'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
     if is_ctrl_q(key) {
         return None;
@@ -409,15 +414,33 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                     LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
                     LeaseDecision::Publish(_)
                     | LeaseDecision::RejectStaleInput
-                    | LeaseDecision::RejectStaleRequest => {}
+                    | LeaseDecision::RejectStaleRequest
+                    | LeaseDecision::RejectActiveController => {}
                 },
                 HostControlEvent::TakeControl { peer_id, request } => {
-                    if let LeaseDecision::Publish(state) = runtime.lease.take_control(
-                        peer_id,
-                        request.known_lease_epoch,
-                        Instant::now(),
-                    )? {
-                        runtime.lease_tx.send_replace(state);
+                    let decision = if request.force {
+                        runtime.lease.force_take_control(
+                            peer_id,
+                            request.known_lease_epoch,
+                            Instant::now(),
+                        )?
+                    } else {
+                        runtime.lease.take_control(
+                            peer_id,
+                            request.known_lease_epoch,
+                            Instant::now(),
+                        )?
+                    };
+                    match decision {
+                        LeaseDecision::Publish(state) => {
+                            runtime.lease_tx.send_replace(state);
+                        }
+                        LeaseDecision::RejectActiveController => {
+                            runtime.lease_tx.send_replace(runtime.lease.state().clone());
+                        }
+                        LeaseDecision::AcceptInput(_)
+                        | LeaseDecision::RejectStaleInput
+                        | LeaseDecision::RejectStaleRequest => {}
                     }
                 }
             }
@@ -458,26 +481,64 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if is_ctrl_q(key) {
                     break;
                 }
-                if let Some(bytes) = encode_key(key, runtime.screen.screen())
-                    && let LeaseDecision::AcceptInput(bytes) = runtime.lease.input(
-                        &runtime.host_peer_id,
-                        runtime.lease.state().epoch,
-                        bytes,
-                        Instant::now(),
-                    )
-                {
-                    runtime.host.write_input(&bytes)?;
+                if is_ctrl_t(key) {
+                    if runtime.lease.state().controller_peer_id != runtime.host_peer_id {
+                        let known_epoch = runtime.lease.state().epoch;
+                        if let LeaseDecision::Publish(state) = runtime.lease.force_take_control(
+                            runtime.host_peer_id.clone(),
+                            known_epoch,
+                            Instant::now(),
+                        )? {
+                            runtime.lease_tx.send_replace(state);
+                        }
+                    }
+                } else if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
+                    let now = Instant::now();
+                    let epoch = runtime.lease.state().epoch;
+                    let decision =
+                        if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
+                            runtime
+                                .lease
+                                .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
+                        } else {
+                            runtime
+                                .lease
+                                .take_control(runtime.host_peer_id.clone(), epoch, now)?
+                        };
+                    match decision {
+                        LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
+                        LeaseDecision::Publish(state) => {
+                            runtime.lease_tx.send_replace(state);
+                            runtime.host.write_input(&bytes)?;
+                        }
+                        LeaseDecision::RejectStaleInput
+                        | LeaseDecision::RejectStaleRequest
+                        | LeaseDecision::RejectActiveController => {}
+                    }
                 }
             }
             Event::Paste(text) => {
                 let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
-                if let LeaseDecision::AcceptInput(bytes) = runtime.lease.input(
-                    &runtime.host_peer_id,
-                    runtime.lease.state().epoch,
-                    bytes,
-                    Instant::now(),
-                ) {
-                    runtime.host.write_input(&bytes)?;
+                let now = Instant::now();
+                let epoch = runtime.lease.state().epoch;
+                let decision = if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
+                    runtime
+                        .lease
+                        .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
+                } else {
+                    runtime
+                        .lease
+                        .take_control(runtime.host_peer_id.clone(), epoch, now)?
+                };
+                match decision {
+                    LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
+                    LeaseDecision::Publish(state) => {
+                        runtime.lease_tx.send_replace(state);
+                        runtime.host.write_input(&bytes)?;
+                    }
+                    LeaseDecision::RejectStaleInput
+                    | LeaseDecision::RejectStaleRequest
+                    | LeaseDecision::RejectActiveController => {}
                 }
             }
             Event::Resize(_, _) => {}
@@ -509,7 +570,9 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;
     let mut last_lease = Instant::now();
-    let mut held_input = None;
+    let mut received_host_lease = false;
+    let mut pending_control = false;
+    let mut held_input = Vec::new();
     let mut dirty = true;
 
     loop {
@@ -532,18 +595,30 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
-                Ok(GuestEvent::Lease(state)) => {
+                Ok(GuestEvent::InitialLease(state)) => {
                     footer = format!(
                         "controller: {} typing",
                         short_peer(&state.controller_peer_id)
                     );
                     lease = Some(state);
                     last_lease = Instant::now();
-                    if let (Some(bytes), Some(state)) = (held_input.take(), lease.as_ref())
-                        && state.controller_peer_id == pane.controls.peer_id()
-                    {
-                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                    dirty = true;
+                }
+                Ok(GuestEvent::Lease(state)) => {
+                    let already_received_host_lease = received_host_lease;
+                    received_host_lease = true;
+                    footer = format!(
+                        "controller: {} typing",
+                        short_peer(&state.controller_peer_id)
+                    );
+                    last_lease = Instant::now();
+                    if pending_control && state.controller_peer_id == pane.controls.peer_id() {
+                        pending_control = false;
+                    } else if pending_control && already_received_host_lease {
+                        pending_control = false;
+                        held_input.clear();
                     }
+                    lease = Some(state);
                     dirty = true;
                 }
                 Ok(GuestEvent::Disconnected)
@@ -555,6 +630,21 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     .into());
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+
+        if !pending_control
+            && !held_input.is_empty()
+            && let Some(state) = lease.as_ref()
+            && state.controller_peer_id == pane.controls.peer_id()
+        {
+            let bytes = std::mem::take(&mut held_input);
+            if pane
+                .controls
+                .try_input(state.lease_epoch, bytes.clone())
+                .is_err()
+            {
+                held_input = bytes;
             }
         }
 
@@ -578,20 +668,36 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 break;
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
-                {
-                    let _ = pane
-                        .controls
-                        .try_take_control(lease.as_ref().map_or(1, |state| state.lease_epoch));
+                if is_ctrl_t(key) {
+                    if let Some(state) = lease.as_ref()
+                        && state.controller_peer_id != pane.controls.peer_id()
+                    {
+                        pending_control = false;
+                        held_input.clear();
+                        let _ = pane.controls.try_take_control(state.lease_epoch, true);
+                    }
                 } else if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
                     && let Some(bytes) = encode_key(key, screen)
                 {
                     if state.controller_peer_id == pane.controls.peer_id() {
-                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                        if held_input.is_empty() {
+                            let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                        } else {
+                            held_input.extend_from_slice(&bytes);
+                        }
                     } else if last_lease.elapsed() >= IDLE_AFTER {
-                        held_input = Some(bytes);
-                        let _ = pane.controls.try_take_control(state.lease_epoch);
+                        held_input.extend_from_slice(&bytes);
+                        if !pending_control {
+                            pending_control = true;
+                            if pane
+                                .controls
+                                .try_take_control(state.lease_epoch, false)
+                                .is_err()
+                            {
+                                pending_control = false;
+                                held_input.clear();
+                            }
+                        }
                     }
                 }
             }
@@ -599,10 +705,24 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen()) {
                     let bytes = encode_paste(&text, screen.bracketed_paste());
                     if state.controller_peer_id == pane.controls.peer_id() {
-                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                        if held_input.is_empty() {
+                            let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                        } else {
+                            held_input.extend_from_slice(&bytes);
+                        }
                     } else if last_lease.elapsed() >= IDLE_AFTER {
-                        held_input = Some(bytes);
-                        let _ = pane.controls.try_take_control(state.lease_epoch);
+                        held_input.extend_from_slice(&bytes);
+                        if !pending_control {
+                            pending_control = true;
+                            if pane
+                                .controls
+                                .try_take_control(state.lease_epoch, false)
+                                .is_err()
+                            {
+                                pending_control = false;
+                                held_input.clear();
+                            }
+                        }
                     }
                 }
             }

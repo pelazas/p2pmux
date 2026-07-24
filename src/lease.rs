@@ -23,6 +23,7 @@ pub enum LeaseDecision {
     Publish(LeaseState),
     RejectStaleInput,
     RejectStaleRequest,
+    RejectActiveController,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -80,6 +81,32 @@ impl LeaseManager {
         if known_epoch != self.state.epoch {
             return Ok(LeaseDecision::RejectStaleRequest);
         }
+        if self.state.epoch == u64::MAX {
+            return Err(LeaseError::EpochExhausted);
+        }
+        if !self.state.is_idle_at(now) {
+            return Ok(LeaseDecision::RejectActiveController);
+        }
+        self.change_controller(sender, now)
+    }
+
+    pub fn force_take_control(
+        &mut self,
+        sender: Vec<u8>,
+        known_epoch: u64,
+        now: Instant,
+    ) -> Result<LeaseDecision, LeaseError> {
+        if known_epoch != self.state.epoch {
+            return Ok(LeaseDecision::RejectStaleRequest);
+        }
+        self.change_controller(sender, now)
+    }
+
+    fn change_controller(
+        &mut self,
+        sender: Vec<u8>,
+        now: Instant,
+    ) -> Result<LeaseDecision, LeaseError> {
         let epoch = self
             .state
             .epoch
