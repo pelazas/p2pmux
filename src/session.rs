@@ -44,6 +44,24 @@ pub enum HostControlEvent {
     },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum ScreenSendPlan {
+    Snapshot,
+    Delta,
+}
+
+pub fn screen_send_plan(
+    last_sent_sequence: u64,
+    frame: &ScreenFrame,
+    heartbeat_due: bool,
+) -> ScreenSendPlan {
+    if heartbeat_due || last_sent_sequence != frame.base_sequence {
+        ScreenSendPlan::Snapshot
+    } else {
+        ScreenSendPlan::Delta
+    }
+}
+
 #[derive(Debug)]
 pub enum GuestEvent {
     ScreenSnapshot(Snapshot),
@@ -383,7 +401,7 @@ async fn screen_writer_task(
             changed = screen_rx.changed() => {
                 changed.map_err(|_| SessionError::PeerTask)?;
                 let frame = screen_rx.borrow_and_update().clone();
-                if last_sent_sequence != frame.base_sequence {
+                if screen_send_plan(last_sent_sequence, &frame, false) == ScreenSendPlan::Snapshot {
                     write_snapshot(&mut writer, &pane_id, &host_peer_id, &frame).await?;
                 } else {
                     writer.write_next(&Envelope {
@@ -402,7 +420,9 @@ async fn screen_writer_task(
             }
             _ = heartbeat.tick() => {
                 let frame = screen_rx.borrow().clone();
-                write_snapshot(&mut writer, &pane_id, &host_peer_id, &frame).await?;
+                if screen_send_plan(last_sent_sequence, &frame, true) == ScreenSendPlan::Snapshot {
+                    write_snapshot(&mut writer, &pane_id, &host_peer_id, &frame).await?;
+                }
                 last_sent_sequence = frame.sequence;
             }
         }
@@ -521,6 +541,11 @@ pub async fn join_pane(
         let (input_tx, input_rx) = mpsc::channel(256);
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let pane_id = DEFAULT_PANE_ID.to_vec();
+        let _ = events_tx.try_send(GuestEvent::Lease(ControlLease {
+            pane_id: pane_id.clone(),
+            controller_peer_id: host_peer_id.clone(),
+            lease_epoch: 1,
+        }));
         let tasks = vec![
             tokio::spawn(guest_screen_reader_task(
                 screen_reader,

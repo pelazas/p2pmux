@@ -25,7 +25,7 @@ use ratatui::{
 };
 
 use crate::{
-    lease::{LeaseDecision, LeaseManager, LeaseState},
+    lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, ScreenFrame},
     session::{GuestEvent, GuestPane, HostControlEvent},
@@ -496,6 +496,8 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut remote = GuestScreen::new();
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;
+    let mut last_lease = Instant::now();
+    let mut held_input = None;
     let mut dirty = true;
 
     loop {
@@ -524,6 +526,12 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         short_peer(&state.controller_peer_id)
                     );
                     lease = Some(state);
+                    last_lease = Instant::now();
+                    if let (Some(bytes), Some(state)) = (held_input.take(), lease.as_ref())
+                        && state.controller_peer_id == pane.controls.peer_id()
+                    {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                    }
                     dirty = true;
                 }
                 Ok(GuestEvent::Disconnected)
@@ -561,20 +569,25 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         .controls
                         .try_take_control(lease.as_ref().map_or(1, |state| state.lease_epoch));
                 } else if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
-                    && state.controller_peer_id == pane.controls.peer_id()
                     && let Some(bytes) = encode_key(key, screen)
                 {
-                    let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                    if state.controller_peer_id == pane.controls.peer_id() {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                    } else if last_lease.elapsed() >= IDLE_AFTER {
+                        held_input = Some(bytes);
+                        let _ = pane.controls.try_take_control(state.lease_epoch);
+                    }
                 }
             }
             Event::Paste(text) => {
-                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
-                    && state.controller_peer_id == pane.controls.peer_id()
-                {
-                    let _ = pane.controls.try_input(
-                        state.lease_epoch,
-                        encode_paste(&text, screen.bracketed_paste()),
-                    );
+                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen()) {
+                    let bytes = encode_paste(&text, screen.bracketed_paste());
+                    if state.controller_peer_id == pane.controls.peer_id() {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                    } else if last_lease.elapsed() >= IDLE_AFTER {
+                        held_input = Some(bytes);
+                        let _ = pane.controls.try_take_control(state.lease_epoch);
+                    }
                 }
             }
             Event::Resize(_, _) => {}

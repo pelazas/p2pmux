@@ -42,8 +42,8 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 
 ## Status
 
-Early design locked (2026-07-24). Spike 1 local terminal implementation is available, along with
-a live Iroh Join/Welcome handshake smoke test.
+Spike 2 provides one host-created, fixed-grid shared terminal pane over an authenticated Iroh
+connection. It intentionally has no tabs, splits, resize protocol, or multiple panes yet.
 
 ## Local Spike 1
 
@@ -54,16 +54,20 @@ the child shell or vt100 parser: larger windows leave extra cells blank and smal
 the upper-left fixed viewport. Dynamic resize is intentionally outside Spike 1 and the MVP wire
 protocol.
 
-To prove one encrypted Iroh Join/Welcome exchange (without terminal mirroring):
+To dogfood the shared host/guest pane:
 
 ```text
 Terminal 1: cargo run -- create
 Terminal 2: cargo run -- join '<printed p2pmux-v1:... ticket>'
 ```
 
-The ticket is reusable while Terminal 1 remains alive. This proves only the authenticated Iroh
-Join/Welcome handshake: it does not mirror a terminal, attach a joined process, or make the local
-shell networked or multi-pane.
+`create` starts one fixed-size local shell and its host view. `join` renders that remote pane.
+Only one peer controls input at a time: after about eight seconds of idle time another guest can
+type to hop in; while someone is actively typing, press Ctrl-T to take control. Ctrl-Q exits only
+the local p2pmux view.
+
+Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
+outer terminal crops or letterboxes the immutable host grid; it never resizes the host PTY.
 
 Full product/architecture docs live in [`docs/`](./docs/).
 
