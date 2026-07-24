@@ -5,8 +5,8 @@ use std::{error::Error, fmt, time::Duration};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{
-        ClosedStream, ConnectingError, Connection, ConnectionError, Incoming, ReadToEndError,
-        RecvStream, SendStream, WriteError, presets,
+        ClosedStream, ConnectingError, Connection, ConnectionError, Incoming, ReadError,
+        ReadToEndError, RecvStream, SendStream, WriteError, presets,
     },
 };
 use tokio::time::timeout;
@@ -29,8 +29,10 @@ pub enum TransportError {
     Stream(ConnectionError),
     Write(WriteError),
     Read(ReadToEndError),
+    StreamRead(ReadError),
     Finish(ClosedStream),
     Protocol(ProtocolError),
+    TruncatedStreamFrame,
     Closed,
     TimedOut(&'static str),
 }
@@ -44,8 +46,12 @@ impl fmt::Display for TransportError {
             Self::Stream(error) => write!(formatter, "Iroh stream operation failed: {error}"),
             Self::Write(error) => write!(formatter, "Iroh stream write failed: {error}"),
             Self::Read(error) => write!(formatter, "Iroh stream read failed: {error}"),
+            Self::StreamRead(error) => write!(formatter, "Iroh stream read failed: {error}"),
             Self::Finish(error) => write!(formatter, "Iroh stream finish failed: {error}"),
             Self::Protocol(error) => write!(formatter, "Iroh frame is invalid: {error}"),
+            Self::TruncatedStreamFrame => {
+                formatter.write_str("Iroh stream ended with a truncated frame")
+            }
             Self::Closed => formatter.write_str("Iroh endpoint is closed"),
             Self::TimedOut(operation) => write!(formatter, "Iroh {operation} timed out"),
         }
@@ -61,11 +67,23 @@ impl Error for TransportError {
             Self::Stream(error) => Some(error),
             Self::Write(error) => Some(error),
             Self::Read(error) => Some(error),
+            Self::StreamRead(error) => Some(error),
             Self::Finish(error) => Some(error),
             Self::Protocol(error) => Some(error),
-            Self::Closed | Self::TimedOut(_) => None,
+            Self::Closed | Self::TimedOut(_) | Self::TruncatedStreamFrame => None,
         }
     }
+}
+
+/// Incremental reader for a long-lived sequence of validated protocol frames.
+pub struct FrameReader {
+    recv: RecvStream,
+    pending: Vec<u8>,
+}
+
+/// Long-lived writer that owns exactly one QUIC send stream.
+pub struct FrameWriter {
+    send: SendStream,
 }
 
 impl Transport {
@@ -128,6 +146,14 @@ impl Transport {
             .map_err(TransportError::Stream)
     }
 
+    pub async fn open_framed_bi(
+        &self,
+        connection: &Connection,
+    ) -> Result<(FrameWriter, FrameReader), TransportError> {
+        let (send, recv) = self.open_bi(connection).await?;
+        Ok((FrameWriter { send }, FrameReader::new(recv)))
+    }
+
     pub async fn accept_bi(
         &self,
         connection: &Connection,
@@ -136,6 +162,14 @@ impl Transport {
             .await
             .map_err(|_| TransportError::TimedOut("accept bi-stream"))?
             .map_err(TransportError::Stream)
+    }
+
+    pub async fn accept_framed_bi(
+        &self,
+        connection: &Connection,
+    ) -> Result<(FrameWriter, FrameReader), TransportError> {
+        let (send, recv) = self.accept_bi(connection).await?;
+        Ok((FrameWriter { send }, FrameReader::new(recv)))
     }
 
     pub async fn write_frame(
@@ -162,4 +196,104 @@ impl Transport {
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
+}
+
+impl FrameReader {
+    fn new(recv: RecvStream) -> Self {
+        Self {
+            recv,
+            pending: Vec::new(),
+        }
+    }
+
+    pub async fn read_next(&mut self) -> Result<Option<Envelope>, TransportError> {
+        loop {
+            if let Some(frame_len) = complete_frame_len(&self.pending)? {
+                let frame = self.pending.drain(..frame_len).collect::<Vec<_>>();
+                return decode_frame(&frame)
+                    .map(Some)
+                    .map_err(TransportError::Protocol);
+            }
+            if self.pending.len() >= MAX_FRAME_BYTES {
+                return Err(TransportError::Protocol(ProtocolError::FrameTooLarge {
+                    limit: MAX_FRAME_BYTES,
+                    actual: self.pending.len(),
+                }));
+            }
+            let maximum = (MAX_FRAME_BYTES - self.pending.len()).min(16 * 1024);
+            match self
+                .recv
+                .read_chunk(maximum)
+                .await
+                .map_err(TransportError::StreamRead)?
+            {
+                Some(chunk) => self.pending.extend_from_slice(&chunk),
+                None if self.pending.is_empty() => return Ok(None),
+                None => return Err(TransportError::TruncatedStreamFrame),
+            }
+        }
+    }
+}
+
+impl FrameWriter {
+    pub async fn write_next(&mut self, envelope: &Envelope) -> Result<(), TransportError> {
+        let frame = encode_frame(envelope).map_err(TransportError::Protocol)?;
+        timeout(HANDSHAKE_TIMEOUT, self.send.write_all(&frame))
+            .await
+            .map_err(|_| TransportError::TimedOut("frame write"))?
+            .map_err(TransportError::Write)
+    }
+
+    pub fn finish(mut self) -> Result<(), TransportError> {
+        self.send.finish().map_err(TransportError::Finish)
+    }
+}
+
+fn complete_frame_len(pending: &[u8]) -> Result<Option<usize>, TransportError> {
+    let Some((declared, prefix_len)) = stream_length_prefix(pending)? else {
+        return Ok(None);
+    };
+    if declared > crate::protocol::MAX_ENVELOPE_BYTES {
+        return Err(TransportError::Protocol(ProtocolError::FrameTooLarge {
+            limit: crate::protocol::MAX_ENVELOPE_BYTES,
+            actual: declared,
+        }));
+    }
+    let frame_len = prefix_len.checked_add(declared).ok_or_else(|| {
+        TransportError::Protocol(ProtocolError::FrameTooLarge {
+            limit: MAX_FRAME_BYTES,
+            actual: declared,
+        })
+    })?;
+    if frame_len > MAX_FRAME_BYTES {
+        return Err(TransportError::Protocol(ProtocolError::FrameTooLarge {
+            limit: MAX_FRAME_BYTES,
+            actual: frame_len,
+        }));
+    }
+    Ok((pending.len() >= frame_len).then_some(frame_len))
+}
+
+fn stream_length_prefix(pending: &[u8]) -> Result<Option<(usize, usize)>, TransportError> {
+    let mut value = 0_u64;
+    for index in 0..10 {
+        let Some(byte) = pending.get(index).copied() else {
+            return Ok(None);
+        };
+        let bits = u64::from(byte & 0x7f);
+        if index == 9 && bits > 1 {
+            return Err(TransportError::Protocol(
+                ProtocolError::MalformedLengthPrefix,
+            ));
+        }
+        value |= bits << (index * 7);
+        if byte & 0x80 == 0 {
+            let declared = usize::try_from(value)
+                .map_err(|_| TransportError::Protocol(ProtocolError::MalformedLengthPrefix))?;
+            return Ok(Some((declared, index + 1)));
+        }
+    }
+    Err(TransportError::Protocol(
+        ProtocolError::MalformedLengthPrefix,
+    ))
 }
