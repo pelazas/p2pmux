@@ -536,7 +536,11 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 }
                 Ok(GuestEvent::Disconnected)
                 | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    return Ok(());
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "host session disconnected",
+                    )
+                    .into());
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             }
