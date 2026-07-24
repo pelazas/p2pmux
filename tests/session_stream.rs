@@ -8,7 +8,7 @@ use p2pmux::{
     session::{DEFAULT_PANE_ID, GuestEvent, HostPaneChannels, HostSession, join_pane},
     transport::{ALPN, Transport},
 };
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -150,6 +150,87 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
     );
     assert!(control_rx.try_recv().is_err());
     drop(lease_tx);
+    host_task.abort();
+    let _ = host_task.await;
+    guest.close().await;
+    host.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_window() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let guest = loopback_transport().await;
+    let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+    let screen = HostScreen::new(1, 3).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    let host_task = {
+        let host = host.clone();
+        tokio::spawn(async move {
+            let incoming = host.accept_incoming().await.expect("incoming");
+            host.serve_peer(
+                incoming,
+                HostPaneChannels {
+                    pane_id: DEFAULT_PANE_ID.to_vec(),
+                    host_peer_id: host_id,
+                    screen_rx,
+                    lease_rx,
+                    control_tx,
+                },
+            )
+            .await
+        })
+    };
+    let connection = guest
+        .connect(host.ticket().endpoint_addr().clone())
+        .await
+        .expect("connect");
+    let guest_id = guest.endpoint_id().as_bytes().to_vec();
+    let (mut handshake_send, mut handshake_recv) =
+        guest.open_bi(&connection).await.expect("handshake");
+    guest
+        .write_frame(
+            &mut handshake_send,
+            &Envelope {
+                version: PROTOCOL_VERSION,
+                sender_peer_id: guest_id.clone(),
+                body: Some(envelope::Body::Join(Join {
+                    session_id: host.ticket().session_id().to_vec(),
+                    peer_id: guest_id,
+                })),
+            },
+        )
+        .await
+        .expect("join");
+    guest
+        .read_frame(&mut handshake_recv)
+        .await
+        .expect("welcome");
+    let (_screen_send, mut screen_recv) =
+        guest.accept_framed_bi(&connection).await.expect("screen");
+    assert!(matches!(
+        timeout(TEST_TIMEOUT, screen_recv.read_next())
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot read"),
+        Some(Envelope {
+            body: Some(envelope::Body::Snapshot(_)),
+            ..
+        })
+    ));
+
+    sleep(Duration::from_secs(6)).await;
+    assert!(
+        !host_task.is_finished(),
+        "a spectator must not need to send input to keep its screen stream alive"
+    );
+
+    connection.close(0u8.into(), b"");
     host_task.abort();
     let _ = host_task.await;
     guest.close().await;

@@ -297,14 +297,17 @@ impl HostSession {
                 pane.pane_id.clone(),
                 pane.host_peer_id.clone(),
             ));
-            let (control_writer, control_reader) =
-                match self.transport.accept_framed_bi(&connection).await {
-                    Ok(streams) => streams,
-                    Err(error) => {
-                        screen_task.abort();
-                        return Err(error.into());
-                    }
-                };
+            let (control_writer, control_reader) = match self
+                .transport
+                .accept_framed_bi_when_ready(&connection)
+                .await
+            {
+                Ok(streams) => streams,
+                Err(error) => {
+                    screen_task.abort();
+                    return Err(error.into());
+                }
+            };
             let lease_task = tokio::spawn(lease_writer_task(
                 self.transport.endpoint_id().as_bytes().to_vec(),
                 pane.lease_rx,
