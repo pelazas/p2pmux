@@ -5,7 +5,7 @@ use p2pmux::{
 
 #[test]
 fn exposes_the_scaffold_module_boundaries() {
-    let _ = Cli;
+    let _: Option<Cli> = None;
     let _ = Tui;
     let _ = PtyHost;
     let _ = Session;
