@@ -45,6 +45,59 @@ pub enum HostControlEvent {
     },
 }
 
+#[derive(Debug)]
+pub enum GuestEvent {
+    ScreenSnapshot(Snapshot),
+    ScreenDelta(Delta),
+    ScreenGap {
+        expected_base: Option<u64>,
+        received_base: u64,
+    },
+    Lease(ControlLease),
+    Disconnected,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct GuestControlSender {
+    peer_id: Vec<u8>,
+    pane_id: Vec<u8>,
+    take_control_tx: mpsc::Sender<u64>,
+    input_tx: mpsc::Sender<(u64, Vec<u8>)>,
+}
+
+pub struct GuestPane {
+    pub pane_id: Vec<u8>,
+    pub host_peer_id: Vec<u8>,
+    pub events: mpsc::Receiver<GuestEvent>,
+    pub controls: GuestControlSender,
+    transport: Transport,
+    connection: Connection,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl GuestPane {
+    pub async fn shutdown(mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        while let Some(task) = self.tasks.pop() {
+            let _ = task.await;
+        }
+        self.connection.close(0u8.into(), b"");
+        self.transport.close().await;
+    }
+}
+
+impl Drop for GuestPane {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.connection.close(0u8.into(), b"");
+    }
+}
+
 #[derive(Clone)]
 pub struct HostSession {
     transport: Transport,
@@ -420,7 +473,74 @@ pub async fn join_once(
     result
 }
 
+pub async fn join_pane(
+    transport: Transport,
+    ticket: JoinTicket,
+) -> Result<GuestPane, SessionError> {
+    let connection = transport.connect(ticket.endpoint_addr().clone()).await?;
+    let result = async {
+        let receipt = join_handshake(&transport, &connection, &ticket).await?;
+        let host_peer_id = receipt.coordinator_peer_id;
+        let (_screen_send, screen_reader) = transport.accept_framed_bi(&connection).await?;
+        let (control_writer, control_reader) = transport.open_framed_bi(&connection).await?;
+        let (events_tx, events) = mpsc::channel(128);
+        let (take_control_tx, take_control_rx) = mpsc::channel(16);
+        let (input_tx, input_rx) = mpsc::channel(256);
+        let peer_id = transport.endpoint_id().as_bytes().to_vec();
+        let pane_id = DEFAULT_PANE_ID.to_vec();
+        let tasks = vec![
+            tokio::spawn(guest_screen_reader_task(
+                screen_reader,
+                events_tx.clone(),
+                pane_id.clone(),
+                host_peer_id.clone(),
+            )),
+            tokio::spawn(guest_lease_reader_task(
+                control_reader,
+                events_tx,
+                pane_id.clone(),
+                host_peer_id.clone(),
+            )),
+            tokio::spawn(guest_control_writer_task(
+                control_writer,
+                take_control_rx,
+                input_rx,
+                peer_id.clone(),
+                pane_id.clone(),
+            )),
+        ];
+        Ok(GuestPane {
+            pane_id: pane_id.clone(),
+            host_peer_id,
+            events,
+            controls: GuestControlSender {
+                peer_id,
+                pane_id,
+                take_control_tx,
+                input_tx,
+            },
+            transport: transport.clone(),
+            connection: connection.clone(),
+            tasks,
+        })
+    }
+    .await;
+    if result.is_err() {
+        connection.close(0u8.into(), b"");
+        transport.close().await;
+    }
+    result
+}
+
 async fn join_connected(
+    transport: &Transport,
+    connection: &Connection,
+    ticket: &JoinTicket,
+) -> Result<JoinReceipt, SessionError> {
+    join_handshake(transport, connection, ticket).await
+}
+
+async fn join_handshake(
     transport: &Transport,
     connection: &Connection,
     ticket: &JoinTicket,
@@ -455,6 +575,97 @@ async fn join_connected(
         admitted_peer_id: welcome.admitted_peer_id,
         coordinator_peer_id: welcome.coordinator_peer_id,
     })
+}
+
+async fn guest_screen_reader_task(
+    mut reader: crate::transport::FrameReader,
+    events_tx: mpsc::Sender<GuestEvent>,
+    pane_id: Vec<u8>,
+    host_peer_id: Vec<u8>,
+) {
+    let mut sequence = None;
+    while let Ok(Some(envelope)) = reader.read_next().await {
+        if envelope.sender_peer_id != host_peer_id {
+            break;
+        }
+        match envelope.body {
+            Some(envelope::Body::Snapshot(snapshot))
+                if snapshot.pane_id == pane_id && snapshot.host_peer_id == host_peer_id =>
+            {
+                sequence = Some(snapshot.sequence);
+                let _ = events_tx.try_send(GuestEvent::ScreenSnapshot(snapshot));
+            }
+            Some(envelope::Body::Delta(delta))
+                if delta.pane_id == pane_id && delta.host_peer_id == host_peer_id =>
+            {
+                if sequence == Some(delta.base_sequence) {
+                    sequence = Some(delta.sequence);
+                    let _ = events_tx.try_send(GuestEvent::ScreenDelta(delta));
+                } else {
+                    let _ = events_tx.try_send(GuestEvent::ScreenGap {
+                        expected_base: sequence,
+                        received_base: delta.base_sequence,
+                    });
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = events_tx.send(GuestEvent::Disconnected).await;
+}
+
+async fn guest_lease_reader_task(
+    mut reader: crate::transport::FrameReader,
+    events_tx: mpsc::Sender<GuestEvent>,
+    pane_id: Vec<u8>,
+    host_peer_id: Vec<u8>,
+) {
+    while let Ok(Some(envelope)) = reader.read_next().await {
+        match envelope.body {
+            Some(envelope::Body::ControlLease(lease))
+                if envelope.sender_peer_id == host_peer_id && lease.pane_id == pane_id =>
+            {
+                if events_tx.send(GuestEvent::Lease(lease)).await.is_err() {
+                    return;
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = events_tx.send(GuestEvent::Disconnected).await;
+}
+
+async fn guest_control_writer_task(
+    mut writer: crate::transport::FrameWriter,
+    mut take_control_rx: mpsc::Receiver<u64>,
+    mut input_rx: mpsc::Receiver<(u64, Vec<u8>)>,
+    peer_id: Vec<u8>,
+    pane_id: Vec<u8>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            Some(known_lease_epoch) = take_control_rx.recv() => {
+                let _ = writer.write_next(&Envelope {
+                    version: PROTOCOL_VERSION,
+                    sender_peer_id: peer_id.clone(),
+                    body: Some(envelope::Body::TakeControl(TakeControl {
+                        pane_id: pane_id.clone(),
+                        requester_peer_id: peer_id.clone(),
+                        known_lease_epoch,
+                    })),
+                }).await;
+            }
+            Some((lease_epoch, data)) = input_rx.recv() => {
+                let _ = writer.write_next(&Envelope {
+                    version: PROTOCOL_VERSION,
+                    sender_peer_id: peer_id.clone(),
+                    body: Some(envelope::Body::Input(Input { pane_id: pane_id.clone(), lease_epoch, data })),
+                }).await;
+            }
+            else => return,
+        }
+    }
 }
 
 fn validate_welcome(

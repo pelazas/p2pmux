@@ -4,7 +4,7 @@ use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
     protocol::{ControlLease, Envelope, Join, PROTOCOL_VERSION, Snapshot, envelope},
     screen::HostScreen,
-    session::{DEFAULT_PANE_ID, HostPaneChannels, HostSession},
+    session::{DEFAULT_PANE_ID, GuestEvent, HostPaneChannels, HostSession, join_pane},
     transport::{ALPN, Transport},
 };
 use tokio::time::timeout;
@@ -22,6 +22,50 @@ async fn loopback_transport() -> Transport {
         .await
         .expect("loopback endpoint");
     Transport::from_endpoint(endpoint)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_pane_delivers_snapshot_then_delta_in_order() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+    let mut screen = HostScreen::new(1, 3).expect("screen");
+    let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(ControlLease {
+        pane_id: DEFAULT_PANE_ID.to_vec(),
+        controller_peer_id: host_id.clone(),
+        lease_epoch: 1,
+    });
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    let host_task = {
+        let host = host.clone();
+        tokio::spawn(async move {
+            let incoming = host.accept_incoming().await.expect("incoming");
+            host.serve_peer(
+                incoming,
+                HostPaneChannels {
+                    pane_id: DEFAULT_PANE_ID.to_vec(),
+                    host_peer_id: host_id,
+                    screen_rx,
+                    lease_rx,
+                    control_tx,
+                },
+            )
+            .await
+        })
+    };
+    let mut pane = join_pane(loopback_transport().await, host.ticket().clone())
+        .await
+        .expect("join pane");
+    assert!(
+        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenSnapshot(snapshot)) if snapshot.sequence == 1)
+    );
+    screen_tx.send_replace(screen.process_pty(b"abc").expect("screen update"));
+    assert!(
+        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenDelta(delta)) if delta.base_sequence == 1 && delta.sequence == 2)
+    );
+    pane.shutdown().await;
+    let _ = timeout(TEST_TIMEOUT, host_task).await;
+    host.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

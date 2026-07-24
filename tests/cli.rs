@@ -39,4 +39,5 @@ fn help_lists_the_local_terminal_command() {
     assert!(stdout.contains("local"));
     assert!(stdout.contains("local interactive shell"));
     assert!(stdout.contains("reusable shared-session ticket"));
+    assert!(stdout.contains("remote fixed-grid shared pane"));
 }

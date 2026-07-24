@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use tokio::task::JoinSet;
 
 use crate::{
-    session::{HostSession, join_once},
+    session::{HostSession, join_pane},
     ticket::JoinTicket,
     transport::Transport,
 };
@@ -32,7 +32,7 @@ enum Command {
     Local,
     /// Create a shared session with a reusable join ticket.
     Create,
-    /// Join a shared session using a reusable shared-session ticket.
+    /// Join a remote fixed-grid shared pane using a reusable shared-session ticket.
     Join { ticket: String },
 }
 
@@ -87,11 +87,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             stdout.flush()?;
             let ticket =
                 JoinTicket::from_str(&ticket).map_err(|_| CliError("invalid ticket format"))?;
-            let _receipt = join_once(Transport::bind().await?, ticket).await?;
-            writeln!(
-                stdout,
-                "Connected to coordinator. Terminal sharing is not yet implemented."
-            )?;
+            let pane = join_pane(Transport::bind().await?, ticket).await?;
+            drop(stdout);
+            let guest_result = tokio::task::spawn_blocking(move || {
+                crate::tui::run_guest(pane).map_err(|error| error.to_string())
+            })
+            .await?;
+            guest_result.map_err(io::Error::other)?;
             Ok(())
         }
     }

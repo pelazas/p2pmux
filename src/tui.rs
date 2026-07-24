@@ -15,7 +15,7 @@ use crossterm::{
 };
 use portable_pty::PtySize;
 use ratatui::{
-    Terminal, TerminalOptions, Viewport,
+    Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     buffer::Buffer,
     layout::Rect,
@@ -23,7 +23,11 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::pty_host::PtyHost;
+use crate::{
+    pty_host::PtyHost,
+    screen::GuestScreen,
+    session::{GuestEvent, GuestPane},
+};
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
@@ -85,6 +89,19 @@ fn vt_color(color: vt100::Color) -> Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(index) => Color::Indexed(index),
         vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
+}
+
+fn render_guest_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &str) {
+    let area = frame.area();
+    let screen_height = screen.size().0.min(area.height.saturating_sub(1));
+    let screen_area = Rect::new(area.x, area.y, area.width, screen_height);
+    frame.render_widget(VtScreen::new(screen), screen_area);
+    if area.height > 0 {
+        let footer_y = area.y + screen_area.height;
+        frame
+            .buffer_mut()
+            .set_string(area.x, footer_y, footer, Style::default());
     }
 }
 
@@ -317,6 +334,97 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Render one remote, immutable terminal grid. Input forwarding arrives in milestone 12.
+pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
+    let (cols, rows) = terminal::size()?;
+    let mut guard = TerminalGuard::new();
+    enable_raw_mode()?;
+    guard.raw_mode = true;
+    guard.alternate_screen = true;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    guard.bracketed_paste = true;
+    execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
+        },
+    )?;
+    let mut remote = GuestScreen::new();
+    let mut footer = String::from("controller: waiting spectator");
+    let mut dirty = true;
+
+    loop {
+        loop {
+            match pane.events.try_recv() {
+                Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
+                    if remote
+                        .apply_snapshot(snapshot.sequence, &snapshot.screen)
+                        .is_ok()
+                    {
+                        dirty = true;
+                    }
+                }
+                Ok(GuestEvent::ScreenDelta(delta)) => {
+                    if remote
+                        .apply_delta(delta.base_sequence, delta.sequence, &delta.changes)
+                        .is_ok()
+                    {
+                        dirty = true;
+                    }
+                }
+                Ok(GuestEvent::ScreenGap { .. }) => {}
+                Ok(GuestEvent::Lease(lease)) => {
+                    footer = format!(
+                        "controller: {} typing",
+                        short_peer(&lease.controller_peer_id)
+                    );
+                    dirty = true;
+                }
+                Ok(GuestEvent::Disconnected)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+
+        if dirty {
+            terminal.draw(|frame| {
+                if let Some(screen) = remote.screen() {
+                    render_guest_screen(frame, screen, &footer);
+                }
+            })?;
+            dirty = false;
+        }
+
+        if !event::poll(Duration::from_millis(16))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && is_ctrl_q(key) =>
+            {
+                break;
+            }
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn short_peer(peer_id: &[u8]) -> String {
+    peer_id
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -326,7 +434,35 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use super::{VtScreen, encode_key, encode_paste};
+    use crate::screen::{GuestScreen, HostScreen};
+
+    use super::{VtScreen, encode_key, encode_paste, render_guest_screen};
+
+    #[test]
+    fn remote_renderer_keeps_host_grid_fixed_and_draws_a_footer() {
+        let mut host = HostScreen::new(1, 3).expect("host screen");
+        let frame = host.process_pty(b"abc").expect("frame");
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(frame.sequence, &frame.snapshot)
+            .expect("snapshot");
+        let mut terminal = Terminal::new(TestBackend::new(5, 3)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_guest_screen(
+                    frame,
+                    guest.screen().expect("guest screen"),
+                    "controller: abcdef idle",
+                )
+            })
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(2, 0)].symbol(), "c");
+        assert_eq!(buffer[(3, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 1)].symbol(), "c");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+    }
 
     #[test]
     fn renders_vt100_cell_styles() {
