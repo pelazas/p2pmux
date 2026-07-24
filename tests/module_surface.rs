@@ -7,7 +7,7 @@ use p2pmux::{
 fn exposes_the_scaffold_module_boundaries() {
     let _: Option<Cli> = None;
     let _ = Tui;
-    let _ = PtyHost;
+    let _: Option<PtyHost> = None;
     let _ = Session;
     let _ = Transport;
     let _ = JoinTicket;

@@ -38,3 +38,13 @@ fn join_requires_a_ticket_argument() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
     assert!(stderr.contains("<TICKET>"));
 }
+
+#[test]
+fn help_lists_the_local_terminal_command() {
+    let output = run(&["--help"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("local"));
+    assert!(stdout.contains("local interactive shell"));
+}
