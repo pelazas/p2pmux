@@ -5,6 +5,7 @@ use std::{
     io,
     time::{Duration, Instant},
 };
+use tokio::sync::{mpsc, watch};
 
 use crossterm::{
     event::{self, DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -24,13 +25,46 @@ use ratatui::{
 };
 
 use crate::{
+    lease::{LeaseDecision, LeaseManager, LeaseState},
     pty_host::PtyHost,
-    screen::GuestScreen,
-    session::{GuestEvent, GuestPane},
+    screen::{GuestScreen, HostScreen, ScreenFrame},
+    session::{GuestEvent, GuestPane, HostControlEvent},
 };
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
+
+pub struct HostPaneRuntime {
+    host: PtyHost,
+    screen: HostScreen,
+    lease: LeaseManager,
+    host_peer_id: Vec<u8>,
+    screen_tx: watch::Sender<ScreenFrame>,
+    lease_tx: watch::Sender<LeaseState>,
+    control_rx: mpsc::Receiver<HostControlEvent>,
+}
+
+impl HostPaneRuntime {
+    pub fn new(
+        size: PtySize,
+        host_peer_id: Vec<u8>,
+        screen_tx: watch::Sender<ScreenFrame>,
+        lease_tx: watch::Sender<LeaseState>,
+        control_rx: mpsc::Receiver<HostControlEvent>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let screen = HostScreen::new(size.rows, size.cols)?;
+        let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
+        Ok(Self {
+            host: PtyHost::spawn_default_shell(size)?,
+            screen,
+            lease,
+            host_peer_id,
+            screen_tx,
+            lease_tx,
+            control_rx,
+        })
+    }
+}
 
 struct VtScreen<'a> {
     screen: &'a vt100::Screen,
@@ -334,6 +368,113 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Run the one fixed-grid host PTY and keep all peer work outside its drain loop.
+pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
+    let (cols, rows) = terminal::size()?;
+    let mut guard = TerminalGuard::new();
+    enable_raw_mode()?;
+    guard.raw_mode = true;
+    guard.alternate_screen = true;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    guard.bracketed_paste = true;
+    execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
+        },
+    )?;
+    let mut dirty = true;
+    loop {
+        while let Ok(event) = runtime.control_rx.try_recv() {
+            match event {
+                HostControlEvent::Input { peer_id, input } => match runtime.lease.input(
+                    &peer_id,
+                    input.lease_epoch,
+                    input.data,
+                    Instant::now(),
+                ) {
+                    LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
+                    LeaseDecision::Publish(_)
+                    | LeaseDecision::RejectStaleInput
+                    | LeaseDecision::RejectStaleRequest => {}
+                },
+                HostControlEvent::TakeControl { peer_id, request } => {
+                    if let LeaseDecision::Publish(state) = runtime.lease.take_control(
+                        peer_id,
+                        request.known_lease_epoch,
+                        Instant::now(),
+                    )? {
+                        runtime.lease_tx.send_replace(state);
+                    }
+                }
+            }
+        }
+        let drain_started = Instant::now();
+        for _ in 0..64 {
+            if drain_started.elapsed() >= Duration::from_millis(4) {
+                break;
+            }
+            let Some(bytes) = runtime.host.try_read_output()? else {
+                break;
+            };
+            if let Ok(frame) = runtime.screen.process_pty(&bytes) {
+                runtime.screen_tx.send_replace(frame);
+            }
+            dirty = true;
+        }
+        if runtime.host.output_closed() {
+            break;
+        }
+        if dirty {
+            terminal.draw(|frame| {
+                let screen = runtime.screen.screen();
+                frame.render_widget(VtScreen::new(screen), frame.area());
+                let (row, col) = screen.cursor_position();
+                if !screen.hide_cursor() && row < frame.area().height && col < frame.area().width {
+                    frame.set_cursor_position((col, row));
+                }
+            })?;
+            dirty = false;
+        }
+        if !event::poll(Duration::from_millis(16))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if is_ctrl_q(key) {
+                    break;
+                }
+                if let Some(bytes) = encode_key(key, runtime.screen.screen())
+                    && let LeaseDecision::AcceptInput(bytes) = runtime.lease.input(
+                        &runtime.host_peer_id,
+                        runtime.lease.state().epoch,
+                        bytes,
+                        Instant::now(),
+                    )
+                {
+                    runtime.host.write_input(&bytes)?;
+                }
+            }
+            Event::Paste(text) => {
+                let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
+                if let LeaseDecision::AcceptInput(bytes) = runtime.lease.input(
+                    &runtime.host_peer_id,
+                    runtime.lease.state().epoch,
+                    bytes,
+                    Instant::now(),
+                ) {
+                    runtime.host.write_input(&bytes)?;
+                }
+            }
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Render one remote, immutable terminal grid. Input forwarding arrives in milestone 12.
 pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let (cols, rows) = terminal::size()?;
@@ -354,6 +495,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     )?;
     let mut remote = GuestScreen::new();
     let mut footer = String::from("controller: waiting spectator");
+    let mut lease = None;
     let mut dirty = true;
 
     loop {
@@ -376,11 +518,12 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
-                Ok(GuestEvent::Lease(lease)) => {
+                Ok(GuestEvent::Lease(state)) => {
                     footer = format!(
                         "controller: {} typing",
-                        short_peer(&lease.controller_peer_id)
+                        short_peer(&state.controller_peer_id)
                     );
+                    lease = Some(state);
                     dirty = true;
                 }
                 Ok(GuestEvent::Disconnected)
@@ -409,6 +552,30 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     && is_ctrl_q(key) =>
             {
                 break;
+            }
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+                {
+                    let _ = pane
+                        .controls
+                        .try_take_control(lease.as_ref().map_or(1, |state| state.lease_epoch));
+                } else if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
+                    && state.controller_peer_id == pane.controls.peer_id()
+                    && let Some(bytes) = encode_key(key, screen)
+                {
+                    let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                }
+            }
+            Event::Paste(text) => {
+                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
+                    && state.controller_peer_id == pane.controls.peer_id()
+                {
+                    let _ = pane.controls.try_input(
+                        state.lease_epoch,
+                        encode_paste(&text, screen.bracketed_paste()),
+                    );
+                }
             }
             Event::Resize(_, _) => {}
             _ => {}

@@ -7,10 +7,12 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use tokio::task::JoinSet;
+use portable_pty::PtySize;
 
 use crate::{
-    session::{HostSession, join_pane},
+    lease::LeaseManager,
+    screen::HostScreen,
+    session::{DEFAULT_PANE_ID, HostPaneChannels, HostSession, join_pane},
     ticket::JoinTicket,
     transport::Transport,
 };
@@ -100,28 +102,53 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {
-    let mut handshakes = JoinSet::new();
-    loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
+    let (cols, rows) = crossterm::terminal::size()?;
+    let size = PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+    let screen = HostScreen::new(rows, cols)?;
+    let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let lease = LeaseManager::new(host_peer_id.clone(), std::time::Instant::now());
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(lease.state().clone());
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(256);
+    let runtime = crate::tui::HostPaneRuntime::new(
+        size,
+        host_peer_id.clone(),
+        screen_tx.clone(),
+        lease_tx,
+        control_rx,
+    )?;
+    let accept_task = {
+        let host = host.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(incoming) = host.accept_incoming().await else {
+                    return;
+                };
+                let pane = HostPaneChannels {
+                    pane_id: DEFAULT_PANE_ID.to_vec(),
+                    host_peer_id: host_peer_id.clone(),
+                    screen_rx: screen_rx.clone(),
+                    lease_rx: lease_rx.clone(),
+                    control_tx: control_tx.clone(),
+                };
+                let host = host.clone();
+                tokio::spawn(async move {
+                    let _ = host.serve_peer(incoming, pane).await;
+                });
             }
-            incoming = host.accept_incoming() => match incoming {
-                Ok(incoming) => {
-                    let host = host.clone();
-                    handshakes.spawn(async move {
-                        if host.handle_incoming(incoming).await.is_err() {
-                            eprintln!("join handshake failed");
-                        }
-                    });
-                }
-                Err(_) => eprintln!("incoming handshake accept failed"),
-            },
-        }
-    }
-    handshakes.abort_all();
-    while handshakes.join_next().await.is_some() {}
+        })
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::tui::run_host(runtime).map_err(|error| error.to_string())
+    })
+    .await?;
+    accept_task.abort();
     host.close().await;
+    result.map_err(io::Error::other)?;
     Ok(())
 }

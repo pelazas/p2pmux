@@ -2,6 +2,7 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
+    lease::LeaseState,
     protocol::{ControlLease, Envelope, Join, PROTOCOL_VERSION, Snapshot, envelope},
     screen::HostScreen,
     session::{DEFAULT_PANE_ID, GuestEvent, HostPaneChannels, HostSession, join_pane},
@@ -30,10 +31,10 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
     let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
     let mut screen = HostScreen::new(1, 3).expect("screen");
     let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
-    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(ControlLease {
-        pane_id: DEFAULT_PANE_ID.to_vec(),
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
         controller_peer_id: host_id.clone(),
-        lease_epoch: 1,
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
     });
     let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
     let host_task = {
@@ -75,10 +76,10 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
     let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
     let mut screen = HostScreen::new(1, 3).expect("screen");
     let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
-    let (lease_tx, lease_rx) = tokio::sync::watch::channel(ControlLease {
-        pane_id: DEFAULT_PANE_ID.to_vec(),
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
         controller_peer_id: host_id.clone(),
-        lease_epoch: 1,
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
     });
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
     let host_task = {

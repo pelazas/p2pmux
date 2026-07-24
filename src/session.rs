@@ -12,6 +12,7 @@ use tokio::{
 };
 
 use crate::{
+    lease::LeaseState,
     protocol::{
         ControlLease, Delta, Envelope, Input, Join, PROTOCOL_VERSION, Snapshot, TakeControl,
         Welcome, envelope,
@@ -27,9 +28,7 @@ pub struct HostPaneChannels {
     pub pane_id: Vec<u8>,
     pub host_peer_id: Vec<u8>,
     pub screen_rx: watch::Receiver<ScreenFrame>,
-    /// This is promoted to the pure LeaseState in milestone 12. Keeping the wire
-    /// message here lets the screen service start before lease ownership exists.
-    pub lease_rx: watch::Receiver<ControlLease>,
+    pub lease_rx: watch::Receiver<LeaseState>,
     pub control_tx: mpsc::Sender<HostControlEvent>,
 }
 
@@ -58,12 +57,45 @@ pub enum GuestEvent {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct GuestControlSender {
     peer_id: Vec<u8>,
     pane_id: Vec<u8>,
     take_control_tx: mpsc::Sender<u64>,
     input_tx: mpsc::Sender<(u64, Vec<u8>)>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ControlQueueError {
+    Full,
+    Closed,
+}
+
+impl GuestControlSender {
+    pub fn try_take_control(&self, known_lease_epoch: u64) -> Result<(), ControlQueueError> {
+        self.take_control_tx
+            .try_send(known_lease_epoch)
+            .map_err(queue_error)
+    }
+
+    pub fn try_input(&self, lease_epoch: u64, data: Vec<u8>) -> Result<(), ControlQueueError> {
+        self.input_tx
+            .try_send((lease_epoch, data))
+            .map_err(queue_error)
+    }
+
+    pub fn peer_id(&self) -> &[u8] {
+        &self.peer_id
+    }
+    pub fn pane_id(&self) -> &[u8] {
+        &self.pane_id
+    }
+}
+
+fn queue_error<T>(error: mpsc::error::TrySendError<T>) -> ControlQueueError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => ControlQueueError::Full,
+        mpsc::error::TrySendError::Closed(_) => ControlQueueError::Closed,
+    }
 }
 
 pub struct GuestPane {
@@ -400,20 +432,21 @@ async fn write_snapshot(
 
 async fn lease_writer_task(
     sender_peer_id: Vec<u8>,
-    mut lease_rx: watch::Receiver<ControlLease>,
+    mut lease_rx: watch::Receiver<LeaseState>,
     pane_id: Vec<u8>,
     mut writer: crate::transport::FrameWriter,
 ) -> Result<(), SessionError> {
     loop {
         let lease = lease_rx.borrow_and_update().clone();
-        if lease.pane_id != pane_id {
-            return Err(SessionError::InvalidPostWelcome);
-        }
         writer
             .write_next(&Envelope {
                 version: PROTOCOL_VERSION,
                 sender_peer_id: sender_peer_id.clone(),
-                body: Some(envelope::Body::ControlLease(lease)),
+                body: Some(envelope::Body::ControlLease(ControlLease {
+                    pane_id: pane_id.clone(),
+                    controller_peer_id: lease.controller_peer_id,
+                    lease_epoch: lease.epoch,
+                })),
             })
             .await?;
         lease_rx
