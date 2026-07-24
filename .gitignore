@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# macOS and local editor metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
