@@ -1,2 +1,6 @@
-//! Future coordinator and member registry; this scaffold stores no session state.
-pub struct Session;
+//! Session lifecycle is added once Join/Welcome handshaking is wired.
+
+/// Opaque future host session type.
+pub struct HostSession {
+    _private: (),
+}
