@@ -15,6 +15,7 @@ use crate::protocol::{Envelope, MAX_FRAME_BYTES, ProtocolError, decode_frame, en
 
 pub const ALPN: &[u8] = b"p2pmux/1";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Transport {
@@ -109,7 +110,7 @@ impl Transport {
     }
 
     pub async fn wait_until_online(&self) -> bool {
-        timeout(HANDSHAKE_TIMEOUT, self.endpoint.online())
+        timeout(CONNECT_TIMEOUT, self.endpoint.online())
             .await
             .is_ok()
     }
@@ -122,7 +123,7 @@ impl Transport {
     }
 
     pub async fn connect(&self, remote: EndpointAddr) -> Result<Connection, TransportError> {
-        timeout(HANDSHAKE_TIMEOUT, self.endpoint.connect(remote, ALPN))
+        timeout(CONNECT_TIMEOUT, self.endpoint.connect(remote, ALPN))
             .await
             .map_err(|_| TransportError::TimedOut("connect"))?
             .map_err(TransportError::Connect)

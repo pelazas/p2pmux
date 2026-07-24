@@ -2,7 +2,9 @@
 
 use std::{
     error::Error,
+    future::Future,
     io::{self, Write},
+    pin::Pin,
     str::FromStr,
 };
 
@@ -12,9 +14,9 @@ use portable_pty::PtySize;
 use crate::{
     lease::LeaseManager,
     screen::HostScreen,
-    session::{DEFAULT_PANE_ID, HostPaneChannels, HostSession, join_pane},
+    session::{DEFAULT_PANE_ID, HostPaneChannels, HostSession, SessionError, join_pane},
     ticket::JoinTicket,
-    transport::Transport,
+    transport::{Transport, TransportError},
 };
 
 /// The temporary p2pmux command-line interface.
@@ -123,24 +125,30 @@ async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {
         control_rx,
     )?;
     let accept_task = {
-        let host = host.clone();
+        let accept_host = host.clone();
+        let serve_host = host.clone();
         tokio::spawn(async move {
-            loop {
-                let Ok(incoming) = host.accept_incoming().await else {
-                    return;
-                };
-                let pane = HostPaneChannels {
-                    pane_id: DEFAULT_PANE_ID.to_vec(),
-                    host_peer_id: host_peer_id.clone(),
-                    screen_rx: screen_rx.clone(),
-                    lease_rx: lease_rx.clone(),
-                    control_tx: control_tx.clone(),
-                };
-                let host = host.clone();
-                tokio::spawn(async move {
-                    let _ = host.serve_peer(incoming, pane).await;
-                });
-            }
+            accept_until_closed(
+                move || {
+                    let host = accept_host.clone();
+                    Box::pin(async move { host.accept_incoming().await })
+                        as Pin<Box<dyn Future<Output = Result<_, SessionError>> + Send>>
+                },
+                move |incoming| {
+                    let pane = HostPaneChannels {
+                        pane_id: DEFAULT_PANE_ID.to_vec(),
+                        host_peer_id: host_peer_id.clone(),
+                        screen_rx: screen_rx.clone(),
+                        lease_rx: lease_rx.clone(),
+                        control_tx: control_tx.clone(),
+                    };
+                    let host = serve_host.clone();
+                    tokio::spawn(async move {
+                        let _ = host.serve_peer(incoming, pane).await;
+                    });
+                },
+            )
+            .await;
         })
     };
     let result = tokio::task::spawn_blocking(move || {
@@ -151,4 +159,77 @@ async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {
     host.close().await;
     result.map_err(io::Error::other)?;
     Ok(())
+}
+
+async fn accept_until_closed<T, Accept, Handle>(mut accept: Accept, mut handle: Handle)
+where
+    Accept: FnMut() -> Pin<Box<dyn Future<Output = Result<T, SessionError>> + Send>>,
+    Handle: FnMut(T),
+{
+    loop {
+        match accept().await {
+            Ok(incoming) => handle(incoming),
+            Err(error) if endpoint_is_closed(&error) => return,
+            Err(error) if !idle_accept_timed_out(&error) => {
+                eprintln!("p2pmux accept failed; continuing to listen: {error}");
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn endpoint_is_closed(error: &SessionError) -> bool {
+    matches!(error, SessionError::Transport(TransportError::Closed))
+}
+
+fn idle_accept_timed_out(error: &SessionError) -> bool {
+    matches!(
+        error,
+        SessionError::Transport(TransportError::TimedOut("incoming accept"))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{session::SessionError, transport::TransportError};
+
+    use super::accept_until_closed;
+
+    #[tokio::test]
+    async fn accept_loop_keeps_accepting_after_an_idle_timeout() {
+        let results = Arc::new(Mutex::new(VecDeque::from([
+            Err(SessionError::Transport(TransportError::TimedOut(
+                "incoming accept",
+            ))),
+            Ok("joined"),
+            Err(SessionError::Transport(TransportError::Closed)),
+        ])));
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let next = results.clone();
+        let handled = accepted.clone();
+
+        accept_until_closed(
+            move || {
+                let next = next.clone();
+                Box::pin(async move {
+                    next.lock()
+                        .expect("results lock")
+                        .pop_front()
+                        .expect("loop should stop when endpoint closes")
+                })
+                    as Pin<Box<dyn Future<Output = Result<&'static str, SessionError>> + Send>>
+            },
+            move |incoming| handled.lock().expect("accepted lock").push(incoming),
+        )
+        .await;
+
+        assert_eq!(*accepted.lock().expect("accepted lock"), vec!["joined"]);
+    }
 }
