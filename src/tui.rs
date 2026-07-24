@@ -151,18 +151,16 @@ fn render_host_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &st
     render_guest_screen(frame, screen, footer);
 }
 
-fn is_ctrl_q(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char(character) if character.eq_ignore_ascii_case(&'q'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
+fn is_quit(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(10) && key.modifiers.is_empty()
 }
 
-fn is_ctrl_t(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char(character) if character.eq_ignore_ascii_case(&'t'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
+fn is_take_control(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(9) && key.modifiers.is_empty()
 }
 
 fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
-    if is_ctrl_q(key) {
+    if is_quit(key) || is_take_control(key) {
         return None;
     }
 
@@ -366,7 +364,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
         }
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_ctrl_q(key) {
+                if is_quit(key) {
                     break;
                 }
                 if let Some(bytes) = encode_key(key, parser.screen()) {
@@ -403,7 +401,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         },
     )?;
     let footer = format!(
-        "join: p2pmux join {} | Ctrl-T take control | Ctrl-Q quit",
+        "join: p2pmux join {} | F9 take control | F10 quit",
         runtime.join_code
     );
     let mut dirty = true;
@@ -483,10 +481,10 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         }
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_ctrl_q(key) {
+                if is_quit(key) {
                     break;
                 }
-                if is_ctrl_t(key) {
+                if is_take_control(key) {
                     if runtime.lease.state().controller_peer_id != runtime.host_peer_id {
                         let known_epoch = runtime.lease.state().epoch;
                         if let LeaseDecision::Publish(state) = runtime.lease.force_take_control(
@@ -668,12 +666,12 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
         match event::read()? {
             Event::Key(key)
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && is_ctrl_q(key) =>
+                    && is_quit(key) =>
             {
                 break;
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_ctrl_t(key) {
+                if is_take_control(key) {
                     if let Some(state) = lease.as_ref()
                         && state.controller_peer_id != pane.controls.peer_id()
                     {
@@ -892,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_supported_keys_and_intercepts_ctrl_q() {
+    fn encodes_supported_keys_and_reserves_f9_and_f10() {
         let parser = vt100::Parser::new(1, 1, 0);
         let screen = parser.screen();
         let cases = [
@@ -949,6 +947,8 @@ mod tests {
                 KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
                 Some("\x1bOP"),
             ),
+            (KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), None),
+            (KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), None),
             (
                 KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
                 Some("\x1b[24~"),
@@ -959,7 +959,7 @@ mod tests {
             ),
             (
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-                None,
+                Some("\x11"),
             ),
             (KeyEvent::new(KeyCode::Null, KeyModifiers::NONE), None),
         ];

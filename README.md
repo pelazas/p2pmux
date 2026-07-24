@@ -47,7 +47,7 @@ connection. It intentionally has no tabs, splits, resize protocol, or multiple p
 
 ## Local Spike 1
 
-Run `cargo run -- local` to start one local shell. Press Ctrl-Q to leave p2pmux.
+Run `cargo run -- local` to start one local shell. Press F10 to leave p2pmux.
 
 The PTY grid is fixed from the terminal size at startup. Resizing the outer terminal never resizes
 the child shell or vt100 parser: larger windows leave extra cells blank and smaller windows crop
@@ -68,7 +68,7 @@ dogfooding only; they work while the corresponding `create` process is alive and
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
 
 Only one peer controls input at a time: after about eight seconds of idle time another guest can
-type to hop in; while someone is actively typing, press Ctrl-T to take control. Ctrl-Q exits only
+type to hop in; while someone is actively typing, press F9 to take control. F10 exits only
 the local p2pmux view.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
