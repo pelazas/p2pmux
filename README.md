@@ -42,8 +42,8 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 
 ## Status
 
-Early design locked (2026-07-24). Spike 1 local terminal implementation is available; the
-networked multiplexer is not started.
+Early design locked (2026-07-24). Spike 1 local terminal implementation is available, along with
+a live Iroh Join/Welcome handshake smoke test.
 
 ## Local Spike 1
 
@@ -54,8 +54,16 @@ the child shell or vt100 parser: larger windows leave extra cells blank and smal
 the upper-left fixed viewport. Dynamic resize is intentionally outside Spike 1 and the MVP wire
 protocol.
 
-`create` and `join <ticket>` remain scaffolding-only commands; the local shell is not networked or
-multi-pane.
+To prove one encrypted Iroh Join/Welcome exchange (without terminal mirroring):
+
+```text
+Terminal 1: cargo run -- create
+Terminal 2: cargo run -- join '<printed p2pmux-v1:... ticket>'
+```
+
+The ticket is reusable while Terminal 1 remains alive. This proves only the authenticated Iroh
+Join/Welcome handshake: it does not mirror a terminal, attach a joined process, or make the local
+shell networked or multi-pane.
 
 Full product/architecture docs live in [`docs/`](./docs/).
 

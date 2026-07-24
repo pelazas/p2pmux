@@ -1,11 +1,19 @@
-//! Command-line parsing and scaffold-only command dispatch.
+//! Command-line parsing and live session dispatch.
 
 use std::{
     error::Error,
     io::{self, Write},
+    str::FromStr,
 };
 
 use clap::{Parser, Subcommand};
+use tokio::task::JoinSet;
+
+use crate::{
+    session::{HostSession, join_once},
+    ticket::JoinTicket,
+    transport::Transport,
+};
 
 /// The temporary p2pmux command-line interface.
 #[derive(Debug, Parser)]
@@ -22,9 +30,9 @@ pub struct Cli {
 enum Command {
     /// Start one local interactive shell (Spike 1).
     Local,
-    /// Create a shared session (scaffold only).
+    /// Create a shared session with a reusable join ticket.
     Create,
-    /// Join a shared session using a reusable ticket (scaffold only).
+    /// Join a shared session using a reusable shared-session ticket.
     Join { ticket: String },
 }
 
@@ -34,26 +42,84 @@ Share the ticket only with people you trust with that access. For risky/unknown 
 
 Processes and credential files stay on the pane host's Mac (not uploaded to peers). That does not stop a controller from using or displaying them via the shared shell.";
 
-/// Parse process arguments and run a scaffold-only command.
-pub fn parse_and_run() -> Result<(), Box<dyn Error>> {
-    run(Cli::parse())
+#[derive(Debug)]
+struct CliError(&'static str);
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+impl Error for CliError {}
+
+/// Parse process arguments and run a command.
+pub async fn parse_and_run() -> Result<(), Box<dyn Error>> {
+    run(Cli::parse()).await
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Local => crate::tui::run_local(),
         Command::Create => {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "{TRUST_WARNING}\n")?;
-            writeln!(stdout, "create is not implemented in the scaffold.")?;
-            Ok(())
+            stdout.flush()?;
+            let host = HostSession::create().await?;
+            writeln!(stdout, "Reusable shared-session ticket:")?;
+            writeln!(stdout, "{}", host.ticket())?;
+            writeln!(
+                stdout,
+                "Waiting for join handshakes; press Ctrl-C to end this live session."
+            )?;
+            if !host.address_ready() {
+                writeln!(
+                    stdout,
+                    "WARNING: the ticket contains only currently discovered direct addresses; localhost/LAN is supported but public reachability is not yet confirmed."
+                )?;
+            }
+            stdout.flush()?;
+            run_host(host).await
         }
         Command::Join { ticket } => {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "{TRUST_WARNING}\n")?;
-            let _ = ticket;
-            writeln!(stdout, "join is not implemented in the scaffold.")?;
+            stdout.flush()?;
+            let ticket =
+                JoinTicket::from_str(&ticket).map_err(|_| CliError("invalid ticket format"))?;
+            let _receipt = join_once(Transport::bind().await?, ticket).await?;
+            writeln!(
+                stdout,
+                "Connected to coordinator. Terminal sharing is not yet implemented."
+            )?;
             Ok(())
         }
     }
+}
+
+async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {
+    let mut handshakes = JoinSet::new();
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                break;
+            }
+            incoming = host.accept_incoming() => match incoming {
+                Ok(incoming) => {
+                    let host = host.clone();
+                    handshakes.spawn(async move {
+                        if host.handle_incoming(incoming).await.is_err() {
+                            eprintln!("join handshake failed");
+                        }
+                    });
+                }
+                Err(_) => eprintln!("incoming handshake accept failed"),
+            },
+        }
+    }
+    handshakes.abort_all();
+    while handshakes.join_next().await.is_some() {}
+    host.close().await;
+    Ok(())
 }
