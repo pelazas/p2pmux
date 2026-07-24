@@ -67,34 +67,42 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Local => crate::tui::run_local(),
         Command::Create => {
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "{TRUST_WARNING}\n")?;
-            stdout.flush()?;
+            {
+                let mut stdout = io::stdout().lock();
+                writeln!(stdout, "{TRUST_WARNING}\n")?;
+                stdout.flush()?;
+            }
             let host = HostSession::create().await?;
             let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
-            writeln!(stdout, "Join with: p2pmux join {}", rendezvous.code())?;
-            writeln!(
-                stdout,
-                "Waiting for join handshakes; press Ctrl-Q to end this live session."
-            )?;
-            if !host.address_ready() {
+            {
+                let mut stdout = io::stdout().lock();
+                writeln!(stdout, "Join with: p2pmux join {}", rendezvous.code())?;
                 writeln!(
                     stdout,
-                    "WARNING: the ticket contains only currently discovered direct addresses; localhost/LAN is supported but public reachability is not yet confirmed."
+                    "Waiting for join handshakes; press Ctrl-Q to end this live session."
                 )?;
+                if !host.address_ready() {
+                    writeln!(
+                        stdout,
+                        "WARNING: the ticket contains only currently discovered direct addresses; localhost/LAN is supported but public reachability is not yet confirmed."
+                    )?;
+                }
+                stdout.flush()?;
+                drop(stdout);
             }
-            stdout.flush()?;
+            // run_host moves terminal I/O to a blocking thread, so no StdoutLock may survive.
             let result = run_host(host).await;
             rendezvous.remove()?;
             result
         }
         Command::Join { ticket } => {
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "{TRUST_WARNING}\n")?;
-            stdout.flush()?;
+            {
+                let mut stdout = io::stdout().lock();
+                writeln!(stdout, "{TRUST_WARNING}\n")?;
+                stdout.flush()?;
+            }
             let ticket = resolve_join_ticket(&ticket)?;
             let pane = join_pane(Transport::bind().await?, ticket).await?;
-            drop(stdout);
             let guest_result = tokio::task::spawn_blocking(move || {
                 crate::tui::run_guest(pane).map_err(|error| error.to_string())
             })
@@ -245,5 +253,27 @@ mod tests {
         .await;
 
         assert_eq!(*accepted.lock().expect("accepted lock"), vec!["joined"]);
+    }
+
+    #[test]
+    fn create_releases_stdout_before_starting_the_host_tui() {
+        let source = include_str!("cli.rs");
+        let create_arm = source
+            .split_once("Command::Create => {")
+            .expect("create arm")
+            .1
+            .split_once("Command::Join { ticket } => {")
+            .expect("join arm")
+            .0;
+
+        assert!(
+            create_arm
+                .find("drop(stdout);")
+                .expect("stdout is released")
+                < create_arm
+                    .find("run_host(host).await")
+                    .expect("host TUI starts"),
+            "create must release stdout before the host TUI runs on a blocking thread"
+        );
     }
 }

@@ -61,8 +61,8 @@ Terminal 1: cargo run -- create
 Terminal 2: cargo run -- join <printed 10-character code>
 ```
 
-`create` prints `Join with: p2pmux join <CODE>`, starts one fixed-size local shell and its host
-view. `join` renders that remote pane. Short join codes resolve through a restrictive local cache
+`create` prints `Join with: p2pmux join <CODE>` and immediately enters the fixed-size local shell
+in its host view. `join` renders that remote pane. Short join codes resolve through a restrictive local cache
 on the same Mac, so they are for current dogfooding only; they work while the corresponding
 `create` process is alive and are removed when it exits. Long `p2pmux-v1:` tickets remain accepted
 for backwards compatibility.
