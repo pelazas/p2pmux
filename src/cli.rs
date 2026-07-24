@@ -74,12 +74,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             let host = HostSession::create().await?;
             let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
+            let join_code = rendezvous.code().to_string();
             {
                 let mut stdout = io::stdout().lock();
-                writeln!(stdout, "Join with: p2pmux join {}", rendezvous.code())?;
+                writeln!(stdout, "Join with: p2pmux join {join_code}")?;
                 writeln!(
                     stdout,
-                    "Waiting for join handshakes; press Ctrl-Q to end this live session."
+                    "This code stays visible in the host status bar after you continue."
                 )?;
                 if !host.address_ready() {
                     writeln!(
@@ -87,11 +88,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                         "WARNING: the ticket contains only currently discovered direct addresses; localhost/LAN is supported but public reachability is not yet confirmed."
                     )?;
                 }
+                write!(stdout, "Press Enter to start the host shell…")?;
                 stdout.flush()?;
                 drop(stdout);
             }
+            wait_for_enter()?;
             // run_host moves terminal I/O to a blocking thread, so no StdoutLock may survive.
-            let result = run_host(host).await;
+            let result = run_host(host, join_code).await;
             rendezvous.remove()?;
             result
         }
@@ -125,16 +128,24 @@ fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
         })
 }
 
-async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {
+fn wait_for_enter() -> io::Result<()> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(())
+}
+
+async fn run_host(host: HostSession, join_code: String) -> Result<(), Box<dyn Error>> {
     let (cols, rows) = crossterm::terminal::size()?;
+    // Reserve one row for the join-code status bar.
+    let shell_rows = rows.max(2).saturating_sub(1);
     let size = PtySize {
-        rows,
+        rows: shell_rows,
         cols,
         pixel_width: 0,
         pixel_height: 0,
     };
     let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
-    let screen = HostScreen::new(rows, cols)?;
+    let screen = HostScreen::new(shell_rows, cols)?;
     let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
     let lease = LeaseManager::new(host_peer_id.clone(), std::time::Instant::now());
     let (lease_tx, lease_rx) = tokio::sync::watch::channel(lease.state().clone());
@@ -145,6 +156,7 @@ async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {
         screen_tx.clone(),
         lease_tx,
         control_rx,
+        join_code,
     )?;
     let accept_task = {
         let accept_host = host.clone();
@@ -271,9 +283,13 @@ mod tests {
                 .find("drop(stdout);")
                 .expect("stdout is released")
                 < create_arm
-                    .find("run_host(host).await")
+                    .find("run_host(host, join_code).await")
                     .expect("host TUI starts"),
             "create must release stdout before the host TUI runs on a blocking thread"
+        );
+        assert!(
+            create_arm.contains("wait_for_enter()?"),
+            "create must pause so the join code can be copied before the TUI starts"
         );
     }
 }

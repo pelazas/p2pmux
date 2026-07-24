@@ -42,6 +42,7 @@ pub struct HostPaneRuntime {
     screen_tx: watch::Sender<ScreenFrame>,
     lease_tx: watch::Sender<LeaseState>,
     control_rx: mpsc::Receiver<HostControlEvent>,
+    join_code: String,
 }
 
 impl HostPaneRuntime {
@@ -51,6 +52,7 @@ impl HostPaneRuntime {
         screen_tx: watch::Sender<ScreenFrame>,
         lease_tx: watch::Sender<LeaseState>,
         control_rx: mpsc::Receiver<HostControlEvent>,
+        join_code: String,
     ) -> Result<Self, Box<dyn Error>> {
         let screen = HostScreen::new(size.rows, size.cols)?;
         let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
@@ -62,6 +64,7 @@ impl HostPaneRuntime {
             screen_tx,
             lease_tx,
             control_rx,
+            join_code,
         })
     }
 }
@@ -137,6 +140,10 @@ fn render_guest_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &s
             .buffer_mut()
             .set_string(area.x, footer_y, footer, Style::default());
     }
+}
+
+fn render_host_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &str) {
+    render_guest_screen(frame, screen, footer);
 }
 
 fn is_ctrl_q(key: KeyEvent) -> bool {
@@ -385,6 +392,10 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
+    let footer = format!(
+        "join: p2pmux join {} | Ctrl-T take control | Ctrl-Q quit",
+        runtime.join_code
+    );
     let mut dirty = true;
     loop {
         while let Ok(event) = runtime.control_rx.try_recv() {
@@ -430,10 +441,11 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         if dirty {
             terminal.draw(|frame| {
                 let screen = runtime.screen.screen();
-                frame.render_widget(VtScreen::new(screen), frame.area());
+                render_host_screen(frame, screen, &footer);
                 let (row, col) = screen.cursor_position();
-                if !screen.hide_cursor() && row < frame.area().height && col < frame.area().width {
-                    frame.set_cursor_position((col, row));
+                let screen_height = screen.size().0.min(frame.area().height.saturating_sub(1));
+                if !screen.hide_cursor() && row < screen_height && col < frame.area().width {
+                    frame.set_cursor_position((frame.area().x + col, frame.area().y + row));
                 }
             })?;
             dirty = false;
