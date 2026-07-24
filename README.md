@@ -42,7 +42,20 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 
 ## Status
 
-Early design locked (2026-07-24). Implementation not started.
+Early design locked (2026-07-24). Spike 1 local terminal implementation is available; the
+networked multiplexer is not started.
+
+## Local Spike 1
+
+Run `cargo run -- local` to start one local shell. Press Ctrl-Q to leave p2pmux.
+
+The PTY grid is fixed from the terminal size at startup. Resizing the outer terminal never resizes
+the child shell or vt100 parser: larger windows leave extra cells blank and smaller windows crop
+the upper-left fixed viewport. Dynamic resize is intentionally outside Spike 1 and the MVP wire
+protocol.
+
+`create` and `join <ticket>` remain scaffolding-only commands; the local shell is not networked or
+multi-pane.
 
 Full product/architecture docs live in [`docs/`](./docs/).
 
