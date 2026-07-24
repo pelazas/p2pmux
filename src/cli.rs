@@ -13,9 +13,10 @@ use portable_pty::PtySize;
 
 use crate::{
     lease::LeaseManager,
+    rendezvous::{LocalRendezvous, RendezvousError},
     screen::HostScreen,
     session::{DEFAULT_PANE_ID, HostPaneChannels, HostSession, SessionError, join_pane},
-    ticket::JoinTicket,
+    ticket::{JoinTicket, TICKET_PREFIX},
     transport::{Transport, TransportError},
 };
 
@@ -70,11 +71,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             writeln!(stdout, "{TRUST_WARNING}\n")?;
             stdout.flush()?;
             let host = HostSession::create().await?;
-            writeln!(stdout, "Reusable shared-session ticket:")?;
-            writeln!(stdout, "{}", host.ticket())?;
+            let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
+            writeln!(stdout, "Join with: p2pmux join {}", rendezvous.code())?;
             writeln!(
                 stdout,
-                "Waiting for join handshakes; press Ctrl-C to end this live session."
+                "Waiting for join handshakes; press Ctrl-Q to end this live session."
             )?;
             if !host.address_ready() {
                 writeln!(
@@ -83,14 +84,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 )?;
             }
             stdout.flush()?;
-            run_host(host).await
+            let result = run_host(host).await;
+            rendezvous.remove()?;
+            result
         }
         Command::Join { ticket } => {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "{TRUST_WARNING}\n")?;
             stdout.flush()?;
-            let ticket =
-                JoinTicket::from_str(&ticket).map_err(|_| CliError("invalid ticket format"))?;
+            let ticket = resolve_join_ticket(&ticket)?;
             let pane = join_pane(Transport::bind().await?, ticket).await?;
             drop(stdout);
             let guest_result = tokio::task::spawn_blocking(move || {
@@ -101,6 +103,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
     }
+}
+
+fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
+    if input.starts_with(TICKET_PREFIX) {
+        return JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"));
+    }
+    LocalRendezvous::for_current_user()
+        .and_then(|store| store.resolve(input))
+        .map_err(|error| match error {
+            RendezvousError::NotFound => CliError("join code was not found on this Mac"),
+            _ => CliError("invalid ticket format"),
+        })
 }
 
 async fn run_host(host: HostSession) -> Result<(), Box<dyn Error>> {

@@ -82,11 +82,25 @@ struct TicketPayload {
 
 impl JoinTicket {
     pub fn mint(endpoint_addr: EndpointAddr) -> Result<Self, TicketError> {
+        Self::from_parts(endpoint_addr.id.as_bytes().to_vec(), endpoint_addr)
+    }
+
+    pub fn from_parts(
+        session_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+    ) -> Result<Self, TicketError> {
+        let session_id: [u8; 32] = session_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| TicketError::InvalidSessionId)?;
         if endpoint_addr.is_empty() {
             return Err(TicketError::MissingAddresses);
         }
+        if session_id != *endpoint_addr.id.as_bytes() {
+            return Err(TicketError::SessionMismatch);
+        }
         Ok(Self {
-            session_id: *endpoint_addr.id.as_bytes(),
+            session_id,
             endpoint_addr,
         })
     }
@@ -133,20 +147,6 @@ impl FromStr for JoinTicket {
         if payload.version != TICKET_VERSION {
             return Err(TicketError::UnsupportedVersion);
         }
-        let session_id: [u8; 32] = payload
-            .session_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| TicketError::InvalidSessionId)?;
-        if payload.endpoint_addr.is_empty() {
-            return Err(TicketError::MissingAddresses);
-        }
-        if session_id != *payload.endpoint_addr.id.as_bytes() {
-            return Err(TicketError::SessionMismatch);
-        }
-        Ok(Self {
-            session_id,
-            endpoint_addr: payload.endpoint_addr,
-        })
+        Self::from_parts(payload.session_id, payload.endpoint_addr)
     }
 }
