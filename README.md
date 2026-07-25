@@ -90,4 +90,4 @@ Full product/architecture docs live in [`docs/`](./docs/).
 
 ## License
 
-TBD.
+This project is licensed under the [MIT License](LICENSE).
