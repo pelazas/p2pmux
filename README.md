@@ -99,7 +99,7 @@ passthrough configuration.
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
 Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
 pane reports whether its controller is actively typing or merely retains idle control, and every
-member sees the same footer: `Ctrl+P panes | Ctrl+T tabs | type to claim idle | active typing is
+member sees the same footer: `Ctrl+P panes | Ctrl+T tabs | type to claim when free | active typing is
 protected | Ctrl+Q quit`.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an

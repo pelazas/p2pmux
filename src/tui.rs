@@ -50,7 +50,44 @@ use crate::{
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
-const CONTROL_HELP: &str = "type to claim idle | active typing is protected | Ctrl+Q quit";
+const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
+const FOOTER_MUTED: Color = Color::DarkGray;
+const FOOTER_ACCENT: Color = Color::Red;
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
+
+type FooterSegment = (&'static str, bool);
+
+const NORMAL_FOOTER: &[FooterSegment] = &[
+    ("Ctrl+ <", false),
+    ("p", true),
+    ("> PANE   <", false),
+    ("t", true),
+    ("> TAB   <", false),
+    ("q", true),
+    ("> QUIT    type to claim when free", false),
+];
+const PANE_FOOTER: &[FooterSegment] = &[
+    ("Pane  <", false),
+    ("←↓↑→", true),
+    ("> FOCUS   <", false),
+    ("n", true),
+    ("> NEW   <", false),
+    ("x", true),
+    ("> CLOSE   <", false),
+    ("Esc", true),
+    ("> BACK", false),
+];
+const TAB_FOOTER: &[FooterSegment] = &[
+    ("Tab  <", false),
+    ("←→", true),
+    ("> SWITCH   <", false),
+    ("n", true),
+    ("> NEW   <", false),
+    ("x", true),
+    ("> CLOSE   <", false),
+    ("Esc", true),
+    ("> BACK", false),
+];
 
 /// The in-progress multi-pane command prefix, kept entirely local to one terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -655,21 +692,99 @@ pub fn render_multi_pane(
     render_shared_multi_pane(frame, tui, screens, "", None);
 }
 
-fn shared_footer_text(status: &str, join_code: Option<&str>, chord_mode: ChordMode) -> String {
-    let controls = match chord_mode {
-        ChordMode::None => format!("Ctrl+P panes | Ctrl+T tabs | {CONTROL_HELP}"),
-        ChordMode::Pane => {
-            String::from("arrows move focus | N new pane | X delete pane | Esc cancel")
-        }
-        ChordMode::Tab => String::from("←/→ switch tab | N new tab | X delete tab | Esc cancel"),
-    };
-    match (status.is_empty(), join_code) {
-        (false, Some(join_code)) => {
-            format!("{status} | {controls} | join: p2pmux join {join_code}")
-        }
-        (false, None) => format!("{status} | {controls}"),
-        (true, Some(join_code)) => format!("{controls} | join: p2pmux join {join_code}"),
-        (true, None) => controls,
+fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
+    match chord_mode {
+        ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
+        ChordMode::Pane => (
+            "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
+            PANE_FOOTER,
+        ),
+        ChordMode::Tab => (
+            "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
+            TAB_FOOTER,
+        ),
+    }
+}
+
+fn render_footer_segments(
+    buffer: &mut Buffer,
+    mut x: u16,
+    y: u16,
+    end_x: u16,
+    segments: &[FooterSegment],
+) -> u16 {
+    for (text, accent) in segments {
+        let style = Style::default()
+            .fg(if *accent { FOOTER_ACCENT } else { FOOTER_MUTED })
+            .bg(FOOTER_BACKGROUND);
+        x = buffer
+            .set_stringn(x, y, text, usize::from(end_x.saturating_sub(x)), style)
+            .0;
+    }
+    x
+}
+
+fn footer_suffix(text: &str, width: usize) -> &str {
+    if width == 0 {
+        return "";
+    }
+    let start = text
+        .char_indices()
+        .nth(text.chars().count().saturating_sub(width))
+        .map_or(0, |(index, _)| index);
+    &text[start..]
+}
+
+fn render_contextual_footer(
+    buffer: &mut Buffer,
+    area: Rect,
+    status: &str,
+    join_code: Option<&str>,
+    chord_mode: ChordMode,
+) {
+    buffer.set_stringn(
+        area.x,
+        area.y,
+        " ".repeat(usize::from(area.width)),
+        usize::from(area.width),
+        Style::default().bg(FOOTER_BACKGROUND),
+    );
+
+    let end_x = area.right();
+    let mut x = area.x;
+    if !status.is_empty() {
+        x = buffer
+            .set_stringn(
+                x,
+                area.y,
+                format!("{status}  "),
+                usize::from(end_x.saturating_sub(x)),
+                Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+            )
+            .0;
+    }
+
+    let join = join_code.map(|code| format!("join: p2pmux join {code}"));
+    let (join_x, join_text) = join
+        .as_deref()
+        .map(|text| {
+            let text = footer_suffix(text, usize::from(end_x.saturating_sub(x)));
+            (
+                end_x.saturating_sub(text.chars().count() as u16),
+                Some(text),
+            )
+        })
+        .unwrap_or((end_x, None));
+    let (_, segments) = contextual_footer(chord_mode);
+    render_footer_segments(buffer, x, area.y, join_x, segments);
+    if let Some(text) = join_text {
+        buffer.set_stringn(
+            join_x,
+            area.y,
+            text,
+            usize::from(end_x.saturating_sub(join_x)),
+            Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+        );
     }
 }
 
@@ -714,11 +829,12 @@ fn render_shared_multi_pane(
         }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
-        frame.buffer_mut().set_string(
-            geometry.footer.x,
-            geometry.footer.y,
-            shared_footer_text(status, join_code, tui.chord_mode),
-            Style::default().fg(Color::DarkGray),
+        render_contextual_footer(
+            frame.buffer_mut(),
+            geometry.footer,
+            status,
+            join_code,
+            tui.chord_mode,
         );
     }
 
@@ -2527,13 +2643,12 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
+        ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
-        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label,
+        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, contextual_footer, encode_key,
+        encode_paste, grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        render_guest_screen, render_multi_pane, render_shared_multi_pane, shared_footer_text,
-        visible_leaf_panes,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2783,14 +2898,49 @@ mod tests {
 
     #[test]
     fn shared_footer_keeps_status_visible_when_a_join_code_is_present() {
-        let footer =
-            shared_footer_text("layout request rejected", Some("TESTCODE"), ChordMode::None);
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        );
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "layout request rejected",
+                    Some("TESTCODE"),
+                );
+            })
+            .expect("draw");
+        let footer = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
+            .collect::<String>();
         assert!(footer.starts_with("layout request rejected"));
-        assert!(footer.contains("Ctrl+P panes"));
-        assert!(footer.contains(CONTROL_HELP));
-        assert!(!footer.contains("F9"));
-        assert!(!footer.contains("F10"));
-        assert!(footer.contains("join: p2pmux join TESTCODE"));
+        assert!(footer.ends_with("join: p2pmux join TESTCODE"));
+
+        let mut narrow_terminal = Terminal::new(TestBackend::new(20, 5)).expect("terminal");
+        narrow_terminal
+            .draw(|frame| {
+                render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "layout request rejected",
+                    Some("TESTCODE"),
+                );
+            })
+            .expect("draw");
+        let narrow_footer = (0..20)
+            .map(|x| narrow_terminal.backend().buffer()[(x, 4)].symbol())
+            .collect::<String>();
+        assert!(narrow_footer.starts_with("layout request"));
+        assert!(!narrow_footer.contains("join"));
     }
 
     #[test]
@@ -3451,15 +3601,15 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+P panes | Ctrl+T tabs | type to claim idle | active typing is protected | Ctrl+Q quit",
+                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free",
             ),
             (
                 ChordMode::Pane,
-                "arrows move focus | N new pane | X delete pane | Esc cancel",
+                "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
-                "←/→ switch tab | N new tab | X delete tab | Esc cancel",
+                "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
         ] {
             tui.chord_mode = mode;
@@ -3473,6 +3623,38 @@ mod tests {
                 footer.starts_with(expected),
                 "mode: {mode:?}, footer: {footer}"
             );
+        }
+    }
+
+    #[test]
+    fn shared_footer_accents_key_glyphs_on_a_dark_background() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
+
+        for mode in [ChordMode::None, ChordMode::Pane, ChordMode::Tab] {
+            tui.chord_mode = mode;
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+                .expect("render");
+            let footer = terminal.backend().buffer();
+            assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
+            let (_, segments) = contextual_footer(mode);
+            let mut x = 0;
+            for (text, accent) in segments {
+                for key in text.chars() {
+                    if *accent {
+                        assert_eq!(footer[(x, 3)].fg, Color::Red, "mode: {mode:?}, key: {key}");
+                    }
+                    x += 1;
+                }
+            }
         }
     }
 
