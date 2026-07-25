@@ -9,7 +9,10 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 use crossterm::{
-    event::{self, DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{
         self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -203,6 +206,17 @@ impl MultiPaneTui {
         self.current_tab = tab_id;
         self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
         Ok(())
+    }
+
+    fn focus_pane_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let Some(pane_id) = pane_at(&self.geometry(area).panes, column, row) else {
+            return false;
+        };
+        if self.focused_pane == pane_id {
+            return false;
+        }
+        self.focused_pane = pane_id;
+        true
     }
 
     pub fn geometry(&self, area: Rect) -> PaneGeometry {
@@ -424,6 +438,16 @@ fn first_leaf(node: &Node) -> Option<PaneId> {
         Node::Leaf { pane_id } => Some(*pane_id),
         Node::Split { first, .. } => first_leaf(first),
     }
+}
+
+fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<PaneId> {
+    panes.iter().find_map(|(pane_id, rect)| {
+        let inside = u32::from(column) >= u32::from(rect.x)
+            && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
+            && u32::from(row) >= u32::from(rect.y)
+            && u32::from(row) < u32::from(rect.y) + u32::from(rect.height);
+        inside.then_some(*pane_id)
+    })
 }
 
 fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
@@ -1227,6 +1251,8 @@ impl SharedLayoutRuntime {
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.bracketed_paste = true;
         execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        guard.mouse_capture = true;
+        execute!(io::stdout(), EnableMouseCapture)?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,
@@ -1279,6 +1305,15 @@ impl SharedLayoutRuntime {
                 Event::Paste(text) => {
                     self.forward_paste(&text)?;
                     dirty = true;
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    dirty |= self.tui.focus_pane_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, cols, rows),
+                    );
                 }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -1906,6 +1941,7 @@ struct TerminalGuard {
     raw_mode: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
 }
 
 impl TerminalGuard {
@@ -1914,6 +1950,7 @@ impl TerminalGuard {
             raw_mode: false,
             alternate_screen: false,
             bracketed_paste: false,
+            mouse_capture: false,
         }
     }
 }
@@ -1923,6 +1960,9 @@ impl Drop for TerminalGuard {
         let mut stdout = io::stdout();
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
+        }
+        if self.mouse_capture {
+            let _ = execute!(stdout, DisableMouseCapture);
         }
         if self.alternate_screen {
             let _ = execute!(stdout, crossterm::cursor::Show, LeaveAlternateScreen);
@@ -2757,6 +2797,22 @@ mod tests {
         assert_eq!(geometry.panes[&1], Rect::new(0, 1, 40, 22));
         assert_eq!(geometry.panes[&2], Rect::new(40, 1, 40, 11));
         assert_eq!(geometry.panes[&3], Rect::new(40, 12, 40, 11));
+    }
+
+    #[test]
+    fn mouse_hit_testing_focuses_the_clicked_pane_and_ignores_misses() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        assert!(tui.focus_pane_at(60, 17, area));
+        assert_eq!(tui.focused_pane(), 3);
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert!(!tui.focus_pane_at(10, 0, area));
+        assert_eq!(tui.focused_pane(), 3);
     }
 
     #[test]

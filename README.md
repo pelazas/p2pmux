@@ -80,6 +80,10 @@ Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
 to leave the mode and send that key to the focused PTY.
 
+Clicking a pane focuses it locally without taking control or sending input. When p2pmux runs
+inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
+passthrough configuration.
+
 - `Ctrl+P`, then `N` — split the focused pane. The new fixed-grid PTY runs on the requester’s Mac.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then arrows — move focus.
