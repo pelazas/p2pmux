@@ -35,6 +35,8 @@ use crate::{
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
+const CONTROL_HELP: &str = "type to claim idle | active typing is protected | Ctrl+Q quit";
+
 pub struct HostPaneRuntime {
     host: PtyHost,
     screen: HostScreen,
@@ -264,8 +266,22 @@ fn render_host_screen(
     render_guest_screen(frame, screen, footer, Some(chrome));
 }
 
+fn host_footer(join_code: &str) -> String {
+    format!("join: p2pmux join {join_code} | {CONTROL_HELP}")
+}
+
+fn guest_footer(controller_peer_id: Option<&[u8]>) -> String {
+    match controller_peer_id {
+        Some(peer_id) => format!(
+            "controller: {} typing | {CONTROL_HELP}",
+            short_peer(peer_id)
+        ),
+        None => format!("waiting for control state | {CONTROL_HELP}"),
+    }
+}
+
 fn is_quit(key: KeyEvent) -> bool {
-    key.code == KeyCode::F(10) && key.modifiers.is_empty()
+    key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL
 }
 
 fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
@@ -509,7 +525,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
-    let footer = format!("join: p2pmux join {} | F10 quit", runtime.join_code);
+    let footer = host_footer(&runtime.join_code);
     let mut dirty = true;
     let mut chrome = None;
     loop {
@@ -650,7 +666,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
         },
     )?;
     let mut remote = GuestScreen::new();
-    let mut footer = String::from("controller: waiting spectator");
+    let mut footer = guest_footer(None);
     let mut lease = None;
     let mut last_lease = None;
     let mut pending_control = false;
@@ -679,10 +695,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
                 Ok(GuestEvent::Lease(state)) => {
-                    footer = format!(
-                        "controller: {} typing",
-                        short_peer(&state.controller_peer_id)
-                    );
+                    footer = guest_footer(Some(&state.controller_peer_id));
                     last_lease = Some(Instant::now());
                     if let Some(bytes) = resolve_guest_claim(
                         &mut pending_control,
@@ -827,9 +840,29 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        ControlChrome, VtScreen, encode_key, encode_paste, handle_input_event,
-        handle_take_control_event, render_guest_screen, resolve_guest_claim,
+        CONTROL_HELP, ControlChrome, VtScreen, encode_key, encode_paste, guest_footer,
+        handle_input_event, handle_take_control_event, host_footer, is_quit, render_guest_screen,
+        resolve_guest_claim,
     };
+
+    #[test]
+    fn shared_control_help_is_exact_and_used_by_every_footer() {
+        assert_eq!(
+            CONTROL_HELP,
+            "type to claim idle | active typing is protected | Ctrl+Q quit"
+        );
+
+        let host = host_footer("abc123");
+        let guest = guest_footer(Some(b"controller"));
+        let pre_lease_guest = guest_footer(None);
+
+        assert!(host.starts_with("join: p2pmux join abc123 | "));
+        assert!(guest.starts_with("controller: 636f6e74 typing | "));
+        assert!(pre_lease_guest.starts_with("waiting for control state | "));
+        for footer in [&host, &guest, &pre_lease_guest] {
+            assert!(footer.ends_with(CONTROL_HELP));
+        }
+    }
 
     #[test]
     fn renders_control_chrome_for_an_active_controller() {
@@ -1092,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_supported_keys_and_reserves_f10() {
+    fn encodes_supported_keys_and_reserves_ctrl_q() {
         let parser = vt100::Parser::new(1, 1, 0);
         let screen = parser.screen();
         let cases = [
@@ -1153,7 +1186,10 @@ mod tests {
                 KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
                 Some("\x1b[20~"),
             ),
-            (KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), None),
+            (
+                KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+                Some("\x1b[21~"),
+            ),
             (
                 KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
                 Some("\x1b[24~"),
@@ -1164,7 +1200,7 @@ mod tests {
             ),
             (
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-                Some("\x11"),
+                None,
             ),
             (KeyEvent::new(KeyCode::Null, KeyModifiers::NONE), None),
         ];
@@ -1176,6 +1212,19 @@ mod tests {
                 "{event:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_ctrl_q_quits() {
+        assert!(is_quit(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_quit(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_quit(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE)));
     }
 
     #[test]
