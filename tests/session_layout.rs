@@ -1,18 +1,36 @@
+use iroh::{EndpointAddr, SecretKey};
 use p2pmux::{
     protocol::{
         CreatePane, CreateTab, DeletePane, DeleteTab, LayoutCommit, LayoutRejectReason,
-        LayoutRequest, PaneReady, SplitAxis,
+        LayoutRequest, PaneFailed, PaneReady, SplitAxis,
     },
-    session::{CoordinatorResponse, LayoutCoordinator},
+    session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
+};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
 };
 
-const HOST_A: &[u8] = b"host-a";
-const HOST_B: &[u8] = b"host-b";
-const ADDR_A: &[u8] = b"endpoint-a";
-const ADDR_B: &[u8] = b"endpoint-b";
+fn endpoint(seed: u8, port: u16) -> EndpointAddr {
+    EndpointAddr::new(SecretKey::from_bytes(&[seed; 32]).public())
+        .with_ip_addr(SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+fn host_a() -> Vec<u8> {
+    endpoint(1, 4101).id.as_bytes().to_vec()
+}
+fn host_b() -> Vec<u8> {
+    endpoint(2, 4102).id.as_bytes().to_vec()
+}
+fn addr_a() -> EndpointAddr {
+    endpoint(1, 4101)
+}
+fn addr_b() -> EndpointAddr {
+    endpoint(2, 4102)
+}
 
 fn coordinator() -> LayoutCoordinator {
-    LayoutCoordinator::new(HOST_A.to_vec(), ADDR_A.to_vec(), 24, 80).expect("valid coordinator")
+    LayoutCoordinator::new(host_a(), addr_a(), 24, 80).expect("valid coordinator")
 }
 
 fn request(request_id: u64, base_revision: u64) -> LayoutRequest {
@@ -48,11 +66,14 @@ fn initial_snapshot_faithfully_converts_the_authoritative_layout() {
 
     assert_eq!(state.revision, 1);
     assert_eq!(state.members.len(), 1);
-    assert_eq!(state.members[0].peer_id, HOST_A);
-    assert_eq!(state.members[0].endpoint_addr, ADDR_A);
+    assert_eq!(state.members[0].peer_id, host_a());
+    assert_eq!(
+        state.members[0].endpoint_addr,
+        serde_json::to_vec(&addr_a()).unwrap()
+    );
     assert_eq!(state.panes.len(), 1);
     assert_eq!(state.panes[0].pane_id, 1);
-    assert_eq!(state.panes[0].host_peer_id, HOST_A);
+    assert_eq!(state.panes[0].host_peer_id, host_a());
     assert_eq!(
         (state.panes[0].grid_rows, state.panes[0].grid_cols),
         (24, 80)
@@ -66,17 +87,13 @@ fn initial_snapshot_faithfully_converts_the_authoritative_layout() {
 fn admission_advances_revision_and_publishes_the_member_endpoint() {
     let mut coordinator = coordinator();
     let commit = coordinator
-        .admit(HOST_B.to_vec(), ADDR_B.to_vec())
+        .admit(host_b(), addr_b())
         .expect("guest is admitted");
 
-    assert_eq!(commit.revision, 2);
-    let state = commit.state.expect("state present");
-    assert!(
-        state
-            .members
-            .iter()
-            .any(|member| member.peer_id == HOST_B && member.endpoint_addr == ADDR_B)
-    );
+    assert_eq!(commit.commit.revision, 2);
+    let state = commit.commit.state.expect("state present");
+    assert!(state.members.iter().any(|member| member.peer_id == host_b()
+        && member.endpoint_addr == serde_json::to_vec(&addr_b()).unwrap()));
 }
 
 #[test]
@@ -90,7 +107,7 @@ fn pane_creation_is_hidden_until_its_creator_marks_the_reservation_ready() {
         grid_cols: 100,
     });
 
-    let reservation = match coordinator.handle_request(HOST_A, create) {
+    let reservation = match coordinator.handle_request(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
         other => panic!("expected reservation, got {other:?}"),
     };
@@ -106,10 +123,11 @@ fn pane_creation_is_hidden_until_its_creator_marks_the_reservation_ready() {
     );
 
     let commit = commit(coordinator.handle_pane_ready(
-        HOST_A,
+        &host_a(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 1,
+            request_id: 10,
         },
     ));
     let state = commit.state.expect("state present");
@@ -132,31 +150,50 @@ fn ready_cannot_commit_a_reservation_after_membership_advances_its_revision() {
         grid_rows: 30,
         grid_cols: 100,
     });
-    let reservation = match coordinator.handle_request(HOST_A, create) {
+    let reservation = match coordinator.handle_request(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
         other => panic!("expected reservation, got {other:?}"),
     };
-    coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();
+    let membership = coordinator.admit(host_b(), addr_b()).unwrap();
+    let invalidation = membership
+        .invalidated_reservation
+        .expect("reservation invalidated");
+    assert_eq!(invalidation.peer_id, host_a());
+    assert_eq!(invalidation.reject.request_id, 101);
+    assert_eq!(invalidation.reject.reason, LayoutRejectReason::Stale as i32);
 
     let rejection = reject(coordinator.handle_pane_ready(
-        HOST_A,
+        &host_a(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 2,
+            request_id: 101,
         },
     ));
     assert_eq!(rejection.request_id, 101);
-    assert_eq!(rejection.reason, LayoutRejectReason::Stale as i32);
+    assert_eq!(
+        rejection.reason,
+        LayoutRejectReason::ReservationFailure as i32
+    );
     let state = coordinator.session_snapshot().unwrap().state.unwrap();
     assert_eq!(state.revision, 2);
     assert_eq!(state.tabs.len(), 1);
     assert_eq!(state.panes.len(), 1);
+    let mut next = request(102, 2);
+    next.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+    });
+    assert!(matches!(
+        coordinator.handle_request(&host_a(), next),
+        CoordinatorResponse::Reservation(_)
+    ));
 }
 
 #[test]
 fn admitted_guest_hosts_its_own_pane_after_ready() {
     let mut coordinator = coordinator();
-    coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();
+    coordinator.admit(host_b(), addr_b()).unwrap();
     let mut create = request(11, 2);
     create.create_pane = Some(CreatePane {
         target_pane_id: 1,
@@ -164,16 +201,17 @@ fn admitted_guest_hosts_its_own_pane_after_ready() {
         grid_rows: 31,
         grid_cols: 101,
     });
-    let reservation = match coordinator.handle_request(HOST_B, create) {
+    let reservation = match coordinator.handle_request(&host_b(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
         other => panic!("expected reservation, got {other:?}"),
     };
 
     let commit = commit(coordinator.handle_pane_ready(
-        HOST_B,
+        &host_b(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 2,
+            request_id: 11,
         },
     ));
     let state = commit.state.unwrap();
@@ -182,7 +220,7 @@ fn admitted_guest_hosts_its_own_pane_after_ready() {
         .iter()
         .find(|pane| pane.pane_id == reservation.pane_id)
         .expect("reserved pane committed");
-    assert_eq!(pane.host_peer_id, HOST_B);
+    assert_eq!(pane.host_peer_id, host_b());
     assert_eq!((pane.grid_rows, pane.grid_cols), (31, 101));
 }
 
@@ -195,7 +233,7 @@ fn stale_request_is_rejected_without_a_layout_change() {
         grid_cols: 80,
     });
 
-    let rejection = reject(coordinator.handle_request(HOST_A, create));
+    let rejection = reject(coordinator.handle_request(&host_a(), create));
     assert_eq!(rejection.reason, LayoutRejectReason::Stale as i32);
     let state = coordinator.session_snapshot().unwrap().state.unwrap();
     assert_eq!(state.revision, 1);
@@ -205,11 +243,11 @@ fn stale_request_is_rejected_without_a_layout_change() {
 #[test]
 fn foreign_pane_deletion_is_rejected() {
     let mut coordinator = coordinator();
-    coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();
+    coordinator.admit(host_b(), addr_b()).unwrap();
     let mut delete = request(13, 2);
     delete.delete_pane = Some(DeletePane { pane_id: 1 });
 
-    let rejection = reject(coordinator.handle_request(HOST_B, delete));
+    let rejection = reject(coordinator.handle_request(&host_b(), delete));
     assert_eq!(rejection.reason, LayoutRejectReason::NotHost as i32);
     assert_eq!(
         coordinator
@@ -225,7 +263,7 @@ fn foreign_pane_deletion_is_rejected() {
 #[test]
 fn mixed_host_tab_deletion_is_rejected() {
     let mut coordinator = coordinator();
-    coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();
+    coordinator.admit(host_b(), addr_b()).unwrap();
     let mut create = request(14, 2);
     create.create_pane = Some(CreatePane {
         target_pane_id: 1,
@@ -233,15 +271,16 @@ fn mixed_host_tab_deletion_is_rejected() {
         grid_rows: 24,
         grid_cols: 80,
     });
-    let reservation = match coordinator.handle_request(HOST_B, create) {
+    let reservation = match coordinator.handle_request(&host_b(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
         other => panic!("expected reservation, got {other:?}"),
     };
     commit(coordinator.handle_pane_ready(
-        HOST_B,
+        &host_b(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 2,
+            request_id: 14,
         },
     ));
     let mut create_tab = request(15, 3);
@@ -249,21 +288,22 @@ fn mixed_host_tab_deletion_is_rejected() {
         grid_rows: 24,
         grid_cols: 80,
     });
-    let reservation = match coordinator.handle_request(HOST_A, create_tab) {
+    let reservation = match coordinator.handle_request(&host_a(), create_tab) {
         CoordinatorResponse::Reservation(reservation) => reservation,
         other => panic!("expected reservation, got {other:?}"),
     };
     commit(coordinator.handle_pane_ready(
-        HOST_A,
+        &host_a(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 3,
+            request_id: 15,
         },
     ));
     let mut delete = request(16, 4);
     delete.delete_tab = Some(DeleteTab { tab_id: 1 });
 
-    let rejection = reject(coordinator.handle_request(HOST_A, delete));
+    let rejection = reject(coordinator.handle_request(&host_a(), delete));
     assert_eq!(rejection.reason, LayoutRejectReason::MixedTab as i32);
 }
 
@@ -277,15 +317,16 @@ fn limits_are_rejected_without_creating_visible_layout() {
             grid_rows: 24,
             grid_cols: 80,
         });
-        let reservation = match coordinator.handle_request(HOST_A, create) {
+        let reservation = match coordinator.handle_request(&host_a(), create) {
             CoordinatorResponse::Reservation(reservation) => reservation,
             other => panic!("expected reservation, got {other:?}"),
         };
         commit(coordinator.handle_pane_ready(
-            HOST_A,
+            &host_a(),
             PaneReady {
                 reservation_id: reservation.reservation_id,
                 base_revision: revision,
+                request_id,
             },
         ));
         revision += 1;
@@ -296,7 +337,7 @@ fn limits_are_rejected_without_creating_visible_layout() {
         grid_cols: 80,
     });
 
-    let rejection = reject(coordinator.handle_request(HOST_A, one_too_many));
+    let rejection = reject(coordinator.handle_request(&host_a(), one_too_many));
     assert_eq!(rejection.reason, LayoutRejectReason::Limit as i32);
     assert_eq!(
         coordinator
@@ -313,22 +354,23 @@ fn limits_are_rejected_without_creating_visible_layout() {
 #[test]
 fn wrong_creator_and_ready_revision_are_rejected_with_the_original_request_id() {
     let mut coordinator = coordinator();
-    coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();
+    coordinator.admit(host_b(), addr_b()).unwrap();
     let mut create = request(18, 2);
     create.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
     });
-    let reservation = match coordinator.handle_request(HOST_A, create) {
+    let reservation = match coordinator.handle_request(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
         other => panic!("expected reservation, got {other:?}"),
     };
 
     let wrong_creator = reject(coordinator.handle_pane_ready(
-        HOST_B,
+        &host_b(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 2,
+            request_id: 18,
         },
     ));
     assert_eq!(wrong_creator.request_id, 18);
@@ -338,10 +380,11 @@ fn wrong_creator_and_ready_revision_are_rejected_with_the_original_request_id() 
     );
 
     let stale_ready = reject(coordinator.handle_pane_ready(
-        HOST_A,
+        &host_a(),
         PaneReady {
             reservation_id: reservation.reservation_id,
             base_revision: 1,
+            request_id: 18,
         },
     ));
     assert_eq!(stale_ready.request_id, 18);
@@ -355,5 +398,137 @@ fn wrong_creator_and_ready_revision_are_rejected_with_the_original_request_id() 
             .tabs
             .len(),
         1
+    );
+}
+
+#[test]
+fn reservation_expiry_is_deterministic_and_unwedges_new_requests() {
+    let now = Instant::now();
+    let mut coordinator = LayoutCoordinator::with_reservation_timeout(
+        host_a(),
+        addr_a(),
+        24,
+        80,
+        Duration::from_secs(5),
+        now,
+    )
+    .unwrap();
+    let mut create = request(201, 1);
+    create.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+    });
+    match coordinator.handle_request_at(&host_a(), create, now) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    assert!(
+        coordinator
+            .expire_reservation_at(now + Duration::from_secs(4))
+            .unwrap()
+            .is_none()
+    );
+    let expired = coordinator
+        .expire_reservation_at(now + Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.peer_id, host_a());
+    assert_eq!(expired.reject.request_id, 201);
+    assert_eq!(
+        expired.reject.reason,
+        LayoutRejectReason::ReservationFailure as i32
+    );
+    let mut next = request(202, 1);
+    next.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+    });
+    assert!(matches!(
+        coordinator.handle_request_at(&host_a(), next, now),
+        CoordinatorResponse::Reservation(_)
+    ));
+}
+
+#[test]
+fn pane_failure_clears_its_creator_reservation_immediately() {
+    let mut coordinator = coordinator();
+    let mut create = request(203, 1);
+    create.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+    });
+    let reservation = match coordinator.handle_request(&host_a(), create) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    let failed = coordinator.handle_pane_failed(
+        &host_a(),
+        PaneFailed {
+            reservation_id: reservation.reservation_id,
+            request_id: 203,
+            base_revision: 1,
+        },
+    );
+    assert_eq!(failed.peer_id, host_a());
+    assert_eq!(failed.reject.request_id, 203);
+    let mut next = request(204, 1);
+    next.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+    });
+    assert!(matches!(
+        coordinator.handle_request(&host_a(), next),
+        CoordinatorResponse::Reservation(_)
+    ));
+}
+
+#[test]
+fn endpoints_and_ready_request_ids_must_match_authenticated_reservations() {
+    assert!(matches!(
+        LayoutCoordinator::new(host_a(), addr_b(), 24, 80),
+        Err(CoordinatorError::EndpointIdentityMismatch)
+    ));
+    assert!(matches!(
+        LayoutCoordinator::new(
+            host_a(),
+            EndpointAddr::new(SecretKey::from_bytes(&[1; 32]).public()),
+            24,
+            80
+        ),
+        Err(CoordinatorError::InvalidEndpointAddress)
+    ));
+    let mut coordinator = coordinator();
+    assert!(matches!(
+        coordinator.admit(host_b(), addr_a()),
+        Err(CoordinatorError::EndpointIdentityMismatch)
+    ));
+    assert!(matches!(
+        coordinator.admit(
+            host_b(),
+            EndpointAddr::new(SecretKey::from_bytes(&[2; 32]).public())
+        ),
+        Err(CoordinatorError::InvalidEndpointAddress)
+    ));
+    let mut create = request(205, 1);
+    create.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+    });
+    let reservation = match coordinator.handle_request(&host_a(), create) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    let rejected = reject(coordinator.handle_pane_ready(
+        &host_a(),
+        PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 1,
+            request_id: 206,
+        },
+    ));
+    assert_eq!(rejected.request_id, 206);
+    assert_eq!(
+        rejected.reason,
+        LayoutRejectReason::ReservationFailure as i32
     );
 }

@@ -67,6 +67,12 @@ pub struct PaneReservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidatedReservation {
+    pub reservation_id: ReservationId,
+    pub creator_peer_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReservationCommit {
     Pane { pane_id: PaneId },
     Tab { tab_id: TabId, pane_id: PaneId },
@@ -254,7 +260,7 @@ impl SessionState {
         base_revision: u64,
         peer_id: Vec<u8>,
         endpoint_addr: Vec<u8>,
-    ) -> Result<(), LayoutError> {
+    ) -> Result<Option<InvalidatedReservation>, LayoutError> {
         self.check_mutation(base_revision)?;
         validate_peer_id(&peer_id)?;
         validate_endpoint_addr(&endpoint_addr)?;
@@ -269,7 +275,7 @@ impl SessionState {
             endpoint_addr,
         });
         self.advance_revision();
-        Ok(())
+        Ok(self.invalidate_reservation())
     }
 
     pub fn update_member_endpoint(
@@ -277,7 +283,7 @@ impl SessionState {
         base_revision: u64,
         peer_id: &[u8],
         endpoint_addr: Vec<u8>,
-    ) -> Result<(), LayoutError> {
+    ) -> Result<Option<InvalidatedReservation>, LayoutError> {
         self.check_mutation(base_revision)?;
         validate_endpoint_addr(&endpoint_addr)?;
         let member = self
@@ -287,7 +293,7 @@ impl SessionState {
             .ok_or(LayoutError::NotMember)?;
         member.endpoint_addr = endpoint_addr;
         self.advance_revision();
-        Ok(())
+        Ok(self.invalidate_reservation())
     }
 
     pub fn reserve_pane(
@@ -457,6 +463,23 @@ impl SessionState {
         reservation_id: ReservationId,
     ) -> Result<(), LayoutError> {
         self.match_reservation(creator, reservation_id)?;
+        self.pending_reservation = None;
+        Ok(())
+    }
+
+    pub fn fail_reservation(
+        &mut self,
+        creator: &[u8],
+        base_revision: u64,
+        reservation_id: ReservationId,
+    ) -> Result<(), LayoutError> {
+        let reservation = self.match_reservation(creator, reservation_id)?;
+        if reservation.base_revision != base_revision {
+            return Err(LayoutError::StaleRevision {
+                expected: reservation.base_revision,
+                got: base_revision,
+            });
+        }
         self.pending_reservation = None;
         Ok(())
     }
@@ -663,6 +686,15 @@ impl SessionState {
 
     fn next_id(&self, id: u64) -> Result<u64, LayoutError> {
         id.checked_add(1).ok_or(LayoutError::IdExhausted)
+    }
+
+    fn invalidate_reservation(&mut self) -> Option<InvalidatedReservation> {
+        self.pending_reservation
+            .take()
+            .map(|reservation| InvalidatedReservation {
+                reservation_id: reservation.reservation_id,
+                creator_peer_id: reservation.creator_peer_id,
+            })
     }
 
     fn tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {

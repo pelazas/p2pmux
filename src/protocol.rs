@@ -108,7 +108,7 @@ pub struct Envelope {
     pub sender_peer_id: Vec<u8>,
     #[prost(
         oneof = "envelope::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -144,6 +144,8 @@ pub mod envelope {
         LayoutReject(super::LayoutReject),
         #[prost(message, tag = "23")]
         PaneSubscribe(super::PaneSubscribe),
+        #[prost(message, tag = "24")]
+        PaneFailed(super::PaneFailed),
     }
 }
 
@@ -359,6 +361,18 @@ pub struct PaneReady {
     #[prost(uint64, tag = "1")]
     pub reservation_id: u64,
     #[prost(uint64, tag = "2")]
+    pub base_revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub request_id: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneFailed {
+    #[prost(uint64, tag = "1")]
+    pub reservation_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub request_id: u64,
+    #[prost(uint64, tag = "3")]
     pub base_revision: u64,
 }
 
@@ -631,6 +645,12 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
         envelope::Body::PaneReady(ready) => {
             validate_nonzero("pane_ready.reservation_id", ready.reservation_id)?;
             validate_nonzero("pane_ready.base_revision", ready.base_revision)?;
+            validate_nonzero("pane_ready.request_id", ready.request_id)?;
+        }
+        envelope::Body::PaneFailed(failed) => {
+            validate_nonzero("pane_failed.reservation_id", failed.reservation_id)?;
+            validate_nonzero("pane_failed.request_id", failed.request_id)?;
+            validate_nonzero("pane_failed.base_revision", failed.base_revision)?;
         }
         envelope::Body::LayoutCommit(commit) => {
             validate_nonzero("layout_commit.revision", commit.revision)?;

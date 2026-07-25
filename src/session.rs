@@ -1,6 +1,11 @@
 //! Authenticated Join/Welcome session handshakes over Iroh bi-streams.
 
-use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use iroh::{
     EndpointAddr, EndpointId,
@@ -17,7 +22,7 @@ use crate::{
     protocol::{
         ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
         LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
-        LayoutState, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneReady,
+        LayoutState, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady,
         PaneReservation, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
         envelope,
     },
@@ -27,28 +32,56 @@ use crate::{
 };
 
 pub const DEFAULT_PANE_ID: &[u8] = b"default-pane";
+pub const DEFAULT_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// In-memory authority for the shared layout. Network code authenticates callers before handing
 /// their protocol messages to this type.
 pub struct LayoutCoordinator {
     state: SessionState,
-    reservation_request_ids: BTreeMap<u64, u64>,
+    reservations: BTreeMap<u64, ReservationContext>,
+    reservation_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct ReservationContext {
+    request_id: u64,
+    creator_peer_id: Vec<u8>,
+    deadline: Instant,
 }
 
 #[derive(Debug)]
 pub enum CoordinatorError {
     Layout(LayoutError),
+    EndpointIdentityMismatch,
+    InvalidEndpointAddress,
+    EndpointSerialization(serde_json::Error),
 }
 
 impl fmt::Display for CoordinatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Layout(error) => write!(formatter, "layout error: {error:?}"),
+            Self::EndpointIdentityMismatch => {
+                formatter.write_str("endpoint identity did not match peer")
+            }
+            Self::InvalidEndpointAddress => {
+                formatter.write_str("endpoint address was empty or invalid")
+            }
+            Self::EndpointSerialization(error) => {
+                write!(formatter, "endpoint address serialization failed: {error}")
+            }
         }
     }
 }
 
-impl Error for CoordinatorError {}
+impl Error for CoordinatorError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::EndpointSerialization(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<LayoutError> for CoordinatorError {
     fn from(error: LayoutError) -> Self {
@@ -63,16 +96,48 @@ pub enum CoordinatorResponse {
     Reject(LayoutReject),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TargetedLayoutReject {
+    pub peer_id: Vec<u8>,
+    pub reject: LayoutReject,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MembershipChange {
+    pub commit: LayoutCommit,
+    pub invalidated_reservation: Option<TargetedLayoutReject>,
+}
+
 impl LayoutCoordinator {
     pub fn new(
         coordinator_peer_id: Vec<u8>,
-        endpoint_addr: Vec<u8>,
+        endpoint_addr: EndpointAddr,
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, CoordinatorError> {
+        Self::with_reservation_timeout(
+            coordinator_peer_id,
+            endpoint_addr,
+            grid_rows,
+            grid_cols,
+            DEFAULT_RESERVATION_TIMEOUT,
+            Instant::now(),
+        )
+    }
+
+    pub fn with_reservation_timeout(
+        coordinator_peer_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+        grid_rows: u16,
+        grid_cols: u16,
+        reservation_timeout: Duration,
+        _now: Instant,
+    ) -> Result<Self, CoordinatorError> {
+        let endpoint_addr = serialized_endpoint(&coordinator_peer_id, endpoint_addr)?;
         Ok(Self {
             state: SessionState::new(coordinator_peer_id, endpoint_addr, grid_rows, grid_cols)?,
-            reservation_request_ids: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            reservation_timeout,
         })
     }
 
@@ -85,17 +150,42 @@ impl LayoutCoordinator {
     pub fn admit(
         &mut self,
         peer_id: Vec<u8>,
-        endpoint_addr: Vec<u8>,
-    ) -> Result<LayoutCommit, CoordinatorError> {
-        self.state
+        endpoint_addr: EndpointAddr,
+    ) -> Result<MembershipChange, CoordinatorError> {
+        let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
+        let invalidated = self
+            .state
             .add_member(self.state.revision(), peer_id, endpoint_addr)?;
-        self.layout_commit()
+        self.membership_change(invalidated)
+    }
+
+    pub fn update_member_endpoint(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        endpoint_addr: EndpointAddr,
+    ) -> Result<MembershipChange, CoordinatorError> {
+        let endpoint_addr = serialized_endpoint(authenticated_peer_id, endpoint_addr)?;
+        let invalidated = self.state.update_member_endpoint(
+            self.state.revision(),
+            authenticated_peer_id,
+            endpoint_addr,
+        )?;
+        self.membership_change(invalidated)
     }
 
     pub fn handle_request(
         &mut self,
         authenticated_peer_id: &[u8],
         request: LayoutRequest,
+    ) -> CoordinatorResponse {
+        self.handle_request_at(authenticated_peer_id, request, Instant::now())
+    }
+
+    pub fn handle_request_at(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        request: LayoutRequest,
+        now: Instant,
     ) -> CoordinatorResponse {
         let request_id = request.request_id;
         let action_count = usize::from(request.create_pane.is_some())
@@ -112,6 +202,7 @@ impl LayoutCoordinator {
                 request.base_revision,
                 create,
                 request_id,
+                now,
             )
         } else if let Some(delete) = request.delete_pane {
             self.delete_pane(authenticated_peer_id, request.base_revision, delete)
@@ -121,6 +212,7 @@ impl LayoutCoordinator {
                 request.base_revision,
                 create,
                 request_id,
+                now,
             )
         } else if let Some(delete) = request.delete_tab {
             self.delete_tab(authenticated_peer_id, request.base_revision, delete)
@@ -139,13 +231,14 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         ready: PaneReady,
     ) -> CoordinatorResponse {
-        let request_id = self
-            .reservation_request_ids
-            .get(&ready.reservation_id)
-            .copied()
-            .unwrap_or(ready.reservation_id);
-        if ready.reservation_id == 0 || ready.base_revision == 0 {
-            return reject(request_id, LayoutRejectReason::Malformed);
+        if ready.reservation_id == 0 || ready.base_revision == 0 || ready.request_id == 0 {
+            return reject(ready.request_id, LayoutRejectReason::Malformed);
+        }
+        let Some(context) = self.reservations.get(&ready.reservation_id) else {
+            return reject(ready.request_id, LayoutRejectReason::ReservationFailure);
+        };
+        if context.request_id != ready.request_id {
+            return reject(ready.request_id, LayoutRejectReason::ReservationFailure);
         }
         match self.state.pane_ready(
             authenticated_peer_id,
@@ -153,13 +246,13 @@ impl LayoutCoordinator {
             ready.reservation_id,
         ) {
             Ok(_) => {
-                self.reservation_request_ids.remove(&ready.reservation_id);
+                self.reservations.remove(&ready.reservation_id);
                 match self.layout_commit() {
                     Ok(commit) => CoordinatorResponse::Commit(commit),
-                    Err(error) => reject(request_id, reject_reason(&layout_error(error))),
+                    Err(error) => reject(ready.request_id, reject_reason(&layout_error(error))),
                 }
             }
-            Err(error) => reject(request_id, reject_reason(&error)),
+            Err(error) => reject(ready.request_id, reject_reason(&error)),
         }
     }
 
@@ -170,14 +263,85 @@ impl LayoutCoordinator {
     ) -> Result<(), CoordinatorError> {
         self.state
             .cancel_reservation(authenticated_peer_id, reservation_id)?;
-        self.reservation_request_ids.remove(&reservation_id);
+        self.reservations.remove(&reservation_id);
         Ok(())
     }
 
     pub fn expire_reservation(&mut self, reservation_id: u64) -> Result<(), CoordinatorError> {
         self.state.expire_reservation(reservation_id)?;
-        self.reservation_request_ids.remove(&reservation_id);
+        self.reservations.remove(&reservation_id);
         Ok(())
+    }
+
+    pub fn expire_reservation_at(
+        &mut self,
+        now: Instant,
+    ) -> Result<Option<TargetedLayoutReject>, CoordinatorError> {
+        let Some((&reservation_id, context)) = self.reservations.iter().next() else {
+            return Ok(None);
+        };
+        if now < context.deadline {
+            return Ok(None);
+        }
+        let context = context.clone();
+        self.state.expire_reservation(reservation_id)?;
+        self.reservations.remove(&reservation_id);
+        Ok(Some(targeted_reject(
+            context.creator_peer_id,
+            context.request_id,
+            LayoutRejectReason::ReservationFailure,
+        )))
+    }
+
+    pub fn handle_pane_failed(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        failed: PaneFailed,
+    ) -> TargetedLayoutReject {
+        if failed.reservation_id == 0 || failed.request_id == 0 || failed.base_revision == 0 {
+            return targeted_reject(
+                authenticated_peer_id.to_vec(),
+                failed.request_id,
+                LayoutRejectReason::Malformed,
+            );
+        }
+        let Some(context) = self.reservations.get(&failed.reservation_id) else {
+            return targeted_reject(
+                authenticated_peer_id.to_vec(),
+                failed.request_id,
+                LayoutRejectReason::ReservationFailure,
+            );
+        };
+        if context.request_id != failed.request_id {
+            return targeted_reject(
+                authenticated_peer_id.to_vec(),
+                failed.request_id,
+                LayoutRejectReason::ReservationFailure,
+            );
+        }
+        match self.state.fail_reservation(
+            authenticated_peer_id,
+            failed.base_revision,
+            failed.reservation_id,
+        ) {
+            Ok(()) => match self.reservations.remove(&failed.reservation_id) {
+                Some(context) => targeted_reject(
+                    context.creator_peer_id,
+                    context.request_id,
+                    LayoutRejectReason::ReservationFailure,
+                ),
+                None => targeted_reject(
+                    authenticated_peer_id.to_vec(),
+                    failed.request_id,
+                    LayoutRejectReason::ReservationFailure,
+                ),
+            },
+            Err(error) => targeted_reject(
+                authenticated_peer_id.to_vec(),
+                failed.request_id,
+                reject_reason(&error),
+            ),
+        }
     }
 
     fn reserve_pane(
@@ -186,6 +350,7 @@ impl LayoutCoordinator {
         base_revision: u64,
         create: CreatePane,
         request_id: u64,
+        now: Instant,
     ) -> Result<CoordinatorResponse, LayoutError> {
         let axis = protocol_axis(create.axis)?;
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
@@ -200,8 +365,14 @@ impl LayoutCoordinator {
             grid_rows,
             grid_cols,
         )?;
-        self.reservation_request_ids
-            .insert(reservation.reservation_id, request_id);
+        self.reservations.insert(
+            reservation.reservation_id,
+            ReservationContext {
+                request_id,
+                creator_peer_id: authenticated_peer_id.to_vec(),
+                deadline: now + self.reservation_timeout,
+            },
+        );
         Ok(CoordinatorResponse::Reservation(protocol_reservation(
             reservation,
         )))
@@ -213,13 +384,20 @@ impl LayoutCoordinator {
         base_revision: u64,
         create: CreateTab,
         request_id: u64,
+        now: Instant,
     ) -> Result<CoordinatorResponse, LayoutError> {
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
         let reservation =
             self.state
                 .reserve_tab(authenticated_peer_id, base_revision, grid_rows, grid_cols)?;
-        self.reservation_request_ids
-            .insert(reservation.reservation_id, request_id);
+        self.reservations.insert(
+            reservation.reservation_id,
+            ReservationContext {
+                request_id,
+                creator_peer_id: authenticated_peer_id.to_vec(),
+                deadline: now + self.reservation_timeout,
+            },
+        );
         Ok(CoordinatorResponse::Reservation(protocol_reservation(
             reservation,
         )))
@@ -270,11 +448,62 @@ impl LayoutCoordinator {
         SessionState::validate_snapshot(&snapshot)?;
         Ok(protocol_layout_state(snapshot))
     }
+
+    fn membership_change(
+        &mut self,
+        invalidated: Option<crate::layout::InvalidatedReservation>,
+    ) -> Result<MembershipChange, CoordinatorError> {
+        let invalidated_reservation = invalidated.and_then(|reservation| {
+            self.reservations
+                .remove(&reservation.reservation_id)
+                .map(|context| {
+                    targeted_reject(
+                        reservation.creator_peer_id,
+                        context.request_id,
+                        LayoutRejectReason::Stale,
+                    )
+                })
+        });
+        Ok(MembershipChange {
+            commit: self.layout_commit()?,
+            invalidated_reservation,
+        })
+    }
+}
+
+fn serialized_endpoint(
+    peer_id: &[u8],
+    endpoint_addr: EndpointAddr,
+) -> Result<Vec<u8>, CoordinatorError> {
+    if endpoint_addr.is_empty() {
+        return Err(CoordinatorError::InvalidEndpointAddress);
+    }
+    if endpoint_addr.id.as_bytes() != peer_id {
+        return Err(CoordinatorError::EndpointIdentityMismatch);
+    }
+    serde_json::to_vec(&endpoint_addr).map_err(CoordinatorError::EndpointSerialization)
+}
+
+fn targeted_reject(
+    peer_id: Vec<u8>,
+    request_id: u64,
+    reason: LayoutRejectReason,
+) -> TargetedLayoutReject {
+    TargetedLayoutReject {
+        peer_id,
+        reject: LayoutReject {
+            request_id,
+            reason: reason as i32,
+        },
+    }
 }
 
 fn layout_error(error: CoordinatorError) -> LayoutError {
     match error {
         CoordinatorError::Layout(error) => error,
+        CoordinatorError::EndpointIdentityMismatch
+        | CoordinatorError::InvalidEndpointAddress
+        | CoordinatorError::EndpointSerialization(_) => LayoutError::InvalidSnapshot,
     }
 }
 
@@ -537,6 +766,7 @@ pub struct JoinReceipt {
     pub session_id: Vec<u8>,
     pub admitted_peer_id: Vec<u8>,
     pub coordinator_peer_id: Vec<u8>,
+    pub endpoint_addr: EndpointAddr,
 }
 
 #[derive(Debug)]
@@ -754,6 +984,7 @@ impl HostSession {
             session_id: self.ticket.session_id().to_vec(),
             admitted_peer_id: remote_id.as_bytes().to_vec(),
             coordinator_peer_id: coordinator.as_bytes().to_vec(),
+            endpoint_addr,
         };
         self.transport
             .write_frame(
@@ -1028,6 +1259,7 @@ async fn join_handshake(
         session_id: welcome.session_id,
         admitted_peer_id: welcome.admitted_peer_id,
         coordinator_peer_id: welcome.coordinator_peer_id,
+        endpoint_addr: ticket.endpoint_addr().clone(),
     })
 }
 

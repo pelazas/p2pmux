@@ -108,6 +108,14 @@ async fn the_same_ticket_admits_two_joiners_in_separate_handshakes() {
     assert_eq!(second_receipt.session_id, session_id);
     assert_eq!(first_host_receipt.admitted_peer_id, first_id);
     assert_eq!(second_host_receipt.admitted_peer_id, second_id);
+    assert_eq!(
+        first_host_receipt.endpoint_addr.id.as_bytes().as_slice(),
+        first_host_receipt.admitted_peer_id
+    );
+    assert_eq!(
+        second_host_receipt.endpoint_addr.id.as_bytes().as_slice(),
+        second_host_receipt.admitted_peer_id
+    );
     assert_eq!(first_receipt.coordinator_peer_id, coordinator);
     assert_eq!(second_receipt.coordinator_peer_id, coordinator);
     assert_ne!(

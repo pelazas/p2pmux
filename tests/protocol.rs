@@ -3,7 +3,7 @@ use p2pmux::protocol::{
     LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
     LayoutState, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES,
     MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SNAPSHOT_BYTES, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneReady,
+    MAX_SNAPSHOT_BYTES, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady,
     PaneReservation, PaneSubscribe, ProtocolError, SessionSnapshot, Snapshot, SplitAxis,
     TabDescriptor, TakeControl, Welcome, decode_frame, encode_frame, envelope,
 };
@@ -261,6 +261,7 @@ fn v2_envelopes() -> Vec<Envelope> {
         envelope(envelope::Body::PaneReady(PaneReady {
             reservation_id: 1,
             base_revision: 1,
+            request_id: 1,
         })),
         envelope(envelope::Body::LayoutCommit(LayoutCommit {
             revision: 1,
@@ -275,24 +276,30 @@ fn v2_envelopes() -> Vec<Envelope> {
             peer_id: b"peer-a".to_vec(),
             pane_id: 1,
         })),
+        envelope(envelope::Body::PaneFailed(PaneFailed {
+            reservation_id: 1,
+            request_id: 1,
+            base_revision: 1,
+        })),
     ]
 }
 
 #[test]
 fn envelope_exposes_each_v2_layout_body_with_stable_tags() {
-    let expected_body_shapes: [&[(u32, u8)]; 7] = [
+    let expected_body_shapes: [&[(u32, u8)]; 8] = [
         &[(1, 2)],
         &[(1, 0), (2, 0), (3, 2)],
         &[(1, 0), (2, 0)],
-        &[(1, 0), (2, 0)],
+        &[(1, 0), (2, 0), (3, 0)],
         &[(1, 0), (2, 2)],
         &[(1, 0), (2, 0)],
         &[(1, 2), (2, 2), (3, 0)],
+        &[(1, 0), (2, 0), (3, 0)],
     ];
 
     for ((message, expected_body_field), expected_body_shape) in v2_envelopes()
         .into_iter()
-        .zip(17..=23)
+        .zip(17..=24)
         .zip(expected_body_shapes)
     {
         let wire = message.encode_to_vec();
@@ -453,6 +460,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         envelope(envelope::Body::PaneReady(PaneReady {
             reservation_id: 0,
             base_revision: 1,
+            request_id: 1,
         })),
         envelope(envelope::Body::LayoutReject(LayoutReject {
             request_id: 1,
@@ -474,7 +482,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
 }
 
 #[test]
-fn join_endpoint_and_pane_ready_revision_are_required() {
+fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
     let empty_join_endpoint = envelope(envelope::Body::Join(Join {
         session_id: b"session-a".to_vec(),
         peer_id: b"peer-a".to_vec(),
@@ -483,9 +491,25 @@ fn join_endpoint_and_pane_ready_revision_are_required() {
     let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
         base_revision: 0,
+        request_id: 1,
+    }));
+    let missing_ready_request = envelope(envelope::Body::PaneReady(PaneReady {
+        reservation_id: 1,
+        base_revision: 1,
+        request_id: 0,
+    }));
+    let missing_failed_request = envelope(envelope::Body::PaneFailed(PaneFailed {
+        reservation_id: 1,
+        request_id: 0,
+        base_revision: 1,
     }));
 
-    for invalid in [empty_join_endpoint, missing_ready_revision] {
+    for invalid in [
+        empty_join_endpoint,
+        missing_ready_revision,
+        missing_ready_request,
+        missing_failed_request,
+    ] {
         assert!(
             encode_frame(&invalid).is_err(),
             "v2 Join endpoint addresses and PaneReady revisions are required"
