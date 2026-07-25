@@ -1,6 +1,6 @@
 //! Authenticated Join/Welcome session handshakes over Iroh bi-streams.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
 use iroh::{
     EndpointAddr, EndpointId,
@@ -12,10 +12,14 @@ use tokio::{
 };
 
 use crate::{
+    layout::{Axis, LayoutError, LayoutSnapshot, Node, SessionState},
     lease::LeaseState,
     protocol::{
-        ControlLease, Delta, Envelope, Input, Join, PROTOCOL_VERSION, Snapshot, TakeControl,
-        Welcome, envelope,
+        ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
+        LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
+        LayoutState, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneReady,
+        PaneReservation, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
+        envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -23,6 +27,374 @@ use crate::{
 };
 
 pub const DEFAULT_PANE_ID: &[u8] = b"default-pane";
+
+/// In-memory authority for the shared layout. Network code authenticates callers before handing
+/// their protocol messages to this type.
+pub struct LayoutCoordinator {
+    state: SessionState,
+    reservation_request_ids: BTreeMap<u64, u64>,
+}
+
+#[derive(Debug)]
+pub enum CoordinatorError {
+    Layout(LayoutError),
+}
+
+impl fmt::Display for CoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Layout(error) => write!(formatter, "layout error: {error:?}"),
+        }
+    }
+}
+
+impl Error for CoordinatorError {}
+
+impl From<LayoutError> for CoordinatorError {
+    fn from(error: LayoutError) -> Self {
+        Self::Layout(error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CoordinatorResponse {
+    Reservation(PaneReservation),
+    Commit(LayoutCommit),
+    Reject(LayoutReject),
+}
+
+impl LayoutCoordinator {
+    pub fn new(
+        coordinator_peer_id: Vec<u8>,
+        endpoint_addr: Vec<u8>,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<Self, CoordinatorError> {
+        Ok(Self {
+            state: SessionState::new(coordinator_peer_id, endpoint_addr, grid_rows, grid_cols)?,
+            reservation_request_ids: BTreeMap::new(),
+        })
+    }
+
+    pub fn session_snapshot(&self) -> Result<SessionSnapshot, CoordinatorError> {
+        Ok(SessionSnapshot {
+            state: Some(self.protocol_layout_state()?),
+        })
+    }
+
+    pub fn admit(
+        &mut self,
+        peer_id: Vec<u8>,
+        endpoint_addr: Vec<u8>,
+    ) -> Result<LayoutCommit, CoordinatorError> {
+        self.state
+            .add_member(self.state.revision(), peer_id, endpoint_addr)?;
+        self.layout_commit()
+    }
+
+    pub fn handle_request(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        request: LayoutRequest,
+    ) -> CoordinatorResponse {
+        let request_id = request.request_id;
+        let action_count = usize::from(request.create_pane.is_some())
+            + usize::from(request.delete_pane.is_some())
+            + usize::from(request.create_tab.is_some())
+            + usize::from(request.delete_tab.is_some());
+        if request_id == 0 || request.base_revision == 0 || action_count != 1 {
+            return reject(request_id, LayoutRejectReason::Malformed);
+        }
+
+        let result = if let Some(create) = request.create_pane {
+            self.reserve_pane(
+                authenticated_peer_id,
+                request.base_revision,
+                create,
+                request_id,
+            )
+        } else if let Some(delete) = request.delete_pane {
+            self.delete_pane(authenticated_peer_id, request.base_revision, delete)
+        } else if let Some(create) = request.create_tab {
+            self.reserve_tab(
+                authenticated_peer_id,
+                request.base_revision,
+                create,
+                request_id,
+            )
+        } else if let Some(delete) = request.delete_tab {
+            self.delete_tab(authenticated_peer_id, request.base_revision, delete)
+        } else {
+            Err(LayoutError::InvalidSnapshot)
+        };
+
+        match result {
+            Ok(response) => response,
+            Err(error) => reject(request_id, reject_reason(&error)),
+        }
+    }
+
+    pub fn handle_pane_ready(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        ready: PaneReady,
+    ) -> CoordinatorResponse {
+        let request_id = self
+            .reservation_request_ids
+            .get(&ready.reservation_id)
+            .copied()
+            .unwrap_or(ready.reservation_id);
+        if ready.reservation_id == 0 || ready.base_revision == 0 {
+            return reject(request_id, LayoutRejectReason::Malformed);
+        }
+        match self.state.pane_ready(
+            authenticated_peer_id,
+            ready.base_revision,
+            ready.reservation_id,
+        ) {
+            Ok(_) => {
+                self.reservation_request_ids.remove(&ready.reservation_id);
+                match self.layout_commit() {
+                    Ok(commit) => CoordinatorResponse::Commit(commit),
+                    Err(error) => reject(request_id, reject_reason(&layout_error(error))),
+                }
+            }
+            Err(error) => reject(request_id, reject_reason(&error)),
+        }
+    }
+
+    pub fn cancel_reservation(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        reservation_id: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.state
+            .cancel_reservation(authenticated_peer_id, reservation_id)?;
+        self.reservation_request_ids.remove(&reservation_id);
+        Ok(())
+    }
+
+    pub fn expire_reservation(&mut self, reservation_id: u64) -> Result<(), CoordinatorError> {
+        self.state.expire_reservation(reservation_id)?;
+        self.reservation_request_ids.remove(&reservation_id);
+        Ok(())
+    }
+
+    fn reserve_pane(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        base_revision: u64,
+        create: CreatePane,
+        request_id: u64,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        let axis = protocol_axis(create.axis)?;
+        let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
+        if create.target_pane_id == 0 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        let reservation = self.state.reserve_pane(
+            authenticated_peer_id,
+            base_revision,
+            create.target_pane_id,
+            axis,
+            grid_rows,
+            grid_cols,
+        )?;
+        self.reservation_request_ids
+            .insert(reservation.reservation_id, request_id);
+        Ok(CoordinatorResponse::Reservation(protocol_reservation(
+            reservation,
+        )))
+    }
+
+    fn reserve_tab(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        base_revision: u64,
+        create: CreateTab,
+        request_id: u64,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
+        let reservation =
+            self.state
+                .reserve_tab(authenticated_peer_id, base_revision, grid_rows, grid_cols)?;
+        self.reservation_request_ids
+            .insert(reservation.reservation_id, request_id);
+        Ok(CoordinatorResponse::Reservation(protocol_reservation(
+            reservation,
+        )))
+    }
+
+    fn delete_pane(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        base_revision: u64,
+        delete: DeletePane,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        if delete.pane_id == 0 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.state
+            .delete_pane(authenticated_peer_id, base_revision, delete.pane_id)?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
+    fn delete_tab(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        base_revision: u64,
+        delete: DeleteTab,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        if delete.tab_id == 0 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.state
+            .delete_tab(authenticated_peer_id, base_revision, delete.tab_id)?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
+    fn layout_commit(&self) -> Result<LayoutCommit, CoordinatorError> {
+        let state = self.protocol_layout_state()?;
+        Ok(LayoutCommit {
+            revision: state.revision,
+            state: Some(state),
+        })
+    }
+
+    fn protocol_layout_state(&self) -> Result<LayoutState, CoordinatorError> {
+        let snapshot = self.state.snapshot();
+        SessionState::validate_snapshot(&snapshot)?;
+        Ok(protocol_layout_state(snapshot))
+    }
+}
+
+fn layout_error(error: CoordinatorError) -> LayoutError {
+    match error {
+        CoordinatorError::Layout(error) => error,
+    }
+}
+
+fn protocol_grid(rows: u32, cols: u32) -> Result<(u16, u16), LayoutError> {
+    let rows = u16::try_from(rows).map_err(|_| LayoutError::InvalidGrid)?;
+    let cols = u16::try_from(cols).map_err(|_| LayoutError::InvalidGrid)?;
+    if rows == 0 || cols == 0 {
+        return Err(LayoutError::InvalidGrid);
+    }
+    Ok((rows, cols))
+}
+
+fn protocol_axis(axis: Option<i32>) -> Result<Axis, LayoutError> {
+    match axis.and_then(|axis| SplitAxis::try_from(axis).ok()) {
+        Some(SplitAxis::LeftRight) => Ok(Axis::LeftRight),
+        Some(SplitAxis::TopBottom) => Ok(Axis::TopBottom),
+        None => Err(LayoutError::InvalidSnapshot),
+    }
+}
+
+fn protocol_reservation(reservation: crate::layout::PaneReservation) -> PaneReservation {
+    PaneReservation {
+        reservation_id: reservation.reservation_id,
+        pane_id: reservation.pane_id,
+        tab_id: reservation.tab_id,
+    }
+}
+
+fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
+    LayoutState {
+        revision: snapshot.revision,
+        members: snapshot
+            .members
+            .into_iter()
+            .map(|member| MemberDescriptor {
+                peer_id: member.peer_id,
+                endpoint_addr: member.endpoint_addr,
+            })
+            .collect(),
+        panes: snapshot
+            .panes
+            .into_values()
+            .map(|pane| PaneDescriptor {
+                pane_id: pane.pane_id,
+                host_peer_id: pane.host_peer_id,
+                grid_rows: u32::from(pane.grid_rows),
+                grid_cols: u32::from(pane.grid_cols),
+            })
+            .collect(),
+        tabs: snapshot
+            .tabs
+            .into_iter()
+            .map(|tab| TabDescriptor {
+                tab_id: tab.tab_id,
+                root: Some(protocol_node(tab.root)),
+            })
+            .collect(),
+    }
+}
+
+fn protocol_node(node: Node) -> LayoutNode {
+    match node {
+        Node::Leaf { pane_id } => LayoutNode {
+            leaf_pane_id: Some(pane_id),
+            split: None,
+        },
+        Node::Split {
+            axis,
+            first,
+            second,
+        } => LayoutNode {
+            leaf_pane_id: None,
+            split: Some(Box::new(LayoutSplit {
+                axis: Some(match axis {
+                    Axis::LeftRight => SplitAxis::LeftRight as i32,
+                    Axis::TopBottom => SplitAxis::TopBottom as i32,
+                }),
+                first: Some(protocol_node(*first)),
+                second: Some(protocol_node(*second)),
+            })),
+        },
+    }
+}
+
+fn reject(request_id: u64, reason: LayoutRejectReason) -> CoordinatorResponse {
+    CoordinatorResponse::Reject(LayoutReject {
+        request_id,
+        reason: reason as i32,
+    })
+}
+
+fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
+    match error {
+        LayoutError::StaleRevision { .. } | LayoutError::RevisionExhausted => {
+            LayoutRejectReason::Stale
+        }
+        LayoutError::NotPaneHost { .. } | LayoutError::NotMember => LayoutRejectReason::NotHost,
+        LayoutError::NotTabHost { .. } => LayoutRejectReason::MixedTab,
+        LayoutError::MemberLimit
+        | LayoutError::TabLimit
+        | LayoutError::PaneLimit
+        | LayoutError::SplitDepthLimit
+        | LayoutError::IdExhausted => LayoutRejectReason::Limit,
+        LayoutError::UnknownPane { .. } | LayoutError::UnknownTab { .. } => {
+            LayoutRejectReason::UnknownId
+        }
+        LayoutError::LastPaneInTab { .. } | LayoutError::LastTab => {
+            LayoutRejectReason::LastPaneOrTab
+        }
+        LayoutError::ReservationPending
+        | LayoutError::UnknownReservation { .. }
+        | LayoutError::ReservationCreatorMismatch
+        | LayoutError::ReservationInvalid => LayoutRejectReason::ReservationFailure,
+        LayoutError::InvalidPeerId
+        | LayoutError::InvalidEndpointAddress
+        | LayoutError::InvalidGrid
+        | LayoutError::AlreadyMember
+        | LayoutError::InvalidSnapshot => LayoutRejectReason::Malformed,
+    }
+}
 
 pub struct HostPaneChannels {
     pub pane_id: Vec<u8>,
