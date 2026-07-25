@@ -2,7 +2,7 @@
 
 use std::{
     error::Error,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     str::FromStr,
 };
 
@@ -33,9 +33,27 @@ enum Command {
     /// Start one local interactive shell (Spike 1).
     Local,
     /// Create a shared session with a reusable join ticket.
-    Create,
+    Create {
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Join a remote fixed-grid shared pane using a reusable shared-session ticket.
-    Join { ticket: String },
+    Join {
+        ticket: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Read or write local configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Set { key: String, value: String },
+    Get { key: String },
 }
 
 const TRUST_WARNING: &str = "TRUST WARNING: This is a fully trusted shared-shell session. Anyone with the join ticket can see every pane and may obtain interactive control of available terminals (run commands, see output, touch files reachable to that macOS user).
@@ -63,12 +81,26 @@ pub async fn parse_and_run() -> Result<(), Box<dyn Error>> {
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Local => crate::tui::run_local(),
-        Command::Create => {
+        Command::Config { command } => match command {
+            ConfigCommand::Set { key, value } if key == "name" => {
+                crate::config::save(&value)?;
+                Ok(())
+            }
+            ConfigCommand::Get { key } if key == "name" => {
+                if let Some(name) = crate::config::load()? {
+                    println!("{name}");
+                }
+                Ok(())
+            }
+            _ => Err(CliError("config key must be name").into()),
+        },
+        Command::Create { name } => {
             {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{TRUST_WARNING}\n")?;
                 stdout.flush()?;
             }
+            let _display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
             let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
             let host = SharedLayoutHost::new(HostSession::create().await?, shell_rows, shell_cols)?;
@@ -138,13 +170,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             result.map_err(io::Error::other)?;
             Ok(())
         }
-        Command::Join { ticket } => {
+        Command::Join { ticket, name } => {
             {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{TRUST_WARNING}\n")?;
                 stdout.flush()?;
             }
             let ticket = resolve_join_ticket(&ticket)?;
+            let _display_name = resolve_display_name(name)?;
             let transport = Transport::bind().await?;
             let mut member = join_layout(transport, ticket.clone()).await?;
             let state = match member.events.recv().await {
@@ -183,6 +216,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn Error>> {
+    if let Some(name) = override_name {
+        return Ok(crate::config::save(&name)?);
+    }
+    if let Some(name) = crate::config::load()? {
+        return Ok(name);
+    }
+    if !io::stdin().is_terminal() {
+        return Err(CliError("missing display name; run: p2pmux config set name <name>").into());
+    }
+    {
+        let mut stdout = io::stdout().lock();
+        write!(stdout, "Choose a display name (visible to session peers): ")?;
+        stdout.flush()?;
+    }
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    Ok(crate::config::save(&name)?)
+}
+
 fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
     if input.starts_with(TICKET_PREFIX) {
         return JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"));
@@ -207,10 +260,10 @@ mod tests {
     fn create_releases_stdout_before_starting_the_host_tui() {
         let source = include_str!("cli.rs");
         let create_arm = source
-            .split_once("Command::Create => {")
+            .split_once("Command::Create { name } => {")
             .expect("create arm")
             .1
-            .split_once("Command::Join { ticket } => {")
+            .split_once("Command::Join { ticket, name } => {")
             .expect("join arm")
             .0;
 

@@ -65,6 +65,11 @@ Terminal 1: cargo run -- create
 Terminal 2: cargo run -- join <printed 10-character code>
 ```
 
+Set a peer-visible display name once with `p2pmux config set name pelazas`; inspect it with
+`p2pmux config get name`. It is stored in `$XDG_CONFIG_HOME/p2pmux/config.toml` (or
+`~/.config/p2pmux/config.toml`). `create` and `join` accept `--name <name>` to override and save
+the value for that run and future sessions.
+
 `create` prints `Join with: p2pmux join <CODE>`, waits for Enter so you can copy it, then
 enters the shared-layout TUI. The same code stays in the footer. `join` first receives the
 authoritative layout, then attaches directly to every remote pane.

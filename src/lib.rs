@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod config;
 pub mod layout;
 pub mod lease;
 pub mod protocol;
