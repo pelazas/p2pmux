@@ -98,17 +98,11 @@ async fn joining_member_receives_a_snapshot_and_existing_members_receive_admissi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incoming_dispatcher_routes_layout_join_and_direct_pane_subscription_on_one_endpoint() {
+async fn late_joiner_subscribes_after_snapshot_without_preloaded_host_roster() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
     let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
     let guest = loopback_transport().await;
     let pane_server = coordinator.pane_server();
-    pane_server
-        .add_member(
-            guest.endpoint_id().as_bytes().to_vec(),
-            guest.endpoint_addr(),
-        )
-        .expect("preload direct-pane roster");
     let host_id = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
     let descriptor = PaneDescriptor {
         pane_id: 201,
@@ -141,21 +135,21 @@ async fn incoming_dispatcher_routes_layout_join_and_direct_pane_subscription_on_
         .expect("matching dispatcher services");
     let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
 
-    let (member, pane) = tokio::join!(
-        join_layout(guest.clone(), coordinator.ticket().clone()),
-        subscribe_pane(
-            guest.clone(),
-            coordinator.ticket().session_id().to_vec(),
-            coordinator.ticket().endpoint_addr().clone(),
-            descriptor,
-        )
-    );
-    let mut member = member.expect("layout join");
-    let mut pane = pane.expect("pane subscription");
+    let mut member = join_layout(guest.clone(), coordinator.ticket().clone())
+        .await
+        .expect("layout join");
     assert!(matches!(
         next_event(&mut member).await,
         LayoutControlEvent::Snapshot(_)
     ));
+    let mut pane = subscribe_pane(
+        guest.clone(),
+        coordinator.ticket().session_id().to_vec(),
+        coordinator.ticket().endpoint_addr().clone(),
+        descriptor,
+    )
+    .await
+    .expect("pane subscription after authoritative snapshot");
     let mut saw_snapshot = false;
     let mut saw_lease = false;
     for _ in 0..2 {

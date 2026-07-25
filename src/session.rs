@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -18,7 +18,7 @@ use iroh::{
     endpoint::{ConnectingError, Connection, Incoming, SendStream},
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     time::{interval, timeout},
 };
 
@@ -784,17 +784,39 @@ pub struct PaneServer {
     session_id: Vec<u8>,
     local_peer_id: Vec<u8>,
     members: Arc<Mutex<BTreeMap<Vec<u8>, EndpointAddr>>>,
-    panes: Arc<Mutex<BTreeMap<u64, HostPaneChannels>>>,
+    registry: Arc<Mutex<PaneRegistry>>,
+    next_subscription_id: Arc<AtomicU64>,
+    service_errors: broadcast::Sender<SessionServiceError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionServiceError {
+    PaneConnection,
+    IncomingDispatcherConnection,
+}
+
+#[derive(Default)]
+struct PaneRegistry {
+    panes: BTreeMap<u64, HostPaneChannels>,
+    subscriptions: BTreeMap<u64, BTreeMap<u64, PaneSubscription>>,
+}
+
+struct PaneSubscription {
+    connection: Connection,
+    active: Arc<AtomicBool>,
 }
 
 impl PaneServer {
     pub fn from_host_session(host: &HostSession) -> Self {
+        let (service_errors, _) = broadcast::channel(32);
         Self {
             transport: host.transport.clone(),
             session_id: host.ticket.session_id().to_vec(),
             local_peer_id: host.transport.endpoint_id().as_bytes().to_vec(),
             members: Arc::new(Mutex::new(BTreeMap::new())),
-            panes: Arc::new(Mutex::new(BTreeMap::new())),
+            registry: Arc::new(Mutex::new(PaneRegistry::default())),
+            next_subscription_id: Arc::new(AtomicU64::new(1)),
+            service_errors,
         }
     }
 
@@ -802,13 +824,35 @@ impl PaneServer {
         if session_id.is_empty() {
             return Err(SessionError::InvalidPostWelcome);
         }
+        let (service_errors, _) = broadcast::channel(32);
         Ok(Self {
             local_peer_id: transport.endpoint_id().as_bytes().to_vec(),
             transport,
             session_id,
             members: Arc::new(Mutex::new(BTreeMap::new())),
-            panes: Arc::new(Mutex::new(BTreeMap::new())),
+            registry: Arc::new(Mutex::new(PaneRegistry::default())),
+            next_subscription_id: Arc::new(AtomicU64::new(1)),
+            service_errors,
         })
+    }
+
+    /// Receives unexpected service failures; malformed and unauthenticated peers are rejected
+    /// without creating operational noise.
+    pub fn subscribe_errors(&self) -> broadcast::Receiver<SessionServiceError> {
+        self.service_errors.subscribe()
+    }
+
+    fn report_service_result(
+        &self,
+        source: SessionServiceError,
+        result: &Result<(), SessionError>,
+    ) {
+        if result
+            .as_ref()
+            .is_err_and(|error| !expected_service_error(error))
+        {
+            let _ = self.service_errors.send(source);
+        }
     }
 
     pub fn add_member(
@@ -873,9 +917,10 @@ impl PaneServer {
         {
             return Err(SessionError::InvalidPostWelcome);
         }
-        self.panes
+        self.registry
             .lock()
             .map_err(|_| SessionError::PeerTask)?
+            .panes
             .insert(descriptor.pane_id, channels);
         Ok(())
     }
@@ -891,11 +936,21 @@ impl PaneServer {
     }
 
     pub fn remove_pane(&self, pane_id: u64) -> Result<Option<HostPaneChannels>, SessionError> {
-        Ok(self
-            .panes
-            .lock()
-            .map_err(|_| SessionError::PeerTask)?
-            .remove(&pane_id))
+        let (pane, subscriptions) = {
+            let mut registry = self.registry.lock().map_err(|_| SessionError::PeerTask)?;
+            (
+                registry.panes.remove(&pane_id),
+                registry.subscriptions.remove(&pane_id),
+            )
+        };
+        for subscription in subscriptions
+            .into_iter()
+            .flat_map(|subscribers| subscribers.into_values())
+        {
+            subscription.active.store(false, Ordering::Release);
+            subscription.connection.close(0u8.into(), b"pane removed");
+        }
+        Ok(pane)
     }
 
     pub fn remove_local_pane(
@@ -914,14 +969,28 @@ impl PaneServer {
     /// arrivals. A runtime that multiplexes layout joins and panes should use
     /// [`IncomingDispatcher`] instead of starting this loop alongside another acceptor.
     pub async fn accept_loop(&self) -> Result<(), SessionError> {
+        self.accept_loop_with_timeout(HANDSHAKE_TIMEOUT).await
+    }
+
+    /// Testable accept-loop variant. Idle accept timeouts are retried; closure and other
+    /// transport errors end the loop.
+    pub async fn accept_loop_with_timeout(
+        &self,
+        accept_timeout: Duration,
+    ) -> Result<(), SessionError> {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                incoming = self.transport.accept_incoming() => {
-                    let incoming = incoming?;
+                incoming = self.transport.accept_incoming_with_timeout(accept_timeout) => {
+                    let incoming = match incoming {
+                        Ok(incoming) => incoming,
+                        Err(TransportError::TimedOut("incoming accept")) => continue,
+                        Err(error) => return Err(error.into()),
+                    };
                     let server = self.clone();
                     tasks.spawn(async move {
-                        let _ = server.serve_incoming(incoming).await;
+                        let result = server.serve_incoming(incoming).await;
+                        server.report_service_result(SessionServiceError::PaneConnection, &result);
                     });
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
@@ -969,19 +1038,52 @@ impl PaneServer {
         {
             return Err(SessionError::UnauthenticatedPeer);
         }
-        let pane = self
-            .panes
-            .lock()
-            .map_err(|_| SessionError::PeerTask)?
-            .get(&subscribe.pane_id)
-            .cloned()
-            .ok_or(SessionError::InvalidPostWelcome)?;
+        let subscription_id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
+        if subscription_id == 0 {
+            return Err(SessionError::PeerTask);
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        let pane = {
+            let mut registry = self.registry.lock().map_err(|_| SessionError::PeerTask)?;
+            let pane = registry
+                .panes
+                .get(&subscribe.pane_id)
+                .cloned()
+                .ok_or(SessionError::InvalidPostWelcome)?;
+            registry
+                .subscriptions
+                .entry(subscribe.pane_id)
+                .or_default()
+                .insert(
+                    subscription_id,
+                    PaneSubscription {
+                        connection: connection.clone(),
+                        active: active.clone(),
+                    },
+                );
+            pane
+        };
         if pane.host_peer_id != self.local_peer_id
             || pane.pane_id != pane_wire_id(subscribe.pane_id)
         {
             return Err(SessionError::InvalidPostWelcome);
         }
-        serve_direct_pane_streams(&self.transport, connection, remote_peer_id, pane).await
+        let result =
+            serve_direct_pane_streams(&self.transport, connection, remote_peer_id, pane, active)
+                .await;
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(subscribers) = registry.subscriptions.get_mut(&subscribe.pane_id)
+        {
+            subscribers.remove(&subscription_id);
+            if subscribers.is_empty() {
+                registry.subscriptions.remove(&subscribe.pane_id);
+            }
+        }
+        if is_normal_peer_disconnect(&result) {
+            Ok(())
+        } else {
+            result
+        }
     }
 
     pub async fn close(&self) {
@@ -1189,6 +1291,7 @@ impl HostSession {
                 connection.remote_id().as_bytes().to_vec(),
                 pane.pane_id,
                 pane.control_tx,
+                None,
             ));
             let mut screen_task = screen_task;
             let mut lease_task = lease_task;
@@ -1277,6 +1380,7 @@ impl HostSession {
 #[derive(Clone)]
 pub struct SharedLayoutHost {
     host: HostSession,
+    pane_server: PaneServer,
     coordinator: Arc<Mutex<LayoutCoordinator>>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     reservation_timeout: Duration,
@@ -1289,6 +1393,33 @@ pub enum LayoutControlEvent {
     Commit(LayoutCommit),
     Reject(LayoutReject),
     Disconnected,
+}
+
+/// Applies authoritative control-plane layout state to a member's local pane registry before the
+/// runtime attempts direct subscriptions described by that state.
+#[derive(Clone)]
+pub struct PaneLayoutReconciler {
+    panes: PaneServer,
+}
+
+impl PaneLayoutReconciler {
+    pub fn new(panes: PaneServer) -> Self {
+        Self { panes }
+    }
+
+    pub fn apply(&self, event: &LayoutControlEvent) -> Result<(), SessionError> {
+        let state = match event {
+            LayoutControlEvent::Snapshot(snapshot) => snapshot.state.as_ref(),
+            LayoutControlEvent::Commit(commit) => commit.state.as_ref(),
+            LayoutControlEvent::Reservation(_)
+            | LayoutControlEvent::Reject(_)
+            | LayoutControlEvent::Disconnected => None,
+        };
+        match state {
+            Some(state) => self.panes.replace_roster_from_layout(state),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1486,6 +1617,7 @@ impl SharedLayoutHost {
         grid_cols: u16,
         reservation_timeout: Duration,
     ) -> Result<Self, SessionError> {
+        let pane_server = host.pane_server();
         let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
         let coordinator = LayoutCoordinator::with_reservation_timeout(
             coordinator_peer_id,
@@ -1497,6 +1629,7 @@ impl SharedLayoutHost {
         )?;
         Ok(Self {
             host,
+            pane_server,
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
@@ -1510,7 +1643,7 @@ impl SharedLayoutHost {
     /// Creates the coordinator-owned pane registry. The runtime must keep this registry's roster
     /// and local pane registrations synchronized from authoritative layout commits.
     pub fn pane_server(&self) -> PaneServer {
-        self.host.pane_server()
+        self.pane_server.clone()
     }
 
     /// Creates the only incoming acceptor for an endpoint that serves both layout control and
@@ -1565,6 +1698,13 @@ impl SharedLayoutHost {
                     receipt.endpoint_addr.clone(),
                 )?;
 
+                let state = membership
+                    .commit
+                    .state
+                    .as_ref()
+                    .ok_or(SessionError::InvalidPostWelcome)?;
+                self.pane_server.replace_roster_from_layout(state)?;
+
                 // Existing members see the authoritative membership commit before the joining
                 // member receives its snapshot. The joiner snapshot already contains that commit.
                 self.broadcast_commit(membership.commit.clone());
@@ -1602,6 +1742,7 @@ impl SharedLayoutHost {
                 self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
                 self.coordinator.clone(),
                 self.peers.clone(),
+                self.pane_server.clone(),
                 self.reservation_timeout,
             ));
             if let Ok(mut slot) = reader_abort.lock() {
@@ -1696,14 +1837,29 @@ impl IncomingDispatcher {
 
     /// Continually accepts connections and dispatches each to an independently managed task.
     pub async fn accept_loop(&self) -> Result<(), SessionError> {
+        self.accept_loop_with_timeout(HANDSHAKE_TIMEOUT).await
+    }
+
+    pub async fn accept_loop_with_timeout(
+        &self,
+        accept_timeout: Duration,
+    ) -> Result<(), SessionError> {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                incoming = self.layout.host.accept_incoming() => {
-                    let incoming = incoming?;
+                incoming = self.layout.host.transport.accept_incoming_with_timeout(accept_timeout) => {
+                    let incoming = match incoming {
+                        Ok(incoming) => incoming,
+                        Err(TransportError::TimedOut("incoming accept")) => continue,
+                        Err(error) => return Err(error.into()),
+                    };
                     let dispatcher = self.clone();
                     tasks.spawn(async move {
-                        let _ = dispatcher.dispatch_incoming(incoming).await;
+                        let result = dispatcher.dispatch_incoming(incoming).await;
+                        dispatcher.panes.report_service_result(
+                            SessionServiceError::IncomingDispatcherConnection,
+                            &result,
+                        );
                     });
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
@@ -1746,6 +1902,26 @@ impl IncomingDispatcher {
         }
         result
     }
+}
+
+fn expected_service_error(error: &SessionError) -> bool {
+    matches!(
+        error,
+        SessionError::TimedOut(_)
+            | SessionError::InvalidJoin
+            | SessionError::InvalidJoinEndpointAddress
+            | SessionError::InvalidWelcome
+            | SessionError::UnauthenticatedPeer
+            | SessionError::InvalidPostWelcome
+            | SessionError::PeerTask
+    )
+}
+
+fn is_normal_peer_disconnect(result: &Result<(), SessionError>) -> bool {
+    matches!(
+        result,
+        Err(SessionError::Transport(TransportError::StreamRead(_)))
+    )
 }
 
 fn layout_queue_error<T>(error: mpsc::error::TrySendError<T>) -> LayoutControlQueueError {
@@ -2001,6 +2177,7 @@ async fn layout_host_reader_task(
     coordinator_peer_id: Vec<u8>,
     coordinator: Arc<Mutex<LayoutCoordinator>>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    pane_server: PaneServer,
     reservation_timeout: Duration,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
@@ -2020,7 +2197,13 @@ async fn layout_host_reader_task(
                     }
                     _ => None,
                 };
-                dispatch_coordinator_response(&peers, &peer_id, &coordinator_peer_id, response);
+                dispatch_coordinator_response(
+                    &peers,
+                    &peer_id,
+                    &coordinator_peer_id,
+                    &pane_server,
+                    response,
+                );
                 drop(coordinator_guard);
                 if let Some(reservation_id) = reservation {
                     tokio::spawn(reservation_expiry_task(
@@ -2038,7 +2221,13 @@ async fn layout_host_reader_task(
                     Err(_) => break,
                 };
                 let response = coordinator_guard.handle_pane_ready(&peer_id, ready);
-                dispatch_coordinator_response(&peers, &peer_id, &coordinator_peer_id, response);
+                dispatch_coordinator_response(
+                    &peers,
+                    &peer_id,
+                    &coordinator_peer_id,
+                    &pane_server,
+                    response,
+                );
                 drop(coordinator_guard);
             }
             Some(envelope::Body::PaneFailed(failed)) => {
@@ -2092,6 +2281,7 @@ fn dispatch_coordinator_response(
     peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     requester_peer_id: &[u8],
     coordinator_peer_id: &[u8],
+    pane_server: &PaneServer,
     response: CoordinatorResponse,
 ) {
     match response {
@@ -2103,10 +2293,15 @@ fn dispatch_coordinator_response(
                 envelope::Body::PaneReservation(reservation),
             ),
         ),
-        CoordinatorResponse::Commit(commit) => broadcast_envelope(
-            peers,
-            coordinator_envelope(coordinator_peer_id, envelope::Body::LayoutCommit(commit)),
-        ),
+        CoordinatorResponse::Commit(commit) => {
+            if let Some(state) = commit.state.as_ref() {
+                let _ = pane_server.replace_roster_from_layout(state);
+            }
+            broadcast_envelope(
+                peers,
+                coordinator_envelope(coordinator_peer_id, envelope::Body::LayoutCommit(commit)),
+            )
+        }
         CoordinatorResponse::Reject(reject) => send_to_peer(
             peers,
             requester_peer_id,
@@ -2126,6 +2321,7 @@ async fn serve_direct_pane_streams(
     connection: &Connection,
     remote_peer_id: Vec<u8>,
     pane: HostPaneChannels,
+    active: Arc<AtomicBool>,
 ) -> Result<(), SessionError> {
     let (screen_writer, _) = transport.open_framed_bi(connection).await?;
     let screen_task = tokio::spawn(screen_writer_task(
@@ -2158,6 +2354,7 @@ async fn serve_direct_pane_streams(
             remote_peer_id,
             pane.pane_id,
             pane.control_tx,
+            Some(active),
         )
         .await
     });
@@ -2271,6 +2468,7 @@ async fn control_reader_task(
     peer_id: Vec<u8>,
     pane_id: Vec<u8>,
     control_tx: mpsc::Sender<HostControlEvent>,
+    active: Option<Arc<AtomicBool>>,
 ) -> Result<(), SessionError> {
     while let Some(envelope) = reader.read_next().await? {
         if envelope.sender_peer_id != peer_id {
@@ -2293,6 +2491,12 @@ async fn control_reader_task(
             }
             _ => return Err(SessionError::InvalidPostWelcome),
         };
+        if active
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+        {
+            return Err(SessionError::InvalidPostWelcome);
+        }
         control_tx
             .send(event)
             .await
@@ -2971,5 +3175,26 @@ mod control_queue_tests {
         ));
         remove_control_peer(&peers, b"member");
         writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unexpected_service_failures_are_observable_but_rejections_are_suppressed() {
+        let server = PaneServer::new(Transport::bind().await.expect("transport"), vec![1])
+            .expect("pane server");
+        let mut errors = server.subscribe_errors();
+        let operational = Err(SessionError::Transport(TransportError::Closed));
+        server.report_service_result(SessionServiceError::PaneConnection, &operational);
+        assert_eq!(
+            errors.recv().await.expect("operational failure"),
+            SessionServiceError::PaneConnection
+        );
+        let rejected = Err(SessionError::UnauthenticatedPeer);
+        server.report_service_result(SessionServiceError::PaneConnection, &rejected);
+        assert!(
+            timeout(Duration::from_millis(10), errors.recv())
+                .await
+                .is_err()
+        );
+        server.close().await;
     }
 }

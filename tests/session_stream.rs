@@ -616,6 +616,167 @@ async fn pane_server_accept_loop_serves_two_viewers_without_waiting_for_the_firs
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pane_server_retries_an_idle_accept_timeout_before_serving_a_later_connection() {
+    let host = loopback_transport().await;
+    let viewer = loopback_transport().await;
+    let server = PaneServer::new(host.clone(), b"shared-session".to_vec()).expect("server");
+    let host_id = host.endpoint_id().as_bytes().to_vec();
+    server
+        .add_member(
+            viewer.endpoint_id().as_bytes().to_vec(),
+            viewer.endpoint_addr(),
+        )
+        .expect("member");
+    let screen = HostScreen::new(1, 1).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+    let descriptor = PaneDescriptor {
+        pane_id: 161,
+        host_peer_id: host_id.clone(),
+        grid_rows: 1,
+        grid_cols: 1,
+    };
+    server
+        .register_pane(
+            descriptor.clone(),
+            HostPaneChannels {
+                pane_id: pane_wire_id(161),
+                host_peer_id: host_id,
+                screen_rx,
+                lease_rx,
+                control_tx,
+            },
+        )
+        .expect("register");
+    let loop_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server
+                .accept_loop_with_timeout(Duration::from_millis(10))
+                .await
+        })
+    };
+    sleep(Duration::from_millis(30)).await;
+    let mut pane = subscribe_pane(
+        viewer.clone(),
+        b"shared-session".to_vec(),
+        host.endpoint_addr(),
+        descriptor,
+    )
+    .await
+    .expect("subscription after idle timeout");
+    let mut saw_lease = false;
+    for _ in 0..2 {
+        if matches!(
+            timeout(TEST_TIMEOUT, pane.events.recv())
+                .await
+                .expect("event"),
+            Some(GuestEvent::Lease(_))
+        ) {
+            saw_lease = true;
+        }
+    }
+    assert!(saw_lease);
+    pane.shutdown().await;
+    loop_task.abort();
+    let _ = loop_task.await;
+    viewer.close().await;
+    host.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_pane_disconnects_subscribers_and_blocks_later_control_delivery() {
+    let host = loopback_transport().await;
+    let viewer = loopback_transport().await;
+    let server = PaneServer::new(host.clone(), b"shared-session".to_vec()).expect("server");
+    let host_id = host.endpoint_id().as_bytes().to_vec();
+    server
+        .add_member(
+            viewer.endpoint_id().as_bytes().to_vec(),
+            viewer.endpoint_addr(),
+        )
+        .expect("member");
+    let screen = HostScreen::new(1, 1).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+    let descriptor = PaneDescriptor {
+        pane_id: 171,
+        host_peer_id: host_id.clone(),
+        grid_rows: 1,
+        grid_cols: 1,
+    };
+    server
+        .register_pane(
+            descriptor.clone(),
+            HostPaneChannels {
+                pane_id: pane_wire_id(171),
+                host_peer_id: host_id,
+                screen_rx,
+                lease_rx,
+                control_tx,
+            },
+        )
+        .expect("register");
+    let loop_task = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept_loop().await })
+    };
+    let mut pane = subscribe_pane(
+        viewer.clone(),
+        b"shared-session".to_vec(),
+        host.endpoint_addr(),
+        descriptor,
+    )
+    .await
+    .expect("subscribe");
+    for _ in 0..2 {
+        let _ = timeout(TEST_TIMEOUT, pane.events.recv())
+            .await
+            .expect("initial event");
+    }
+    assert!(server.remove_pane(171).expect("remove").is_some());
+    let mut disconnected = false;
+    for _ in 0..2 {
+        if matches!(
+            timeout(TEST_TIMEOUT, pane.events.recv())
+                .await
+                .expect("disconnect event"),
+            Some(GuestEvent::Disconnected)
+        ) {
+            disconnected = true;
+            break;
+        }
+    }
+    assert!(
+        disconnected,
+        "removed pane must close existing subscriptions"
+    );
+    let _ = pane.controls.try_input(1, b"late".to_vec());
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), control_rx.recv()).await,
+            Ok(Some(_))
+        ),
+        "removed pane must not receive late input"
+    );
+    pane.shutdown().await;
+    loop_task.abort();
+    let _ = loop_task.await;
+    viewer.close().await;
+    host.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
     let guest = loopback_transport().await;

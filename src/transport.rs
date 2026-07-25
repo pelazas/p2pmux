@@ -116,7 +116,14 @@ impl Transport {
     }
 
     pub async fn accept_incoming(&self) -> Result<Incoming, TransportError> {
-        timeout(HANDSHAKE_TIMEOUT, self.endpoint.accept())
+        self.accept_incoming_with_timeout(HANDSHAKE_TIMEOUT).await
+    }
+
+    pub async fn accept_incoming_with_timeout(
+        &self,
+        accept_timeout: Duration,
+    ) -> Result<Incoming, TransportError> {
+        timeout(accept_timeout, self.endpoint.accept())
             .await
             .map_err(|_| TransportError::TimedOut("incoming accept"))?
             .ok_or(TransportError::Closed)
