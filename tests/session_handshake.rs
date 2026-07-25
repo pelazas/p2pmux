@@ -46,6 +46,7 @@ async fn rejected_raw_join_endpoint(host: &HostSession, endpoint_addr: Vec<u8>) 
                     session_id: host.ticket().session_id().to_vec(),
                     peer_id: guest_id,
                     endpoint_addr,
+                    display_name: String::new(),
                 })),
             },
         )

@@ -640,15 +640,21 @@ fn render_shared_multi_pane(
         let focused = pane_id == tui.focused_pane;
         let lease = match view.controller_peer_id.as_deref() {
             Some(peer) if view.controller_active => {
-                format!("ctrl:{} this user is typing", short_peer(peer))
+                format!(
+                    "ctrl:{} this user is typing",
+                    member_label(peer, &tui.snapshot.members)
+                )
             }
-            Some(peer) => format!("ctrl:{} this user has control", short_peer(peer)),
+            Some(peer) => format!(
+                "ctrl:{} this user has control",
+                member_label(peer, &tui.snapshot.members)
+            ),
             None => String::from("lease: waiting"),
         };
         let title = format!(
             "{} host:{} {lease}",
             if focused { "*" } else { " " },
-            short_peer(&pane.host_peer_id)
+            member_label(&pane.host_peer_id, &tui.snapshot.members)
         );
         let border_color = match view.controller_peer_id.as_ref() {
             Some(_) if view.controller_active => Color::Rgb(255, 69, 0),
@@ -2379,6 +2385,24 @@ fn short_peer(peer_id: &[u8]) -> String {
         .collect()
 }
 
+fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
+    let Some(member) = members.iter().find(|member| member.peer_id == peer_id) else {
+        return short_peer(peer_id);
+    };
+    if member.display_name.is_empty() {
+        return short_peer(peer_id);
+    }
+    let duplicates = members
+        .iter()
+        .filter(|candidate| candidate.display_name == member.display_name)
+        .count();
+    if duplicates > 1 {
+        format!("{} · {}", member.display_name, short_peer(peer_id))
+    } else {
+        member.display_name.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2410,7 +2434,7 @@ mod tests {
         CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, pane_wire_id, render_guest_screen,
+        grid_for_pane, initial_root_pane_grid, member_label, pane_wire_id, render_guest_screen,
         render_multi_pane, render_shared_multi_pane, shared_footer_text,
     };
 
@@ -2420,6 +2444,7 @@ mod tests {
             members: vec![crate::layout::Member {
                 peer_id: b"host".to_vec(),
                 endpoint_addr: b"endpoint".to_vec(),
+                display_name: String::new(),
             }],
             tabs,
             panes: panes
@@ -3167,6 +3192,33 @@ mod tests {
         assert!(tab_bar.contains("Tab #2"));
         assert_eq!(buffer[(0, 0)].fg, Color::White);
         assert_eq!(buffer[(0, 0)].bg, Color::Rgb(220, 50, 47));
+    }
+
+    #[test]
+    fn member_labels_disambiguate_duplicate_display_names() {
+        let members = vec![
+            crate::layout::Member {
+                peer_id: vec![0xaa, 0xbb, 0xcc, 0xdd],
+                endpoint_addr: vec![1],
+                display_name: "sam".into(),
+            },
+            crate::layout::Member {
+                peer_id: vec![0x11, 0x22, 0x33, 0x44],
+                endpoint_addr: vec![2],
+                display_name: "sam".into(),
+            },
+            crate::layout::Member {
+                peer_id: vec![0x55, 0x66, 0x77, 0x88],
+                endpoint_addr: vec![3],
+                display_name: "pat".into(),
+            },
+        ];
+
+        assert_eq!(
+            member_label(&members[0].peer_id, &members),
+            "sam · aabbccdd"
+        );
+        assert_eq!(member_label(&members[2].peer_id, &members), "pat");
     }
 
     #[test]

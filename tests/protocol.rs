@@ -36,6 +36,7 @@ fn envelope_exposes_each_v1_body() {
             session_id: b"session-a".to_vec(),
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
+            display_name: String::new(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -160,6 +161,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             session_id: b"session-a".to_vec(),
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
+            display_name: String::new(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -218,6 +220,7 @@ fn layout_state(root: LayoutNode) -> LayoutState {
         members: vec![MemberDescriptor {
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
+            display_name: String::new(),
         }],
         panes: vec![PaneDescriptor {
             pane_id: 1,
@@ -372,6 +375,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             .map(|index| MemberDescriptor {
                 peer_id: format!("peer-{index}").into_bytes(),
                 endpoint_addr: b"endpoint".to_vec(),
+                display_name: String::new(),
             })
             .collect(),
         ..state.clone()
@@ -485,6 +489,7 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         session_id: b"session-a".to_vec(),
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: Vec::new(),
+        display_name: String::new(),
     }));
     let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
@@ -871,6 +876,7 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
         members: vec![MemberDescriptor {
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
+            display_name: String::new(),
         }],
         panes: vec![PaneDescriptor {
             pane_id: 11,
@@ -925,6 +931,7 @@ fn join_wire_shape_encodes_a_present_endpoint_address() {
         session_id: b"session-a".to_vec(),
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: b"endpoint-a".to_vec(),
+        display_name: String::new(),
     };
 
     assert_eq!(
@@ -973,6 +980,7 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         session_id: b"session-a".to_vec(),
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: vec![0; MAX_ENDPOINT_ADDR_BYTES + 1],
+        display_name: String::new(),
     }));
 
     for invalid in [
@@ -1129,6 +1137,7 @@ fn decoder_rejects_missing_fields_and_invalid_sequences() {
         session_id: Vec::new(),
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: Vec::new(),
+        display_name: String::new(),
     }));
     let mut empty_id_frame = Vec::new();
     empty_id
@@ -1244,6 +1253,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 session_id: vec![0; MAX_SESSION_ID_BYTES + 1],
                 peer_id: b"peer-a".to_vec(),
                 endpoint_addr: Vec::new(),
+                display_name: String::new(),
             })),
         ),
         (
@@ -1252,6 +1262,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 session_id: b"session-a".to_vec(),
                 peer_id: vec![0; MAX_PEER_ID_BYTES + 1],
                 endpoint_addr: Vec::new(),
+                display_name: String::new(),
             })),
         ),
         (

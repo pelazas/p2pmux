@@ -121,9 +121,26 @@ impl LayoutCoordinator {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, CoordinatorError> {
-        Self::with_reservation_timeout(
+        Self::new_with_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            String::new(),
+            grid_rows,
+            grid_cols,
+        )
+    }
+
+    pub fn new_with_display_name(
+        coordinator_peer_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+        display_name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<Self, CoordinatorError> {
+        Self::with_reservation_timeout_and_display_name(
+            coordinator_peer_id,
+            endpoint_addr,
+            display_name,
             grid_rows,
             grid_cols,
             DEFAULT_RESERVATION_TIMEOUT,
@@ -137,11 +154,37 @@ impl LayoutCoordinator {
         grid_rows: u16,
         grid_cols: u16,
         reservation_timeout: Duration,
+        now: Instant,
+    ) -> Result<Self, CoordinatorError> {
+        Self::with_reservation_timeout_and_display_name(
+            coordinator_peer_id,
+            endpoint_addr,
+            String::new(),
+            grid_rows,
+            grid_cols,
+            reservation_timeout,
+            now,
+        )
+    }
+
+    pub fn with_reservation_timeout_and_display_name(
+        coordinator_peer_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+        display_name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+        reservation_timeout: Duration,
         _now: Instant,
     ) -> Result<Self, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&coordinator_peer_id, endpoint_addr)?;
         Ok(Self {
-            state: SessionState::new(coordinator_peer_id, endpoint_addr, grid_rows, grid_cols)?,
+            state: SessionState::new_with_display_name(
+                coordinator_peer_id,
+                endpoint_addr,
+                display_name,
+                grid_rows,
+                grid_cols,
+            )?,
             reservations: BTreeMap::new(),
             reservation_timeout,
         })
@@ -158,10 +201,22 @@ impl LayoutCoordinator {
         peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
     ) -> Result<MembershipChange, CoordinatorError> {
+        self.admit_with_display_name(peer_id, endpoint_addr, String::new())
+    }
+
+    pub fn admit_with_display_name(
+        &mut self,
+        peer_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+        display_name: String,
+    ) -> Result<MembershipChange, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
-        let invalidated = self
-            .state
-            .add_member(self.state.revision(), peer_id, endpoint_addr)?;
+        let invalidated = self.state.add_member_with_display_name(
+            self.state.revision(),
+            peer_id,
+            endpoint_addr,
+            display_name,
+        )?;
         self.membership_change(invalidated)
     }
 
@@ -563,6 +618,7 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
             .map(|member| MemberDescriptor {
                 peer_id: member.peer_id,
                 endpoint_addr: member.endpoint_addr,
+                display_name: member.display_name,
             })
             .collect(),
         panes: snapshot
@@ -597,6 +653,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
         .map(|member| Member {
             peer_id: member.peer_id.clone(),
             endpoint_addr: member.endpoint_addr.clone(),
+            display_name: member.display_name.clone(),
         })
         .collect();
     let panes = state
@@ -708,6 +765,7 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         | LayoutError::ReservationInvalid => LayoutRejectReason::ReservationFailure,
         LayoutError::InvalidPeerId
         | LayoutError::InvalidEndpointAddress
+        | LayoutError::InvalidDisplayName
         | LayoutError::InvalidGrid
         | LayoutError::AlreadyMember
         | LayoutError::InvalidSnapshot => LayoutRejectReason::Malformed,
@@ -1207,6 +1265,7 @@ pub struct JoinReceipt {
     pub admitted_peer_id: Vec<u8>,
     pub coordinator_peer_id: Vec<u8>,
     pub endpoint_addr: EndpointAddr,
+    pub display_name: String,
 }
 
 #[derive(Debug)]
@@ -1446,6 +1505,7 @@ impl HostSession {
             admitted_peer_id: remote_id.as_bytes().to_vec(),
             coordinator_peer_id: coordinator.as_bytes().to_vec(),
             endpoint_addr,
+            display_name: join.display_name,
         };
         self.transport
             .write_frame(
@@ -1710,7 +1770,22 @@ impl Drop for SharedLayoutMember {
 
 impl SharedLayoutHost {
     pub fn new(host: HostSession, grid_rows: u16, grid_cols: u16) -> Result<Self, SessionError> {
-        Self::with_reservation_timeout(host, grid_rows, grid_cols, DEFAULT_RESERVATION_TIMEOUT)
+        Self::with_display_name(host, String::new(), grid_rows, grid_cols)
+    }
+
+    pub fn with_display_name(
+        host: HostSession,
+        display_name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<Self, SessionError> {
+        Self::with_reservation_timeout_and_display_name(
+            host,
+            display_name,
+            grid_rows,
+            grid_cols,
+            DEFAULT_RESERVATION_TIMEOUT,
+        )
     }
 
     pub fn with_reservation_timeout(
@@ -1719,11 +1794,28 @@ impl SharedLayoutHost {
         grid_cols: u16,
         reservation_timeout: Duration,
     ) -> Result<Self, SessionError> {
+        Self::with_reservation_timeout_and_display_name(
+            host,
+            String::new(),
+            grid_rows,
+            grid_cols,
+            reservation_timeout,
+        )
+    }
+
+    pub fn with_reservation_timeout_and_display_name(
+        host: HostSession,
+        display_name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+        reservation_timeout: Duration,
+    ) -> Result<Self, SessionError> {
         let pane_server = host.pane_server();
         let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
-        let coordinator = LayoutCoordinator::with_reservation_timeout(
+        let coordinator = LayoutCoordinator::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             host.ticket().endpoint_addr().clone(),
+            display_name,
             grid_rows,
             grid_cols,
             reservation_timeout,
@@ -1870,9 +1962,10 @@ impl SharedLayoutHost {
                     .coordinator
                     .lock()
                     .map_err(|_| SessionError::PeerTask)?;
-                let membership = coordinator_guard.admit(
+                let membership = coordinator_guard.admit_with_display_name(
                     receipt.admitted_peer_id.clone(),
                     receipt.endpoint_addr.clone(),
+                    receipt.display_name.clone(),
                 )?;
 
                 let state = membership
@@ -2203,9 +2296,19 @@ pub async fn join_layout(
     transport: Transport,
     ticket: JoinTicket,
 ) -> Result<SharedLayoutMember, SessionError> {
+    join_layout_with_display_name(transport, ticket, String::new()).await
+}
+
+pub async fn join_layout_with_display_name(
+    transport: Transport,
+    ticket: JoinTicket,
+    display_name: String,
+) -> Result<SharedLayoutMember, SessionError> {
     let connection = transport.connect(ticket.endpoint_addr().clone()).await?;
     let result = async {
-        let receipt = join_handshake(&transport, &connection, &ticket).await?;
+        let receipt =
+            join_handshake_with_display_name(&transport, &connection, &ticket, display_name)
+                .await?;
         let (writer, reader) = transport.accept_framed_bi(&connection).await?;
         let (events_tx, events) = mpsc::channel(128);
         let (outbound, outbound_rx) = mpsc::channel(64);
@@ -2868,6 +2971,15 @@ async fn join_handshake(
     connection: &Connection,
     ticket: &JoinTicket,
 ) -> Result<JoinReceipt, SessionError> {
+    join_handshake_with_display_name(transport, connection, ticket, String::new()).await
+}
+
+async fn join_handshake_with_display_name(
+    transport: &Transport,
+    connection: &Connection,
+    ticket: &JoinTicket,
+    display_name: String,
+) -> Result<JoinReceipt, SessionError> {
     let client_id = transport.endpoint_id();
     if connection.remote_id() != ticket.endpoint_addr().id {
         return Err(SessionError::UnauthenticatedPeer);
@@ -2884,6 +2996,7 @@ async fn join_handshake(
                     peer_id: client_id.as_bytes().to_vec(),
                     endpoint_addr: serde_json::to_vec(&transport.endpoint_addr())
                         .expect("endpoint address should serialize"),
+                    display_name,
                 })),
             },
         )
@@ -2900,6 +3013,7 @@ async fn join_handshake(
         admitted_peer_id: welcome.admitted_peer_id,
         coordinator_peer_id: welcome.coordinator_peer_id,
         endpoint_addr: ticket.endpoint_addr().clone(),
+        display_name: String::new(),
     })
 }
 

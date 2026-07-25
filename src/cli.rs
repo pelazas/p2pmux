@@ -11,7 +11,8 @@ use clap::{Parser, Subcommand};
 use crate::{
     rendezvous::{LocalRendezvous, RendezvousError},
     session::{
-        HostSession, LayoutControlEvent, SharedLayoutHost, join_layout, layout_snapshot_from_state,
+        HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
+        layout_snapshot_from_state,
     },
     ticket::{JoinTicket, TICKET_PREFIX},
     transport::Transport,
@@ -100,10 +101,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 writeln!(stdout, "{TRUST_WARNING}\n")?;
                 stdout.flush()?;
             }
-            let _display_name = resolve_display_name(name)?;
+            let display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
             let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
-            let host = SharedLayoutHost::new(HostSession::create().await?, shell_rows, shell_cols)?;
+            let host = SharedLayoutHost::with_display_name(
+                HostSession::create().await?,
+                display_name,
+                shell_rows,
+                shell_cols,
+            )?;
             let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
             let initial = crate::tui::SharedLocalPane::spawn(
                 1,
@@ -177,9 +183,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 stdout.flush()?;
             }
             let ticket = resolve_join_ticket(&ticket)?;
-            let _display_name = resolve_display_name(name)?;
+            let display_name = resolve_display_name(name)?;
             let transport = Transport::bind().await?;
-            let mut member = join_layout(transport, ticket.clone()).await?;
+            let mut member =
+                join_layout_with_display_name(transport, ticket.clone(), display_name).await?;
             let state = match member.events.recv().await {
                 Some(LayoutControlEvent::Snapshot(snapshot)) => {
                     snapshot.state.ok_or("missing layout snapshot")?

@@ -35,6 +35,7 @@ pub enum Node {
 pub struct Member {
     pub peer_id: Vec<u8>,
     pub endpoint_addr: Vec<u8>,
+    pub display_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +125,7 @@ pub enum LayoutError {
     NotMember,
     InvalidPeerId,
     InvalidEndpointAddress,
+    InvalidDisplayName,
     TabLimit,
     PaneLimit,
     SplitDepthLimit,
@@ -149,9 +151,26 @@ impl SessionState {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, LayoutError> {
+        Self::new_with_display_name(
+            initial_host,
+            endpoint_addr,
+            String::new(),
+            grid_rows,
+            grid_cols,
+        )
+    }
+
+    pub fn new_with_display_name(
+        initial_host: Vec<u8>,
+        endpoint_addr: Vec<u8>,
+        display_name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<Self, LayoutError> {
         validate_grid(grid_rows, grid_cols)?;
         validate_peer_id(&initial_host)?;
         validate_endpoint_addr(&endpoint_addr)?;
+        validate_display_name(&display_name)?;
         let initial_pane = Pane {
             pane_id: 1,
             host_peer_id: initial_host.clone(),
@@ -165,6 +184,7 @@ impl SessionState {
             members: vec![Member {
                 peer_id: initial_host,
                 endpoint_addr,
+                display_name,
             }],
             tabs: vec![Tab {
                 tab_id: 1,
@@ -221,6 +241,7 @@ impl SessionState {
             if validate_peer_id(&member.peer_id).is_err()
                 || !peer_ids.insert(&member.peer_id)
                 || validate_endpoint_addr(&member.endpoint_addr).is_err()
+                || validate_display_name(&member.display_name).is_err()
             {
                 return Err(LayoutError::InvalidSnapshot);
             }
@@ -261,9 +282,20 @@ impl SessionState {
         peer_id: Vec<u8>,
         endpoint_addr: Vec<u8>,
     ) -> Result<Option<InvalidatedReservation>, LayoutError> {
+        self.add_member_with_display_name(base_revision, peer_id, endpoint_addr, String::new())
+    }
+
+    pub fn add_member_with_display_name(
+        &mut self,
+        base_revision: u64,
+        peer_id: Vec<u8>,
+        endpoint_addr: Vec<u8>,
+        display_name: String,
+    ) -> Result<Option<InvalidatedReservation>, LayoutError> {
         self.check_mutation(base_revision)?;
         validate_peer_id(&peer_id)?;
         validate_endpoint_addr(&endpoint_addr)?;
+        validate_display_name(&display_name)?;
         if self.members.iter().any(|member| member.peer_id == peer_id) {
             return Err(LayoutError::AlreadyMember);
         }
@@ -273,6 +305,7 @@ impl SessionState {
         self.members.push(Member {
             peer_id,
             endpoint_addr,
+            display_name,
         });
         self.advance_revision();
         Ok(self.invalidate_reservation())
@@ -849,6 +882,13 @@ fn validate_grid(grid_rows: u16, grid_cols: u16) -> Result<(), LayoutError> {
     (grid_rows > 0 && grid_cols > 0)
         .then_some(())
         .ok_or(LayoutError::InvalidGrid)
+}
+
+fn validate_display_name(display_name: &str) -> Result<(), LayoutError> {
+    if display_name.chars().count() > 32 || display_name.chars().any(char::is_control) {
+        return Err(LayoutError::InvalidDisplayName);
+    }
+    Ok(())
 }
 
 fn validate_endpoint_addr(endpoint_addr: &[u8]) -> Result<(), LayoutError> {
