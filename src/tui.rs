@@ -61,7 +61,7 @@ const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <Alt+←↓↑→> FOCUS   <q> QUIT";
 
 type FooterSegment = (&'static str, bool);
 
@@ -71,6 +71,8 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     ("> PANE   <", false),
     ("t", true),
     ("> TAB   <", false),
+    ("Alt+←↓↑→", true),
+    ("> FOCUS   <", false),
     ("q", true),
     ("> QUIT", false),
 ];
@@ -80,6 +82,8 @@ const PANE_FOOTER: &[FooterSegment] = &[
     ("> FOCUS   <", false),
     ("n", true),
     ("> NEW   <", false),
+    ("r/l/d/u", true),
+    ("> SPLIT   <", false),
     ("x", true),
     ("> CLOSE   <", false),
     ("Esc", true),
@@ -976,7 +980,7 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
+            "Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
@@ -3140,7 +3144,7 @@ mod tests {
         initial_root_pane_grid, is_chord_command, lease_allows_held_input, member_label,
         mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
         reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
-        render_shared_multi_pane, selection_text, viewed_screen, visible_leaf_panes,
+        render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -3529,11 +3533,11 @@ mod tests {
 
         assert!(copied > quit + "> QUIT".len());
         assert_eq!(
-            terminal.backend().buffer()[(copied as u16, 4)].fg,
+            terminal.backend().buffer()[(text_width(&footer[..copied]), 4)].fg,
             Color::White
         );
         assert_eq!(
-            terminal.backend().buffer()[(count as u16, 4)].fg,
+            terminal.backend().buffer()[(text_width(&footer[..count]), 4)].fg,
             Color::Rgb(255, 69, 0)
         );
     }
@@ -4345,10 +4349,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
 
         for (mode, expected) in [
-            (ChordMode::None, "Ctrl+ <p> PANE   <t> TAB   <q> QUIT"),
+            (
+                ChordMode::None,
+                "Ctrl+ <p> PANE   <t> TAB   <Alt+←↓↑→> FOCUS   <q> QUIT",
+            ),
             (
                 ChordMode::Pane,
-                "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
+                "Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
