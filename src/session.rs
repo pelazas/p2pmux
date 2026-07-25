@@ -6,7 +6,10 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -1051,30 +1054,58 @@ const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Clone)]
 struct ControlMailbox {
-    state_tx: watch::Sender<Option<Envelope>>,
-    targeted_tx: mpsc::Sender<Envelope>,
+    initial_tx: mpsc::Sender<Envelope>,
+    state_tx: watch::Sender<Option<SequencedEnvelope>>,
+    targeted_tx: mpsc::Sender<SequencedEnvelope>,
+    next_sequence: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct SequencedEnvelope {
+    sequence: u64,
+    envelope: Envelope,
 }
 
 impl ControlMailbox {
     fn new() -> (
         Self,
-        watch::Receiver<Option<Envelope>>,
         mpsc::Receiver<Envelope>,
+        watch::Receiver<Option<SequencedEnvelope>>,
+        mpsc::Receiver<SequencedEnvelope>,
     ) {
+        let (initial_tx, initial_rx) = mpsc::channel(1);
         let (state_tx, state_rx) = watch::channel(None);
         let (targeted_tx, targeted_rx) = mpsc::channel(TARGETED_CONTROL_QUEUE_CAPACITY);
         (
             Self {
+                initial_tx,
                 state_tx,
                 targeted_tx,
+                next_sequence: Arc::new(AtomicU64::new(1)),
             },
+            initial_rx,
             state_rx,
             targeted_rx,
         )
     }
 
+    fn enqueue_initial(&self, envelope: Envelope) -> bool {
+        self.initial_tx.try_send(envelope).is_ok()
+    }
+
     fn publish_state(&self, envelope: Envelope) {
-        self.state_tx.send_replace(Some(envelope));
+        self.state_tx.send_replace(Some(self.sequenced(envelope)));
+    }
+
+    fn enqueue_targeted(&self, envelope: Envelope) -> bool {
+        self.targeted_tx.try_send(self.sequenced(envelope)).is_ok()
+    }
+
+    fn sequenced(&self, envelope: Envelope) -> SequencedEnvelope {
+        SequencedEnvelope {
+            sequence: self.next_sequence.fetch_add(1, Ordering::SeqCst),
+            envelope,
+        }
     }
 }
 
@@ -1232,7 +1263,7 @@ impl SharedLayoutHost {
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
             let peer_id = receipt.admitted_peer_id.clone();
-            let (mailbox, state_rx, targeted_rx) = ControlMailbox::new();
+            let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
             let peer = ControlPeer::pending_reader(mailbox.clone(), connection.clone());
             let reader_abort = peer.reader_abort.clone();
             self.peers
@@ -1244,10 +1275,13 @@ impl SharedLayoutHost {
                 .lock()
                 .map_err(|_| SessionError::PeerTask)?
                 .session_snapshot()?;
-            mailbox.publish_state(coordinator_envelope(
-                self.host.ticket().endpoint_addr().id.as_bytes(),
-                envelope::Body::SessionSnapshot(snapshot),
-            ));
+            mailbox
+                .enqueue_initial(coordinator_envelope(
+                    self.host.ticket().endpoint_addr().id.as_bytes(),
+                    envelope::Body::SessionSnapshot(snapshot),
+                ))
+                .then_some(())
+                .ok_or(SessionError::PeerTask)?;
 
             let reader_task = tokio::spawn(layout_host_reader_task(
                 reader,
@@ -1261,6 +1295,7 @@ impl SharedLayoutHost {
             }
             tokio::spawn(layout_peer_writer_task(
                 writer,
+                initial_rx,
                 state_rx,
                 targeted_rx,
                 receipt.admitted_peer_id.clone(),
@@ -1346,7 +1381,7 @@ fn send_to_peer(
 ) {
     let failed_peer = match peers.lock() {
         Ok(mut peers) => match peers.get(peer_id) {
-            Some(peer) if peer.mailbox.targeted_tx.try_send(envelope).is_ok() => None,
+            Some(peer) if peer.mailbox.enqueue_targeted(envelope) => None,
             Some(_) => peers.remove(peer_id),
             None => None,
         },
@@ -1412,38 +1447,63 @@ pub async fn join_layout(
 
 async fn layout_peer_writer_task<W>(
     mut writer: W,
-    mut state_rx: watch::Receiver<Option<Envelope>>,
-    mut targeted_rx: mpsc::Receiver<Envelope>,
+    mut initial_rx: mpsc::Receiver<Envelope>,
+    mut state_rx: watch::Receiver<Option<SequencedEnvelope>>,
+    mut targeted_rx: mpsc::Receiver<SequencedEnvelope>,
     peer_id: Vec<u8>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
 ) where
     W: ControlFrameSink + 'static,
 {
+    let Some(initial) = initial_rx.recv().await else {
+        remove_control_peer(&peers, &peer_id);
+        return;
+    };
+    if !writer.write_control(&initial).await {
+        remove_control_peer(&peers, &peer_id);
+        return;
+    }
     let mut targeted_open = true;
     let mut state_open = true;
+    let mut pending_targeted = None;
+    let mut pending_state = None;
     loop {
-        let envelope = tokio::select! {
-            biased;
-            changed = state_rx.changed(), if state_open => match changed {
-                Ok(()) => match state_rx.borrow_and_update().clone() {
-                    Some(envelope) => envelope,
-                    None => continue,
-                },
-                Err(_) => {
-                    state_open = false;
-                    continue;
+        if pending_targeted.is_none() {
+            match targeted_rx.try_recv() {
+                Ok(targeted) => pending_targeted = Some(targeted),
+                Err(mpsc::error::TryRecvError::Disconnected) => targeted_open = false,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        if pending_state.is_none() && state_open && state_rx.has_changed().unwrap_or(false) {
+            pending_state = state_rx.borrow_and_update().clone();
+        }
+
+        let next = match (&pending_state, &pending_targeted) {
+            (Some(state), Some(targeted)) if state.sequence < targeted.sequence => {
+                pending_state.take()
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => pending_targeted.take(),
+            (Some(_), None) => pending_state.take(),
+            (None, None) => {
+                tokio::select! {
+                    targeted = targeted_rx.recv(), if targeted_open => match targeted {
+                        Some(targeted) => pending_targeted = Some(targeted),
+                        None => targeted_open = false,
+                    },
+                    changed = state_rx.changed(), if state_open => match changed {
+                        Ok(()) => pending_state = state_rx.borrow_and_update().clone(),
+                        Err(_) => state_open = false,
+                    },
+                    else => return,
                 }
-            },
-            targeted = targeted_rx.recv(), if targeted_open => match targeted {
-                Some(envelope) => envelope,
-                None => {
-                    targeted_open = false;
-                    continue;
-                }
-            },
-            else => return,
+                continue;
+            }
         };
-        if !writer.write_control(&envelope).await {
+        let Some(next) = next else {
+            continue;
+        };
+        if !writer.write_control(&next.envelope).await {
             remove_control_peer(&peers, &peer_id);
             return;
         }
@@ -2004,7 +2064,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn failed_writer_removes_the_peer_and_aborts_its_reader() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, state_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
@@ -2017,10 +2077,11 @@ mod control_queue_tests {
                 reason: LayoutRejectReason::Stale as i32,
             }),
         );
-        mailbox.publish_state(commit);
+        assert!(mailbox.enqueue_initial(commit), "initial frame queues");
 
         layout_peer_writer_task(
             FailingWriter,
+            initial_rx,
             state_rx,
             targeted_rx,
             b"slow".to_vec(),
@@ -2031,32 +2092,28 @@ mod control_queue_tests {
         assert!(!peers.lock().unwrap().contains_key(b"slow".as_slice()));
         tokio::task::yield_now().await;
         assert!(reader.is_finished());
-        assert!(
-            mailbox
-                .targeted_tx
-                .send(coordinator_envelope(
-                    b"coordinator",
-                    envelope::Body::LayoutReject(LayoutReject {
-                        request_id: 10,
-                        reason: LayoutRejectReason::Stale as i32,
-                    }),
-                ))
-                .await
-                .is_err()
-        );
+        assert!(!mailbox.enqueue_targeted(coordinator_envelope(
+            b"coordinator",
+            envelope::Body::LayoutReject(LayoutReject {
+                request_id: 10,
+                reason: LayoutRejectReason::Stale as i32,
+            }),
+        )));
     }
 
     #[tokio::test]
     async fn stalled_peer_coalesces_commits_while_a_healthy_peer_receives_the_latest() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (slow_mailbox, slow_state_rx, slow_targeted_rx) = ControlMailbox::new();
+        let (slow_mailbox, slow_initial_rx, slow_state_rx, slow_targeted_rx) =
+            ControlMailbox::new();
         let observed_slow_state = slow_state_rx.clone();
         let slow_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
             ControlPeer::new(slow_mailbox, slow_reader.abort_handle(), None),
         );
-        let (healthy_mailbox, healthy_state_rx, healthy_targeted_rx) = ControlMailbox::new();
+        let (healthy_mailbox, healthy_initial_rx, healthy_state_rx, healthy_targeted_rx) =
+            ControlMailbox::new();
         let healthy_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"healthy".to_vec(),
@@ -2064,11 +2121,32 @@ mod control_queue_tests {
         );
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
+        assert!(
+            peers
+                .lock()
+                .unwrap()
+                .get(b"slow".as_slice())
+                .expect("slow peer")
+                .mailbox
+                .enqueue_initial(commit(1)),
+            "slow initial"
+        );
+        assert!(
+            peers
+                .lock()
+                .unwrap()
+                .get(b"healthy".as_slice())
+                .expect("healthy peer")
+                .mailbox
+                .enqueue_initial(commit(1)),
+            "healthy initial"
+        );
         let slow_task = tokio::spawn(layout_peer_writer_task(
             StalledWriter {
                 started: Some(started_tx),
                 release: Some(release_rx),
             },
+            slow_initial_rx,
             slow_state_rx,
             slow_targeted_rx,
             b"slow".to_vec(),
@@ -2077,6 +2155,7 @@ mod control_queue_tests {
         let (healthy_tx, mut healthy_rx) = mpsc::unbounded_channel();
         let healthy_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(healthy_tx),
+            healthy_initial_rx,
             healthy_state_rx,
             healthy_targeted_rx,
             b"healthy".to_vec(),
@@ -2090,7 +2169,10 @@ mod control_queue_tests {
         broadcast_envelope(&peers, commit(3));
         broadcast_envelope(&peers, commit(4));
         assert!(matches!(
-            observed_slow_state.borrow().as_ref(),
+            observed_slow_state
+                .borrow()
+                .as_ref()
+                .map(|state| &state.envelope),
             Some(Envelope {
                 body: Some(envelope::Body::LayoutCommit(LayoutCommit {
                     revision: 4,
@@ -2122,7 +2204,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn targeted_queue_overflow_closes_the_peer_before_it_can_keep_reading() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, _state_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, _initial_rx, _state_rx, targeted_rx) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
@@ -2158,18 +2240,105 @@ mod control_queue_tests {
         tokio::task::yield_now().await;
         assert!(reader.is_finished());
         drop(targeted_rx);
-        assert!(
-            mailbox
-                .targeted_tx
-                .send(coordinator_envelope(
-                    b"coordinator",
-                    envelope::Body::LayoutReject(LayoutReject {
-                        request_id: 100,
-                        reason: LayoutRejectReason::Stale as i32,
-                    }),
-                ))
-                .await
-                .is_err()
+        assert!(!mailbox.enqueue_targeted(coordinator_envelope(
+            b"coordinator",
+            envelope::Body::LayoutReject(LayoutReject {
+                request_id: 100,
+                reason: LayoutRejectReason::Stale as i32,
+            }),
+        )));
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_is_first_when_a_commit_arrives_before_the_writer_starts() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
+        let reader = tokio::spawn(std::future::pending::<()>());
+        peers.lock().unwrap().insert(
+            b"member".to_vec(),
+            ControlPeer::new(mailbox.clone(), reader.abort_handle(), None),
         );
+        let snapshot = coordinator_envelope(
+            b"coordinator",
+            envelope::Body::SessionSnapshot(SessionSnapshot { state: None }),
+        );
+        assert!(
+            mailbox.enqueue_initial(snapshot.clone()),
+            "initial snapshot queues"
+        );
+        mailbox.publish_state(commit(2));
+        let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(layout_peer_writer_task(
+            RecordingWriter(recorded_tx),
+            initial_rx,
+            state_rx,
+            targeted_rx,
+            b"member".to_vec(),
+            peers.clone(),
+        ));
+
+        assert_eq!(recorded_rx.recv().await, Some(snapshot));
+        assert!(matches!(
+            recorded_rx.recv().await,
+            Some(Envelope {
+                body: Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 2,
+                    ..
+                })),
+                ..
+            })
+        ));
+        remove_control_peer(&peers, b"member");
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn targeted_frame_precedes_later_coalesced_state_updates() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
+        let reader = tokio::spawn(std::future::pending::<()>());
+        peers.lock().unwrap().insert(
+            b"member".to_vec(),
+            ControlPeer::new(mailbox.clone(), reader.abort_handle(), None),
+        );
+        assert!(mailbox.enqueue_initial(commit(1)), "initial frame queues");
+        mailbox.publish_state(commit(2));
+        let reject = coordinator_envelope(
+            b"coordinator",
+            envelope::Body::LayoutReject(LayoutReject {
+                request_id: 7,
+                reason: LayoutRejectReason::Stale as i32,
+            }),
+        );
+        assert!(
+            mailbox.enqueue_targeted(reject.clone()),
+            "targeted frame queues"
+        );
+        mailbox.publish_state(commit(3));
+        mailbox.publish_state(commit(4));
+        let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(layout_peer_writer_task(
+            RecordingWriter(recorded_tx),
+            initial_rx,
+            state_rx,
+            targeted_rx,
+            b"member".to_vec(),
+            peers.clone(),
+        ));
+
+        let _initial = recorded_rx.recv().await.expect("initial output");
+        assert_eq!(recorded_rx.recv().await, Some(reject));
+        assert!(matches!(
+            recorded_rx.recv().await,
+            Some(Envelope {
+                body: Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 4,
+                    ..
+                })),
+                ..
+            })
+        ));
+        remove_control_peer(&peers, b"member");
+        writer_task.abort();
     }
 }
