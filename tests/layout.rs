@@ -226,3 +226,146 @@ fn pane_ids_are_not_reused_after_deletion() {
         3
     );
 }
+
+#[test]
+fn zero_sized_grids_are_rejected_without_mutating_the_state() {
+    let mut state = state();
+    let before = state.clone();
+
+    assert_eq!(
+        state.create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 0, 80),
+        Err(LayoutError::InvalidGrid)
+    );
+    assert_eq!(state, before);
+
+    assert_eq!(
+        state.create_tab(HOST_A, state.revision, 24, 0),
+        Err(LayoutError::InvalidGrid)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn a_created_tab_has_one_creator_hosted_pane_at_the_requested_grid() {
+    let mut state = state();
+    state
+        .add_member(state.revision, HOST_B.to_vec())
+        .expect("member B joins");
+
+    let tab_id = state
+        .create_tab(HOST_B, state.revision, 33, 111)
+        .expect("B creates a tab");
+    let tab = state
+        .tabs
+        .iter()
+        .find(|tab| tab.tab_id == tab_id)
+        .expect("created tab exists");
+    let Node::Leaf { pane_id } = tab.root else {
+        panic!("a new tab starts with exactly one leaf");
+    };
+    let pane = &state.panes[&pane_id];
+
+    assert_eq!(state.pane_ids_in_tab(tab_id), vec![pane_id]);
+    assert_eq!(pane.host_peer_id, HOST_B);
+    assert_eq!((pane.grid_rows, pane.grid_cols), (33, 111));
+}
+
+#[test]
+fn successful_mutations_advance_the_revision_once() {
+    let mut state = state();
+    let revision = state.revision;
+    state
+        .add_member(revision, HOST_B.to_vec())
+        .expect("member joins");
+    assert_eq!(state.revision, revision + 1);
+
+    let revision = state.revision;
+    let tab_id = state
+        .create_tab(HOST_A, revision, 24, 80)
+        .expect("create tab");
+    assert_eq!(state.revision, revision + 1);
+
+    let pane_id = state
+        .create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 24, 80)
+        .expect("create pane to delete");
+    let revision = state.revision;
+    state
+        .delete_pane(HOST_A, revision, pane_id)
+        .expect("delete pane");
+    assert_eq!(state.revision, revision + 1);
+
+    let revision = state.revision;
+    state
+        .delete_tab(HOST_A, revision, tab_id)
+        .expect("delete all-owned tab");
+    assert_eq!(state.revision, revision + 1);
+}
+
+#[test]
+fn failed_ownership_and_limit_operations_leave_the_entire_state_unchanged() {
+    let mut ownership = state();
+    ownership
+        .add_member(ownership.revision, HOST_B.to_vec())
+        .expect("member B joins");
+    let before = ownership.clone();
+    assert_eq!(
+        ownership.delete_pane(HOST_B, ownership.revision, 1),
+        Err(LayoutError::NotPaneHost { pane_id: 1 })
+    );
+    assert_eq!(ownership, before);
+
+    let mut capped = state();
+    let mut leaves = vec![1];
+    while leaves.len() < MAX_PANES_PER_TAB {
+        let target = leaves.remove(0);
+        let new_pane = capped
+            .create_pane(HOST_A, capped.revision, target, Axis::LeftRight, 24, 80)
+            .expect("within pane limit");
+        leaves.extend([target, new_pane]);
+    }
+    let before = capped.clone();
+    assert_eq!(
+        capped.create_pane(HOST_A, capped.revision, leaves[0], Axis::LeftRight, 24, 80),
+        Err(LayoutError::PaneLimit)
+    );
+    assert_eq!(capped, before);
+}
+
+#[test]
+fn tab_ids_are_not_reused_after_a_tab_is_deleted() {
+    let mut state = state();
+    let first_new_tab = state
+        .create_tab(HOST_A, state.revision, 24, 80)
+        .expect("first new tab");
+    let second_new_tab = state
+        .create_tab(HOST_A, state.revision, 24, 80)
+        .expect("second new tab");
+    state
+        .delete_tab(HOST_A, state.revision, first_new_tab)
+        .expect("delete first new tab");
+
+    assert_eq!(
+        state
+            .create_tab(HOST_A, state.revision, 24, 80)
+            .expect("replacement tab"),
+        second_new_tab + 1
+    );
+}
+
+#[test]
+fn an_owner_can_delete_an_entire_tab_when_every_pane_is_local() {
+    let mut state = state();
+    let tab_id = state
+        .create_tab(HOST_A, state.revision, 24, 80)
+        .expect("second tab");
+    let only_pane = state.pane_ids_in_tab(tab_id)[0];
+    let revision = state.revision;
+
+    state
+        .delete_tab(HOST_A, revision, tab_id)
+        .expect("all-owned tab can be deleted");
+
+    assert_eq!(state.revision, revision + 1);
+    assert_eq!(state.tabs.len(), 1);
+    assert!(!state.panes.contains_key(&only_pane));
+}
