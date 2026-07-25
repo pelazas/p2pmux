@@ -90,18 +90,6 @@ impl LeaseManager {
         self.change_controller(sender, now)
     }
 
-    pub fn force_take_control(
-        &mut self,
-        sender: Vec<u8>,
-        known_epoch: u64,
-        now: Instant,
-    ) -> Result<LeaseDecision, LeaseError> {
-        if known_epoch != self.state.epoch {
-            return Ok(LeaseDecision::RejectStaleRequest);
-        }
-        self.change_controller(sender, now)
-    }
-
     fn change_controller(
         &mut self,
         sender: Vec<u8>,

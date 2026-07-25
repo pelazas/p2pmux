@@ -16,9 +16,9 @@
 - The layout always retains at least one tab, and every tab retains at least one pane. A last leaf cannot be deleted; its owner can delete its tab when another tab exists.
 - New panes split the selected leaf 50/50. The requesting TUI chooses `LeftRight` or `TopBottom` from its local rectangle and sends that axis.
 - PTY grids are fixed at pane creation. Every viewer letterboxes or clips a fixed grid; no resize protocol is added.
-- `Ctrl+P`, then `N`/`X` creates/deletes the selected pane. `Ctrl+T`, then `N`/`X` creates/deletes the selected tab. `Ctrl+P`, arrows move pane selection; `Ctrl+T`, left/right switch tabs; `Esc` cancels a chord. `F9` and `F10` retain the currently locked take-control/quit behavior.
+- `Ctrl+P`, then `N`/`X` creates/deletes the selected pane. `Ctrl+T`, then `N`/`X` creates/deletes the selected tab. `Ctrl+P`, arrows move pane selection; `Ctrl+T`, left/right switch tabs; `Esc` cancels a chord. Ctrl+Q quits; F9 and F10 pass through to the focused PTY.
 - A request rejected for a stale revision refreshes the UI state but is never automatically replayed.
-- This spike's host-owned deletion and `F9`/`F10` controls supersede the older close-confirmation and `Ctrl+Q` shared-control design wording. The documentation task must make `docs/MVP_DESIGN.md`, `docs/SPIKE_PLAN.md`, and the shared-control design agree.
+- This spike's host-owned deletion is combined with the shared-control policy: Ctrl+Q exits, while F9/F10 remain available to nested applications. The documentation task must make `docs/MVP_DESIGN.md`, `docs/SPIKE_PLAN.md`, and the shared-control design agree.
 
 ## Files and boundaries
 
@@ -105,7 +105,7 @@
 - [ ] Write failing ratatui `TestBackend` tests for tab bar/recursive rectangles, focus movement, fixed-grid clipping, chord consumption, and request routing for each create/delete command.
 - [ ] Verify they fail against the single-pane renderer.
 - [ ] Replace separate one-pane host/guest loops with one multi-pane loop. Render host badges and lease state; render layout immediately but disable pane input until its Snapshot and ControlLease arrive.
-- [ ] Route normal typing, paste, and F9 only to the focused pane. Keep mux chords out of every PTY.
+- [ ] Route normal typing and paste to the focused pane. Keep mux chords out of every PTY; F9/F10 remain PTY input.
 - [ ] Run TUI and full test suites; commit `feat: add tabs splits and pane chords to tui`.
 
 ## Chunk 4: Completion checks
@@ -114,13 +114,13 @@
 
 **Files:** Modify `README.md`, `docs/MVP_DESIGN.md`, `docs/SPIKE_PLAN.md`, `docs/superpowers/specs/2026-07-25-shared-control-ui-design.md`.
 
-- [ ] Add localhost instructions and the exact ownership/chord rules; move nested-split completion to Spike 3. Reconcile the existing shared-control design with the host-owned-delete and `F9`/`F10` rules before claiming the MVP document is authoritative.
+- [ ] Add localhost instructions and the exact ownership/chord rules; move nested-split completion to Spike 3. Reconcile the existing shared-control design with host-owned delete, Ctrl+Q, and F9/F10 PTY forwarding before claiming the MVP document is authoritative.
 - [ ] Run `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Commit `docs: document localhost shared layout`.
 
 ### Task 9: Manual acceptance and PR
 
 - [ ] Build the binary and run one `create` plus at least two `join` processes on localhost in separate terminals/PTYs.
-- [ ] Verify: each member creates a pane; foreign delete is rejected; host delete succeeds; tab create/delete works; a mixed tab delete is rejected; a late join receives all panes; F10 exits cleanly.
+- [ ] Verify: each member creates a pane; foreign delete is rejected; host delete succeeds; tab create/delete works; a mixed tab delete is rejected; a late join receives all panes; Ctrl+Q exits cleanly and F9/F10 reach the focused PTY.
 - [ ] Fix every failure and repeat this acceptance sequence until it passes.
 - [ ] Inspect status/diff, run the final suite, push `codex/spike3-shared-layout`, and open a PR targeting `main`.

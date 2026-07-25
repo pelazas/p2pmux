@@ -67,11 +67,23 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
     let mut pane = join_pane(loopback_transport().await, host.ticket().clone())
         .await
         .expect("join pane");
+    let mut saw_snapshot = false;
+    let mut saw_lease = false;
+    for _ in 0..2 {
+        match timeout(TEST_TIMEOUT, pane.events.recv())
+            .await
+            .expect("initial event timeout")
+        {
+            Some(GuestEvent::ScreenSnapshot(snapshot)) if snapshot.sequence == 1 => {
+                saw_snapshot = true;
+            }
+            Some(GuestEvent::Lease(lease)) if lease.lease_epoch == 1 => saw_lease = true,
+            other => panic!("unexpected initial event: {other:?}"),
+        }
+    }
     assert!(
-        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("lease timeout"), Some(GuestEvent::InitialLease(lease)) if lease.lease_epoch == 1)
-    );
-    assert!(
-        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenSnapshot(snapshot)) if snapshot.sequence == 1)
+        saw_snapshot && saw_lease,
+        "host must publish the initial lease"
     );
     screen_tx.send_replace(screen.process_pty(b"abc").expect("screen update"));
     assert!(
@@ -151,9 +163,6 @@ async fn direct_subscription_streams_a_registered_non_default_pane_without_synth
                 assert_eq!(lease.pane_id, pane_wire_id(pane_id));
                 assert_eq!(lease.lease_epoch, 7);
                 saw_lease = true;
-            }
-            Some(GuestEvent::InitialLease(_)) => {
-                panic!("direct subscriptions must not synthesize a lease")
             }
             Some(GuestEvent::Disconnected) => panic!("direct pane disconnected before its lease"),
             other => panic!("unexpected direct pane event: {other:?}"),

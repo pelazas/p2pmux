@@ -180,7 +180,7 @@ impl Transport {
         Ok((FrameWriter { send }, FrameReader::new(recv)))
     }
 
-    /// Accept a post-handshake stream that may remain dormant until a peer needs it.
+    /// Accept a post-handshake control stream without imposing the handshake timeout while idle.
     pub async fn accept_framed_bi_when_ready(
         &self,
         connection: &Connection,

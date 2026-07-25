@@ -47,6 +47,8 @@ use crate::{
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
+const CONTROL_HELP: &str = "type to claim idle | active typing is protected | Ctrl+Q quit";
+
 /// The in-progress multi-pane command prefix, kept entirely local to one terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ChordMode {
@@ -96,7 +98,6 @@ pub enum UiIntent {
 pub enum KeyHandling {
     Forward,
     Consumed(Vec<UiIntent>),
-    TakeControl,
     Quit,
 }
 
@@ -160,10 +161,14 @@ impl MultiPaneTui {
         self.pane_views.get(&pane_id)
     }
 
-    pub fn set_pane_view(&mut self, pane_id: PaneId, state: PaneViewState) {
-        if self.snapshot.panes.contains_key(&pane_id) {
+    pub fn set_pane_view(&mut self, pane_id: PaneId, state: PaneViewState) -> bool {
+        if self.snapshot.panes.contains_key(&pane_id)
+            && self.pane_views.get(&pane_id) != Some(&state)
+        {
             self.pane_views.insert(pane_id, state);
+            return true;
         }
+        false
     }
 
     /// Select a tab only when the coordinator publishes the exact ID reserved for this member.
@@ -232,10 +237,6 @@ impl MultiPaneTui {
         if is_quit(key) {
             self.chord_mode = ChordMode::None;
             return KeyHandling::Quit;
-        }
-        if is_take_control(key) {
-            self.chord_mode = ChordMode::None;
-            return KeyHandling::TakeControl;
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
@@ -516,14 +517,14 @@ pub fn render_multi_pane(
 }
 
 fn shared_footer_text(status: &str, join_code: Option<&str>) -> String {
-    let controls = "Ctrl+P panes | Ctrl+T tabs | F9 control | F10 quit";
+    let controls = format!("Ctrl+P panes | Ctrl+T tabs | {CONTROL_HELP}");
     match (status.is_empty(), join_code) {
         (false, Some(join_code)) => {
             format!("{status} | {controls} | join: p2pmux join {join_code}")
         }
         (false, None) => format!("{status} | {controls}"),
         (true, Some(join_code)) => format!("{controls} | join: p2pmux join {join_code}"),
-        (true, None) => String::from(controls),
+        (true, None) => controls,
     }
 }
 
@@ -570,8 +571,10 @@ fn render_shared_multi_pane(
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
         let lease = match view.controller_peer_id.as_deref() {
-            Some(peer) if view.controller_active => format!("ctrl:{} typing", short_peer(peer)),
-            Some(peer) => format!("ctrl:{} idle", short_peer(peer)),
+            Some(peer) if view.controller_active => {
+                format!("ctrl:{} this user is typing", short_peer(peer))
+            }
+            Some(peer) => format!("ctrl:{} this user has control", short_peer(peer)),
             None => String::from("lease: waiting"),
         };
         let title = format!(
@@ -579,10 +582,11 @@ fn render_shared_multi_pane(
             if focused { "*" } else { " " },
             short_peer(&pane.host_peer_id)
         );
-        let border_color = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
+        let border_color = match view.controller_peer_id.as_ref() {
+            Some(_) if view.controller_active => Color::Rgb(255, 69, 0),
+            Some(_) => Color::Rgb(140, 91, 68),
+            None if focused => Color::Yellow,
+            None => Color::DarkGray,
         };
         let block = Block::bordered()
             .title(title)
@@ -683,22 +687,16 @@ impl SharedLocalPane {
                             .input(&peer_id, input.lease_epoch, input.data, Instant::now())
                     {
                         self.host.write_input(&bytes)?;
+                        self.lease_tx.send_replace(self.lease.state().clone());
+                        changed = true;
                     }
                 }
                 HostControlEvent::TakeControl { peer_id, request } => {
-                    let decision = if request.force {
-                        self.lease.force_take_control(
-                            peer_id,
-                            request.known_lease_epoch,
-                            Instant::now(),
-                        )?
-                    } else {
-                        self.lease.take_control(
-                            peer_id,
-                            request.known_lease_epoch,
-                            Instant::now(),
-                        )?
-                    };
+                    let decision = self.lease.take_control(
+                        peer_id,
+                        request.known_lease_epoch,
+                        Instant::now(),
+                    )?;
                     match decision {
                         LeaseDecision::Publish(state) => {
                             self.lease_tx.send_replace(state);
@@ -733,19 +731,6 @@ impl SharedLocalPane {
         Ok(changed)
     }
 
-    fn take_control(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.lease.state().controller_peer_id != self.host_peer_id
-            && let LeaseDecision::Publish(state) = self.lease.force_take_control(
-                self.host_peer_id.clone(),
-                self.lease.state().epoch,
-                Instant::now(),
-            )?
-        {
-            self.lease_tx.send_replace(state);
-        }
-        Ok(())
-    }
-
     fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
         let epoch = self.lease.state().epoch;
         let decision = if self.lease.state().controller_peer_id == self.host_peer_id {
@@ -756,7 +741,10 @@ impl SharedLocalPane {
                 .take_control(self.host_peer_id.clone(), epoch, Instant::now())?
         };
         match decision {
-            LeaseDecision::AcceptInput(bytes) => self.host.write_input(&bytes)?,
+            LeaseDecision::AcceptInput(bytes) => {
+                self.host.write_input(&bytes)?;
+                self.lease_tx.send_replace(self.lease.state().clone());
+            }
             LeaseDecision::Publish(state) => {
                 self.lease_tx.send_replace(state);
                 self.host.write_input(&bytes)?;
@@ -831,14 +819,21 @@ impl SharedRemotePane {
                         .apply_delta(delta.base_sequence, delta.sequence, &delta.changes)
                         .is_ok();
                 }
-                Ok(GuestEvent::InitialLease(lease)) | Ok(GuestEvent::Lease(lease)) => {
+                Ok(GuestEvent::Lease(lease)) => {
+                    let controls_this_pane =
+                        lease.controller_peer_id == self.pane.controls.peer_id();
                     self.lease = Some(LeaseState {
                         controller_peer_id: lease.controller_peer_id,
                         epoch: lease.lease_epoch,
                         last_activity: Instant::now(),
                     });
                     self.last_lease = Instant::now();
-                    self.pending_control = false;
+                    if self.pending_control {
+                        self.pending_control = false;
+                        if !controls_this_pane {
+                            self.held_input.clear();
+                        }
+                    }
                     changed = true;
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
@@ -876,14 +871,6 @@ impl SharedRemotePane {
         }
     }
 
-    fn take_control(&mut self) {
-        if let Some(lease) = self.lease.as_ref()
-            && lease.controller_peer_id != self.pane.controls.peer_id()
-        {
-            let _ = self.pane.controls.try_take_control(lease.epoch, true);
-        }
-    }
-
     fn input(&mut self, bytes: Vec<u8>) {
         let Some(lease) = self.lease.as_ref() else {
             return;
@@ -896,11 +883,7 @@ impl SharedRemotePane {
             }
         } else if self.last_lease.elapsed() >= IDLE_AFTER && !self.pending_control {
             self.held_input.extend_from_slice(&bytes);
-            self.pending_control = self
-                .pane
-                .controls
-                .try_take_control(lease.epoch, false)
-                .is_ok();
+            self.pending_control = self.pane.controls.try_take_control(lease.epoch).is_ok();
             if !self.pending_control {
                 self.held_input.clear();
             }
@@ -1240,7 +1223,6 @@ impl SharedLayoutRuntime {
                 {
                     match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
                         KeyHandling::Quit => break,
-                        KeyHandling::TakeControl => self.take_control()?,
                         KeyHandling::Consumed(intents) => {
                             for intent in intents {
                                 self.handle_intent(intent)?;
@@ -1312,7 +1294,7 @@ impl SharedLayoutRuntime {
             }
             changed = true;
         }
-        self.refresh_local_views();
+        changed |= self.refresh_local_views();
         Ok(changed)
     }
 
@@ -1320,13 +1302,15 @@ impl SharedLayoutRuntime {
         self.runtime.spawn(async move { pane.shutdown().await });
     }
 
-    fn refresh_local_views(&mut self) {
+    fn refresh_local_views(&mut self) -> bool {
+        let mut changed = false;
         for (pane_id, pane) in &self.local {
-            self.tui.set_pane_view(*pane_id, pane.view_state());
+            changed |= self.tui.set_pane_view(*pane_id, pane.view_state());
         }
         for (pane_id, pane) in &self.remote {
-            self.tui.set_pane_view(*pane_id, pane.view_state());
+            changed |= self.tui.set_pane_view(*pane_id, pane.view_state());
         }
+        changed
     }
 
     fn handle_control_event(&mut self, event: LayoutControlEvent) -> Result<(), Box<dyn Error>> {
@@ -1602,17 +1586,6 @@ impl SharedLayoutRuntime {
         id
     }
 
-    fn take_control(&mut self) -> Result<(), Box<dyn Error>> {
-        let pane_id = self.tui.focused_pane();
-        if let Some(pane) = self.local.get_mut(&pane_id) {
-            pane.take_control()?;
-        }
-        if let Some(pane) = self.remote.get_mut(&pane_id) {
-            pane.take_control();
-        }
-        Ok(())
-    }
-
     fn forward_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
         if let Some(pane) = self.local.get_mut(&pane_id)
@@ -1772,15 +1745,11 @@ fn render_host_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &st
 }
 
 fn is_quit(key: KeyEvent) -> bool {
-    key.code == KeyCode::F(10) && key.modifiers.is_empty()
-}
-
-fn is_take_control(key: KeyEvent) -> bool {
-    key.code == KeyCode::F(9) && key.modifiers.is_empty()
+    key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL
 }
 
 fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
-    if is_quit(key) || is_take_control(key) {
+    if is_quit(key) {
         return None;
     }
 
@@ -2020,10 +1989,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
-    let footer = format!(
-        "join: p2pmux join {} | F9 take control | F10 quit",
-        runtime.join_code
-    );
+    let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
     let mut dirty = true;
     loop {
         while let Ok(event) = runtime.control_rx.try_recv() {
@@ -2034,26 +2000,21 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                     input.data,
                     Instant::now(),
                 ) {
-                    LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
+                    LeaseDecision::AcceptInput(bytes) => {
+                        runtime.host.write_input(&bytes)?;
+                        runtime.lease_tx.send_replace(runtime.lease.state().clone());
+                    }
                     LeaseDecision::Publish(_)
                     | LeaseDecision::RejectStaleInput
                     | LeaseDecision::RejectStaleRequest
                     | LeaseDecision::RejectActiveController => {}
                 },
                 HostControlEvent::TakeControl { peer_id, request } => {
-                    let decision = if request.force {
-                        runtime.lease.force_take_control(
-                            peer_id,
-                            request.known_lease_epoch,
-                            Instant::now(),
-                        )?
-                    } else {
-                        runtime.lease.take_control(
-                            peer_id,
-                            request.known_lease_epoch,
-                            Instant::now(),
-                        )?
-                    };
+                    let decision = runtime.lease.take_control(
+                        peer_id,
+                        request.known_lease_epoch,
+                        Instant::now(),
+                    )?;
                     match decision {
                         LeaseDecision::Publish(state) => {
                             runtime.lease_tx.send_replace(state);
@@ -2104,18 +2065,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if is_quit(key) {
                     break;
                 }
-                if is_take_control(key) {
-                    if runtime.lease.state().controller_peer_id != runtime.host_peer_id {
-                        let known_epoch = runtime.lease.state().epoch;
-                        if let LeaseDecision::Publish(state) = runtime.lease.force_take_control(
-                            runtime.host_peer_id.clone(),
-                            known_epoch,
-                            Instant::now(),
-                        )? {
-                            runtime.lease_tx.send_replace(state);
-                        }
-                    }
-                } else if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
+                if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
                     let decision =
@@ -2129,7 +2079,10 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                                 .take_control(runtime.host_peer_id.clone(), epoch, now)?
                         };
                     match decision {
-                        LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
+                        LeaseDecision::AcceptInput(bytes) => {
+                            runtime.host.write_input(&bytes)?;
+                            runtime.lease_tx.send_replace(runtime.lease.state().clone());
+                        }
                         LeaseDecision::Publish(state) => {
                             runtime.lease_tx.send_replace(state);
                             runtime.host.write_input(&bytes)?;
@@ -2154,7 +2107,10 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                         .take_control(runtime.host_peer_id.clone(), epoch, now)?
                 };
                 match decision {
-                    LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
+                    LeaseDecision::AcceptInput(bytes) => {
+                        runtime.host.write_input(&bytes)?;
+                        runtime.lease_tx.send_replace(runtime.lease.state().clone());
+                    }
                     LeaseDecision::Publish(state) => {
                         runtime.lease_tx.send_replace(state);
                         runtime.host.write_input(&bytes)?;
@@ -2218,15 +2174,6 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
-                Ok(GuestEvent::InitialLease(state)) => {
-                    footer = format!(
-                        "controller: {} typing",
-                        short_peer(&state.controller_peer_id)
-                    );
-                    lease = Some(state);
-                    last_lease = Instant::now();
-                    dirty = true;
-                }
                 Ok(GuestEvent::Lease(state)) => {
                     let already_received_host_lease = received_host_lease;
                     received_host_lease = true;
@@ -2291,15 +2238,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 break;
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_take_control(key) {
-                    if let Some(state) = lease.as_ref()
-                        && state.controller_peer_id != pane.controls.peer_id()
-                    {
-                        pending_control = false;
-                        held_input.clear();
-                        let _ = pane.controls.try_take_control(state.lease_epoch, true);
-                    }
-                } else if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
+                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
                     && let Some(bytes) = encode_key(key, screen)
                 {
                     if state.controller_peer_id == pane.controls.peer_id() {
@@ -2312,11 +2251,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
                             pending_control = true;
-                            if pane
-                                .controls
-                                .try_take_control(state.lease_epoch, false)
-                                .is_err()
-                            {
+                            if pane.controls.try_take_control(state.lease_epoch).is_err() {
                                 pending_control = false;
                                 held_input.clear();
                             }
@@ -2337,11 +2272,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
                             pending_control = true;
-                            if pane
-                                .controls
-                                .try_take_control(state.lease_epoch, false)
-                                .is_err()
-                            {
+                            if pane.controls.try_take_control(state.lease_epoch).is_err() {
                                 pending_control = false;
                                 held_input.clear();
                             }
@@ -2392,11 +2323,11 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        ChordMode, HostControlEvent, HostPaneChannels, KeyHandling, LayoutControlEvent,
-        MultiPaneTui, PaneViewState, RemoteSubscriptionState, SharedLayoutRuntime, SharedLocalPane,
-        UiIntent, VtScreen, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
-        pane_wire_id, render_guest_screen, render_multi_pane, render_shared_multi_pane,
-        shared_footer_text,
+        CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, KeyHandling,
+        LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
+        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
+        grid_for_pane, initial_root_pane_grid, pane_wire_id, render_guest_screen,
+        render_multi_pane, render_shared_multi_pane, shared_footer_text,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2648,7 +2579,36 @@ mod tests {
         let footer = shared_footer_text("layout request rejected", Some("TESTCODE"));
         assert!(footer.starts_with("layout request rejected"));
         assert!(footer.contains("Ctrl+P panes"));
+        assert!(footer.contains(CONTROL_HELP));
+        assert!(!footer.contains("F9"));
+        assert!(!footer.contains("F10"));
         assert!(footer.contains("join: p2pmux join TESTCODE"));
+    }
+
+    #[test]
+    fn pane_view_activity_transition_reports_a_redraw() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("layout");
+        let active = PaneViewState {
+            ready: true,
+            controller_peer_id: Some(b"controller".to_vec()),
+            controller_active: true,
+        };
+        assert!(tui.set_pane_view(1, active.clone()));
+        assert!(!tui.set_pane_view(1, active));
+        assert!(tui.set_pane_view(
+            1,
+            PaneViewState {
+                controller_active: false,
+                ..tui.pane_view(1).expect("pane view").clone()
+            },
+        ));
     }
 
     #[test]
@@ -2685,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_busy_takeover_republishes_lease_and_idle_takeover_succeeds_without_force() {
+    fn rejected_busy_claim_republishes_lease_and_idle_claim_succeeds() {
         let owner = b"owner".to_vec();
         let requester = b"guest".to_vec();
         let mut pane = SharedLocalPane::spawn(99, 1, 1, owner.clone()).expect("local pane");
@@ -2697,7 +2657,6 @@ mod tests {
                     pane_id: pane_wire_id(99),
                     requester_peer_id: requester.clone(),
                     known_lease_epoch: 1,
-                    force: false,
                 },
             })
             .expect("busy takeover event");
@@ -2717,7 +2676,6 @@ mod tests {
                     pane_id: pane_wire_id(99),
                     requester_peer_id: requester.clone(),
                     known_lease_epoch: 1,
-                    force: false,
                 },
             })
             .expect("idle takeover event");
@@ -3276,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_keys_escape_and_function_keys_are_classified_without_pty_encoding() {
+    fn normal_keys_escape_and_function_keys_leave_f9_and_f10_for_the_pty() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
         assert_eq!(
@@ -3293,10 +3251,17 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), area),
-            KeyHandling::TakeControl
+            KeyHandling::Forward
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area,
+            ),
             KeyHandling::Quit
         );
     }
@@ -3434,7 +3399,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_supported_keys_and_reserves_f9_and_f10() {
+    fn encodes_supported_keys_and_reserves_ctrl_q_only() {
         let parser = vt100::Parser::new(1, 1, 0);
         let screen = parser.screen();
         let cases = [
@@ -3491,8 +3456,14 @@ mod tests {
                 KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
                 Some("\x1bOP"),
             ),
-            (KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), None),
-            (KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), None),
+            (
+                KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+                Some("\x1b[20~"),
+            ),
+            (
+                KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+                Some("\x1b[21~"),
+            ),
             (
                 KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
                 Some("\x1b[24~"),
@@ -3503,7 +3474,7 @@ mod tests {
             ),
             (
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-                Some("\x11"),
+                None,
             ),
             (KeyEvent::new(KeyCode::Null, KeyModifiers::NONE), None),
         ];

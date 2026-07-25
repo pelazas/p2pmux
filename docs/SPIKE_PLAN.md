@@ -37,8 +37,8 @@ new pane/tab PTY runs on the creating member’s Mac and serves direct pane stre
 The coordinator reserves a pane, the creator registers its PTY, then reports ready before the
 layout commit exposes it.
 
-Commands: `Ctrl+P` then `N`/`X`/arrows; `Ctrl+T` then `N`/`X`/left/right; `Esc` cancels; F9 is
-focused-pane Take control; F10 exits. Pane grids are fixed at creation. Pane deletion is host-only;
+Commands: `Ctrl+P` then `N`/`X`/arrows; `Ctrl+T` then `N`/`X`/left/right; `Esc` cancels; Ctrl+Q
+exits. F9 and F10 pass through to the focused PTY. Pane grids are fixed at creation. Pane deletion is host-only;
 tab deletion requires every pane in that tab to be hosted by the requester. Maximums: 8 members,
 9 tabs, 8 panes/tab, split depth 4.
 

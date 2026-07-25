@@ -51,7 +51,7 @@ by smaller local rectangles.
 
 ## Local Spike 1
 
-Run `cargo run -- local` to start one local shell. Press F10 to leave p2pmux.
+Run `cargo run -- local` to start one local shell. Press Ctrl+Q to leave p2pmux.
 
 The PTY grid is fixed from the terminal size at startup. Resizing the outer terminal never resizes
 the child shell or vt100 parser: larger windows leave extra cells blank and smaller windows crop
@@ -73,8 +73,8 @@ dogfooding only; they work while the corresponding `create` process is alive and
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
 
 Only one peer controls each pane at a time: after about eight seconds of idle time another member
-can type to hop in; while someone is actively typing, press F9 to force Take control of the
-**focused** pane. F10 exits only the local p2pmux view.
+can type to hop in. Active typing is protected, so there is no forced takeover. Ctrl+Q exits only
+the local p2pmux view; F9 and F10 continue through to the focused PTY.
 
 Shared-layout commands are local mux chords and never reach a PTY:
 
@@ -86,7 +86,10 @@ Shared-layout commands are local mux chords and never reach a PTY:
 - `Ctrl+T`, then left/right — switch tabs; `Esc` cancels a chord.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
-Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs).
+Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
+pane reports whether its controller is actively typing or merely retains idle control, and every
+member sees the same footer: `Ctrl+P panes | Ctrl+T tabs | type to claim idle | active typing is
+protected | Ctrl+Q quit`.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal crops or letterboxes the immutable host grid; it never resizes the host PTY.

@@ -40,7 +40,7 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 
 1. You `create` → reusable join ticket → first shell on your Mac. You start as coordinator.
 2. Others `join <ticket>` (up to 8). Everyone sees the same tabs/panes.
-3. Shells run on whoever **hosts** that pane’s Mac. Others watch; when idle they hop in and type; if someone’s mid-typing, press F9 to Take control of the focused pane.
+3. Shells run on whoever **hosts** that pane’s Mac. Others watch; when idle they hop in and type; active typing is protected until the controller becomes idle.
 4. Any member can split an available pane or create a tab; the requester hosts the new PTY. Only the host can delete a pane. A member can delete a tab only when it owns every pane in that tab.
 5. Spike 3 is localhost layout/control work. Disconnect grace and coordinator failover remain later spikes.
 
@@ -93,8 +93,8 @@ The last pane in a tab must be removed by deleting the tab; the final tab is ret
 
 `Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` plus arrows
 moves focus. `Ctrl+T` then `N` creates a tab; `Ctrl+T` then `X` requests tab deletion; `Ctrl+T`
-plus left/right switches tabs; `Esc` cancels. These mux chords are consumed locally. F9 forces
-Take control of the focused pane and F10 exits the local view. Pane grids never resize.
+plus left/right switches tabs; `Esc` cancels. These mux chords are consumed locally. Ctrl+Q exits
+the local view; F9 and F10 reach the focused PTY. Pane grids never resize.
 
 ### Disconnect grace (any member)
 
