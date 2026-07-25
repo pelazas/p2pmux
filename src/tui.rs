@@ -17,7 +17,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode,
+        enable_raw_mode,
     },
 };
 use iroh::EndpointAddr;
@@ -1727,6 +1728,7 @@ impl SharedLayoutRuntime {
         let mut guard = TerminalGuard::new();
         enable_raw_mode()?;
         guard.raw_mode = true;
+        execute!(io::stdout(), SetTitle("p2pmux"))?;
         guard.alternate_screen = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.bracketed_paste = true;
@@ -2584,6 +2586,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
+    execute!(io::stdout(), SetTitle("p2pmux"))?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
