@@ -27,7 +27,7 @@ use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::{Margin, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     widgets::{Block, Paragraph, Widget},
 };
@@ -834,7 +834,7 @@ fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
 }
 
 fn pane_content_rect(pane_rect: Rect) -> Rect {
-    Block::bordered().inner(pane_rect).inner(Margin::new(1, 1))
+    Block::bordered().inner(pane_rect)
 }
 
 fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
@@ -3648,20 +3648,20 @@ mod tests {
     }
 
     #[test]
-    fn selection_hit_testing_uses_the_padded_pane_content_area() {
+    fn selection_hit_testing_uses_the_bordered_pane_content_area() {
         let tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
             }],
-            &[(1, 18, 76)],
+            &[(1, 20, 78)],
         ))
         .expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
-        assert_eq!(tui.screen_cell_at(1, 2, area), None);
+        assert_eq!(tui.screen_cell_at(0, 1, area), None);
         assert_eq!(
-            tui.screen_cell_at(2, 3, area),
+            tui.screen_cell_at(1, 2, area),
             Some((1, ScreenCell { row: 0, col: 0 }))
         );
     }
@@ -3971,8 +3971,8 @@ mod tests {
             .expect("render");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(2, 3)].symbol(), "a");
-        assert_eq!(buffer[(5, 3)].symbol(), "d");
+        assert_eq!(buffer[(1, 3)].symbol(), "a");
+        assert_eq!(buffer[(4, 3)].symbol(), "d");
         assert_eq!(buffer[(7, 3)].symbol(), "│");
     }
 
@@ -3994,8 +3994,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::LeftRight,
-                grid_rows: 18,
-                grid_cols: 36,
+                grid_rows: 20,
+                grid_cols: 38,
             }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
@@ -4235,8 +4235,8 @@ mod tests {
             .get(&1)
             .copied()
             .expect("root pane");
-        assert_eq!(grid_for_pane(pane), (18, 76));
-        assert_eq!(initial_root_pane_grid(80, 24), (18, 76));
+        assert_eq!(grid_for_pane(pane), (20, 78));
+        assert_eq!(initial_root_pane_grid(80, 24), (20, 78));
     }
 
     #[test]
@@ -4260,8 +4260,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
-                grid_rows: 8,
-                grid_cols: 8,
+                grid_rows: 10,
+                grid_cols: 10,
             }])
         );
     }
@@ -4308,8 +4308,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
-                grid_rows: 34,
-                grid_cols: 16,
+                grid_rows: 36,
+                grid_cols: 18,
             }])
         );
     }
@@ -4491,8 +4491,8 @@ mod tests {
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::CreateTab {
-                grid_rows: 2,
-                grid_cols: 8,
+                grid_rows: 4,
+                grid_cols: 10,
             }])
         );
 
