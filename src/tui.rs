@@ -39,7 +39,7 @@ use crate::{
         PaneReady, SplitAxis,
     },
     pty_host::PtyHost,
-    screen::{GuestScreen, HostScreen, ScreenFrame},
+    screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
     session::{
         CoordinatorResponse, GuestEvent, GuestPane, HostControlEvent, HostPaneChannels,
         LayoutControlEvent, LayoutControlQueueError, PaneLayoutReconciler, PaneServer,
@@ -109,6 +109,7 @@ pub struct PaneViewState {
     pub ready: bool,
     pub controller_peer_id: Option<Vec<u8>>,
     pub controller_active: bool,
+    scrollback: usize,
 }
 
 /// User operations emitted by the TUI. Session code owns all resulting mutations and PTYs.
@@ -302,10 +303,49 @@ impl MultiPaneTui {
         self.pane_views.get(&pane_id)
     }
 
-    pub fn set_pane_view(&mut self, pane_id: PaneId, state: PaneViewState) -> bool {
-        if self.snapshot.panes.contains_key(&pane_id)
-            && self.pane_views.get(&pane_id) != Some(&state)
-        {
+    fn scrollback_offset(&self, pane_id: PaneId) -> usize {
+        self.pane_views
+            .get(&pane_id)
+            .map_or(0, |view| view.scrollback)
+    }
+
+    fn pane_at_or_focused(&self, column: u16, row: u16, area: Rect) -> PaneId {
+        pane_at(&self.geometry(area).panes, column, row).unwrap_or(self.focused_pane)
+    }
+
+    fn scroll_pane(&mut self, pane_id: PaneId, scrollback_len: usize, up: bool) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        let scrollback = if up {
+            view.scrollback.saturating_add(1).min(scrollback_len)
+        } else {
+            view.scrollback.saturating_sub(1)
+        };
+        if view.scrollback == scrollback {
+            return false;
+        }
+        view.scrollback = scrollback;
+        true
+    }
+
+    fn reset_scrollback(&mut self, pane_id: PaneId) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        if view.scrollback == 0 {
+            return false;
+        }
+        view.scrollback = 0;
+        true
+    }
+
+    pub fn set_pane_view(&mut self, pane_id: PaneId, mut state: PaneViewState) -> bool {
+        if self.snapshot.panes.contains_key(&pane_id) {
+            state.scrollback = self.scrollback_offset(pane_id);
+            if self.pane_views.get(&pane_id) == Some(&state) {
+                return false;
+            }
             self.pane_views.insert(pane_id, state);
             return true;
         }
@@ -1067,8 +1107,9 @@ fn render_shared_multi_pane(
         frame.render_widget(block, rect);
         if let Some(screen) = screens.get(&pane_id) {
             let viewport = fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols);
+            let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
             frame.render_widget(
-                VtScreen::new(screen).with_selection(
+                VtScreen::new(&screen).with_selection(
                     tui.selection()
                         .filter(|selection| selection.pane_id == pane_id),
                 ),
@@ -1077,6 +1118,7 @@ fn render_shared_multi_pane(
             let (row, col) = screen.cursor_position();
             if focused
                 && view.ready
+                && screen.scrollback() == 0
                 && !screen.hide_cursor()
                 && row < viewport.height
                 && col < viewport.width
@@ -1152,6 +1194,7 @@ impl SharedLocalPane {
             ready: true,
             controller_peer_id: Some(self.lease.state().controller_peer_id.clone()),
             controller_active: !self.lease.state().is_idle_at(Instant::now()),
+            scrollback: 0,
         }
     }
 
@@ -1291,6 +1334,7 @@ impl SharedRemotePane {
                 .lease
                 .as_ref()
                 .is_some_and(|lease| !lease.is_idle_at(Instant::now())),
+            scrollback: 0,
         }
     }
 
@@ -1771,6 +1815,31 @@ impl SharedLayoutRuntime {
                     }
                     dirty = true;
                 }
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let area = Rect::new(0, 0, cols, rows);
+                    let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                    let scrollback_len = self
+                        .local
+                        .get(&pane_id)
+                        .map(|pane| available_scrollback(pane.screen.screen()))
+                        .or_else(|| {
+                            self.remote
+                                .get(&pane_id)
+                                .and_then(|pane| pane.screen.screen())
+                                .map(available_scrollback)
+                        })
+                        .unwrap_or(0);
+                    dirty |= self.tui.scroll_pane(
+                        pane_id,
+                        scrollback_len,
+                        matches!(mouse.kind, MouseEventKind::ScrollUp),
+                    );
+                }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -1783,15 +1852,20 @@ impl SharedLayoutRuntime {
         let Some(selection) = self.tui.selection() else {
             return;
         };
+        let scrollback = self.tui.scrollback_offset(selection.pane_id);
         let text = self
             .local
             .get(&selection.pane_id)
-            .and_then(|pane| selection_text(pane.screen.screen(), selection))
+            .and_then(|pane| {
+                selection_text(&viewed_screen(pane.screen.screen(), scrollback), selection)
+            })
             .or_else(|| {
                 self.remote
                     .get(&selection.pane_id)
                     .and_then(|pane| pane.screen.screen())
-                    .and_then(|screen| selection_text(screen, selection))
+                    .and_then(|screen| {
+                        selection_text(&viewed_screen(screen, scrollback), selection)
+                    })
             });
         let Some(text) = text else {
             return;
@@ -2145,16 +2219,22 @@ impl SharedLayoutRuntime {
 
     fn forward_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
+        let mut sent = false;
         if let Some(pane) = self.local.get_mut(&pane_id)
             && let Some(bytes) = encode_key(key, pane.screen.screen())
         {
             pane.input(bytes)?;
+            sent = true;
         }
         if let Some(pane) = self.remote.get_mut(&pane_id)
             && let Some(screen) = pane.screen.screen()
             && let Some(bytes) = encode_key(key, screen)
         {
             pane.input(bytes);
+            sent = true;
+        }
+        if sent {
+            self.tui.reset_scrollback(pane_id);
         }
         Ok(())
     }
@@ -2169,6 +2249,7 @@ impl SharedLayoutRuntime {
         {
             pane.input(encode_paste(text, screen.bracketed_paste()));
         }
+        self.tui.reset_scrollback(pane_id);
         Ok(())
     }
 
@@ -2237,6 +2318,18 @@ impl<'a> VtScreen<'a> {
         self.selection = selection;
         self
     }
+}
+
+fn viewed_screen(screen: &vt100::Screen, scrollback: usize) -> vt100::Screen {
+    let mut screen = screen.clone();
+    screen.set_scrollback(scrollback);
+    screen
+}
+
+fn available_scrollback(screen: &vt100::Screen) -> usize {
+    let mut screen = screen.clone();
+    screen.set_scrollback(SCROLLBACK_LINES);
+    screen.scrollback()
 }
 
 impl Widget for VtScreen<'_> {
@@ -2923,7 +3016,7 @@ mod tests {
         initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
         render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
-        visible_leaf_panes,
+        viewed_screen, visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -3235,6 +3328,7 @@ mod tests {
             ready: true,
             controller_peer_id: Some(b"controller".to_vec()),
             controller_active: true,
+            scrollback: 0,
         };
         assert!(tui.set_pane_view(1, active.clone()));
         assert!(!tui.set_pane_view(1, active));
@@ -3546,6 +3640,32 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_adjusts_the_hovered_pane_scrollback_with_clamping() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let pane_id = tui.pane_at_or_focused(60, 17, area);
+        assert_eq!(pane_id, 3);
+
+        assert!(tui.scroll_pane(pane_id, 2, true));
+        assert!(tui.scroll_pane(pane_id, 2, true));
+        assert!(!tui.scroll_pane(pane_id, 2, true));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 2);
+        assert!(tui.scroll_pane(pane_id, 2, false));
+        assert!(tui.scroll_pane(pane_id, 2, false));
+        assert!(!tui.scroll_pane(pane_id, 2, false));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 0);
+    }
+
+    #[test]
+    fn input_resets_the_pane_scrollback_to_the_live_edge() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 4, true));
+        assert!(tui.reset_scrollback(1));
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 0);
+        assert!(!tui.reset_scrollback(1));
+    }
+
+    #[test]
     fn selection_text_extracts_the_selected_grid_cells() {
         let mut parser = vt100::Parser::new(2, 4, 0);
         parser.process(b"ab  \r\ncdef");
@@ -3559,6 +3679,20 @@ mod tests {
             selection_text(parser.screen(), selection),
             Some("b\nde".to_owned())
         );
+    }
+
+    #[test]
+    fn selection_text_uses_the_scrolled_view_cells() {
+        let mut parser = vt100::Parser::new(1, 3, 10);
+        parser.process(b"one\r\ntwo");
+        let screen = viewed_screen(parser.screen(), 1);
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 1 },
+        };
+
+        assert_eq!(selection_text(&screen, selection), Some("on".to_owned()));
     }
 
     #[test]
@@ -3670,6 +3804,7 @@ mod tests {
                 ready: true,
                 controller_peer_id: Some(b"peer".to_vec()),
                 controller_active: true,
+                scrollback: 0,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(36, 6)).expect("test terminal");
@@ -3702,6 +3837,7 @@ mod tests {
                 ready: true,
                 controller_peer_id: None,
                 controller_active: false,
+                scrollback: 0,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("test terminal");
@@ -3735,6 +3871,7 @@ mod tests {
                 ready: true,
                 controller_peer_id: None,
                 controller_active: false,
+                scrollback: 0,
             },
         );
         let screens = BTreeMap::from([(1, parser.screen())]);
@@ -3766,6 +3903,7 @@ mod tests {
                     ready: true,
                     controller_peer_id: None,
                     controller_active: false,
+                    scrollback: 0,
                 },
             );
             let screens = BTreeMap::from([(1, parser.screen())]);
@@ -4510,6 +4648,29 @@ mod tests {
         assert_eq!(buffer[(2, 1)].symbol(), "f");
         assert_eq!(buffer[(3, 0)].symbol(), " ");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
+    }
+
+    #[test]
+    fn renderer_uses_the_requested_scrollback_view() {
+        let mut parser = vt100::Parser::new(1, 3, 10);
+        parser.process(b"one\r\ntwo");
+        let live = parser.screen().clone();
+        let history = viewed_screen(parser.screen(), 1);
+        assert_eq!(history.scrollback(), 1);
+        assert_ne!(
+            history.cell(0, 0).expect("history cell").contents(),
+            live.cell(0, 0).expect("live cell").contents()
+        );
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(&history), frame.area()))
+            .expect("render should work");
+
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].symbol(),
+            history.cell(0, 0).expect("history cell").contents()
+        );
     }
 
     #[test]

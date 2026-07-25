@@ -5,6 +5,7 @@ use std::{fmt, sync::Arc};
 use crate::protocol::{MAX_DELTA_BYTES, MAX_SNAPSHOT_BYTES};
 
 pub const SCREEN_CODEC_VERSION: u8 = 1;
+pub(crate) const SCROLLBACK_LINES: usize = 10_000;
 const SNAPSHOT_HEADER_BYTES: usize = 5;
 
 #[derive(Clone, Debug)]
@@ -55,7 +56,7 @@ pub struct HostScreen {
 impl HostScreen {
     pub fn new(rows: u16, cols: u16) -> Result<Self, ScreenError> {
         validate_dimensions(rows, cols)?;
-        let parser = vt100::Parser::new(rows, cols, 0);
+        let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
         let previous = parser.screen().clone();
         let snapshot = snapshot_payload(parser.screen())?;
         Ok(Self {
@@ -135,7 +136,7 @@ impl GuestScreen {
             return Err(ScreenError::SnapshotTooLarge(payload.len()));
         }
         let (rows, cols, state) = decode_snapshot(payload)?;
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
         parser.process(state);
         self.parser = Some(parser);
         self.sequence = Some(sequence);

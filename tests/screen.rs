@@ -26,6 +26,26 @@ fn initial_snapshot_describes_the_empty_fixed_grid() {
 }
 
 #[test]
+fn host_snapshots_the_live_edge_after_scrollback_accumulates() {
+    let mut host = HostScreen::new(1, 3).expect("valid fixed grid");
+    let frame = host.process_pty(b"a\r\nb\r\nc").expect("scrollback update");
+    let mut history = host.screen().clone();
+    history.set_scrollback(10_000);
+    assert!(history.scrollback() > 0);
+    assert_eq!(host.screen().scrollback(), 0);
+
+    let mut guest = GuestScreen::new();
+    guest
+        .apply_snapshot(frame.sequence, &frame.snapshot)
+        .expect("live snapshot applies");
+    assert_eq!(
+        guest.screen().expect("guest screen").contents(),
+        host.screen().contents()
+    );
+    assert_eq!(guest.screen().expect("guest screen").scrollback(), 0);
+}
+
+#[test]
 fn snapshot_then_delta_reproduces_formatted_screen_and_modes() {
     let mut host = HostScreen::new(2, 3).expect("valid grid");
     let first = host

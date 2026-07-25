@@ -106,7 +106,7 @@ The final pane in a tab must be removed by deleting its tab; the final tab canno
 Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Click tab labels to switch tabs without
-claiming control or sending input. The dark contextual footer uses red key accents: normal mode is
+claiming control or sending input. Mouse wheel scrolls pane history locally. The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free`; pane mode is
 `Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK`; tab mode is
 `Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK`.
