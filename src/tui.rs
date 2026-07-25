@@ -9,7 +9,10 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 use crossterm::{
-    event::{self, DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{
         self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -157,6 +160,10 @@ impl MultiPaneTui {
         self.chord_mode
     }
 
+    fn exit_chord_mode(&mut self) {
+        self.chord_mode = ChordMode::None;
+    }
+
     pub fn pane_view(&self, pane_id: PaneId) -> Option<&PaneViewState> {
         self.pane_views.get(&pane_id)
     }
@@ -203,6 +210,17 @@ impl MultiPaneTui {
         self.current_tab = tab_id;
         self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
         Ok(())
+    }
+
+    fn focus_pane_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let Some(pane_id) = pane_at(&self.geometry(area).panes, column, row) else {
+            return false;
+        };
+        if self.focused_pane == pane_id {
+            return false;
+        }
+        self.focused_pane = pane_id;
+        true
     }
 
     pub fn geometry(&self, area: Rect) -> PaneGeometry {
@@ -258,13 +276,25 @@ impl MultiPaneTui {
         }
 
         let chord = self.chord_mode;
-        self.chord_mode = ChordMode::None;
+        if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
+            self.chord_mode = ChordMode::Pane;
+            return KeyHandling::Consumed(vec![]);
+        }
+        if key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL {
+            self.chord_mode = ChordMode::Tab;
+            return KeyHandling::Consumed(vec![]);
+        }
         let intent = match chord {
             ChordMode::Pane => self.handle_pane_chord(key, area),
             ChordMode::Tab => self.handle_tab_chord(key, area),
             ChordMode::None => None,
         };
-        KeyHandling::Consumed(intent.into_iter().collect())
+        if intent.is_some() || is_chord_command(chord, key) {
+            KeyHandling::Consumed(intent.into_iter().collect())
+        } else {
+            self.chord_mode = ChordMode::None;
+            KeyHandling::Forward
+        }
     }
 
     fn handle_pane_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
@@ -385,11 +415,43 @@ impl MultiPaneTui {
     }
 }
 
+fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+    match mode {
+        ChordMode::Pane => matches!(
+            key.code,
+            KeyCode::Char('n')
+                | KeyCode::Char('x')
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+        ),
+        ChordMode::Tab => matches!(
+            key.code,
+            KeyCode::Char('n') | KeyCode::Char('x') | KeyCode::Left | KeyCode::Right
+        ),
+        ChordMode::None => false,
+    }
+}
+
 fn first_leaf(node: &Node) -> Option<PaneId> {
     match node {
         Node::Leaf { pane_id } => Some(*pane_id),
         Node::Split { first, .. } => first_leaf(first),
     }
+}
+
+fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<PaneId> {
+    panes.iter().find_map(|(pane_id, rect)| {
+        let inside = u32::from(column) >= u32::from(rect.x)
+            && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
+            && u32::from(row) >= u32::from(rect.y)
+            && u32::from(row) < u32::from(rect.y) + u32::from(rect.height);
+        inside.then_some(*pane_id)
+    })
 }
 
 fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
@@ -516,8 +578,14 @@ pub fn render_multi_pane(
     render_shared_multi_pane(frame, tui, screens, "", None);
 }
 
-fn shared_footer_text(status: &str, join_code: Option<&str>) -> String {
-    let controls = format!("Ctrl+P panes | Ctrl+T tabs | {CONTROL_HELP}");
+fn shared_footer_text(status: &str, join_code: Option<&str>, chord_mode: ChordMode) -> String {
+    let controls = match chord_mode {
+        ChordMode::None => format!("Ctrl+P panes | Ctrl+T tabs | {CONTROL_HELP}"),
+        ChordMode::Pane => {
+            String::from("arrows move focus | N new pane | X delete pane | Esc cancel")
+        }
+        ChordMode::Tab => String::from("←/→ switch tab | N new tab | X delete tab | Esc cancel"),
+    };
     match (status.is_empty(), join_code) {
         (false, Some(join_code)) => {
             format!("{status} | {controls} | join: p2pmux join {join_code}")
@@ -536,32 +604,36 @@ fn render_shared_multi_pane(
     join_code: Option<&str>,
 ) {
     let geometry = tui.geometry(frame.area());
-    let tabs = tui
-        .snapshot
-        .tabs
-        .iter()
-        .map(|tab| {
-            if tab.tab_id == tui.current_tab {
-                format!("[*{}]", tab.tab_id)
-            } else {
-                format!("[{}]", tab.tab_id)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     if geometry.tab_bar.width > 0 && geometry.tab_bar.height > 0 {
-        frame.buffer_mut().set_string(
-            geometry.tab_bar.x,
-            geometry.tab_bar.y,
-            tabs,
-            Style::default().fg(Color::Cyan),
-        );
+        let mut x = geometry.tab_bar.x;
+        for (index, tab) in tui.snapshot.tabs.iter().enumerate() {
+            if index > 0 {
+                frame
+                    .buffer_mut()
+                    .set_string(x, geometry.tab_bar.y, " ", Style::default());
+                x = x.saturating_add(1);
+            }
+            let active = tab.tab_id == tui.current_tab;
+            let style = if active {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(220, 50, 47))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let label = format!("Tab #{}", index + 1);
+            frame
+                .buffer_mut()
+                .set_string(x, geometry.tab_bar.y, &label, style);
+            x = x.saturating_add(label.len() as u16);
+        }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
         frame.buffer_mut().set_string(
             geometry.footer.x,
             geometry.footer.y,
-            shared_footer_text(status, join_code),
+            shared_footer_text(status, join_code, tui.chord_mode),
             Style::default().fg(Color::DarkGray),
         );
     }
@@ -572,15 +644,21 @@ fn render_shared_multi_pane(
         let focused = pane_id == tui.focused_pane;
         let lease = match view.controller_peer_id.as_deref() {
             Some(peer) if view.controller_active => {
-                format!("ctrl:{} this user is typing", short_peer(peer))
+                format!(
+                    "ctrl:{} this user is typing",
+                    member_label(peer, &tui.snapshot.members)
+                )
             }
-            Some(peer) => format!("ctrl:{} this user has control", short_peer(peer)),
+            Some(peer) => format!(
+                "ctrl:{} this user has control",
+                member_label(peer, &tui.snapshot.members)
+            ),
             None => String::from("lease: waiting"),
         };
         let title = format!(
             "{} host:{} {lease}",
             if focused { "*" } else { " " },
-            short_peer(&pane.host_peer_id)
+            member_label(&pane.host_peer_id, &tui.snapshot.members)
         );
         let border_color = match view.controller_peer_id.as_ref() {
             Some(_) if view.controller_active => Color::Rgb(255, 69, 0),
@@ -1183,6 +1261,8 @@ impl SharedLayoutRuntime {
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.bracketed_paste = true;
         execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        guard.mouse_capture = true;
+        execute!(io::stdout(), EnableMouseCapture)?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,
@@ -1233,8 +1313,18 @@ impl SharedLayoutRuntime {
                     dirty = true;
                 }
                 Event::Paste(text) => {
+                    self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
                     dirty = true;
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    dirty |= self.tui.focus_pane_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, cols, rows),
+                    );
                 }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -1862,6 +1952,7 @@ struct TerminalGuard {
     raw_mode: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
 }
 
 impl TerminalGuard {
@@ -1870,6 +1961,7 @@ impl TerminalGuard {
             raw_mode: false,
             alternate_screen: false,
             bracketed_paste: false,
+            mouse_capture: false,
         }
     }
 }
@@ -1879,6 +1971,9 @@ impl Drop for TerminalGuard {
         let mut stdout = io::stdout();
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
+        }
+        if self.mouse_capture {
+            let _ = execute!(stdout, DisableMouseCapture);
         }
         if self.alternate_screen {
             let _ = execute!(stdout, crossterm::cursor::Show, LeaveAlternateScreen);
@@ -2295,6 +2390,24 @@ fn short_peer(peer_id: &[u8]) -> String {
         .collect()
 }
 
+fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
+    let Some(member) = members.iter().find(|member| member.peer_id == peer_id) else {
+        return short_peer(peer_id);
+    };
+    if member.display_name.is_empty() {
+        return short_peer(peer_id);
+    }
+    let duplicates = members
+        .iter()
+        .filter(|candidate| candidate.display_name == member.display_name)
+        .count();
+    if duplicates > 1 {
+        format!("{} · {}", member.display_name, short_peer(peer_id))
+    } else {
+        member.display_name.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2326,7 +2439,7 @@ mod tests {
         CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, pane_wire_id, render_guest_screen,
+        grid_for_pane, initial_root_pane_grid, member_label, pane_wire_id, render_guest_screen,
         render_multi_pane, render_shared_multi_pane, shared_footer_text,
     };
 
@@ -2336,6 +2449,7 @@ mod tests {
             members: vec![crate::layout::Member {
                 peer_id: b"host".to_vec(),
                 endpoint_addr: b"endpoint".to_vec(),
+                display_name: String::new(),
             }],
             tabs,
             panes: panes
@@ -2576,7 +2690,8 @@ mod tests {
 
     #[test]
     fn shared_footer_keeps_status_visible_when_a_join_code_is_present() {
-        let footer = shared_footer_text("layout request rejected", Some("TESTCODE"));
+        let footer =
+            shared_footer_text("layout request rejected", Some("TESTCODE"), ChordMode::None);
         assert!(footer.starts_with("layout request rejected"));
         assert!(footer.contains("Ctrl+P panes"));
         assert!(footer.contains(CONTROL_HELP));
@@ -2712,6 +2827,22 @@ mod tests {
         assert_eq!(geometry.panes[&1], Rect::new(0, 1, 40, 22));
         assert_eq!(geometry.panes[&2], Rect::new(40, 1, 40, 11));
         assert_eq!(geometry.panes[&3], Rect::new(40, 12, 40, 11));
+    }
+
+    #[test]
+    fn mouse_hit_testing_focuses_the_clicked_pane_and_ignores_misses() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        assert!(tui.focus_pane_at(60, 17, area));
+        assert_eq!(tui.focused_pane(), 3);
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert!(!tui.focus_pane_at(10, 0, area));
+        assert_eq!(tui.focused_pane(), 3);
     }
 
     #[test]
@@ -2932,7 +3063,7 @@ mod tests {
                 grid_cols: 38,
             }])
         );
-        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
@@ -2943,6 +3074,170 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
         assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn sticky_pane_mode_moves_focus_across_multiple_arrows() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+    }
+
+    #[test]
+    fn escape_clears_sticky_chord_mode_without_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn forwarding_key_exits_sticky_pane_mode_once() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn paste_exits_sticky_chord_mode_before_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        tui.exit_chord_mode();
+
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn shared_footer_uses_help_for_each_chord_mode() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
+
+        for (mode, expected) in [
+            (
+                ChordMode::None,
+                "Ctrl+P panes | Ctrl+T tabs | type to claim idle | active typing is protected | Ctrl+Q quit",
+            ),
+            (
+                ChordMode::Pane,
+                "arrows move focus | N new pane | X delete pane | Esc cancel",
+            ),
+            (
+                ChordMode::Tab,
+                "←/→ switch tab | N new tab | X delete tab | Esc cancel",
+            ),
+        ] {
+            tui.chord_mode = mode;
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+                .expect("render");
+            let footer = (0..120)
+                .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+                .collect::<String>();
+            assert!(
+                footer.starts_with(expected),
+                "mode: {mode:?}, footer: {footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_bar_uses_ordinal_labels_and_highlights_the_active_tab() {
+        let tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 10,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 20,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(32, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..32).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(tab_bar.contains("Tab #1"));
+        assert!(tab_bar.contains("Tab #2"));
+        assert_eq!(buffer[(0, 0)].fg, Color::White);
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(220, 50, 47));
+    }
+
+    #[test]
+    fn member_labels_disambiguate_duplicate_display_names() {
+        let members = vec![
+            crate::layout::Member {
+                peer_id: vec![0xaa, 0xbb, 0xcc, 0xdd],
+                endpoint_addr: vec![1],
+                display_name: "sam".into(),
+            },
+            crate::layout::Member {
+                peer_id: vec![0x11, 0x22, 0x33, 0x44],
+                endpoint_addr: vec![2],
+                display_name: "sam".into(),
+            },
+            crate::layout::Member {
+                peer_id: vec![0x55, 0x66, 0x77, 0x88],
+                endpoint_addr: vec![3],
+                display_name: "pat".into(),
+            },
+        ];
+
+        assert_eq!(
+            member_label(&members[0].peer_id, &members),
+            "sam · aabbccdd"
+        );
+        assert_eq!(member_label(&members[2].peer_id, &members), "pat");
     }
 
     #[test]
@@ -3042,7 +3337,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_second_chord_keys_are_consumed_instead_of_forwarded() {
+    fn forwarding_keys_exit_a_chord_mode_and_are_forwarded() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
@@ -3056,7 +3351,7 @@ mod tests {
             );
             assert_eq!(
                 tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
-                KeyHandling::Consumed(vec![])
+                KeyHandling::Forward
             );
             assert_eq!(tui.chord_mode(), ChordMode::None);
         }
@@ -3231,6 +3526,44 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 2 }])
         );
+    }
+
+    #[test]
+    fn sticky_tab_mode_switches_tabs_repeatedly() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+                Tab {
+                    tab_id: 3,
+                    root: Node::Leaf { pane_id: 3 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 12, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SwitchTab { tab_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SwitchTab { tab_id: 3 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
     }
 
     #[test]

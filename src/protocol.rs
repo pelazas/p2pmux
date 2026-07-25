@@ -157,6 +157,8 @@ pub struct Join {
     pub peer_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "3")]
     pub endpoint_addr: Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub display_name: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -249,6 +251,8 @@ pub struct MemberDescriptor {
     pub peer_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub endpoint_addr: Vec<u8>,
+    #[prost(string, tag = "3")]
+    pub display_name: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

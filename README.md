@@ -65,6 +65,11 @@ Terminal 1: cargo run -- create
 Terminal 2: cargo run -- join <printed 10-character code>
 ```
 
+Set a peer-visible display name once with `p2pmux config set name pelazas`; inspect it with
+`p2pmux config get name`. It is stored in `$XDG_CONFIG_HOME/p2pmux/config.toml` (or
+`~/.config/p2pmux/config.toml`). `create` and `join` accept `--name <name>` to override and save
+the value for that run and future sessions.
+
 `create` prints `Join with: p2pmux join <CODE>`, waits for Enter so you can copy it, then
 enters the shared-layout TUI. The same code stays in the footer. `join` first receives the
 authoritative layout, then attaches directly to every remote pane.
@@ -76,14 +81,20 @@ Only one peer controls each pane at a time: after about eight seconds of idle ti
 can type to hop in. Active typing is protected, so there is no forced takeover. Ctrl+Q exits only
 the local p2pmux view; F9 and F10 continue through to the focused PTY.
 
-Shared-layout commands are local mux chords and never reach a PTY:
+Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
+enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
+to leave the mode and send that key to the focused PTY.
+
+Clicking a pane focuses it locally without taking control or sending input. When p2pmux runs
+inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
+passthrough configuration.
 
 - `Ctrl+P`, then `N` — split the focused pane. The new fixed-grid PTY runs on the requester’s Mac.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then arrows — move focus.
 - `Ctrl+T`, then `N` — create a tab with a local PTY on the requester’s Mac.
 - `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
-- `Ctrl+T`, then left/right — switch tabs; `Esc` cancels a chord.
+- `Ctrl+T`, then left/right — switch tabs.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
 Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
