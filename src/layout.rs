@@ -296,6 +296,49 @@ impl SessionState {
         Ok(self.invalidate_reservation())
     }
 
+    /// Removes a departed non-final member and every pane it hosted. Tabs with no remaining
+    /// leaves disappear; mixed tabs collapse around the departed leaves in one revision.
+    pub fn remove_member(
+        &mut self,
+        peer_id: &[u8],
+    ) -> Result<Option<InvalidatedReservation>, LayoutError> {
+        self.require_member(peer_id)?;
+        if self.members.len() == 1 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.revision
+            .checked_add(1)
+            .ok_or(LayoutError::RevisionExhausted)?;
+        let removed_panes = self
+            .panes
+            .values()
+            .filter(|pane| pane.host_peer_id == peer_id)
+            .map(|pane| pane.pane_id)
+            .collect::<BTreeSet<_>>();
+        let mut tabs = Vec::with_capacity(self.tabs.len());
+        for tab in self.tabs.drain(..) {
+            let mut root = Some(tab.root);
+            for pane_id in &removed_panes {
+                root = root.and_then(|root| root.remove_leaf(*pane_id));
+            }
+            if let Some(root) = root {
+                tabs.push(Tab {
+                    tab_id: tab.tab_id,
+                    root,
+                });
+            }
+        }
+        if tabs.is_empty() {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.members.retain(|member| member.peer_id != peer_id);
+        self.panes
+            .retain(|pane_id, _| !removed_panes.contains(pane_id));
+        self.tabs = tabs;
+        self.advance_revision();
+        Ok(self.invalidate_reservation())
+    }
+
     pub fn reserve_pane(
         &mut self,
         creator: &[u8],

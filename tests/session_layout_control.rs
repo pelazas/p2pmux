@@ -170,7 +170,7 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
     assert!(matches!(
         next_event(&mut second).await,
         LayoutControlEvent::Snapshot(snapshot)
-            if snapshot.state.as_ref().is_some_and(|state| state.revision == 3 && state.tabs.len() == 1 && state.panes.len() == 1)
+            if snapshot.state.as_ref().is_some_and(|state| state.revision == 4 && state.tabs.len() == 1 && state.panes.len() == 1)
     ));
 
     connection.close(0u8.into(), b"");
@@ -372,6 +372,45 @@ async fn stale_requests_are_rejected_only_for_the_requester() {
     assert!(
         matches!(next_event(&mut member).await, LayoutControlEvent::Reject(reject) if reject.request_id == 8 && reject.reason == LayoutRejectReason::Stale as i32)
     );
+    member.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_reservation_rejects_its_creator_and_unblocks_the_next_request() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::with_reservation_timeout(host, 24, 80, Duration::ZERO)
+        .expect("shared host");
+    let accept = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut member = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("member joins");
+    accept.await.unwrap().unwrap();
+    let _ = next_event(&mut member).await;
+
+    member
+        .try_request(create_request(21, 2))
+        .expect("queue creation");
+    assert!(matches!(
+        next_event(&mut member).await,
+        LayoutControlEvent::Reservation(_)
+    ));
+    assert!(matches!(
+        next_event(&mut member).await,
+        LayoutControlEvent::Reject(reject)
+            if reject.request_id == 21 && reject.reason == LayoutRejectReason::ReservationFailure as i32
+    ));
+    member
+        .try_request(create_request(22, 2))
+        .expect("reservation expiry unblocks a new request");
+    assert!(matches!(
+        next_event(&mut member).await,
+        LayoutControlEvent::Reservation(_)
+    ));
+
     member.shutdown().await;
     coordinator.close().await;
 }

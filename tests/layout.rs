@@ -16,6 +16,27 @@ fn snapshot(state: &SessionState) -> LayoutSnapshot {
     state.snapshot()
 }
 
+#[test]
+fn removing_a_member_atomically_prunes_its_panes_and_empty_tabs() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    state
+        .create_tab(HOST_B, state.revision(), 24, 80)
+        .expect("B creates a tab");
+
+    state.remove_member(HOST_B).expect("member B departs");
+    let snapshot = snapshot(&state);
+    assert_eq!(snapshot.revision, 4);
+    assert_eq!(snapshot.members.len(), 1);
+    assert_eq!(snapshot.members[0].peer_id, HOST_A);
+    assert_eq!(snapshot.tabs.len(), 1);
+    assert_eq!(snapshot.panes.len(), 1);
+    assert_eq!(snapshot.panes[&1].host_peer_id, HOST_A);
+    SessionState::validate_snapshot(&snapshot).expect("departure leaves a valid snapshot");
+}
+
 fn tab(snapshot: &LayoutSnapshot, tab_id: u64) -> &p2pmux::layout::Tab {
     snapshot
         .tabs

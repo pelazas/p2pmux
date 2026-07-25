@@ -179,6 +179,11 @@ impl LayoutCoordinator {
         self.membership_change(invalidated)
     }
 
+    pub fn remove_member(&mut self, peer_id: &[u8]) -> Result<MembershipChange, CoordinatorError> {
+        let invalidated = self.state.remove_member(peer_id)?;
+        self.membership_change(invalidated)
+    }
+
     pub fn handle_request(
         &mut self,
         authenticated_peer_id: &[u8],
@@ -297,6 +302,17 @@ impl LayoutCoordinator {
             context.request_id,
             LayoutRejectReason::ReservationFailure,
         )))
+    }
+
+    pub fn expire_reservation_if_at(
+        &mut self,
+        reservation_id: u64,
+        now: Instant,
+    ) -> Result<Option<TargetedLayoutReject>, CoordinatorError> {
+        if !self.reservations.contains_key(&reservation_id) {
+            return Ok(None);
+        }
+        self.expire_reservation_at(now)
     }
 
     pub fn handle_pane_failed(
@@ -1027,6 +1043,7 @@ pub struct SharedLayoutHost {
     host: HostSession,
     coordinator: Arc<Mutex<LayoutCoordinator>>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    reservation_timeout: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1218,17 +1235,29 @@ impl Drop for SharedLayoutMember {
 
 impl SharedLayoutHost {
     pub fn new(host: HostSession, grid_rows: u16, grid_cols: u16) -> Result<Self, SessionError> {
+        Self::with_reservation_timeout(host, grid_rows, grid_cols, DEFAULT_RESERVATION_TIMEOUT)
+    }
+
+    pub fn with_reservation_timeout(
+        host: HostSession,
+        grid_rows: u16,
+        grid_cols: u16,
+        reservation_timeout: Duration,
+    ) -> Result<Self, SessionError> {
         let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
-        let coordinator = LayoutCoordinator::new(
+        let coordinator = LayoutCoordinator::with_reservation_timeout(
             coordinator_peer_id,
             host.ticket().endpoint_addr().clone(),
             grid_rows,
             grid_cols,
+            reservation_timeout,
+            Instant::now(),
         )?;
         Ok(Self {
             host,
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
+            reservation_timeout,
         })
     }
 
@@ -1245,20 +1274,22 @@ impl SharedLayoutHost {
             .map_err(SessionError::Incoming)?;
         let result = async {
             let receipt = self.host.handshake_connection(&connection).await?;
-            let membership = self
-                .coordinator
-                .lock()
-                .map_err(|_| SessionError::PeerTask)?
-                .admit(
+            {
+                let mut coordinator_guard = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| SessionError::PeerTask)?;
+                let membership = coordinator_guard.admit(
                     receipt.admitted_peer_id.clone(),
                     receipt.endpoint_addr.clone(),
                 )?;
 
-            // Existing members see the authoritative membership commit before the joining
-            // member receives its snapshot. The joiner snapshot already contains that commit.
-            self.broadcast_commit(membership.commit.clone());
-            if let Some(reject) = membership.invalidated_reservation {
-                self.send_reject(reject);
+                // Existing members see the authoritative membership commit before the joining
+                // member receives its snapshot. The joiner snapshot already contains that commit.
+                self.broadcast_commit(membership.commit.clone());
+                if let Some(reject) = membership.invalidated_reservation {
+                    self.send_reject(reject);
+                }
             }
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
@@ -1289,6 +1320,7 @@ impl SharedLayoutHost {
                 self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
                 self.coordinator.clone(),
                 self.peers.clone(),
+                self.reservation_timeout,
             ));
             if let Ok(mut slot) = reader_abort.lock() {
                 *slot = Some(reader_task.abort_handle());
@@ -1300,6 +1332,10 @@ impl SharedLayoutHost {
                 targeted_rx,
                 receipt.admitted_peer_id.clone(),
                 self.peers.clone(),
+                Some((
+                    self.coordinator.clone(),
+                    self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+                )),
             ));
             Ok(receipt)
         }
@@ -1402,6 +1438,41 @@ fn remove_control_peer(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, peer_
     }
 }
 
+fn disconnect_or_remove(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    coordinator: Option<&(Arc<Mutex<LayoutCoordinator>>, Vec<u8>)>,
+    peer_id: &[u8],
+) {
+    let Some((coordinator, coordinator_peer_id)) = coordinator else {
+        remove_control_peer(peers, peer_id);
+        return;
+    };
+    let Ok(mut coordinator) = coordinator.lock() else {
+        remove_control_peer(peers, peer_id);
+        return;
+    };
+    remove_control_peer(peers, peer_id);
+    if let Ok(change) = coordinator.remove_member(peer_id) {
+        broadcast_envelope(
+            peers,
+            coordinator_envelope(
+                coordinator_peer_id,
+                envelope::Body::LayoutCommit(change.commit),
+            ),
+        );
+        if let Some(reject) = change.invalidated_reservation {
+            send_to_peer(
+                peers,
+                &reject.peer_id,
+                coordinator_envelope(
+                    coordinator_peer_id,
+                    envelope::Body::LayoutReject(reject.reject),
+                ),
+            );
+        }
+    }
+}
+
 /// Join a coordinator and establish the persistent member-to-coordinator layout stream.
 pub async fn join_layout(
     transport: Transport,
@@ -1452,15 +1523,16 @@ async fn layout_peer_writer_task<W>(
     mut targeted_rx: mpsc::Receiver<SequencedEnvelope>,
     peer_id: Vec<u8>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    coordinator: Option<(Arc<Mutex<LayoutCoordinator>>, Vec<u8>)>,
 ) where
     W: ControlFrameSink + 'static,
 {
     let Some(initial) = initial_rx.recv().await else {
-        remove_control_peer(&peers, &peer_id);
+        disconnect_or_remove(&peers, coordinator.as_ref(), &peer_id);
         return;
     };
     if !writer.write_control(&initial).await {
-        remove_control_peer(&peers, &peer_id);
+        disconnect_or_remove(&peers, coordinator.as_ref(), &peer_id);
         return;
     }
     let mut targeted_open = true;
@@ -1504,7 +1576,7 @@ async fn layout_peer_writer_task<W>(
             continue;
         };
         if !writer.write_control(&next.envelope).await {
-            remove_control_peer(&peers, &peer_id);
+            disconnect_or_remove(&peers, coordinator.as_ref(), &peer_id);
             return;
         }
     }
@@ -1564,6 +1636,7 @@ async fn layout_host_reader_task(
     coordinator_peer_id: Vec<u8>,
     coordinator: Arc<Mutex<LayoutCoordinator>>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    reservation_timeout: Duration,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != peer_id {
@@ -1571,24 +1644,44 @@ async fn layout_host_reader_task(
         }
         match envelope.body {
             Some(envelope::Body::LayoutRequest(request)) => {
-                let response = match coordinator.lock() {
-                    Ok(mut coordinator) => coordinator.handle_request(&peer_id, request),
+                let mut coordinator_guard = match coordinator.lock() {
+                    Ok(coordinator) => coordinator,
                     Err(_) => break,
                 };
+                let response = coordinator_guard.handle_request(&peer_id, request);
+                let reservation = match &response {
+                    CoordinatorResponse::Reservation(reservation) => {
+                        Some(reservation.reservation_id)
+                    }
+                    _ => None,
+                };
                 dispatch_coordinator_response(&peers, &peer_id, &coordinator_peer_id, response);
+                drop(coordinator_guard);
+                if let Some(reservation_id) = reservation {
+                    tokio::spawn(reservation_expiry_task(
+                        reservation_id,
+                        reservation_timeout,
+                        coordinator.clone(),
+                        peers.clone(),
+                        coordinator_peer_id.clone(),
+                    ));
+                }
             }
             Some(envelope::Body::PaneReady(ready)) => {
-                let response = match coordinator.lock() {
-                    Ok(mut coordinator) => coordinator.handle_pane_ready(&peer_id, ready),
+                let mut coordinator_guard = match coordinator.lock() {
+                    Ok(coordinator) => coordinator,
                     Err(_) => break,
                 };
+                let response = coordinator_guard.handle_pane_ready(&peer_id, ready);
                 dispatch_coordinator_response(&peers, &peer_id, &coordinator_peer_id, response);
+                drop(coordinator_guard);
             }
             Some(envelope::Body::PaneFailed(failed)) => {
-                let reject = match coordinator.lock() {
-                    Ok(mut coordinator) => coordinator.handle_pane_failed(&peer_id, failed),
+                let mut coordinator_guard = match coordinator.lock() {
+                    Ok(coordinator) => coordinator,
                     Err(_) => break,
                 };
+                let reject = coordinator_guard.handle_pane_failed(&peer_id, failed);
                 send_to_peer(
                     &peers,
                     &reject.peer_id,
@@ -1597,11 +1690,37 @@ async fn layout_host_reader_task(
                         envelope::Body::LayoutReject(reject.reject),
                     ),
                 );
+                drop(coordinator_guard);
             }
             _ => break,
         }
     }
-    remove_control_peer(&peers, &peer_id);
+    disconnect_or_remove(&peers, Some(&(coordinator, coordinator_peer_id)), &peer_id);
+}
+
+async fn reservation_expiry_task(
+    reservation_id: u64,
+    reservation_timeout: Duration,
+    coordinator: Arc<Mutex<LayoutCoordinator>>,
+    peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    coordinator_peer_id: Vec<u8>,
+) {
+    tokio::time::sleep(reservation_timeout).await;
+    let Ok(mut coordinator) = coordinator.lock() else {
+        return;
+    };
+    let Ok(Some(reject)) = coordinator.expire_reservation_if_at(reservation_id, Instant::now())
+    else {
+        return;
+    };
+    send_to_peer(
+        &peers,
+        &reject.peer_id,
+        coordinator_envelope(
+            &coordinator_peer_id,
+            envelope::Body::LayoutReject(reject.reject),
+        ),
+    );
 }
 
 fn dispatch_coordinator_response(
@@ -2086,6 +2205,7 @@ mod control_queue_tests {
             targeted_rx,
             b"slow".to_vec(),
             peers.clone(),
+            None,
         )
         .await;
 
@@ -2151,6 +2271,7 @@ mod control_queue_tests {
             slow_targeted_rx,
             b"slow".to_vec(),
             peers.clone(),
+            None,
         ));
         let (healthy_tx, mut healthy_rx) = mpsc::unbounded_channel();
         let healthy_task = tokio::spawn(layout_peer_writer_task(
@@ -2160,6 +2281,7 @@ mod control_queue_tests {
             healthy_targeted_rx,
             b"healthy".to_vec(),
             peers.clone(),
+            None,
         ));
 
         broadcast_envelope(&peers, commit(2));
@@ -2275,6 +2397,7 @@ mod control_queue_tests {
             targeted_rx,
             b"member".to_vec(),
             peers.clone(),
+            None,
         ));
 
         assert_eq!(recorded_rx.recv().await, Some(snapshot));
@@ -2324,6 +2447,7 @@ mod control_queue_tests {
             targeted_rx,
             b"member".to_vec(),
             peers.clone(),
+            None,
         ));
 
         let _initial = recorded_rx.recv().await.expect("initial output");
