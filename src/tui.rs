@@ -4,6 +4,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     io,
+    io::Write,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -37,7 +39,7 @@ use crate::{
         PaneReady, SplitAxis,
     },
     pty_host::PtyHost,
-    screen::{GuestScreen, HostScreen, ScreenFrame},
+    screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
     session::{
         CoordinatorResponse, GuestEvent, GuestPane, HostControlEvent, HostPaneChannels,
         LayoutControlEvent, LayoutControlQueueError, PaneLayoutReconciler, PaneServer,
@@ -51,8 +53,11 @@ use crate::{
 pub struct Tui;
 
 const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
-const FOOTER_MUTED: Color = Color::DarkGray;
-const FOOTER_ACCENT: Color = Color::Red;
+const FOOTER_MUTED: Color = Color::White;
+const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
+const TOP_BAR_BRAND: &str = "p2pmux";
+const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
+const TAB_BAR_SEPARATOR: &str = " · ";
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
 
 type FooterSegment = (&'static str, bool);
@@ -104,6 +109,7 @@ pub struct PaneViewState {
     pub ready: bool,
     pub controller_peer_id: Option<Vec<u8>>,
     pub controller_active: bool,
+    scrollback: usize,
 }
 
 /// User operations emitted by the TUI. Session code owns all resulting mutations and PTYs.
@@ -151,6 +157,35 @@ pub struct PaneGeometry {
     pub panes: BTreeMap<PaneId, Rect>,
 }
 
+/// One cell in a pane's fixed VT grid.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ScreenCell {
+    row: u16,
+    col: u16,
+}
+
+/// A local, pane-scoped text selection. Both ends are inclusive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PaneTextSelection {
+    pane_id: PaneId,
+    anchor: ScreenCell,
+    cursor: ScreenCell,
+}
+
+impl PaneTextSelection {
+    fn is_empty(self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    fn contains(self, cell: ScreenCell) -> bool {
+        let min_row = self.anchor.row.min(self.cursor.row);
+        let max_row = self.anchor.row.max(self.cursor.row);
+        let min_col = self.anchor.col.min(self.cursor.col);
+        let max_col = self.anchor.col.max(self.cursor.col);
+        (min_row..=max_row).contains(&cell.row) && (min_col..=max_col).contains(&cell.col)
+    }
+}
+
 /// Pure local rendering and selection state for a revisioned shared layout.
 #[derive(Clone, Debug)]
 pub struct MultiPaneTui {
@@ -160,6 +195,8 @@ pub struct MultiPaneTui {
     chord_mode: ChordMode,
     pane_views: BTreeMap<PaneId, PaneViewState>,
     pending_created_tab: Option<TabId>,
+    selection: Option<PaneTextSelection>,
+    selection_dragging: bool,
 }
 
 impl MultiPaneTui {
@@ -179,6 +216,8 @@ impl MultiPaneTui {
             chord_mode: ChordMode::None,
             pane_views,
             pending_created_tab: None,
+            selection: None,
+            selection_dragging: false,
         })
     }
 
@@ -202,14 +241,111 @@ impl MultiPaneTui {
         self.chord_mode = ChordMode::None;
     }
 
+    fn clear_selection(&mut self) -> bool {
+        let changed = self.selection.take().is_some();
+        self.selection_dragging = false;
+        changed
+    }
+
+    fn begin_selection_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let Some((pane_id, cell)) = self.screen_cell_at(column, row, area) else {
+            return false;
+        };
+        self.selection = Some(PaneTextSelection {
+            pane_id,
+            anchor: cell,
+            cursor: cell,
+        });
+        self.selection_dragging = true;
+        true
+    }
+
+    fn extend_selection_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if !self.selection_dragging {
+            return false;
+        }
+        let Some((pane_id, cell)) = self.screen_cell_at(column, row, area) else {
+            return false;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        if selection.pane_id != pane_id || selection.cursor == cell {
+            return false;
+        }
+        selection.cursor = cell;
+        true
+    }
+
+    fn end_selection_drag(&mut self) -> bool {
+        std::mem::replace(&mut self.selection_dragging, false)
+    }
+
+    fn selection(&self) -> Option<PaneTextSelection> {
+        self.selection.filter(|selection| !selection.is_empty())
+    }
+
+    fn screen_cell_at(&self, column: u16, row: u16, area: Rect) -> Option<(PaneId, ScreenCell)> {
+        let geometry = self.geometry(area);
+        let (pane_id, pane_rect) = geometry.panes.iter().find_map(|(pane_id, rect)| {
+            rect_contains(*rect, column, row).then_some((*pane_id, *rect))
+        })?;
+        let pane = self.snapshot.panes.get(&pane_id)?;
+        let viewport = fixed_grid_viewport(
+            Block::bordered().inner(pane_rect),
+            pane.grid_rows,
+            pane.grid_cols,
+        );
+        mouse_to_screen_cell(viewport, column, row).map(|cell| (pane_id, cell))
+    }
+
     pub fn pane_view(&self, pane_id: PaneId) -> Option<&PaneViewState> {
         self.pane_views.get(&pane_id)
     }
 
-    pub fn set_pane_view(&mut self, pane_id: PaneId, state: PaneViewState) -> bool {
-        if self.snapshot.panes.contains_key(&pane_id)
-            && self.pane_views.get(&pane_id) != Some(&state)
-        {
+    fn scrollback_offset(&self, pane_id: PaneId) -> usize {
+        self.pane_views
+            .get(&pane_id)
+            .map_or(0, |view| view.scrollback)
+    }
+
+    fn pane_at_or_focused(&self, column: u16, row: u16, area: Rect) -> PaneId {
+        pane_at(&self.geometry(area).panes, column, row).unwrap_or(self.focused_pane)
+    }
+
+    fn scroll_pane(&mut self, pane_id: PaneId, scrollback_len: usize, up: bool) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        let scrollback = if up {
+            view.scrollback.saturating_add(1).min(scrollback_len)
+        } else {
+            view.scrollback.saturating_sub(1)
+        };
+        if view.scrollback == scrollback {
+            return false;
+        }
+        view.scrollback = scrollback;
+        true
+    }
+
+    fn reset_scrollback(&mut self, pane_id: PaneId) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        if view.scrollback == 0 {
+            return false;
+        }
+        view.scrollback = 0;
+        true
+    }
+
+    pub fn set_pane_view(&mut self, pane_id: PaneId, mut state: PaneViewState) -> bool {
+        if self.snapshot.panes.contains_key(&pane_id) {
+            state.scrollback = self.scrollback_offset(pane_id);
+            if self.pane_views.get(&pane_id) == Some(&state) {
+                return false;
+            }
             self.pane_views.insert(pane_id, state);
             return true;
         }
@@ -302,7 +438,10 @@ impl MultiPaneTui {
     }
 
     fn tab_label_rects(&self, tab_bar: Rect) -> BTreeMap<TabId, Rect> {
-        let mut x = tab_bar.x;
+        let mut x = tab_bar
+            .x
+            .saturating_add(text_width(TOP_BAR_BRAND))
+            .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR));
         let right = tab_bar.x.saturating_add(tab_bar.width);
         self.snapshot
             .tabs
@@ -310,9 +449,9 @@ impl MultiPaneTui {
             .enumerate()
             .map(|(index, tab)| {
                 if index > 0 {
-                    x = x.saturating_add(1);
+                    x = x.saturating_add(text_width(TAB_BAR_SEPARATOR));
                 }
-                let label_width = format!("Tab #{}", index + 1).len() as u16;
+                let label_width = text_width(&tab_label(index + 1, tab.tab_id == self.current_tab));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
@@ -538,6 +677,15 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && u32::from(row) < u32::from(rect.y) + u32::from(rect.height)
 }
 
+fn text_width(text: &str) -> u16 {
+    text.chars().count() as u16
+}
+
+fn tab_label(index: usize, active: bool) -> String {
+    let label = format!("Tab #{index}");
+    if active { format!(" {label} ") } else { label }
+}
+
 fn pane_title(
     index: usize,
     host_peer_id: &[u8],
@@ -550,7 +698,7 @@ fn pane_title(
         None => "…".to_owned(),
     };
     format!(
-        "Pane #{index}  host: {}  control: {control}",
+        "Pane #{index} host: {} control: {control}",
         member_label(host_peer_id, members)
     )
 }
@@ -683,6 +831,67 @@ fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
     )
 }
 
+fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
+    rect_contains(viewport, column, row).then_some(ScreenCell {
+        row: row.saturating_sub(viewport.y),
+        col: column.saturating_sub(viewport.x),
+    })
+}
+
+fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Option<String> {
+    if selection.is_empty() {
+        return None;
+    }
+    let (rows, cols) = screen.size();
+    let min_row = selection.anchor.row.min(selection.cursor.row).min(rows);
+    let max_row = selection
+        .anchor
+        .row
+        .max(selection.cursor.row)
+        .min(rows.saturating_sub(1));
+    let min_col = selection.anchor.col.min(selection.cursor.col).min(cols);
+    let max_col = selection
+        .anchor
+        .col
+        .max(selection.cursor.col)
+        .min(cols.saturating_sub(1));
+    if min_row > max_row || min_col > max_col {
+        return None;
+    }
+
+    let lines = (min_row..=max_row)
+        .map(|row| {
+            let mut line = String::new();
+            for col in min_col..=max_col {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if !cell.is_wide_continuation() {
+                    let contents = cell.contents();
+                    line.push_str(if contents.is_empty() { " " } else { contents });
+                }
+            }
+            line.trim_end().to_owned()
+        })
+        .collect::<Vec<_>>();
+    Some(lines.join("\n"))
+}
+
+fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("pbcopy stdin unavailable"))?;
+    stdin.write_all(text.as_bytes())?;
+    drop(stdin);
+    if child.wait()?.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("pbcopy failed"))
+    }
+}
+
 /// Renders layout chrome plus any currently available fixed-size VT screens.
 pub fn render_multi_pane(
     frame: &mut Frame<'_>,
@@ -797,13 +1006,43 @@ fn render_shared_multi_pane(
 ) {
     let geometry = tui.geometry(frame.area());
     if geometry.tab_bar.width > 0 && geometry.tab_bar.height > 0 {
-        let mut x = geometry.tab_bar.x;
+        let buffer = frame.buffer_mut();
+        buffer.set_stringn(
+            geometry.tab_bar.x,
+            geometry.tab_bar.y,
+            " ".repeat(usize::from(geometry.tab_bar.width)),
+            usize::from(geometry.tab_bar.width),
+            Style::default().bg(FOOTER_BACKGROUND),
+        );
+        let mut x = buffer
+            .set_stringn(
+                geometry.tab_bar.x,
+                geometry.tab_bar.y,
+                TOP_BAR_BRAND,
+                usize::from(geometry.tab_bar.width),
+                Style::default().fg(Color::White).bg(FOOTER_BACKGROUND),
+            )
+            .0;
+        x = buffer
+            .set_stringn(
+                x,
+                geometry.tab_bar.y,
+                TOP_BAR_BRAND_SEPARATOR,
+                usize::from(geometry.tab_bar.right().saturating_sub(x)),
+                Style::default().fg(Color::DarkGray).bg(FOOTER_BACKGROUND),
+            )
+            .0;
         for (index, tab) in tui.snapshot.tabs.iter().enumerate() {
             if index > 0 {
-                frame
-                    .buffer_mut()
-                    .set_string(x, geometry.tab_bar.y, " ", Style::default());
-                x = x.saturating_add(1);
+                x = buffer
+                    .set_stringn(
+                        x,
+                        geometry.tab_bar.y,
+                        TAB_BAR_SEPARATOR,
+                        usize::from(geometry.tab_bar.right().saturating_sub(x)),
+                        Style::default().fg(Color::DarkGray).bg(FOOTER_BACKGROUND),
+                    )
+                    .0;
             }
             let active = tab.tab_id == tui.current_tab;
             let style = if active {
@@ -812,20 +1051,21 @@ fn render_shared_multi_pane(
                     .bg(Color::Rgb(220, 50, 47))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::White).bg(FOOTER_BACKGROUND)
             };
-            let label = format!("Tab #{}", index + 1);
+            let label = tab_label(index + 1, active);
             let label_rect = geometry.tab_labels[&tab.tab_id];
             if label_rect.width == 0 {
                 continue;
             }
-            frame.buffer_mut().set_string(
+            buffer.set_stringn(
                 label_rect.x,
                 label_rect.y,
-                &label[..usize::from(label_rect.width)],
+                &label,
+                usize::from(label_rect.width),
                 style,
             );
-            x = x.saturating_add(label.len() as u16);
+            x = x.saturating_add(text_width(&label));
         }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
@@ -861,16 +1101,24 @@ fn render_shared_multi_pane(
             focused,
         );
         let block = Block::bordered()
-            .title(title)
+            .title(format!(" {title} "))
             .border_style(Style::default().fg(border_color));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if let Some(screen) = screens.get(&pane_id) {
             let viewport = fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols);
-            frame.render_widget(VtScreen::new(screen), viewport);
+            let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
+            frame.render_widget(
+                VtScreen::new(&screen).with_selection(
+                    tui.selection()
+                        .filter(|selection| selection.pane_id == pane_id),
+                ),
+                viewport,
+            );
             let (row, col) = screen.cursor_position();
             if focused
                 && view.ready
+                && screen.scrollback() == 0
                 && !screen.hide_cursor()
                 && row < viewport.height
                 && col < viewport.width
@@ -946,6 +1194,7 @@ impl SharedLocalPane {
             ready: true,
             controller_peer_id: Some(self.lease.state().controller_peer_id.clone()),
             controller_active: !self.lease.state().is_idle_at(Instant::now()),
+            scrollback: 0,
         }
     }
 
@@ -1085,6 +1334,7 @@ impl SharedRemotePane {
                 .lease
                 .as_ref()
                 .is_some_and(|lease| !lease.is_idle_at(Instant::now())),
+            scrollback: 0,
         }
     }
 
@@ -1512,6 +1762,13 @@ impl SharedLayoutRuntime {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
+                    if key.code == KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && self.tui.clear_selection()
+                    {
+                        dirty = true;
+                        continue;
+                    }
                     match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
                         KeyHandling::Quit => break,
                         KeyHandling::Consumed(intents) => {
@@ -1532,12 +1789,56 @@ impl SharedLayoutRuntime {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
                     let area = Rect::new(0, 0, cols, rows);
+                    dirty |= self.tui.clear_selection();
                     if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
                         self.handle_intent(intent)?;
                         dirty = true;
                     } else {
                         dirty |= self.tui.focus_pane_at(mouse.column, mouse.row, area);
+                        dirty |= self.tui.begin_selection_at(mouse.column, mouse.row, area);
                     }
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
+                {
+                    dirty |= self.tui.extend_selection_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, cols, rows),
+                    );
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
+                {
+                    if self.tui.end_selection_drag() {
+                        self.copy_selection_to_clipboard();
+                    }
+                    dirty = true;
+                }
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let area = Rect::new(0, 0, cols, rows);
+                    let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                    let scrollback_len = self
+                        .local
+                        .get(&pane_id)
+                        .map(|pane| available_scrollback(pane.screen.screen()))
+                        .or_else(|| {
+                            self.remote
+                                .get(&pane_id)
+                                .and_then(|pane| pane.screen.screen())
+                                .map(available_scrollback)
+                        })
+                        .unwrap_or(0);
+                    dirty |= self.tui.scroll_pane(
+                        pane_id,
+                        scrollback_len,
+                        matches!(mouse.kind, MouseEventKind::ScrollUp),
+                    );
                 }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -1545,6 +1846,33 @@ impl SharedLayoutRuntime {
         }
         self.shutdown();
         Ok(())
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(selection) = self.tui.selection() else {
+            return;
+        };
+        let scrollback = self.tui.scrollback_offset(selection.pane_id);
+        let text = self
+            .local
+            .get(&selection.pane_id)
+            .and_then(|pane| {
+                selection_text(&viewed_screen(pane.screen.screen(), scrollback), selection)
+            })
+            .or_else(|| {
+                self.remote
+                    .get(&selection.pane_id)
+                    .and_then(|pane| pane.screen.screen())
+                    .and_then(|screen| {
+                        selection_text(&viewed_screen(screen, scrollback), selection)
+                    })
+            });
+        let Some(text) = text else {
+            return;
+        };
+        if let Err(error) = copy_to_macos_clipboard(&text) {
+            self.status = format!("clipboard copy failed: {error}");
+        }
     }
 
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
@@ -1891,16 +2219,22 @@ impl SharedLayoutRuntime {
 
     fn forward_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
+        let mut sent = false;
         if let Some(pane) = self.local.get_mut(&pane_id)
             && let Some(bytes) = encode_key(key, pane.screen.screen())
         {
             pane.input(bytes)?;
+            sent = true;
         }
         if let Some(pane) = self.remote.get_mut(&pane_id)
             && let Some(screen) = pane.screen.screen()
             && let Some(bytes) = encode_key(key, screen)
         {
             pane.input(bytes);
+            sent = true;
+        }
+        if sent {
+            self.tui.reset_scrollback(pane_id);
         }
         Ok(())
     }
@@ -1915,6 +2249,7 @@ impl SharedLayoutRuntime {
         {
             pane.input(encode_paste(text, screen.bracketed_paste()));
         }
+        self.tui.reset_scrollback(pane_id);
         Ok(())
     }
 
@@ -1968,12 +2303,33 @@ impl HostPaneRuntime {
 
 struct VtScreen<'a> {
     screen: &'a vt100::Screen,
+    selection: Option<PaneTextSelection>,
 }
 
 impl<'a> VtScreen<'a> {
     fn new(screen: &'a vt100::Screen) -> Self {
-        Self { screen }
+        Self {
+            screen,
+            selection: None,
+        }
     }
+
+    fn with_selection(mut self, selection: Option<PaneTextSelection>) -> Self {
+        self.selection = selection;
+        self
+    }
+}
+
+fn viewed_screen(screen: &vt100::Screen, scrollback: usize) -> vt100::Screen {
+    let mut screen = screen.clone();
+    screen.set_scrollback(scrollback);
+    screen
+}
+
+fn available_scrollback(screen: &vt100::Screen) -> usize {
+    let mut screen = screen.clone();
+    screen.set_scrollback(SCROLLBACK_LINES);
+    screen.scrollback()
 }
 
 impl Widget for VtScreen<'_> {
@@ -1990,7 +2346,17 @@ impl Widget for VtScreen<'_> {
                 let target = &mut buf[(area.x + col, area.y + row)];
                 let contents = source.contents();
                 target.set_symbol(if contents.is_empty() { " " } else { contents });
-                target.set_style(vt_style(source));
+                let style = if self
+                    .selection
+                    .is_some_and(|selection| selection.contains(ScreenCell { row, col }))
+                {
+                    vt_style(source)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::REVERSED)
+                } else {
+                    vt_style(source)
+                };
+                target.set_style(style);
             }
         }
     }
@@ -2644,11 +3010,13 @@ mod tests {
 
     use super::{
         ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
-        LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
-        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, contextual_footer, encode_key,
-        encode_paste, grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label,
+        LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
+        RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
+        VtScreen, contextual_footer, encode_key, encode_paste, grid_for_pane,
+        initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        render_guest_screen, render_multi_pane, render_shared_multi_pane, visible_leaf_panes,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
+        viewed_screen, visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2923,6 +3291,9 @@ mod tests {
             .collect::<String>();
         assert!(footer.starts_with("layout request rejected"));
         assert!(footer.ends_with("join: p2pmux join TESTCODE"));
+        assert_eq!(terminal.backend().buffer()[(0, 4)].fg, Color::White);
+        let join_x = footer.find("join:").expect("join code rendered") as u16;
+        assert_eq!(terminal.backend().buffer()[(join_x, 4)].fg, Color::White);
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(20, 5)).expect("terminal");
         narrow_terminal
@@ -2957,6 +3328,7 @@ mod tests {
             ready: true,
             controller_peer_id: Some(b"controller".to_vec()),
             controller_active: true,
+            scrollback: 0,
         };
         assert!(tui.set_pane_view(1, active.clone()));
         assert!(!tui.set_pane_view(1, active));
@@ -3199,15 +3571,15 @@ mod tests {
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
             pane_title(1, b"host", Some(b""), &members),
-            "Pane #1  host: Host  control: free"
+            "Pane #1 host: Host control: free"
         );
         assert_eq!(
             pane_title(2, b"host", Some(b"guest"), &members),
-            "Pane #2  host: Host  control: Guest"
+            "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
             pane_title(2, b"host", None, &members),
-            "Pane #2  host: Host  control: …"
+            "Pane #2 host: Host control: …"
         );
     }
 
@@ -3256,6 +3628,86 @@ mod tests {
     }
 
     #[test]
+    fn mouse_coordinates_map_to_visible_screen_cells_only() {
+        let viewport = Rect::new(10, 5, 3, 2);
+
+        assert_eq!(
+            mouse_to_screen_cell(viewport, 12, 6),
+            Some(ScreenCell { row: 1, col: 2 })
+        );
+        assert_eq!(mouse_to_screen_cell(viewport, 9, 5), None);
+        assert_eq!(mouse_to_screen_cell(viewport, 13, 6), None);
+    }
+
+    #[test]
+    fn mouse_wheel_adjusts_the_hovered_pane_scrollback_with_clamping() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let pane_id = tui.pane_at_or_focused(60, 17, area);
+        assert_eq!(pane_id, 3);
+
+        assert!(tui.scroll_pane(pane_id, 2, true));
+        assert!(tui.scroll_pane(pane_id, 2, true));
+        assert!(!tui.scroll_pane(pane_id, 2, true));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 2);
+        assert!(tui.scroll_pane(pane_id, 2, false));
+        assert!(tui.scroll_pane(pane_id, 2, false));
+        assert!(!tui.scroll_pane(pane_id, 2, false));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 0);
+    }
+
+    #[test]
+    fn input_resets_the_pane_scrollback_to_the_live_edge() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 4, true));
+        assert!(tui.reset_scrollback(1));
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 0);
+        assert!(!tui.reset_scrollback(1));
+    }
+
+    #[test]
+    fn selection_text_extracts_the_selected_grid_cells() {
+        let mut parser = vt100::Parser::new(2, 4, 0);
+        parser.process(b"ab  \r\ncdef");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 1 },
+            cursor: ScreenCell { row: 1, col: 2 },
+        };
+
+        assert_eq!(
+            selection_text(parser.screen(), selection),
+            Some("b\nde".to_owned())
+        );
+    }
+
+    #[test]
+    fn selection_text_uses_the_scrolled_view_cells() {
+        let mut parser = vt100::Parser::new(1, 3, 10);
+        parser.process(b"one\r\ntwo");
+        let screen = viewed_screen(parser.screen(), 1);
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 1 },
+        };
+
+        assert_eq!(selection_text(&screen, selection), Some("on".to_owned()));
+    }
+
+    #[test]
+    fn empty_selection_has_no_clipboard_text() {
+        let parser = vt100::Parser::new(1, 1, 0);
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 0 },
+        };
+
+        assert_eq!(selection_text(parser.screen(), selection), None);
+    }
+
+    #[test]
     fn tab_hit_testing_switches_the_clicked_rendered_label_without_exiting_tab_mode() {
         let mut tui = MultiPaneTui::new(layout(
             vec![
@@ -3271,21 +3723,22 @@ mod tests {
             &[(1, 2, 2), (2, 2, 2)],
         ))
         .expect("valid layout");
-        let area = Rect::new(0, 0, 20, 8);
+        let area = Rect::new(0, 0, 32, 8);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
             area,
         );
 
+        let second_tab = tui.geometry(area).tab_labels[&2];
         assert_eq!(
-            tui.switch_tab_at(8, 0, area),
+            tui.switch_tab_at(second_tab.x, 0, area),
             Some(UiIntent::SwitchTab { tab_id: 2 })
         );
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
         assert_eq!(tui.chord_mode(), ChordMode::Tab);
-        assert_eq!(tui.switch_tab_at(6, 0, area), None);
+        assert_eq!(tui.switch_tab_at(0, 0, area), None);
     }
 
     #[test]
@@ -3351,6 +3804,7 @@ mod tests {
                 ready: true,
                 controller_peer_id: Some(b"peer".to_vec()),
                 controller_active: true,
+                scrollback: 0,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(36, 6)).expect("test terminal");
@@ -3361,7 +3815,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(1, 1)].symbol(), "P");
+        assert_eq!(buffer[(1, 1)].symbol(), " ");
+        assert_eq!(buffer[(2, 1)].symbol(), "P");
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
@@ -3382,6 +3837,7 @@ mod tests {
                 ready: true,
                 controller_peer_id: None,
                 controller_active: false,
+                scrollback: 0,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("test terminal");
@@ -3415,6 +3871,7 @@ mod tests {
                 ready: true,
                 controller_peer_id: None,
                 controller_active: false,
+                scrollback: 0,
             },
         );
         let screens = BTreeMap::from([(1, parser.screen())]);
@@ -3446,6 +3903,7 @@ mod tests {
                     ready: true,
                     controller_peer_id: None,
                     controller_active: false,
+                    scrollback: 0,
                 },
             );
             let screens = BTreeMap::from([(1, parser.screen())]);
@@ -3650,7 +4108,13 @@ mod tests {
             for (text, accent) in segments {
                 for key in text.chars() {
                     if *accent {
-                        assert_eq!(footer[(x, 3)].fg, Color::Red, "mode: {mode:?}, key: {key}");
+                        assert_eq!(
+                            footer[(x, 3)].fg,
+                            Color::Rgb(220, 50, 47),
+                            "mode: {mode:?}, key: {key}"
+                        );
+                    } else {
+                        assert_eq!(footer[(x, 3)].fg, Color::White, "mode: {mode:?}");
                     }
                     x += 1;
                 }
@@ -3659,7 +4123,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_uses_ordinal_labels_and_highlights_the_active_tab() {
+    fn tab_bar_uses_a_branded_footer_like_strip_and_highlights_the_active_tab() {
         let tui = MultiPaneTui::new(layout(
             vec![
                 Tab {
@@ -3682,10 +4146,15 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let tab_bar = (0..32).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
+        assert!(tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2"));
         assert!(tab_bar.contains("Tab #1"));
         assert!(tab_bar.contains("Tab #2"));
         assert_eq!(buffer[(0, 0)].fg, Color::White);
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(30, 30, 30));
+        assert_eq!(buffer[(9, 0)].fg, Color::White);
+        assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(20, 0)].fg, Color::White);
+        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
     }
 
     #[test]
@@ -4140,6 +4609,32 @@ mod tests {
     }
 
     #[test]
+    fn renderer_highlights_selected_cells() {
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process(b"abc");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 1 },
+        };
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    VtScreen::new(parser.screen()).with_selection(Some(selection)),
+                    frame.area(),
+                )
+            })
+            .expect("render should work");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, Color::DarkGray);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert_ne!(buffer[(2, 0)].bg, Color::DarkGray);
+    }
+
+    #[test]
     fn renderer_keeps_the_parser_grid_fixed() {
         let mut parser = vt100::Parser::new(2, 3, 0);
         parser.process(b"abc\r\ndef");
@@ -4153,6 +4648,29 @@ mod tests {
         assert_eq!(buffer[(2, 1)].symbol(), "f");
         assert_eq!(buffer[(3, 0)].symbol(), " ");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
+    }
+
+    #[test]
+    fn renderer_uses_the_requested_scrollback_view() {
+        let mut parser = vt100::Parser::new(1, 3, 10);
+        parser.process(b"one\r\ntwo");
+        let live = parser.screen().clone();
+        let history = viewed_screen(parser.screen(), 1);
+        assert_eq!(history.scrollback(), 1);
+        assert_ne!(
+            history.cell(0, 0).expect("history cell").contents(),
+            live.cell(0, 0).expect("live cell").contents()
+        );
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(&history), frame.area()))
+            .expect("render should work");
+
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].symbol(),
+            history.cell(0, 0).expect("history cell").contents()
+        );
     }
 
     #[test]
