@@ -896,6 +896,11 @@ fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     }
 }
 
+fn copied_status(text: &str) -> String {
+    let lines = text.split('\n').count().max(1);
+    format!("copied {lines} line{}", if lines == 1 { "" } else { "s" })
+}
+
 /// Renders layout chrome plus any currently available fixed-size VT screens.
 pub fn render_multi_pane(
     frame: &mut Frame<'_>,
@@ -1867,8 +1872,9 @@ impl SharedLayoutRuntime {
         let Some(text) = text else {
             return;
         };
-        if let Err(error) = copy_to_macos_clipboard(&text) {
-            self.status = format!("clipboard copy failed: {error}");
+        match copy_to_macos_clipboard(&text) {
+            Ok(()) => self.status = copied_status(&text),
+            Err(error) => self.status = format!("clipboard copy failed: {error}"),
         }
     }
 
@@ -3011,7 +3017,7 @@ mod tests {
         ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
         RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
-        VtScreen, contextual_footer, encode_key, encode_paste, grid_for_pane,
+        VtScreen, contextual_footer, copied_status, encode_key, encode_paste, grid_for_pane,
         initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
         render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
@@ -3723,6 +3729,13 @@ mod tests {
         };
 
         assert_eq!(selection_text(parser.screen(), selection), None);
+    }
+
+    #[test]
+    fn copied_status_reports_the_number_of_newline_separated_lines() {
+        assert_eq!(copied_status("one line"), "copied 1 line");
+        assert_eq!(copied_status("first\nsecond\nthird"), "copied 3 lines");
+        assert_eq!(copied_status(""), "copied 1 line");
     }
 
     #[test]
