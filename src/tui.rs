@@ -508,6 +508,28 @@ pub fn render_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
+    render_shared_multi_pane(frame, tui, screens, "", None);
+}
+
+fn shared_footer_text(status: &str, join_code: Option<&str>) -> String {
+    let controls = "Ctrl+P panes | Ctrl+T tabs | F9 control | F10 quit";
+    match (status.is_empty(), join_code) {
+        (false, Some(join_code)) => {
+            format!("{status} | {controls} | join: p2pmux join {join_code}")
+        }
+        (false, None) => format!("{status} | {controls}"),
+        (true, Some(join_code)) => format!("{controls} | join: p2pmux join {join_code}"),
+        (true, None) => String::from(controls),
+    }
+}
+
+fn render_shared_multi_pane(
+    frame: &mut Frame<'_>,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
+    status: &str,
+    join_code: Option<&str>,
+) {
     let geometry = tui.geometry(frame.area());
     let tabs = tui
         .snapshot
@@ -534,7 +556,7 @@ pub fn render_multi_pane(
         frame.buffer_mut().set_string(
             geometry.footer.x,
             geometry.footer.y,
-            "Ctrl+P panes | Ctrl+T tabs | F9 control | F10 quit",
+            shared_footer_text(status, join_code),
             Style::default().fg(Color::DarkGray),
         );
     }
@@ -673,9 +695,21 @@ impl SharedLocalPane {
                             Instant::now(),
                         )?
                     };
-                    if let LeaseDecision::Publish(state) = decision {
-                        self.lease_tx.send_replace(state);
-                        changed = true;
+                    match decision {
+                        LeaseDecision::Publish(state) => {
+                            self.lease_tx.send_replace(state);
+                            changed = true;
+                        }
+                        // A normal request while the holder is active does not change the lease,
+                        // but the requester needs an authoritative re-publication to clear its
+                        // pending claim and try again after the idle timeout.
+                        LeaseDecision::RejectActiveController => {
+                            self.lease_tx.send_replace(self.lease.state().clone());
+                            changed = true;
+                        }
+                        LeaseDecision::AcceptInput(_)
+                        | LeaseDecision::RejectStaleInput
+                        | LeaseDecision::RejectStaleRequest => {}
                     }
                 }
             }
@@ -744,6 +778,13 @@ struct SharedRemotePane {
     held_input: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemotePaneDrain {
+    Unchanged,
+    Changed,
+    Disconnected,
+}
+
 impl SharedRemotePane {
     fn new(pane: GuestPane) -> Self {
         Self {
@@ -770,7 +811,7 @@ impl SharedRemotePane {
         }
     }
 
-    fn drain(&mut self) -> bool {
+    fn drain(&mut self) -> RemotePaneDrain {
         let mut changed = false;
         loop {
             match self.pane.events.try_recv() {
@@ -798,7 +839,9 @@ impl SharedRemotePane {
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
                 Ok(GuestEvent::Disconnected)
-                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return true,
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return RemotePaneDrain::Disconnected;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             }
         }
@@ -822,7 +865,11 @@ impl SharedRemotePane {
                 self.held_input = bytes;
             }
         }
-        changed
+        if changed {
+            RemotePaneDrain::Changed
+        } else {
+            RemotePaneDrain::Unchanged
+        }
     }
 
     fn take_control(&mut self) {
@@ -1170,27 +1217,13 @@ impl SharedLayoutRuntime {
                     }
                 }
                 terminal.draw(|frame| {
-                    let area = frame.area();
-                    render_multi_pane(frame, &self.tui, &screens);
-                    if !self.status.is_empty() && area.height > 0 {
-                        frame.buffer_mut().set_string(
-                            area.x,
-                            area.bottom().saturating_sub(1),
-                            &self.status,
-                            Style::default().fg(Color::Red),
-                        );
-                    }
-                    if let Some(join_code) = &self.join_code
-                        && area.height > 0
-                    {
-                        let text = format!("join: p2pmux join {join_code}");
-                        frame.buffer_mut().set_string(
-                            area.x,
-                            area.bottom().saturating_sub(1),
-                            text,
-                            Style::default().fg(Color::DarkGray),
-                        );
-                    }
+                    render_shared_multi_pane(
+                        frame,
+                        &self.tui,
+                        &screens,
+                        &self.status,
+                        self.join_code.as_deref(),
+                    );
                 })?;
                 dirty = false;
             }
@@ -1239,7 +1272,7 @@ impl SharedLayoutRuntime {
                         self.subscriptions.succeeded(pane_id);
                         self.remote.insert(pane_id, SharedRemotePane::new(pane));
                     } else {
-                        self.runtime.block_on(pane.shutdown());
+                        self.spawn_remote_shutdown(pane);
                     }
                 }
                 Err(error) => {
@@ -1253,11 +1286,34 @@ impl SharedLayoutRuntime {
         for pane in self.local.values_mut() {
             changed |= pane.drain()?;
         }
-        for pane in self.remote.values_mut() {
-            changed |= pane.drain();
+        let disconnected = self
+            .remote
+            .iter_mut()
+            .filter_map(|(pane_id, pane)| match pane.drain() {
+                RemotePaneDrain::Unchanged => None,
+                RemotePaneDrain::Changed => {
+                    changed = true;
+                    None
+                }
+                RemotePaneDrain::Disconnected => Some(*pane_id),
+            })
+            .collect::<Vec<_>>();
+        for pane_id in disconnected {
+            if let Some(pane) = self.remote.remove(&pane_id) {
+                self.spawn_remote_shutdown(pane.pane);
+            }
+            if self.remote_descriptors.contains_key(&pane_id) {
+                self.subscriptions.failed(pane_id, self.retry_tick);
+                self.status = format!("pane {pane_id} disconnected; retrying");
+            }
+            changed = true;
         }
         self.refresh_local_views();
         Ok(changed)
+    }
+
+    fn spawn_remote_shutdown(&self, pane: GuestPane) {
+        self.runtime.spawn(async move { pane.shutdown().await });
     }
 
     fn refresh_local_views(&mut self) {
@@ -1294,6 +1350,11 @@ impl SharedLayoutRuntime {
         let snapshot = layout_snapshot_from_state(state)
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
         let current_ids = snapshot.panes.keys().copied().collect::<BTreeSet<_>>();
+        // A successful authoritative commit is the only point at which a provisional local PTY
+        // becomes a real pane. Forget the request bookkeeping then; rejection handles the other
+        // path and tears the provisional PTY down.
+        self.provisional
+            .retain(|_, pane_id| !current_ids.contains(pane_id));
         let local_ids = self.local.keys().copied().collect::<Vec<_>>();
         for pane_id in local_ids {
             if !current_ids.contains(&pane_id) {
@@ -1308,7 +1369,7 @@ impl SharedLayoutRuntime {
             if !current_ids.contains(&pane_id)
                 && let Some(pane) = self.remote.remove(&pane_id)
             {
-                self.runtime.block_on(pane.pane.shutdown());
+                self.spawn_remote_shutdown(pane.pane);
             }
         }
         self.tui
@@ -2317,7 +2378,7 @@ mod tests {
     };
 
     use crate::layout::{Axis, LayoutSnapshot, Node, Pane, Tab};
-    use crate::lease::LeaseState;
+    use crate::lease::{IDLE_AFTER, LeaseManager, LeaseState};
     use crate::screen::{GuestScreen, HostScreen};
     use crate::{
         protocol::PaneDescriptor,
@@ -2327,9 +2388,10 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        ChordMode, HostPaneChannels, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneViewState,
-        RemoteSubscriptionState, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
-        encode_key, encode_paste, pane_wire_id, render_guest_screen, render_multi_pane,
+        ChordMode, HostControlEvent, HostPaneChannels, KeyHandling, LayoutControlEvent,
+        MultiPaneTui, PaneViewState, RemoteSubscriptionState, SharedLayoutRuntime, SharedLocalPane,
+        UiIntent, VtScreen, encode_key, encode_paste, pane_wire_id, render_guest_screen,
+        render_multi_pane, render_shared_multi_pane, shared_footer_text,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2442,6 +2504,10 @@ mod tests {
             .expect("create intent commits after registering a local pane");
         assert!(runtime.local.contains_key(&2));
         assert!(runtime.panes.has_registered_pane(2).expect("pane registry"));
+        assert!(
+            runtime.provisional.is_empty(),
+            "committed panes clear provisional state"
+        );
         assert_eq!(runtime.tui.snapshot().panes.len(), 2);
 
         runtime
@@ -2473,25 +2539,26 @@ mod tests {
             last_activity: Instant::now(),
         });
         let (control_tx, _control_rx) = mpsc::channel(8);
+        let descriptor = PaneDescriptor {
+            pane_id: 1,
+            host_peer_id: host_id.clone(),
+            grid_rows: 1,
+            grid_cols: 1,
+        };
         host_panes
             .register_local_pane(
-                PaneDescriptor {
-                    pane_id: 1,
-                    host_peer_id: host_id.clone(),
-                    grid_rows: 1,
-                    grid_cols: 1,
-                },
+                descriptor.clone(),
                 HostPaneChannels {
                     pane_id: pane_wire_id(1),
                     host_peer_id: host_id,
-                    screen_rx,
-                    lease_rx,
-                    control_tx,
+                    screen_rx: screen_rx.clone(),
+                    lease_rx: lease_rx.clone(),
+                    control_tx: control_tx.clone(),
                 },
             )
             .expect("host pane");
         let dispatcher = host
-            .incoming_dispatcher(host_panes)
+            .incoming_dispatcher(host_panes.clone())
             .expect("single dispatcher");
         let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
 
@@ -2511,7 +2578,7 @@ mod tests {
             member,
             member_panes,
             host.ticket().session_id().to_vec(),
-            state,
+            state.clone(),
             tokio::runtime::Handle::current(),
         )
         .expect("member runtime");
@@ -2526,7 +2593,132 @@ mod tests {
             runtime.remote.contains_key(&1),
             "remote pane attached from snapshot"
         );
+
+        host_panes
+            .remove_local_pane(1)
+            .expect("remove direct pane")
+            .expect("registered pane");
+        for _ in 0..20 {
+            runtime.drain().expect("runtime drain after direct close");
+            if !runtime.remote.contains_key(&1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !runtime.remote.contains_key(&1),
+            "a direct stream close removes the stale remote pane"
+        );
+        host_panes
+            .register_local_pane(
+                descriptor,
+                HostPaneChannels {
+                    pane_id: pane_wire_id(1),
+                    host_peer_id: host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+                    screen_rx,
+                    lease_rx,
+                    control_tx,
+                },
+            )
+            .expect("restore direct pane");
+        runtime
+            .apply_layout_state(&state)
+            .expect("authoritative snapshot nudges reconnect");
+        for _ in 0..20 {
+            runtime.drain().expect("runtime drain after restore");
+            if runtime.remote.contains_key(&1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            runtime.remote.contains_key(&1),
+            "remote pane reconnects after a transient direct close"
+        );
         dispatcher_task.abort();
+    }
+
+    #[test]
+    fn shared_footer_keeps_status_visible_when_a_join_code_is_present() {
+        let footer = shared_footer_text("layout request rejected", Some("TESTCODE"));
+        assert!(footer.starts_with("layout request rejected"));
+        assert!(footer.contains("Ctrl+P panes"));
+        assert!(footer.contains("join: p2pmux join TESTCODE"));
+    }
+
+    #[test]
+    fn shared_renderer_draws_status_before_join_code_in_the_footer() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        );
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(160, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "layout request rejected",
+                    Some("TESTCODE"),
+                );
+            })
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("layout request rejected"));
+        assert!(rendered.contains("join: p2pmux join TESTCODE"));
+    }
+
+    #[test]
+    fn rejected_busy_takeover_republishes_lease_and_idle_takeover_succeeds_without_force() {
+        let owner = b"owner".to_vec();
+        let requester = b"guest".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, owner.clone()).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
+        pane.control_tx
+            .try_send(HostControlEvent::TakeControl {
+                peer_id: requester.clone(),
+                request: crate::protocol::TakeControl {
+                    pane_id: pane_wire_id(99),
+                    requester_peer_id: requester.clone(),
+                    known_lease_epoch: 1,
+                    force: false,
+                },
+            })
+            .expect("busy takeover event");
+        pane.drain().expect("drain busy takeover");
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        assert_eq!(lease_rx.borrow_and_update().controller_peer_id, owner);
+
+        pane.lease = LeaseManager::with_epoch_for_test(
+            pane.host_peer_id.clone(),
+            1,
+            Instant::now() - IDLE_AFTER,
+        );
+        pane.control_tx
+            .try_send(HostControlEvent::TakeControl {
+                peer_id: requester.clone(),
+                request: crate::protocol::TakeControl {
+                    pane_id: pane_wire_id(99),
+                    requester_peer_id: requester.clone(),
+                    known_lease_epoch: 1,
+                    force: false,
+                },
+            })
+            .expect("idle takeover event");
+        pane.drain().expect("drain idle takeover");
+        assert_eq!(pane.lease.state().controller_peer_id, requester);
+        assert_eq!(pane.lease.state().epoch, 2);
     }
 
     fn split_layout() -> LayoutSnapshot {
