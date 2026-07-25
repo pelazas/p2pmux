@@ -24,6 +24,18 @@ fn initial_state_has_one_tab_and_one_hosted_pane() {
 }
 
 #[test]
+fn initial_layout_rejects_zero_sized_grids() {
+    assert_eq!(
+        SessionState::new(HOST_A.to_vec(), 0, 80),
+        Err(LayoutError::InvalidGrid)
+    );
+    assert_eq!(
+        SessionState::new(HOST_A.to_vec(), 24, 0),
+        Err(LayoutError::InvalidGrid)
+    );
+}
+
+#[test]
 fn creating_panes_uses_the_requested_split_axis() {
     let mut state = state();
     let first_revision = state.revision;
