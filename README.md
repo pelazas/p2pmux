@@ -95,8 +95,8 @@ passthrough configuration.
 Drag inside a pane's terminal content to select text; releasing the mouse copies it to the macOS
 clipboard.
 
-- `⌥⇧` + arrows — move focus to the nearest pane in that direction in the current tab. Some
-  terminals need Shift with `⌥` for horizontal arrows.
+- `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
+  tab. Some terminals need Shift with Option for horizontal arrows.
 - `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new
   fixed-grid PTY runs on the requester’s Mac.
 - `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
@@ -112,7 +112,7 @@ Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at mo
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Click tab labels to switch tabs without
 claiming control or sending input. Mouse wheel scrolls pane history locally. The dark contextual footer uses red key accents: normal mode is
-`Ctrl+ <p> PANE   <t> TAB   <⌥> + <⇧> + <↑↓←→> FOCUS   <q> QUIT    type to claim when free`; pane mode is
+`Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`; pane mode is
 `Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK`; tab mode is
 `Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK`.
 

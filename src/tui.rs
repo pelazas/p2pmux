@@ -30,7 +30,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Widget},
+    widgets::{Block, Clear, Paragraph, Widget},
 };
 
 use crate::{
@@ -58,53 +58,59 @@ pub struct Tui;
 const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
 const FOOTER_MUTED: Color = Color::White;
 const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
+const FOOTER_ORANGE: Color = Color::Rgb(255, 120, 70);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <⌥> + <⇧> + <↑↓←→> FOCUS   <q> QUIT";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
+const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-type FooterSegment = (&'static str, bool);
+enum FooterSegment {
+    Text(&'static str),
+    Key(&'static str),
+    OrangeKey(&'static str),
+}
 
 const NORMAL_FOOTER: &[FooterSegment] = &[
-    ("Ctrl+ <", false),
-    ("p", true),
-    ("> PANE   <", false),
-    ("t", true),
-    ("> TAB   ", false),
-    ("<", false),
-    ("⌥", true),
-    ("> + <", false),
-    ("⇧", true),
-    ("> + <", false),
-    ("↑↓←→", true),
-    ("> FOCUS   <", false),
-    ("q", true),
-    ("> QUIT", false),
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> PANE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text("> QUIT   "),
+    FooterSegment::OrangeKey("Option"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("shift"),
+    FooterSegment::Text("> + <"),
+    FooterSegment::Key("↑↓←→"),
+    FooterSegment::Text("> FOCUS"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
-    ("Pane  <", false),
-    ("←↓↑→", true),
-    ("> FOCUS   <", false),
-    ("n", true),
-    ("> NEW   <", false),
-    ("r/l/d/u", true),
-    ("> SPLIT   <", false),
-    ("x", true),
-    ("> CLOSE   <", false),
-    ("Esc", true),
-    ("> BACK", false),
+    FooterSegment::Text("Pane  <"),
+    FooterSegment::Key("←↓↑→"),
+    FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("r/l/d/u"),
+    FooterSegment::Text("> SPLIT   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
 ];
 const TAB_FOOTER: &[FooterSegment] = &[
-    ("Tab  <", false),
-    ("←→", true),
-    ("> SWITCH   <", false),
-    ("n", true),
-    ("> NEW   <", false),
-    ("x", true),
-    ("> CLOSE   <", false),
-    ("Esc", true),
-    ("> BACK", false),
+    FooterSegment::Text("Tab  <"),
+    FooterSegment::Key("←→"),
+    FooterSegment::Text("> SWITCH   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
 ];
 
 /// The in-progress multi-pane command prefix, kept entirely local to one terminal.
@@ -214,6 +220,7 @@ pub struct MultiPaneTui {
     focused_pane: PaneId,
     hovered_pane: Option<PaneId>,
     chord_mode: ChordMode,
+    chord_last_activity: Option<Instant>,
     pane_views: BTreeMap<PaneId, PaneViewState>,
     pending_created_tab: Option<TabId>,
     pending_created_pane: Option<PaneId>,
@@ -237,6 +244,7 @@ impl MultiPaneTui {
             focused_pane,
             hovered_pane: None,
             chord_mode: ChordMode::None,
+            chord_last_activity: None,
             pane_views,
             pending_created_tab: None,
             pending_created_pane: None,
@@ -263,6 +271,32 @@ impl MultiPaneTui {
 
     fn exit_chord_mode(&mut self) {
         self.chord_mode = ChordMode::None;
+        self.chord_last_activity = None;
+    }
+
+    fn enter_chord_mode(&mut self, mode: ChordMode) {
+        self.chord_mode = mode;
+        self.chord_last_activity = Some(Instant::now());
+    }
+
+    fn touch_chord_activity(&mut self) {
+        if self.chord_mode != ChordMode::None {
+            self.chord_last_activity = Some(Instant::now());
+        }
+    }
+
+    /// Clears sticky pane/tab mode after [`CHORD_IDLE_TIMEOUT`] without a key.
+    fn expire_chord_mode(&mut self, now: Instant) -> bool {
+        let Some(last) = self.chord_last_activity else {
+            return false;
+        };
+        if self.chord_mode == ChordMode::None
+            || now.saturating_duration_since(last) < CHORD_IDLE_TIMEOUT
+        {
+            return false;
+        }
+        self.exit_chord_mode();
+        true
     }
 
     fn clear_selection(&mut self) -> bool {
@@ -500,26 +534,27 @@ impl MultiPaneTui {
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
         if is_quit(key) {
-            self.chord_mode = ChordMode::None;
+            self.exit_chord_mode();
             return KeyHandling::Quit;
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
             && self.chord_mode != ChordMode::None
         {
-            self.chord_mode = ChordMode::None;
+            self.exit_chord_mode();
             return KeyHandling::Consumed(vec![]);
         }
         if matches!(self.chord_mode, ChordMode::None | ChordMode::Pane) && is_option_arrow(key) {
+            self.touch_chord_activity();
             return KeyHandling::Consumed(self.move_focus(key.code, area).into_iter().collect());
         }
         if self.chord_mode == ChordMode::None {
             if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
-                self.chord_mode = ChordMode::Pane;
+                self.enter_chord_mode(ChordMode::Pane);
                 return KeyHandling::Consumed(vec![]);
             }
             if key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL {
-                self.chord_mode = ChordMode::Tab;
+                self.enter_chord_mode(ChordMode::Tab);
                 return KeyHandling::Consumed(vec![]);
             }
             return KeyHandling::Forward;
@@ -527,11 +562,11 @@ impl MultiPaneTui {
 
         let chord = self.chord_mode;
         if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
-            self.chord_mode = ChordMode::Pane;
+            self.enter_chord_mode(ChordMode::Pane);
             return KeyHandling::Consumed(vec![]);
         }
         if key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL {
-            self.chord_mode = ChordMode::Tab;
+            self.enter_chord_mode(ChordMode::Tab);
             return KeyHandling::Consumed(vec![]);
         }
         let intent = match chord {
@@ -540,9 +575,10 @@ impl MultiPaneTui {
             ChordMode::None => None,
         };
         if intent.is_some() || is_chord_command(chord, key) {
+            self.touch_chord_activity();
             KeyHandling::Consumed(intent.into_iter().collect())
         } else {
-            self.chord_mode = ChordMode::None;
+            self.exit_chord_mode();
             KeyHandling::Forward
         }
     }
@@ -955,16 +991,7 @@ fn direction_distance(
 fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
     let width = inner.width.min(cols);
     let height = inner.height.min(rows);
-    Rect::new(
-        inner
-            .x
-            .saturating_add(inner.width.saturating_sub(width) / 2),
-        inner
-            .y
-            .saturating_add(inner.height.saturating_sub(height) / 2),
-        width,
-        height,
-    )
+    Rect::new(inner.x, inner.y, width, height)
 }
 
 fn pane_content_rect(pane_rect: Rect) -> Rect {
@@ -1041,7 +1068,7 @@ pub fn render_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", None, None);
+    render_shared_multi_pane(frame, tui, screens, "", None, None, None);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -1065,15 +1092,27 @@ fn render_footer_segments(
     end_x: u16,
     segments: &[FooterSegment],
 ) -> u16 {
-    for (text, accent) in segments {
-        let style = Style::default()
-            .fg(if *accent { FOOTER_ACCENT } else { FOOTER_MUTED })
-            .bg(FOOTER_BACKGROUND)
-            .add_modifier(if *accent {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            });
+    for segment in segments {
+        let (text, style) = match segment {
+            FooterSegment::Text(text) => (
+                *text,
+                Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+            ),
+            FooterSegment::Key(text) => (
+                *text,
+                Style::default()
+                    .fg(FOOTER_ACCENT)
+                    .bg(FOOTER_BACKGROUND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            FooterSegment::OrangeKey(text) => (
+                *text,
+                Style::default()
+                    .fg(FOOTER_ORANGE)
+                    .bg(FOOTER_BACKGROUND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        };
         x = buffer
             .set_stringn(x, y, text, usize::from(end_x.saturating_sub(x)), style)
             .0;
@@ -1102,6 +1141,19 @@ fn render_copy_feedback(buffer: &mut Buffer, mut x: u16, y: u16, end_x: u16, lin
     );
 }
 
+fn render_footer_notice(buffer: &mut Buffer, x: u16, y: u16, end_x: u16, notice: &str) {
+    buffer.set_stringn(
+        x,
+        y,
+        format!("  {notice}"),
+        usize::from(end_x.saturating_sub(x)),
+        Style::default()
+            .fg(FOOTER_ORANGE)
+            .bg(FOOTER_BACKGROUND)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 fn footer_suffix(text: &str, width: usize) -> &str {
     if width == 0 {
         return "";
@@ -1113,11 +1165,29 @@ fn footer_suffix(text: &str, width: usize) -> &str {
     &text[start..]
 }
 
+fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&str>) -> u16 {
+    if let Some(notice) = footer_notice {
+        return u16::try_from(notice.chars().count().saturating_add(2)).unwrap_or(u16::MAX);
+    }
+    if let Some(lines) = copied_lines {
+        let count = format!("{lines} line{}", if lines == 1 { "" } else { "s" });
+        return u16::try_from(
+            count
+                .chars()
+                .count()
+                .saturating_add("  copied ".chars().count()),
+        )
+        .unwrap_or(u16::MAX);
+    }
+    0
+}
+
 fn render_contextual_footer(
     buffer: &mut Buffer,
     area: Rect,
     status: &str,
     copied_lines: Option<usize>,
+    footer_notice: Option<&str>,
     join_code: Option<&str>,
     chord_mode: ChordMode,
 ) {
@@ -1154,10 +1224,20 @@ fn render_contextual_footer(
             )
         })
         .unwrap_or((end_x, None));
+    let flash_width = if footer_notice.is_some() {
+        mid_footer_flash_width(None, footer_notice)
+    } else if status.is_empty() && chord_mode == ChordMode::None {
+        mid_footer_flash_width(copied_lines, None)
+    } else {
+        0
+    };
+    let help_end = join_x.saturating_sub(flash_width);
     let (_, segments) = contextual_footer(chord_mode);
-    let x = render_footer_segments(buffer, x, area.y, join_x, segments);
-    // Chord help takes precedence over copy feedback so its commands stay contiguous.
-    if status.is_empty()
+    let x = render_footer_segments(buffer, x, area.y, help_end, segments);
+    // Mid-bar flash messages sit after chord help and before the join code.
+    if let Some(notice) = footer_notice {
+        render_footer_notice(buffer, x, area.y, join_x, notice);
+    } else if status.is_empty()
         && chord_mode == ChordMode::None
         && let Some(lines) = copied_lines
     {
@@ -1180,6 +1260,7 @@ fn render_shared_multi_pane(
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     status: &str,
     copied_lines: Option<usize>,
+    footer_notice: Option<&str>,
     join_code: Option<&str>,
 ) {
     let geometry = tui.geometry(frame.area());
@@ -1252,6 +1333,7 @@ fn render_shared_multi_pane(
             geometry.footer,
             status,
             copied_lines,
+            footer_notice,
             join_code,
             tui.chord_mode,
         );
@@ -1287,6 +1369,9 @@ fn render_shared_multi_pane(
             .border_style(Style::default().fg(border_color));
         let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
+        // The fixed VT grid may be smaller than this pane after layout reflow. Clear the full
+        // interior before drawing it so letterbox margins cannot retain cells from an older pane.
+        frame.render_widget(Clear, content);
         if let Some(screen) = screens.get(&pane_id) {
             let viewport = fixed_grid_viewport(content, pane.grid_rows, pane.grid_cols);
             let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
@@ -1822,6 +1907,7 @@ pub struct SharedLayoutRuntime {
     next_request_id: u64,
     status: String,
     copied_lines: Option<usize>,
+    footer_notice: Option<String>,
     join_code: Option<String>,
 }
 
@@ -1921,6 +2007,7 @@ impl SharedLayoutRuntime {
             next_request_id: 1,
             status: String::new(),
             copied_lines: None,
+            footer_notice: None,
             join_code,
         };
         value.refresh_local_views();
@@ -1960,6 +2047,7 @@ impl SharedLayoutRuntime {
         if self.tui.focused_pane() == previously_focused {
             return Ok(());
         }
+        self.footer_notice = None;
         let peer_id = self.control.peer_id();
         if let Some(pane) = self.local.get_mut(&previously_focused) {
             pane.release_controller(&peer_id)?;
@@ -1993,6 +2081,9 @@ impl SharedLayoutRuntime {
         let mut pending_escape = PendingEscape::default();
         loop {
             dirty |= self.drain()?;
+            if self.tui.expire_chord_mode(Instant::now()) {
+                dirty = true;
+            }
             if pending_escape.take_if_expired(Instant::now()) {
                 if self.handle_key(
                     KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -2019,6 +2110,7 @@ impl SharedLayoutRuntime {
                         &screens,
                         &self.status,
                         self.copied_lines,
+                        self.footer_notice.as_deref(),
                         self.join_code.as_deref(),
                     );
                 })?;
@@ -2504,7 +2596,7 @@ impl SharedLayoutRuntime {
                 let _ = pane.shutdown();
             }
         }
-        self.status = format!("layout request {request_id} rejected");
+        self.footer_notice = Some(format!("layout request {request_id} rejected"));
     }
 
     fn next_id(&mut self) -> u64 {
@@ -3315,13 +3407,14 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        ChordMode, ESC_PREFIX_WINDOW, HostControlEvent, HostPaneChannels, HostPaneRuntime,
-        KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
-        PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane,
-        UiIntent, VtScreen, contextual_footer, copied_line_count, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, is_chord_command, lease_allows_held_input,
-        member_label, mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
-        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FOOTER_ACCENT, FOOTER_BACKGROUND,
+        FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent, HostPaneChannels,
+        HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection,
+        PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
+        SharedLocalPane, UiIntent, VtScreen, contextual_footer, copied_line_count, encode_key,
+        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
+        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
+        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
@@ -3454,6 +3547,7 @@ mod tests {
         assert_eq!(runtime.tui.snapshot().panes.len(), 2);
         assert_eq!(runtime.tui.focused_pane(), 2);
 
+        runtime.footer_notice = Some(String::from("layout request 5 rejected"));
         let peer_id = runtime.control.peer_id();
         let pane = runtime.local.get_mut(&2).expect("created local pane");
         pane.lease = LeaseManager::new(peer_id, Instant::now());
@@ -3466,6 +3560,7 @@ mod tests {
                 )
                 .expect("focus change")
         );
+        assert_eq!(runtime.footer_notice, None);
         assert!(lease_rx.has_changed().expect("lease published immediately"));
         assert!(lease_rx.borrow_and_update().controller_peer_id.is_empty());
 
@@ -3598,7 +3693,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_footer_keeps_status_visible_when_a_join_code_is_present() {
+    fn shared_footer_places_rejection_notice_after_help() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -3607,46 +3702,38 @@ mod tests {
             &[(1, 1, 1)],
         );
         let tui = MultiPaneTui::new(snapshot).expect("layout");
-        let mut terminal = Terminal::new(TestBackend::new(80, 5)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(160, 5)).expect("terminal");
         terminal
             .draw(|frame| {
                 render_shared_multi_pane(
                     frame,
                     &tui,
                     &BTreeMap::new(),
-                    "layout request rejected",
+                    "",
                     None,
+                    Some("layout request 5 rejected"),
                     Some("TESTCODE"),
                 );
             })
             .expect("draw");
-        let footer = (0..80)
+        let footer = (0..160)
             .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
             .collect::<String>();
-        assert!(footer.starts_with("layout request rejected"));
-        assert!(footer.ends_with("join: p2pmux join TESTCODE"));
-        assert_eq!(terminal.backend().buffer()[(0, 4)].fg, Color::White);
-        let join_x = footer.find("join:").expect("join code rendered") as u16;
-        assert_eq!(terminal.backend().buffer()[(join_x, 4)].fg, Color::White);
-
-        let mut narrow_terminal = Terminal::new(TestBackend::new(20, 5)).expect("terminal");
-        narrow_terminal
-            .draw(|frame| {
-                render_shared_multi_pane(
-                    frame,
-                    &tui,
-                    &BTreeMap::new(),
-                    "layout request rejected",
-                    None,
-                    Some("TESTCODE"),
-                );
-            })
-            .expect("draw");
-        let narrow_footer = (0..20)
-            .map(|x| narrow_terminal.backend().buffer()[(x, 4)].symbol())
-            .collect::<String>();
-        assert!(narrow_footer.starts_with("layout request"));
-        assert!(!narrow_footer.contains("join"));
+        let help = footer.find("QUIT").expect("help rendered");
+        let notice = footer
+            .find("layout request 5 rejected")
+            .expect("rejection notice rendered");
+        let join = footer.find("join:").expect("join code rendered");
+        assert!(help < notice, "notice sits after helper text");
+        assert!(notice < join, "notice sits before join code");
+        assert_eq!(
+            terminal.backend().buffer()[(notice as u16, 4)].fg,
+            FOOTER_ORANGE
+        );
+        assert!(
+            !footer.trim_start().starts_with("layout request"),
+            "rejection no longer occupies the left status slot: {footer}"
+        );
     }
 
     #[test]
@@ -3693,7 +3780,8 @@ mod tests {
                     frame,
                     &tui,
                     &BTreeMap::new(),
-                    "layout request rejected",
+                    "waiting for current pane reservation",
+                    None,
                     None,
                     Some("TESTCODE"),
                 );
@@ -3706,7 +3794,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("layout request rejected"));
+        assert!(rendered.contains("waiting for current pane reservation"));
         assert!(rendered.contains("join: p2pmux join TESTCODE"));
     }
 
@@ -3723,7 +3811,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 5)).expect("terminal");
         terminal
             .draw(|frame| {
-                render_shared_multi_pane(frame, &tui, &BTreeMap::new(), "", Some(3), None);
+                render_shared_multi_pane(frame, &tui, &BTreeMap::new(), "", Some(3), None, None);
             })
             .expect("draw");
         let footer = (0..120)
@@ -4330,7 +4418,7 @@ mod tests {
             .draw(|frame| render_multi_pane(frame, &tui, &screens))
             .expect("render");
 
-        terminal.backend_mut().assert_cursor_position((5, 3));
+        terminal.backend_mut().assert_cursor_position((3, 2));
     }
 
     #[test]
@@ -4367,7 +4455,28 @@ mod tests {
     }
 
     #[test]
-    fn fixed_grid_view_is_centered_and_clipped_inside_pane_chrome() {
+    fn fixed_grid_view_is_top_left_and_clears_letterbox_margins() {
+        let mut previous_parser = vt100::Parser::new(3, 6, 0);
+        previous_parser.process(b"XXXXXX\r\nYYYYYY\r\nZZZZZZ");
+        let previous_tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 3, 6)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(8, 7)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_multi_pane(
+                    frame,
+                    &previous_tui,
+                    &BTreeMap::from([(1, previous_parser.screen())]),
+                )
+            })
+            .expect("initial render");
+
         let mut parser = vt100::Parser::new(1, 5, 0);
         parser.process(b"abcde");
         let tui = MultiPaneTui::new(layout(
@@ -4379,16 +4488,18 @@ mod tests {
         ))
         .expect("valid layout");
         let screens = BTreeMap::from([(1, parser.screen())]);
-        let mut terminal = Terminal::new(TestBackend::new(8, 7)).expect("test terminal");
 
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &screens))
             .expect("render");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(1, 3)].symbol(), "a");
-        assert_eq!(buffer[(4, 3)].symbol(), "d");
+        assert_eq!(buffer[(1, 2)].symbol(), "a");
+        assert_eq!(buffer[(5, 2)].symbol(), "e");
         assert_eq!(buffer[(7, 3)].symbol(), "│");
+        for (x, y) in [(6, 2), (1, 3), (6, 3), (1, 4), (6, 4)] {
+            assert_eq!(buffer[(x, y)].symbol(), " ", "letterbox cell ({x}, {y})");
+        }
     }
 
     #[test]
@@ -4583,6 +4694,35 @@ mod tests {
     }
 
     #[test]
+    fn sticky_chord_mode_expires_two_seconds_after_last_key() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let now = Instant::now();
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        tui.chord_last_activity = now.checked_sub(CHORD_IDLE_TIMEOUT);
+        assert!(tui.expire_chord_mode(now));
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(tui.chord_last_activity.is_none());
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        tui.chord_last_activity = now.checked_sub(Duration::from_millis(1_999));
+        assert!(!tui.expire_chord_mode(now));
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        tui.chord_last_activity = now.checked_sub(CHORD_IDLE_TIMEOUT);
+        assert!(tui.expire_chord_mode(now));
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
     fn forwarding_key_exits_sticky_pane_mode_once() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -4627,7 +4767,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <⌥> + <⇧> + <↑↓←→> FOCUS   <q> QUIT",
+                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
             ),
             (
                 ChordMode::Pane,
@@ -4673,25 +4813,22 @@ mod tests {
             assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
             let (_, segments) = contextual_footer(mode);
             let mut x = 0;
-            for (text, accent) in segments {
-                for key in text.chars() {
-                    if *accent {
-                        assert_eq!(
-                            footer[(x, 3)].fg,
-                            Color::Rgb(220, 50, 47),
-                            "mode: {mode:?}, key: {key}"
-                        );
-                        assert!(
-                            footer[(x, 3)].modifier.contains(Modifier::BOLD),
-                            "mode: {mode:?}, key: {key}"
-                        );
-                    } else {
-                        assert_eq!(footer[(x, 3)].fg, Color::White, "mode: {mode:?}");
-                        assert!(
-                            !footer[(x, 3)].modifier.contains(Modifier::BOLD),
-                            "mode: {mode:?}, text: {text}"
-                        );
+            for segment in segments {
+                let (text, fg, bg, bold) = match segment {
+                    FooterSegment::Text(text) => (*text, FOOTER_MUTED, FOOTER_BACKGROUND, false),
+                    FooterSegment::Key(text) => (*text, FOOTER_ACCENT, FOOTER_BACKGROUND, true),
+                    FooterSegment::OrangeKey(text) => {
+                        (*text, FOOTER_ORANGE, FOOTER_BACKGROUND, true)
                     }
+                };
+                for key in text.chars() {
+                    assert_eq!(footer[(x, 3)].fg, fg, "mode: {mode:?}, key: {key}");
+                    assert_eq!(footer[(x, 3)].bg, bg, "mode: {mode:?}, key: {key}");
+                    assert_eq!(
+                        footer[(x, 3)].modifier.contains(Modifier::BOLD),
+                        bold,
+                        "mode: {mode:?}, key: {key}"
+                    );
                     x += 1;
                 }
             }
