@@ -444,6 +444,17 @@ fn first_leaf(node: &Node) -> Option<PaneId> {
     }
 }
 
+fn visible_leaf_panes(node: &Node) -> Vec<PaneId> {
+    match node {
+        Node::Leaf { pane_id } => vec![*pane_id],
+        Node::Split { first, second, .. } => {
+            let mut panes = visible_leaf_panes(first);
+            panes.extend(visible_leaf_panes(second));
+            panes
+        }
+    }
+}
+
 fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<PaneId> {
     panes.iter().find_map(|(pane_id, rect)| {
         let inside = u32::from(column) >= u32::from(rect.x)
@@ -452,6 +463,35 @@ fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<Pane
             && u32::from(row) < u32::from(rect.y) + u32::from(rect.height);
         inside.then_some(*pane_id)
     })
+}
+
+fn pane_title(
+    index: usize,
+    host_peer_id: &[u8],
+    controller_peer_id: Option<&[u8]>,
+    members: &[crate::layout::Member],
+) -> String {
+    let control = match controller_peer_id {
+        Some([]) => "free".to_owned(),
+        Some(peer_id) => member_label(peer_id, members),
+        None => "…".to_owned(),
+    };
+    format!(
+        "Pane #{index}  host: {}  control: {control}",
+        member_label(host_peer_id, members)
+    )
+}
+
+fn pane_border_color(
+    controller_peer_id: Option<&[u8]>,
+    _controller_active: bool,
+    focused: bool,
+) -> Color {
+    match controller_peer_id {
+        Some([]) if focused => Color::White,
+        Some([]) | None => Color::DarkGray,
+        Some(_) => Color::Rgb(255, 69, 0),
+    }
 }
 
 fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
@@ -638,34 +678,28 @@ fn render_shared_multi_pane(
         );
     }
 
-    for (pane_id, rect) in geometry.panes {
+    let pane_ids = tui
+        .current_tab_layout()
+        .map(|tab| visible_leaf_panes(&tab.root))
+        .unwrap_or_default();
+    for (index, pane_id) in pane_ids.into_iter().enumerate() {
+        let Some(rect) = geometry.panes.get(&pane_id).copied() else {
+            continue;
+        };
         let pane = &tui.snapshot.panes[&pane_id];
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
-        let lease = match view.controller_peer_id.as_deref() {
-            Some(peer) if view.controller_active => {
-                format!(
-                    "ctrl:{} this user is typing",
-                    member_label(peer, &tui.snapshot.members)
-                )
-            }
-            Some(peer) => format!(
-                "ctrl:{} this user has control",
-                member_label(peer, &tui.snapshot.members)
-            ),
-            None => String::from("lease: waiting"),
-        };
-        let title = format!(
-            "{} host:{} {lease}",
-            if focused { "*" } else { " " },
-            member_label(&pane.host_peer_id, &tui.snapshot.members)
+        let title = pane_title(
+            index + 1,
+            &pane.host_peer_id,
+            view.controller_peer_id.as_deref(),
+            &tui.snapshot.members,
         );
-        let border_color = match view.controller_peer_id.as_ref() {
-            Some(_) if view.controller_active => Color::Rgb(255, 69, 0),
-            Some(_) => Color::Rgb(140, 91, 68),
-            None if focused => Color::Yellow,
-            None => Color::DarkGray,
-        };
+        let border_color = pane_border_color(
+            view.controller_peer_id.as_deref(),
+            view.controller_active,
+            focused,
+        );
         let block = Block::bordered()
             .title(title)
             .border_style(Style::default().fg(border_color));
@@ -2450,9 +2484,10 @@ mod tests {
         CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label, pane_wire_id,
-        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
-        render_shared_multi_pane, shared_footer_text,
+        grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label,
+        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, shared_footer_text,
+        visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2945,6 +2980,56 @@ mod tests {
     }
 
     #[test]
+    fn pane_title_uses_stable_leaf_order_and_control_state() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first: Box::new(Node::Leaf { pane_id: 8 }),
+                    second: Box::new(Node::Leaf { pane_id: 3 }),
+                },
+            }],
+            &[(3, 1, 1), (8, 1, 1)],
+        );
+        let mut members = snapshot.members.clone();
+        members[0].display_name = String::from("Host");
+        members.push(crate::layout::Member {
+            peer_id: b"guest".to_vec(),
+            endpoint_addr: b"guest-endpoint".to_vec(),
+            display_name: String::from("Guest"),
+        });
+
+        assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
+        assert_eq!(
+            pane_title(1, b"host", Some(b""), &members),
+            "Pane #1  host: Host  control: free"
+        );
+        assert_eq!(
+            pane_title(2, b"host", Some(b"guest"), &members),
+            "Pane #2  host: Host  control: Guest"
+        );
+        assert_eq!(
+            pane_title(2, b"host", None, &members),
+            "Pane #2  host: Host  control: …"
+        );
+    }
+
+    #[test]
+    fn free_panes_use_white_when_focused_and_dark_gray_when_unfocused() {
+        assert_eq!(pane_border_color(Some(b""), false, true), Color::White);
+        assert_eq!(pane_border_color(Some(b""), false, false), Color::DarkGray);
+        assert_eq!(
+            pane_border_color(Some(b"guest"), true, true),
+            Color::Rgb(255, 69, 0)
+        );
+        assert_ne!(
+            pane_border_color(Some(b"guest"), false, false),
+            Color::Rgb(140, 91, 68)
+        );
+    }
+
+    #[test]
     fn multi_pane_geometry_recursively_splits_the_content_area() {
         let tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let geometry = tui.geometry(Rect::new(0, 0, 80, 24));
@@ -3020,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_marks_focus_and_reports_host_and_lease() {
+    fn chrome_reports_the_pane_host_and_controller() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -3045,7 +3130,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(1, 1)].symbol(), "*");
+        assert_eq!(buffer[(1, 1)].symbol(), "P");
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
@@ -3077,8 +3162,8 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
 
-        assert!(title.contains("host:686f7374"));
-        assert!(!title.contains("host:66616b65"));
+        assert!(title.contains("host: 686f7374"));
+        assert!(!title.contains("host: 66616b65"));
     }
 
     #[test]
