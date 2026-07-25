@@ -909,9 +909,8 @@ fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     }
 }
 
-fn copied_status(text: &str) -> String {
-    let lines = text.split('\n').count().max(1);
-    format!("copied {lines} line{}", if lines == 1 { "" } else { "s" })
+fn copied_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
 }
 
 /// Renders layout chrome plus any currently available fixed-size VT screens.
@@ -920,7 +919,7 @@ pub fn render_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", None);
+    render_shared_multi_pane(frame, tui, screens, "", None, None);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -955,6 +954,27 @@ fn render_footer_segments(
     x
 }
 
+fn render_copy_feedback(buffer: &mut Buffer, mut x: u16, y: u16, end_x: u16, lines: usize) {
+    x = buffer
+        .set_stringn(
+            x,
+            y,
+            "  copied ",
+            usize::from(end_x.saturating_sub(x)),
+            Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+        )
+        .0;
+    buffer.set_stringn(
+        x,
+        y,
+        format!("{lines} line{}", if lines == 1 { "" } else { "s" }),
+        usize::from(end_x.saturating_sub(x)),
+        Style::default()
+            .fg(Color::Rgb(255, 69, 0))
+            .bg(FOOTER_BACKGROUND),
+    );
+}
+
 fn footer_suffix(text: &str, width: usize) -> &str {
     if width == 0 {
         return "";
@@ -970,6 +990,7 @@ fn render_contextual_footer(
     buffer: &mut Buffer,
     area: Rect,
     status: &str,
+    copied_lines: Option<usize>,
     join_code: Option<&str>,
     chord_mode: ChordMode,
 ) {
@@ -1007,7 +1028,14 @@ fn render_contextual_footer(
         })
         .unwrap_or((end_x, None));
     let (_, segments) = contextual_footer(chord_mode);
-    render_footer_segments(buffer, x, area.y, join_x, segments);
+    let x = render_footer_segments(buffer, x, area.y, join_x, segments);
+    // Chord help takes precedence over copy feedback so its commands stay contiguous.
+    if status.is_empty()
+        && chord_mode == ChordMode::None
+        && let Some(lines) = copied_lines
+    {
+        render_copy_feedback(buffer, x, area.y, join_x, lines);
+    }
     if let Some(text) = join_text {
         buffer.set_stringn(
             join_x,
@@ -1024,6 +1052,7 @@ fn render_shared_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     status: &str,
+    copied_lines: Option<usize>,
     join_code: Option<&str>,
 ) {
     let geometry = tui.geometry(frame.area());
@@ -1095,6 +1124,7 @@ fn render_shared_multi_pane(
             frame.buffer_mut(),
             geometry.footer,
             status,
+            copied_lines,
             join_code,
             tui.chord_mode,
         );
@@ -1629,6 +1659,7 @@ pub struct SharedLayoutRuntime {
     provisional: BTreeMap<u64, PaneId>,
     next_request_id: u64,
     status: String,
+    copied_lines: Option<usize>,
     join_code: Option<String>,
 }
 
@@ -1727,6 +1758,7 @@ impl SharedLayoutRuntime {
             provisional: BTreeMap::new(),
             next_request_id: 1,
             status: String::new(),
+            copied_lines: None,
             join_code,
         };
         value.refresh_local_views();
@@ -1775,6 +1807,7 @@ impl SharedLayoutRuntime {
                         &self.tui,
                         &screens,
                         &self.status,
+                        self.copied_lines,
                         self.join_code.as_deref(),
                     );
                 })?;
@@ -1889,8 +1922,14 @@ impl SharedLayoutRuntime {
             return;
         };
         match copy_to_macos_clipboard(&text) {
-            Ok(()) => self.status = copied_status(&text),
-            Err(error) => self.status = format!("clipboard copy failed: {error}"),
+            Ok(()) => {
+                self.status.clear();
+                self.copied_lines = Some(copied_line_count(&text));
+            }
+            Err(error) => {
+                self.copied_lines = None;
+                self.status = format!("clipboard copy failed: {error}");
+            }
         }
     }
 
@@ -3034,7 +3073,7 @@ mod tests {
         ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
         RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
-        VtScreen, contextual_footer, copied_status, encode_key, encode_paste, grid_for_pane,
+        VtScreen, contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
         initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
         render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
@@ -3304,6 +3343,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     "layout request rejected",
+                    None,
                     Some("TESTCODE"),
                 );
             })
@@ -3325,6 +3365,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     "layout request rejected",
+                    None,
                     Some("TESTCODE"),
                 );
             })
@@ -3381,6 +3422,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     "layout request rejected",
+                    None,
                     Some("TESTCODE"),
                 );
             })
@@ -3394,6 +3436,42 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("layout request rejected"));
         assert!(rendered.contains("join: p2pmux join TESTCODE"));
+    }
+
+    #[test]
+    fn shared_footer_places_copy_feedback_after_quit_with_a_red_line_count() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        );
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(120, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_shared_multi_pane(frame, &tui, &BTreeMap::new(), "", Some(3), None);
+            })
+            .expect("draw");
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
+            .collect::<String>();
+        let quit = footer.find("> QUIT").expect("quit help rendered");
+        let copied = footer
+            .find("copied 3 lines")
+            .expect("copy feedback rendered");
+        let count = footer.find("3 lines").expect("line count rendered");
+
+        assert!(copied > quit + "> QUIT".len());
+        assert_eq!(
+            terminal.backend().buffer()[(copied as u16, 4)].fg,
+            Color::White
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(count as u16, 4)].fg,
+            Color::Rgb(255, 69, 0)
+        );
     }
 
     #[test]
@@ -3750,10 +3828,10 @@ mod tests {
     }
 
     #[test]
-    fn copied_status_reports_the_number_of_newline_separated_lines() {
-        assert_eq!(copied_status("one line"), "copied 1 line");
-        assert_eq!(copied_status("first\nsecond\nthird"), "copied 3 lines");
-        assert_eq!(copied_status(""), "copied 1 line");
+    fn copied_line_count_reports_newline_separated_lines() {
+        assert_eq!(copied_line_count("one line"), 1);
+        assert_eq!(copied_line_count("first\nsecond\nthird"), 3);
+        assert_eq!(copied_line_count(""), 1);
     }
 
     #[test]
