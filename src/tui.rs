@@ -897,6 +897,7 @@ impl SharedRemotePane {
                 Ok(GuestEvent::Lease(lease)) => {
                     let controls_this_pane =
                         lease.controller_peer_id == self.pane.controls.peer_id();
+                    let pane_is_free = lease.controller_peer_id.is_empty();
                     self.lease = Some(LeaseState {
                         controller_peer_id: lease.controller_peer_id,
                         epoch: lease.lease_epoch,
@@ -905,7 +906,7 @@ impl SharedRemotePane {
                     self.last_lease = Instant::now();
                     if self.pending_control {
                         self.pending_control = false;
-                        if !controls_this_pane {
+                        if !controls_this_pane && !pane_is_free {
                             self.held_input.clear();
                         }
                     }
@@ -921,10 +922,10 @@ impl SharedRemotePane {
         }
         if !self.pending_control
             && !self.held_input.is_empty()
-            && self
-                .lease
-                .as_ref()
-                .is_some_and(|lease| lease.controller_peer_id == self.pane.controls.peer_id())
+            && self.lease.as_ref().is_some_and(|lease| {
+                lease.controller_peer_id == self.pane.controls.peer_id()
+                    || lease.controller_peer_id.is_empty()
+            })
         {
             let bytes = std::mem::take(&mut self.held_input);
             if self
@@ -2262,7 +2263,10 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     last_lease = Instant::now();
                     if pending_control && state.controller_peer_id == pane.controls.peer_id() {
                         pending_control = false;
-                    } else if pending_control && already_received_host_lease {
+                    } else if pending_control
+                        && already_received_host_lease
+                        && !state.controller_peer_id.is_empty()
+                    {
                         pending_control = false;
                         held_input.clear();
                     }
@@ -2284,7 +2288,8 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
         if !pending_control
             && !held_input.is_empty()
             && let Some(state) = lease.as_ref()
-            && state.controller_peer_id == pane.controls.peer_id()
+            && (state.controller_peer_id == pane.controls.peer_id()
+                || state.controller_peer_id.is_empty())
         {
             let bytes = std::mem::take(&mut held_input);
             if pane
@@ -2799,6 +2804,20 @@ mod tests {
         let lease = lease_rx.borrow_and_update().clone();
         assert!(lease.controller_peer_id.is_empty());
         assert_eq!(lease.epoch, 2);
+    }
+
+    #[test]
+    fn local_input_crossing_the_idle_timeout_reclaims_and_delivers_it() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        pane.lease =
+            LeaseManager::with_epoch_for_test(b"remote".to_vec(), 1, Instant::now() - IDLE_AFTER);
+
+        pane.input(b"first".to_vec())
+            .expect("first input at idle boundary");
+
+        assert_eq!(pane.lease.state().controller_peer_id, host_id);
+        assert_eq!(pane.lease.state().epoch, 3);
     }
 
     fn split_layout() -> LayoutSnapshot {
