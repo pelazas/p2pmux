@@ -1,7 +1,7 @@
 //! The fixed-grid local terminal renderer and input loop.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     io,
     time::{Duration, Instant},
@@ -28,9 +28,19 @@ use ratatui::{
 use crate::{
     layout::{Axis, LayoutError, LayoutSnapshot, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
+    protocol::{
+        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRequest, PaneDescriptor, PaneFailed,
+        PaneReady, SplitAxis,
+    },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, ScreenFrame},
-    session::{GuestEvent, GuestPane, HostControlEvent},
+    session::{
+        CoordinatorResponse, GuestEvent, GuestPane, HostControlEvent, HostPaneChannels,
+        LayoutControlEvent, LayoutControlQueueError, PaneLayoutReconciler, PaneServer,
+        SharedLayoutHost, SharedLayoutMember, layout_snapshot_from_state, pane_wire_id,
+        subscribe_pane,
+    },
+    transport::Transport,
 };
 
 /// Kept as the module's public marker from the scaffold.
@@ -570,6 +580,922 @@ pub fn render_multi_pane(
         } else if !view.ready {
             frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), inner);
         }
+    }
+}
+
+/// One fixed-grid PTY owned by this process. Its watch channels are registered with the pane
+/// service before the layout coordinator is told that the pane is ready.
+pub struct SharedLocalPane {
+    pane_id: PaneId,
+    host: PtyHost,
+    screen: HostScreen,
+    lease: LeaseManager,
+    host_peer_id: Vec<u8>,
+    screen_tx: watch::Sender<ScreenFrame>,
+    lease_tx: watch::Sender<LeaseState>,
+    control_tx: mpsc::Sender<HostControlEvent>,
+    control_rx: mpsc::Receiver<HostControlEvent>,
+}
+
+impl SharedLocalPane {
+    pub fn spawn(
+        pane_id: PaneId,
+        grid_rows: u16,
+        grid_cols: u16,
+        host_peer_id: Vec<u8>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let size = PtySize {
+            rows: grid_rows,
+            cols: grid_cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let screen = HostScreen::new(grid_rows, grid_cols)?;
+        let (screen_tx, _) = watch::channel(screen.current_frame().clone());
+        let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
+        let (lease_tx, _) = watch::channel(lease.state().clone());
+        let (control_tx, control_rx) = mpsc::channel(256);
+        Ok(Self {
+            pane_id,
+            host: PtyHost::spawn_default_shell(size)?,
+            screen,
+            lease,
+            host_peer_id,
+            screen_tx,
+            lease_tx,
+            control_tx,
+            control_rx,
+        })
+    }
+
+    pub fn channels(&self) -> HostPaneChannels {
+        HostPaneChannels {
+            pane_id: pane_wire_id(self.pane_id),
+            host_peer_id: self.host_peer_id.clone(),
+            screen_rx: self.screen_tx.subscribe(),
+            lease_rx: self.lease_tx.subscribe(),
+            control_tx: self.control_tx.clone(),
+        }
+    }
+
+    fn view_state(&self) -> PaneViewState {
+        PaneViewState {
+            ready: true,
+            controller_peer_id: Some(self.lease.state().controller_peer_id.clone()),
+            controller_active: !self.lease.state().is_idle_at(Instant::now()),
+        }
+    }
+
+    fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
+        let mut changed = false;
+        while let Ok(event) = self.control_rx.try_recv() {
+            match event {
+                HostControlEvent::Input { peer_id, input } => {
+                    if let LeaseDecision::AcceptInput(bytes) =
+                        self.lease
+                            .input(&peer_id, input.lease_epoch, input.data, Instant::now())
+                    {
+                        self.host.write_input(&bytes)?;
+                    }
+                }
+                HostControlEvent::TakeControl { peer_id, request } => {
+                    let decision = if request.force {
+                        self.lease.force_take_control(
+                            peer_id,
+                            request.known_lease_epoch,
+                            Instant::now(),
+                        )?
+                    } else {
+                        self.lease.take_control(
+                            peer_id,
+                            request.known_lease_epoch,
+                            Instant::now(),
+                        )?
+                    };
+                    if let LeaseDecision::Publish(state) = decision {
+                        self.lease_tx.send_replace(state);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let started = Instant::now();
+        for _ in 0..64 {
+            if started.elapsed() >= Duration::from_millis(4) {
+                break;
+            }
+            let Some(bytes) = self.host.try_read_output()? else {
+                break;
+            };
+            let frame = self.screen.process_pty(&bytes)?;
+            self.screen_tx.send_replace(frame);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn take_control(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.lease.state().controller_peer_id != self.host_peer_id
+            && let LeaseDecision::Publish(state) = self.lease.force_take_control(
+                self.host_peer_id.clone(),
+                self.lease.state().epoch,
+                Instant::now(),
+            )?
+        {
+            self.lease_tx.send_replace(state);
+        }
+        Ok(())
+    }
+
+    fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let epoch = self.lease.state().epoch;
+        let decision = if self.lease.state().controller_peer_id == self.host_peer_id {
+            self.lease
+                .input(&self.host_peer_id, epoch, bytes.clone(), Instant::now())
+        } else {
+            self.lease
+                .take_control(self.host_peer_id.clone(), epoch, Instant::now())?
+        };
+        match decision {
+            LeaseDecision::AcceptInput(bytes) => self.host.write_input(&bytes)?,
+            LeaseDecision::Publish(state) => {
+                self.lease_tx.send_replace(state);
+                self.host.write_input(&bytes)?;
+            }
+            LeaseDecision::RejectStaleInput
+            | LeaseDecision::RejectStaleRequest
+            | LeaseDecision::RejectActiveController => {}
+        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
+        self.host.shutdown()
+    }
+}
+
+struct SharedRemotePane {
+    pane: GuestPane,
+    screen: GuestScreen,
+    lease: Option<LeaseState>,
+    last_lease: Instant,
+    pending_control: bool,
+    held_input: Vec<u8>,
+}
+
+impl SharedRemotePane {
+    fn new(pane: GuestPane) -> Self {
+        Self {
+            pane,
+            screen: GuestScreen::new(),
+            lease: None,
+            last_lease: Instant::now(),
+            pending_control: false,
+            held_input: Vec::new(),
+        }
+    }
+
+    fn view_state(&self) -> PaneViewState {
+        PaneViewState {
+            ready: self.screen.screen().is_some() && self.lease.is_some(),
+            controller_peer_id: self
+                .lease
+                .as_ref()
+                .map(|lease| lease.controller_peer_id.clone()),
+            controller_active: self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| !lease.is_idle_at(Instant::now())),
+        }
+    }
+
+    fn drain(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.pane.events.try_recv() {
+                Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
+                    changed |= self
+                        .screen
+                        .apply_snapshot(snapshot.sequence, &snapshot.screen)
+                        .is_ok();
+                }
+                Ok(GuestEvent::ScreenDelta(delta)) => {
+                    changed |= self
+                        .screen
+                        .apply_delta(delta.base_sequence, delta.sequence, &delta.changes)
+                        .is_ok();
+                }
+                Ok(GuestEvent::InitialLease(lease)) | Ok(GuestEvent::Lease(lease)) => {
+                    self.lease = Some(LeaseState {
+                        controller_peer_id: lease.controller_peer_id,
+                        epoch: lease.lease_epoch,
+                        last_activity: Instant::now(),
+                    });
+                    self.last_lease = Instant::now();
+                    self.pending_control = false;
+                    changed = true;
+                }
+                Ok(GuestEvent::ScreenGap { .. }) => {}
+                Ok(GuestEvent::Disconnected)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return true,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+        if !self.pending_control
+            && !self.held_input.is_empty()
+            && self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.controller_peer_id == self.pane.controls.peer_id())
+        {
+            let bytes = std::mem::take(&mut self.held_input);
+            if self
+                .pane
+                .controls
+                .try_input(
+                    self.lease.as_ref().expect("checked lease").epoch,
+                    bytes.clone(),
+                )
+                .is_err()
+            {
+                self.held_input = bytes;
+            }
+        }
+        changed
+    }
+
+    fn take_control(&mut self) {
+        if let Some(lease) = self.lease.as_ref()
+            && lease.controller_peer_id != self.pane.controls.peer_id()
+        {
+            let _ = self.pane.controls.try_take_control(lease.epoch, true);
+        }
+    }
+
+    fn input(&mut self, bytes: Vec<u8>) {
+        let Some(lease) = self.lease.as_ref() else {
+            return;
+        };
+        if lease.controller_peer_id == self.pane.controls.peer_id() {
+            if self.held_input.is_empty() {
+                let _ = self.pane.controls.try_input(lease.epoch, bytes);
+            } else {
+                self.held_input.extend_from_slice(&bytes);
+            }
+        } else if self.last_lease.elapsed() >= IDLE_AFTER && !self.pending_control {
+            self.held_input.extend_from_slice(&bytes);
+            self.pending_control = self
+                .pane
+                .controls
+                .try_take_control(lease.epoch, false)
+                .is_ok();
+            if !self.pending_control {
+                self.held_input.clear();
+            }
+        }
+    }
+}
+
+enum SharedControl {
+    Host(SharedLayoutHost),
+    Member(SharedLayoutMember),
+}
+
+impl SharedControl {
+    fn peer_id(&self) -> Vec<u8> {
+        match self {
+            Self::Host(host) => host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+            Self::Member(member) => member.peer_id.clone(),
+        }
+    }
+
+    fn try_request(&self, request: LayoutRequest) -> Result<Option<CoordinatorResponse>, String> {
+        match self {
+            Self::Host(host) => host
+                .handle_local_request(request)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_request(request)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    fn try_ready(&self, ready: PaneReady) -> Result<Option<CoordinatorResponse>, String> {
+        match self {
+            Self::Host(host) => host
+                .handle_local_ready(ready)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_ready(ready)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    fn try_failed(&self, failed: PaneFailed) -> Result<(), String> {
+        match self {
+            Self::Host(host) => host
+                .handle_local_failed(failed)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member.try_failed(failed).map_err(layout_queue_message),
+        }
+    }
+
+    fn try_event(&mut self, current_revision: u64) -> Option<LayoutControlEvent> {
+        match self {
+            // The coordinator is the authority, so it does not receive its own broadcasts. Poll
+            // its tiny in-memory snapshot to observe joins, departures, and member-originated
+            // commits without adding a second internal control stream.
+            Self::Host(host) => host
+                .session_snapshot()
+                .ok()
+                .filter(|snapshot| {
+                    snapshot
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.revision > current_revision)
+                })
+                .map(LayoutControlEvent::Snapshot),
+            Self::Member(member) => member.events.try_recv().ok(),
+        }
+    }
+
+    async fn shutdown(self) {
+        match self {
+            Self::Host(host) => host.close().await,
+            Self::Member(member) => member.shutdown().await,
+        }
+    }
+}
+
+fn layout_queue_message(error: LayoutControlQueueError) -> String {
+    match error {
+        LayoutControlQueueError::Full => String::from("layout request queue is busy"),
+        LayoutControlQueueError::Closed => String::from("layout coordinator disconnected"),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingCreate {
+    request_id: u64,
+    base_revision: u64,
+    grid_rows: u16,
+    grid_cols: u16,
+}
+
+/// Blocking terminal runtime for the shared layout. Network tasks keep streams independent while
+/// this loop only drains ready channels and renders the current fixed grids.
+pub struct SharedLayoutRuntime {
+    tui: MultiPaneTui,
+    control: SharedControl,
+    panes: PaneServer,
+    reconciler: PaneLayoutReconciler,
+    transport: Transport,
+    session_id: Vec<u8>,
+    runtime: tokio::runtime::Handle,
+    local: BTreeMap<PaneId, SharedLocalPane>,
+    remote: BTreeMap<PaneId, SharedRemotePane>,
+    pending_subscriptions: BTreeSet<PaneId>,
+    subscription_tx: tokio::sync::mpsc::UnboundedSender<(PaneId, Result<GuestPane, String>)>,
+    subscription_rx: tokio::sync::mpsc::UnboundedReceiver<(PaneId, Result<GuestPane, String>)>,
+    pending_create: Option<PendingCreate>,
+    provisional: BTreeMap<u64, PaneId>,
+    next_request_id: u64,
+    status: String,
+    join_code: Option<String>,
+}
+
+impl SharedLayoutRuntime {
+    pub fn host(
+        host: SharedLayoutHost,
+        panes: PaneServer,
+        snapshot: LayoutSnapshot,
+        initial: SharedLocalPane,
+        join_code: String,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, Box<dyn Error>> {
+        let transport = host.transport();
+        Self::new(
+            SharedControl::Host(host),
+            panes,
+            transport,
+            snapshot,
+            Some(initial),
+            Some(join_code),
+            runtime,
+        )
+    }
+
+    pub fn member(
+        member: SharedLayoutMember,
+        panes: PaneServer,
+        session_id: Vec<u8>,
+        snapshot: LayoutSnapshot,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, Box<dyn Error>> {
+        let transport = member.transport();
+        let mut value = Self::new(
+            SharedControl::Member(member),
+            panes,
+            transport,
+            snapshot,
+            None,
+            None,
+            runtime,
+        )?;
+        value.session_id = session_id;
+        Ok(value)
+    }
+
+    /// Builds a member runtime from the first authoritative snapshot. Applying the state before
+    /// entering raw-terminal mode both establishes the direct-pane admission roster and starts
+    /// nonblocking subscriptions for panes hosted by other members.
+    pub fn member_from_state(
+        member: SharedLayoutMember,
+        panes: PaneServer,
+        session_id: Vec<u8>,
+        state: crate::protocol::LayoutState,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, Box<dyn Error>> {
+        let snapshot = layout_snapshot_from_state(&state)
+            .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
+        let mut value = Self::member(member, panes, session_id, snapshot, runtime)?;
+        value.apply_layout_state(&state)?;
+        Ok(value)
+    }
+
+    fn new(
+        control: SharedControl,
+        panes: PaneServer,
+        transport: Transport,
+        snapshot: LayoutSnapshot,
+        initial: Option<SharedLocalPane>,
+        join_code: Option<String>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, Box<dyn Error>> {
+        let (subscription_tx, subscription_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut local = BTreeMap::new();
+        if let Some(initial) = initial {
+            local.insert(initial.pane_id, initial);
+        }
+        let session_id = Vec::new();
+        let reconciler = PaneLayoutReconciler::new(panes.clone());
+        let mut value = Self {
+            tui: MultiPaneTui::new(snapshot)
+                .map_err(|error| io::Error::other(format!("invalid layout: {error:?}")))?,
+            control,
+            panes,
+            reconciler,
+            transport,
+            session_id,
+            runtime,
+            local,
+            remote: BTreeMap::new(),
+            pending_subscriptions: BTreeSet::new(),
+            subscription_tx,
+            subscription_rx,
+            pending_create: None,
+            provisional: BTreeMap::new(),
+            next_request_id: 1,
+            status: String::new(),
+            join_code,
+        };
+        value.refresh_local_views();
+        Ok(value)
+    }
+
+    pub fn set_session_id(&mut self, session_id: Vec<u8>) {
+        self.session_id = session_id;
+    }
+
+    pub fn run(mut self) -> Result<(), Box<dyn Error>> {
+        let (cols, rows) = terminal::size()?;
+        let mut guard = TerminalGuard::new();
+        enable_raw_mode()?;
+        guard.raw_mode = true;
+        guard.alternate_screen = true;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        guard.bracketed_paste = true;
+        execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
+            },
+        )?;
+        let mut dirty = true;
+        loop {
+            dirty |= self.drain()?;
+            if dirty {
+                let mut screens = BTreeMap::new();
+                for (pane_id, pane) in &self.local {
+                    screens.insert(*pane_id, pane.screen.screen());
+                }
+                for (pane_id, pane) in &self.remote {
+                    if let Some(screen) = pane.screen.screen() {
+                        screens.insert(*pane_id, screen);
+                    }
+                }
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    render_multi_pane(frame, &self.tui, &screens);
+                    if !self.status.is_empty() && area.height > 0 {
+                        frame.buffer_mut().set_string(
+                            area.x,
+                            area.bottom().saturating_sub(1),
+                            &self.status,
+                            Style::default().fg(Color::Red),
+                        );
+                    }
+                    if let Some(join_code) = &self.join_code
+                        && area.height > 0
+                    {
+                        let text = format!("join: p2pmux join {join_code}");
+                        frame.buffer_mut().set_string(
+                            area.x,
+                            area.bottom().saturating_sub(1),
+                            text,
+                            Style::default().fg(Color::DarkGray),
+                        );
+                    }
+                })?;
+                dirty = false;
+            }
+            if !event::poll(Duration::from_millis(16))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
+                        KeyHandling::Quit => break,
+                        KeyHandling::TakeControl => self.take_control()?,
+                        KeyHandling::Consumed(intents) => {
+                            for intent in intents {
+                                self.handle_intent(intent)?;
+                            }
+                        }
+                        KeyHandling::Forward => self.forward_key(key)?,
+                    }
+                    dirty = true;
+                }
+                Event::Paste(text) => {
+                    self.forward_paste(&text)?;
+                    dirty = true;
+                }
+                Event::Resize(_, _) => dirty = true,
+                _ => {}
+            }
+        }
+        self.shutdown();
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
+        let mut changed = false;
+        while let Some(event) = self.control.try_event(self.tui.snapshot().revision) {
+            self.handle_control_event(event)?;
+            changed = true;
+        }
+        while let Ok((pane_id, result)) = self.subscription_rx.try_recv() {
+            self.pending_subscriptions.remove(&pane_id);
+            match result {
+                Ok(pane) => {
+                    self.remote.insert(pane_id, SharedRemotePane::new(pane));
+                }
+                Err(error) => self.status = format!("pane {pane_id}: {error}"),
+            }
+            changed = true;
+        }
+        for pane in self.local.values_mut() {
+            changed |= pane.drain()?;
+        }
+        for pane in self.remote.values_mut() {
+            changed |= pane.drain();
+        }
+        self.refresh_local_views();
+        Ok(changed)
+    }
+
+    fn refresh_local_views(&mut self) {
+        for (pane_id, pane) in &self.local {
+            self.tui.set_pane_view(*pane_id, pane.view_state());
+        }
+        for (pane_id, pane) in &self.remote {
+            self.tui.set_pane_view(*pane_id, pane.view_state());
+        }
+    }
+
+    fn handle_control_event(&mut self, event: LayoutControlEvent) -> Result<(), Box<dyn Error>> {
+        self.reconciler.apply(&event)?;
+        match event {
+            LayoutControlEvent::Snapshot(snapshot) => {
+                self.apply_layout_state(snapshot.state.as_ref().ok_or("missing layout state")?)?;
+            }
+            LayoutControlEvent::Commit(commit) => {
+                self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
+            }
+            LayoutControlEvent::Reservation(reservation) => self.accept_reservation(reservation)?,
+            LayoutControlEvent::Reject(reject) => self.reject_request(reject.request_id),
+            LayoutControlEvent::Disconnected => {
+                self.status = String::from("layout coordinator disconnected")
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_layout_state(
+        &mut self,
+        state: &crate::protocol::LayoutState,
+    ) -> Result<(), Box<dyn Error>> {
+        let snapshot = layout_snapshot_from_state(state)
+            .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
+        let current_ids = snapshot.panes.keys().copied().collect::<BTreeSet<_>>();
+        let local_ids = self.local.keys().copied().collect::<Vec<_>>();
+        for pane_id in local_ids {
+            if !current_ids.contains(&pane_id) {
+                let _ = self.panes.remove_local_pane(pane_id)?;
+                if let Some(mut pane) = self.local.remove(&pane_id) {
+                    pane.shutdown()?;
+                }
+            }
+        }
+        let remote_ids = self.remote.keys().copied().collect::<Vec<_>>();
+        for pane_id in remote_ids {
+            if !current_ids.contains(&pane_id)
+                && let Some(pane) = self.remote.remove(&pane_id)
+            {
+                self.runtime.block_on(pane.pane.shutdown());
+            }
+        }
+        self.tui
+            .apply_snapshot(snapshot.clone())
+            .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
+        let me = self.control.peer_id();
+        for pane in state.panes.iter().filter(|pane| pane.host_peer_id != me) {
+            if self.remote.contains_key(&pane.pane_id)
+                || self.pending_subscriptions.contains(&pane.pane_id)
+            {
+                continue;
+            }
+            let endpoint = state
+                .members
+                .iter()
+                .find(|member| member.peer_id == pane.host_peer_id)
+                .and_then(|member| serde_json::from_slice(&member.endpoint_addr).ok());
+            let Some(endpoint) = endpoint else {
+                self.status = format!("pane {} has no usable host address", pane.pane_id);
+                continue;
+            };
+            self.pending_subscriptions.insert(pane.pane_id);
+            let tx = self.subscription_tx.clone();
+            let transport = self.transport.clone();
+            let session_id = self.session_id.clone();
+            let descriptor = pane.clone();
+            let pane_id = pane.pane_id;
+            self.runtime.spawn(async move {
+                let result = subscribe_pane(transport, session_id, endpoint, descriptor)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send((pane_id, result));
+            });
+        }
+        self.refresh_local_views();
+        Ok(())
+    }
+
+    fn handle_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
+        match intent {
+            UiIntent::CreatePane {
+                target_pane_id,
+                axis,
+                grid_rows,
+                grid_cols,
+            } => {
+                self.begin_create(Some((target_pane_id, axis)), grid_rows, grid_cols)?;
+            }
+            UiIntent::CreateTab {
+                grid_rows,
+                grid_cols,
+            } => {
+                self.begin_create(None, grid_rows, grid_cols)?;
+            }
+            UiIntent::DeletePane { pane_id } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision: self.tui.snapshot().revision,
+                    create_pane: None,
+                    delete_pane: Some(DeletePane { pane_id }),
+                    create_tab: None,
+                    delete_tab: None,
+                })?
+            }
+            UiIntent::DeleteTab { tab_id } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision: self.tui.snapshot().revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: Some(DeleteTab { tab_id }),
+                })?
+            }
+            UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn begin_create(
+        &mut self,
+        pane: Option<(PaneId, Axis)>,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.pending_create.is_some() {
+            self.status = String::from("waiting for current pane reservation");
+            return Ok(());
+        }
+        let request_id = self.next_id();
+        let base_revision = self.tui.snapshot().revision;
+        self.pending_create = Some(PendingCreate {
+            request_id,
+            base_revision,
+            grid_rows,
+            grid_cols,
+        });
+        self.send_request(LayoutRequest {
+            request_id,
+            base_revision,
+            create_pane: pane.map(|(target_pane_id, axis)| CreatePane {
+                target_pane_id,
+                axis: Some(match axis {
+                    Axis::LeftRight => SplitAxis::LeftRight as i32,
+                    Axis::TopBottom => SplitAxis::TopBottom as i32,
+                }),
+                grid_rows: u32::from(grid_rows),
+                grid_cols: u32::from(grid_cols),
+            }),
+            delete_pane: None,
+            create_tab: pane.is_none().then_some(CreateTab {
+                grid_rows: u32::from(grid_rows),
+                grid_cols: u32::from(grid_cols),
+            }),
+            delete_tab: None,
+        })
+    }
+
+    fn send_request(&mut self, request: LayoutRequest) -> Result<(), Box<dyn Error>> {
+        if let Some(response) = self.control.try_request(request)? {
+            match response {
+                CoordinatorResponse::Reservation(reservation) => {
+                    self.accept_reservation(reservation)?
+                }
+                CoordinatorResponse::Commit(commit) => {
+                    self.handle_control_event(LayoutControlEvent::Commit(commit))?
+                }
+                CoordinatorResponse::Reject(reject) => self.reject_request(reject.request_id),
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_reservation(
+        &mut self,
+        reservation: crate::protocol::PaneReservation,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(pending) = self.pending_create.take() else {
+            self.status = String::from("unexpected pane reservation");
+            return Ok(());
+        };
+        let host_peer_id = self.control.peer_id();
+        let pane = match SharedLocalPane::spawn(
+            reservation.pane_id,
+            pending.grid_rows,
+            pending.grid_cols,
+            host_peer_id.clone(),
+        ) {
+            Ok(pane) => pane,
+            Err(error) => {
+                let _ = self.control.try_failed(PaneFailed {
+                    reservation_id: reservation.reservation_id,
+                    request_id: pending.request_id,
+                    base_revision: pending.base_revision,
+                });
+                self.status = format!("pane spawn failed: {error}");
+                return Ok(());
+            }
+        };
+        let descriptor = PaneDescriptor {
+            pane_id: reservation.pane_id,
+            host_peer_id,
+            grid_rows: u32::from(pending.grid_rows),
+            grid_cols: u32::from(pending.grid_cols),
+        };
+        if let Err(error) = self.panes.register_local_pane(descriptor, pane.channels()) {
+            let _ = self.control.try_failed(PaneFailed {
+                reservation_id: reservation.reservation_id,
+                request_id: pending.request_id,
+                base_revision: pending.base_revision,
+            });
+            self.status = format!("pane registration failed: {error}");
+            return Ok(());
+        }
+        self.provisional
+            .insert(pending.request_id, reservation.pane_id);
+        self.local.insert(reservation.pane_id, pane);
+        if let Some(tab_id) = reservation.tab_id {
+            self.tui.select_created_tab(tab_id);
+        }
+        match self.control.try_ready(PaneReady {
+            reservation_id: reservation.reservation_id,
+            request_id: pending.request_id,
+            base_revision: pending.base_revision,
+        })? {
+            Some(CoordinatorResponse::Commit(commit)) => {
+                self.handle_control_event(LayoutControlEvent::Commit(commit))?
+            }
+            Some(CoordinatorResponse::Reject(reject)) => self.reject_request(reject.request_id),
+            Some(CoordinatorResponse::Reservation(_)) | None => {}
+        }
+        Ok(())
+    }
+
+    fn reject_request(&mut self, request_id: u64) {
+        self.pending_create = self
+            .pending_create
+            .filter(|pending| pending.request_id != request_id);
+        if let Some(pane_id) = self.provisional.remove(&request_id) {
+            let _ = self.panes.remove_local_pane(pane_id);
+            if let Some(mut pane) = self.local.remove(&pane_id) {
+                let _ = pane.shutdown();
+            }
+        }
+        self.status = format!("layout request {request_id} rejected");
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1).max(1);
+        id
+    }
+
+    fn take_control(&mut self) -> Result<(), Box<dyn Error>> {
+        let pane_id = self.tui.focused_pane();
+        if let Some(pane) = self.local.get_mut(&pane_id) {
+            pane.take_control()?;
+        }
+        if let Some(pane) = self.remote.get_mut(&pane_id) {
+            pane.take_control();
+        }
+        Ok(())
+    }
+
+    fn forward_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
+        let pane_id = self.tui.focused_pane();
+        if let Some(pane) = self.local.get_mut(&pane_id)
+            && let Some(bytes) = encode_key(key, pane.screen.screen())
+        {
+            pane.input(bytes)?;
+        }
+        if let Some(pane) = self.remote.get_mut(&pane_id)
+            && let Some(screen) = pane.screen.screen()
+            && let Some(bytes) = encode_key(key, screen)
+        {
+            pane.input(bytes);
+        }
+        Ok(())
+    }
+
+    fn forward_paste(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
+        let pane_id = self.tui.focused_pane();
+        if let Some(pane) = self.local.get_mut(&pane_id) {
+            pane.input(encode_paste(text, pane.screen.screen().bracketed_paste()))?;
+        }
+        if let Some(pane) = self.remote.get_mut(&pane_id)
+            && let Some(screen) = pane.screen.screen()
+        {
+            pane.input(encode_paste(text, screen.bracketed_paste()));
+        }
+        Ok(())
+    }
+
+    fn shutdown(mut self) {
+        for (_, mut pane) in std::mem::take(&mut self.local) {
+            let _ = self.panes.remove_local_pane(pane.pane_id);
+            let _ = pane.shutdown();
+        }
+        for (_, pane) in std::mem::take(&mut self.remote) {
+            self.runtime.block_on(pane.pane.shutdown());
+        }
+        self.runtime.block_on(self.control.shutdown());
     }
 }
 

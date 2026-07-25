@@ -23,7 +23,7 @@ use tokio::{
 };
 
 use crate::{
-    layout::{Axis, LayoutError, LayoutSnapshot, Node, SessionState},
+    layout::{Axis, LayoutError, LayoutSnapshot, Member, Node, Pane, SessionState, Tab},
     lease::LeaseState,
     protocol::{
         ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
@@ -583,6 +583,73 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
                 root: Some(protocol_node(tab.root)),
             })
             .collect(),
+    }
+}
+
+/// Converts an authoritative wire layout into the I/O-free model consumed by the renderer.
+///
+/// The conversion deliberately reuses the same validation as coordinator state so a malformed
+/// peer message can never become a partially rendered local layout.
+pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot, LayoutError> {
+    let members = state
+        .members
+        .iter()
+        .map(|member| Member {
+            peer_id: member.peer_id.clone(),
+            endpoint_addr: member.endpoint_addr.clone(),
+        })
+        .collect();
+    let panes = state
+        .panes
+        .iter()
+        .map(|pane| {
+            let (grid_rows, grid_cols) = protocol_grid(pane.grid_rows, pane.grid_cols)?;
+            Ok((
+                pane.pane_id,
+                Pane {
+                    pane_id: pane.pane_id,
+                    host_peer_id: pane.host_peer_id.clone(),
+                    grid_rows,
+                    grid_cols,
+                },
+            ))
+        })
+        .collect::<Result<_, LayoutError>>()?;
+    let tabs = state
+        .tabs
+        .iter()
+        .map(|tab| {
+            Ok(Tab {
+                tab_id: tab.tab_id,
+                root: layout_node_from_protocol(
+                    tab.root.as_ref().ok_or(LayoutError::InvalidSnapshot)?,
+                )?,
+            })
+        })
+        .collect::<Result<_, LayoutError>>()?;
+    let snapshot = LayoutSnapshot {
+        revision: state.revision,
+        members,
+        tabs,
+        panes,
+    };
+    SessionState::validate_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn layout_node_from_protocol(node: &LayoutNode) -> Result<Node, LayoutError> {
+    match (&node.leaf_pane_id, &node.split) {
+        (Some(pane_id), None) if *pane_id != 0 => Ok(Node::Leaf { pane_id: *pane_id }),
+        (None, Some(split)) => Ok(Node::Split {
+            axis: protocol_axis(split.axis)?,
+            first: Box::new(layout_node_from_protocol(
+                split.first.as_ref().ok_or(LayoutError::InvalidSnapshot)?,
+            )?),
+            second: Box::new(layout_node_from_protocol(
+                split.second.as_ref().ok_or(LayoutError::InvalidSnapshot)?,
+            )?),
+        }),
+        _ => Err(LayoutError::InvalidSnapshot),
     }
 }
 
@@ -1588,6 +1655,11 @@ impl SharedLayoutMember {
         PaneServer::new(self.transport.clone(), session_id)
     }
 
+    /// The endpoint that owns this member's locally hosted panes and outbound subscriptions.
+    pub fn transport(&self) -> Transport {
+        self.transport.clone()
+    }
+
     pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
         self.outbound
             .try_send(LayoutClientMessage::Request(request))
@@ -1665,6 +1737,81 @@ impl SharedLayoutHost {
 
     pub fn ticket(&self) -> &JoinTicket {
         self.host.ticket()
+    }
+
+    pub fn address_ready(&self) -> bool {
+        self.host.address_ready()
+    }
+
+    /// Cloned endpoint used for direct subscriptions to panes owned by other members.
+    pub fn transport(&self) -> Transport {
+        self.host.transport.clone()
+    }
+
+    /// Returns the coordinator's current full layout for its own local renderer.
+    pub fn session_snapshot(&self) -> Result<SessionSnapshot, SessionError> {
+        self.coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .session_snapshot()
+            .map_err(|_| SessionError::InvalidPostWelcome)
+    }
+
+    /// Applies a request made by the coordinator process itself. Remote peers receive the same
+    /// commit as they would for a member-originated request; the caller applies the returned
+    /// response to its own renderer.
+    pub fn handle_local_request(
+        &self,
+        request: LayoutRequest,
+    ) -> Result<CoordinatorResponse, SessionError> {
+        let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
+        let response = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .handle_request(&peer_id, request);
+        self.publish_local_response(&response)?;
+        Ok(response)
+    }
+
+    /// Commits a coordinator-local reservation only after its PTY has been registered.
+    pub fn handle_local_ready(
+        &self,
+        ready: PaneReady,
+    ) -> Result<CoordinatorResponse, SessionError> {
+        let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
+        let response = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .handle_pane_ready(&peer_id, ready);
+        self.publish_local_response(&response)?;
+        Ok(response)
+    }
+
+    /// Cancels a failed coordinator-local spawn and makes the corresponding rejection available
+    /// to the local runtime without advertising an unready pane.
+    pub fn handle_local_failed(&self, failed: PaneFailed) -> Result<LayoutReject, SessionError> {
+        let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
+        let rejection = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .handle_pane_failed(&peer_id, failed)
+            .reject;
+        Ok(rejection)
+    }
+
+    fn publish_local_response(&self, response: &CoordinatorResponse) -> Result<(), SessionError> {
+        if let CoordinatorResponse::Commit(commit) = response {
+            let state = commit
+                .state
+                .as_ref()
+                .ok_or(SessionError::InvalidPostWelcome)?;
+            self.pane_server.replace_roster_from_layout(state)?;
+            self.broadcast_commit(commit.clone());
+        }
+        Ok(())
     }
 
     /// Creates the coordinator-owned pane registry. The runtime must keep this registry's roster

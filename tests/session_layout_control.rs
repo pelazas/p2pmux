@@ -10,7 +10,7 @@ use p2pmux::{
     screen::HostScreen,
     session::{
         GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent, SharedLayoutHost,
-        join_layout, pane_wire_id, subscribe_pane,
+        join_layout, layout_snapshot_from_state, pane_wire_id, subscribe_pane,
     },
     transport::{ALPN, Transport},
 };
@@ -29,6 +29,38 @@ async fn loopback_transport() -> Transport {
         .await
         .expect("loopback endpoint");
     Transport::from_endpoint(endpoint)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_snapshot_converts_to_a_renderable_local_layout() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut member = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("member joins");
+    accept.await.expect("accept task").expect("accept member");
+
+    let LayoutControlEvent::Snapshot(snapshot) = next_event(&mut member).await else {
+        panic!("first layout event must be a snapshot");
+    };
+    let layout = layout_snapshot_from_state(snapshot.state.as_ref().expect("state"))
+        .expect("wire layout is renderable");
+    assert_eq!(layout.revision, 2);
+    assert_eq!(layout.tabs.len(), 1);
+    assert_eq!(layout.panes.len(), 1);
+    assert!(
+        layout
+            .panes
+            .get(&1)
+            .is_some_and(|pane| pane.grid_rows == 24 && pane.grid_cols == 80)
+    );
+
+    member.shutdown().await;
+    coordinator.close().await;
 }
 
 async fn next_event(member: &mut p2pmux::session::SharedLayoutMember) -> LayoutControlEvent {
