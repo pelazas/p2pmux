@@ -69,10 +69,11 @@ impl LeaseManager {
         if data.is_empty() || epoch != self.state.epoch {
             return LeaseDecision::RejectStaleInput;
         }
-        if !self.state.controller_peer_id.is_empty() && self.state.is_idle_at(now) {
-            if self.change_controller(Vec::new(), now).is_err() {
-                return LeaseDecision::RejectStaleInput;
-            }
+        if !self.state.controller_peer_id.is_empty()
+            && self.state.is_idle_at(now)
+            && self.change_controller(Vec::new(), now).is_err()
+        {
+            return LeaseDecision::RejectStaleInput;
         }
         if self.state.controller_peer_id.is_empty() {
             if self.change_controller(sender.to_vec(), now).is_err() {

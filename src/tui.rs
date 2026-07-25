@@ -852,6 +852,22 @@ enum RemotePaneDrain {
     Disconnected,
 }
 
+fn lease_allows_held_input(controller_peer_id: &[u8], peer_id: &[u8]) -> bool {
+    controller_peer_id.is_empty() || controller_peer_id == peer_id
+}
+
+fn reconcile_remote_control_attempt(
+    pending_control: &mut bool,
+    held_input: &mut Vec<u8>,
+    controller_peer_id: &[u8],
+    peer_id: &[u8],
+) {
+    *pending_control = false;
+    if !lease_allows_held_input(controller_peer_id, peer_id) {
+        held_input.clear();
+    }
+}
+
 impl SharedRemotePane {
     fn new(pane: GuestPane) -> Self {
         Self {
@@ -880,6 +896,7 @@ impl SharedRemotePane {
 
     fn drain(&mut self) -> RemotePaneDrain {
         let mut changed = false;
+        let mut received_lease = false;
         loop {
             match self.pane.events.try_recv() {
                 Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
@@ -895,21 +912,14 @@ impl SharedRemotePane {
                         .is_ok();
                 }
                 Ok(GuestEvent::Lease(lease)) => {
-                    let controls_this_pane =
-                        lease.controller_peer_id == self.pane.controls.peer_id();
-                    let pane_is_free = lease.controller_peer_id.is_empty();
+                    received_lease = true;
                     self.lease = Some(LeaseState {
                         controller_peer_id: lease.controller_peer_id,
                         epoch: lease.lease_epoch,
                         last_activity: Instant::now(),
                     });
                     self.last_lease = Instant::now();
-                    if self.pending_control {
-                        self.pending_control = false;
-                        if !controls_this_pane && !pane_is_free {
-                            self.held_input.clear();
-                        }
-                    }
+                    self.pending_control = false;
                     changed = true;
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
@@ -920,11 +930,18 @@ impl SharedRemotePane {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             }
         }
+        if received_lease && let Some(lease) = self.lease.as_ref() {
+            reconcile_remote_control_attempt(
+                &mut self.pending_control,
+                &mut self.held_input,
+                &lease.controller_peer_id,
+                self.pane.controls.peer_id(),
+            );
+        }
         if !self.pending_control
             && !self.held_input.is_empty()
             && self.lease.as_ref().is_some_and(|lease| {
-                lease.controller_peer_id == self.pane.controls.peer_id()
-                    || lease.controller_peer_id.is_empty()
+                lease_allows_held_input(&lease.controller_peer_id, self.pane.controls.peer_id())
             })
         {
             let bytes = std::mem::take(&mut self.held_input);
@@ -2228,12 +2245,12 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;
     let mut last_lease = Instant::now();
-    let mut received_host_lease = false;
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
 
     loop {
+        let mut received_lease = false;
         loop {
             match pane.events.try_recv() {
                 Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
@@ -2254,22 +2271,13 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
                 Ok(GuestEvent::Lease(state)) => {
-                    let already_received_host_lease = received_host_lease;
-                    received_host_lease = true;
+                    received_lease = true;
                     footer = format!(
                         "controller: {} typing",
                         short_peer(&state.controller_peer_id)
                     );
                     last_lease = Instant::now();
-                    if pending_control && state.controller_peer_id == pane.controls.peer_id() {
-                        pending_control = false;
-                    } else if pending_control
-                        && already_received_host_lease
-                        && !state.controller_peer_id.is_empty()
-                    {
-                        pending_control = false;
-                        held_input.clear();
-                    }
+                    pending_control = false;
                     lease = Some(state);
                     dirty = true;
                 }
@@ -2285,11 +2293,19 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        if received_lease && let Some(state) = lease.as_ref() {
+            reconcile_remote_control_attempt(
+                &mut pending_control,
+                &mut held_input,
+                &state.controller_peer_id,
+                pane.controls.peer_id(),
+            );
+        }
+
         if !pending_control
             && !held_input.is_empty()
             && let Some(state) = lease.as_ref()
-            && (state.controller_peer_id == pane.controls.peer_id()
-                || state.controller_peer_id.is_empty())
+            && lease_allows_held_input(&state.controller_peer_id, pane.controls.peer_id())
         {
             let bytes = std::mem::take(&mut held_input);
             if pane
@@ -2405,6 +2421,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         net::Ipv4Addr,
+        thread,
         time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, watch};
@@ -2431,8 +2448,9 @@ mod tests {
         CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, member_label, pane_wire_id, render_guest_screen,
-        render_multi_pane, render_shared_multi_pane, shared_footer_text,
+        grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label, pane_wire_id,
+        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        render_shared_multi_pane, shared_footer_text,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2810,14 +2828,55 @@ mod tests {
     fn local_input_crossing_the_idle_timeout_reclaims_and_delivers_it() {
         let host_id = b"host".to_vec();
         let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
         pane.lease =
             LeaseManager::with_epoch_for_test(b"remote".to_vec(), 1, Instant::now() - IDLE_AFTER);
 
-        pane.input(b"first".to_vec())
+        pane.input(b"printf boundary-input-delivered\\n".to_vec())
             .expect("first input at idle boundary");
 
         assert_eq!(pane.lease.state().controller_peer_id, host_id);
         assert_eq!(pane.lease.state().epoch, 3);
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        let lease = lease_rx.borrow_and_update().clone();
+        assert_eq!(lease.controller_peer_id, b"host");
+        assert_eq!(lease.epoch, 3);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            while let Some(bytes) = pane.host.try_read_output().expect("PTY reader") {
+                output.extend(bytes);
+            }
+            if String::from_utf8_lossy(&output).contains("boundary-input-delivered") {
+                pane.shutdown().expect("shutdown local pane");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        pane.shutdown().expect("shutdown local pane");
+        panic!(
+            "first input was not delivered to the PTY: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn remote_held_input_follows_the_final_lease_owner() {
+        let peer = b"requester";
+        let mut pending_control = true;
+        let mut held_input = b"first".to_vec();
+
+        assert!(lease_allows_held_input(b"", peer));
+        reconcile_remote_control_attempt(&mut pending_control, &mut held_input, b"", peer);
+        assert!(!pending_control, "free leases release the retry gate");
+        assert_eq!(held_input, b"first", "free leases retain queued input");
+
+        reconcile_remote_control_attempt(&mut pending_control, &mut held_input, b"other", peer);
+        assert!(
+            held_input.is_empty(),
+            "a later controller wins and discards stale input"
+        );
     }
 
     fn split_layout() -> LayoutSnapshot {
