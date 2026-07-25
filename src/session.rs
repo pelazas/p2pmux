@@ -1049,6 +1049,17 @@ impl PaneServer {
         self.remove_pane(pane_id)
     }
 
+    /// Reports whether this member is currently serving the pane. Runtime lifecycle checks use
+    /// this to verify that a committed deletion revokes direct subscriptions before PTY teardown.
+    pub fn has_registered_pane(&self, pane_id: u64) -> Result<bool, SessionError> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .panes
+            .contains_key(&pane_id))
+    }
+
     pub async fn accept_one(&self) -> Result<(), SessionError> {
         let incoming = self.transport.accept_incoming().await?;
         self.serve_incoming(incoming).await

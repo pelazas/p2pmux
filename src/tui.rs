@@ -15,6 +15,7 @@ use crossterm::{
         self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
+use iroh::EndpointAddr;
 use portable_pty::PtySize;
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
@@ -947,6 +948,69 @@ struct PendingCreate {
     grid_cols: u16,
 }
 
+/// Pure retry state for direct remote-pane subscriptions. Ticks are supplied by the UI drain
+/// loop, which keeps retry behavior deterministic in tests and prevents a failed connect from
+/// either becoming permanent or spinning a busy loop.
+#[derive(Default)]
+struct RemoteSubscriptionState {
+    in_flight: BTreeSet<PaneId>,
+    retry_at: BTreeMap<PaneId, u64>,
+    failures: BTreeMap<PaneId, u8>,
+}
+
+impl RemoteSubscriptionState {
+    const MAX_BACKOFF_TICKS: u64 = 32;
+
+    fn start(&mut self, pane_id: PaneId, tick: u64) -> bool {
+        if self.in_flight.contains(&pane_id)
+            || self
+                .retry_at
+                .get(&pane_id)
+                .is_some_and(|retry_at| *retry_at > tick)
+        {
+            return false;
+        }
+        self.in_flight.insert(pane_id);
+        true
+    }
+
+    fn succeeded(&mut self, pane_id: PaneId) {
+        self.in_flight.remove(&pane_id);
+        self.retry_at.remove(&pane_id);
+        self.failures.remove(&pane_id);
+    }
+
+    fn failed(&mut self, pane_id: PaneId, tick: u64) {
+        self.in_flight.remove(&pane_id);
+        let failures = self.failures.entry(pane_id).or_default();
+        *failures = failures.saturating_add(1);
+        let delay = 1_u64
+            .checked_shl(u32::from((*failures).saturating_sub(1)))
+            .unwrap_or(Self::MAX_BACKOFF_TICKS)
+            .min(Self::MAX_BACKOFF_TICKS);
+        self.retry_at.insert(pane_id, tick.saturating_add(delay));
+    }
+
+    fn nudge(&mut self) {
+        for retry_at in self.retry_at.values_mut() {
+            *retry_at = 0;
+        }
+    }
+
+    fn retain(&mut self, pane_ids: &BTreeSet<PaneId>) {
+        self.in_flight.retain(|pane_id| pane_ids.contains(pane_id));
+        self.retry_at
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+        self.failures
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+    }
+
+    #[cfg(test)]
+    fn next_retry_at(&self, pane_id: PaneId) -> Option<u64> {
+        self.retry_at.get(&pane_id).copied()
+    }
+}
+
 /// Blocking terminal runtime for the shared layout. Network tasks keep streams independent while
 /// this loop only drains ready channels and renders the current fixed grids.
 pub struct SharedLayoutRuntime {
@@ -959,7 +1023,9 @@ pub struct SharedLayoutRuntime {
     runtime: tokio::runtime::Handle,
     local: BTreeMap<PaneId, SharedLocalPane>,
     remote: BTreeMap<PaneId, SharedRemotePane>,
-    pending_subscriptions: BTreeSet<PaneId>,
+    remote_descriptors: BTreeMap<PaneId, (EndpointAddr, PaneDescriptor)>,
+    subscriptions: RemoteSubscriptionState,
+    retry_tick: u64,
     subscription_tx: tokio::sync::mpsc::UnboundedSender<(PaneId, Result<GuestPane, String>)>,
     subscription_rx: tokio::sync::mpsc::UnboundedReceiver<(PaneId, Result<GuestPane, String>)>,
     pending_create: Option<PendingCreate>,
@@ -1055,7 +1121,9 @@ impl SharedLayoutRuntime {
             runtime,
             local,
             remote: BTreeMap::new(),
-            pending_subscriptions: BTreeSet::new(),
+            remote_descriptors: BTreeMap::new(),
+            subscriptions: RemoteSubscriptionState::default(),
+            retry_tick: 0,
             subscription_tx,
             subscription_rx,
             pending_create: None,
@@ -1159,20 +1227,29 @@ impl SharedLayoutRuntime {
 
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = false;
+        self.retry_tick = self.retry_tick.saturating_add(1);
         while let Some(event) = self.control.try_event(self.tui.snapshot().revision) {
             self.handle_control_event(event)?;
             changed = true;
         }
         while let Ok((pane_id, result)) = self.subscription_rx.try_recv() {
-            self.pending_subscriptions.remove(&pane_id);
             match result {
                 Ok(pane) => {
-                    self.remote.insert(pane_id, SharedRemotePane::new(pane));
+                    if self.remote_descriptors.contains_key(&pane_id) {
+                        self.subscriptions.succeeded(pane_id);
+                        self.remote.insert(pane_id, SharedRemotePane::new(pane));
+                    } else {
+                        self.runtime.block_on(pane.shutdown());
+                    }
                 }
-                Err(error) => self.status = format!("pane {pane_id}: {error}"),
+                Err(error) => {
+                    self.subscriptions.failed(pane_id, self.retry_tick);
+                    self.status = format!("pane {pane_id}: {error}; retrying");
+                }
             }
             changed = true;
         }
+        self.start_eligible_subscriptions();
         for pane in self.local.values_mut() {
             changed |= pane.drain()?;
         }
@@ -1238,12 +1315,8 @@ impl SharedLayoutRuntime {
             .apply_snapshot(snapshot.clone())
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
         let me = self.control.peer_id();
+        self.remote_descriptors.clear();
         for pane in state.panes.iter().filter(|pane| pane.host_peer_id != me) {
-            if self.remote.contains_key(&pane.pane_id)
-                || self.pending_subscriptions.contains(&pane.pane_id)
-            {
-                continue;
-            }
             let endpoint = state
                 .members
                 .iter()
@@ -1253,12 +1326,31 @@ impl SharedLayoutRuntime {
                 self.status = format!("pane {} has no usable host address", pane.pane_id);
                 continue;
             };
-            self.pending_subscriptions.insert(pane.pane_id);
+            self.remote_descriptors
+                .insert(pane.pane_id, (endpoint, pane.clone()));
+        }
+        let remote_ids = self
+            .remote_descriptors
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.subscriptions.retain(&remote_ids);
+        self.subscriptions.nudge();
+        self.start_eligible_subscriptions();
+        self.refresh_local_views();
+        Ok(())
+    }
+
+    fn start_eligible_subscriptions(&mut self) {
+        for (pane_id, (endpoint, descriptor)) in self.remote_descriptors.clone() {
+            if self.remote.contains_key(&pane_id)
+                || !self.subscriptions.start(pane_id, self.retry_tick)
+            {
+                continue;
+            }
             let tx = self.subscription_tx.clone();
             let transport = self.transport.clone();
             let session_id = self.session_id.clone();
-            let descriptor = pane.clone();
-            let pane_id = pane.pane_id;
             self.runtime.spawn(async move {
                 let result = subscribe_pane(transport, session_id, endpoint, descriptor)
                     .await
@@ -1266,8 +1358,6 @@ impl SharedLayoutRuntime {
                 let _ = tx.send((pane_id, result));
             });
         }
-        self.refresh_local_views();
-        Ok(())
     }
 
     fn handle_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
@@ -2211,7 +2301,12 @@ fn short_peer(peer_id: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        net::Ipv4Addr,
+        time::{Duration, Instant},
+    };
+    use tokio::sync::{mpsc, watch};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
@@ -2222,11 +2317,19 @@ mod tests {
     };
 
     use crate::layout::{Axis, LayoutSnapshot, Node, Pane, Tab};
+    use crate::lease::LeaseState;
     use crate::screen::{GuestScreen, HostScreen};
+    use crate::{
+        protocol::PaneDescriptor,
+        session::{HostSession, SharedLayoutHost, layout_snapshot_from_state},
+        transport::{ALPN, Transport},
+    };
+    use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        ChordMode, KeyHandling, MultiPaneTui, PaneViewState, UiIntent, VtScreen, encode_key,
-        encode_paste, render_guest_screen, render_multi_pane,
+        ChordMode, HostPaneChannels, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneViewState,
+        RemoteSubscriptionState, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
+        encode_key, encode_paste, pane_wire_id, render_guest_screen, render_multi_pane,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2252,6 +2355,178 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>(),
         }
+    }
+
+    #[test]
+    fn failed_remote_subscription_retries_with_bounded_backoff_and_commit_nudge() {
+        let mut subscriptions = RemoteSubscriptionState::default();
+        assert!(subscriptions.start(7, 0));
+        subscriptions.failed(7, 0);
+        assert!(!subscriptions.start(7, 0));
+        assert!(subscriptions.start(7, 1));
+        subscriptions.failed(7, 1);
+        assert!(!subscriptions.start(7, 2));
+        assert!(subscriptions.start(7, 3));
+
+        for tick in [3, 7, 15, 31, 63, 95] {
+            subscriptions.failed(7, tick);
+            assert!(
+                subscriptions
+                    .next_retry_at(7)
+                    .is_some_and(|next| next <= tick + 32)
+            );
+        }
+        subscriptions.nudge();
+        assert!(subscriptions.start(7, 95));
+    }
+
+    async fn loopback_transport() -> Transport {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("localhost address")
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("loopback endpoint");
+        Transport::from_endpoint(endpoint)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_create_then_committed_delete_updates_its_local_pane_lifecycle() {
+        let host = SharedLayoutHost::new(
+            HostSession::from_transport(loopback_transport().await).expect("host session"),
+            2,
+            8,
+        )
+        .expect("shared host");
+        let pane_server = host.pane_server();
+        let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_id.clone()).expect("initial pty");
+        pane_server
+            .register_local_pane(
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_id,
+                    grid_rows: 2,
+                    grid_cols: 8,
+                },
+                initial.channels(),
+            )
+            .expect("initial pane registered");
+        let state = host
+            .session_snapshot()
+            .expect("snapshot")
+            .state
+            .expect("layout state");
+        let snapshot = layout_snapshot_from_state(&state).expect("render layout");
+        let mut runtime = SharedLayoutRuntime::host(
+            host,
+            pane_server,
+            snapshot,
+            initial,
+            String::from("TESTCODE"),
+            tokio::runtime::Handle::current(),
+        )
+        .expect("runtime");
+        runtime.set_session_id(b"session".to_vec());
+
+        runtime
+            .handle_intent(UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::LeftRight,
+                grid_rows: 2,
+                grid_cols: 8,
+            })
+            .expect("create intent commits after registering a local pane");
+        assert!(runtime.local.contains_key(&2));
+        assert!(runtime.panes.has_registered_pane(2).expect("pane registry"));
+        assert_eq!(runtime.tui.snapshot().panes.len(), 2);
+
+        runtime
+            .handle_intent(UiIntent::DeletePane { pane_id: 2 })
+            .expect("host-owned deletion commits");
+        assert!(!runtime.local.contains_key(&2));
+        assert!(
+            !runtime.panes.has_registered_pane(2).expect("pane registry"),
+            "committed removal revokes the direct-pane service before the PTY is shut down"
+        );
+        assert_eq!(runtime.tui.snapshot().panes.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_runtime_reconciles_snapshot_into_a_direct_remote_pane_attachment() {
+        let host = SharedLayoutHost::new(
+            HostSession::from_transport(loopback_transport().await).expect("host session"),
+            1,
+            1,
+        )
+        .expect("shared host");
+        let host_panes = host.pane_server();
+        let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let screen = HostScreen::new(1, 1).expect("screen");
+        let (_screen_tx, screen_rx) = watch::channel(screen.current_frame().clone());
+        let (_lease_tx, lease_rx) = watch::channel(LeaseState {
+            controller_peer_id: host_id.clone(),
+            epoch: 1,
+            last_activity: Instant::now(),
+        });
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        host_panes
+            .register_local_pane(
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_id.clone(),
+                    grid_rows: 1,
+                    grid_cols: 1,
+                },
+                HostPaneChannels {
+                    pane_id: pane_wire_id(1),
+                    host_peer_id: host_id,
+                    screen_rx,
+                    lease_rx,
+                    control_tx,
+                },
+            )
+            .expect("host pane");
+        let dispatcher = host
+            .incoming_dispatcher(host_panes)
+            .expect("single dispatcher");
+        let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
+
+        let mut member =
+            crate::session::join_layout(loopback_transport().await, host.ticket().clone())
+                .await
+                .expect("member joins");
+        let LayoutControlEvent::Snapshot(snapshot) = member.events.recv().await.expect("snapshot")
+        else {
+            panic!("member must receive snapshot first");
+        };
+        let state = snapshot.state.expect("state");
+        let member_panes = member
+            .pane_server(host.ticket().session_id().to_vec())
+            .expect("member pane server");
+        let mut runtime = SharedLayoutRuntime::member_from_state(
+            member,
+            member_panes,
+            host.ticket().session_id().to_vec(),
+            state,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("member runtime");
+        for _ in 0..20 {
+            runtime.drain().expect("runtime drain");
+            if runtime.remote.contains_key(&1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            runtime.remote.contains_key(&1),
+            "remote pane attached from snapshot"
+        );
+        dispatcher_task.abort();
     }
 
     fn split_layout() -> LayoutSnapshot {
