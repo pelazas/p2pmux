@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -781,6 +782,7 @@ pub enum SessionError {
     UnauthenticatedPeer,
     InvalidPostWelcome,
     PeerTask,
+    Coordinator(CoordinatorError),
 }
 
 impl fmt::Display for SessionError {
@@ -800,6 +802,7 @@ impl fmt::Display for SessionError {
             }
             Self::InvalidPostWelcome => formatter.write_str("invalid post-Welcome message"),
             Self::PeerTask => formatter.write_str("peer stream task stopped unexpectedly"),
+            Self::Coordinator(error) => write!(formatter, "layout coordinator error: {error}"),
         }
     }
 }
@@ -817,6 +820,7 @@ impl Error for SessionError {
             | Self::UnauthenticatedPeer
             | Self::InvalidPostWelcome
             | Self::PeerTask => None,
+            Self::Coordinator(error) => Some(error),
         }
     }
 }
@@ -824,6 +828,12 @@ impl Error for SessionError {
 impl From<TransportError> for SessionError {
     fn from(error: TransportError) -> Self {
         Self::Transport(error)
+    }
+}
+
+impl From<CoordinatorError> for SessionError {
+    fn from(error: CoordinatorError) -> Self {
+        Self::Coordinator(error)
     }
 }
 
@@ -1001,6 +1011,424 @@ impl HostSession {
             )
             .await?;
         Ok(receipt)
+    }
+}
+
+/// A coordinator that keeps the shared layout authoritative while each admitted member has one
+/// independent, long-lived control stream. Pane data streams deliberately remain outside this
+/// type so they can later connect directly to their pane hosts.
+#[derive(Clone)]
+pub struct SharedLayoutHost {
+    host: HostSession,
+    coordinator: Arc<Mutex<LayoutCoordinator>>,
+    peers: Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayoutControlEvent {
+    Snapshot(SessionSnapshot),
+    Reservation(PaneReservation),
+    Commit(LayoutCommit),
+    Reject(LayoutReject),
+    Disconnected,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum LayoutControlQueueError {
+    Full,
+    Closed,
+}
+
+enum LayoutClientMessage {
+    Request(LayoutRequest),
+    Ready(PaneReady),
+    Failed(PaneFailed),
+}
+
+/// The member side of a shared-layout control connection.
+pub struct SharedLayoutMember {
+    pub peer_id: Vec<u8>,
+    pub coordinator_peer_id: Vec<u8>,
+    pub events: mpsc::Receiver<LayoutControlEvent>,
+    outbound: mpsc::Sender<LayoutClientMessage>,
+    transport: Transport,
+    connection: Connection,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl SharedLayoutMember {
+    pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::Request(request))
+            .map_err(layout_queue_error)
+    }
+
+    pub fn try_ready(&self, ready: PaneReady) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::Ready(ready))
+            .map_err(layout_queue_error)
+    }
+
+    pub fn try_failed(&self, failed: PaneFailed) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::Failed(failed))
+            .map_err(layout_queue_error)
+    }
+
+    pub async fn shutdown(mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        while let Some(task) = self.tasks.pop() {
+            let _ = task.await;
+        }
+        self.connection.close(0u8.into(), b"");
+        self.transport.close().await;
+    }
+}
+
+impl Drop for SharedLayoutMember {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.connection.close(0u8.into(), b"");
+    }
+}
+
+impl SharedLayoutHost {
+    pub fn new(host: HostSession, grid_rows: u16, grid_cols: u16) -> Result<Self, SessionError> {
+        let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let coordinator = LayoutCoordinator::new(
+            coordinator_peer_id,
+            host.ticket().endpoint_addr().clone(),
+            grid_rows,
+            grid_cols,
+        )?;
+        Ok(Self {
+            host,
+            coordinator: Arc::new(Mutex::new(coordinator)),
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub fn ticket(&self) -> &JoinTicket {
+        self.host.ticket()
+    }
+
+    /// Accept one authenticated member and then its persistent control stream.
+    pub async fn accept_one_member(&self) -> Result<JoinReceipt, SessionError> {
+        let incoming = self.host.accept_incoming().await?;
+        let connection = timeout(HANDSHAKE_TIMEOUT, incoming)
+            .await
+            .map_err(|_| SessionError::TimedOut("incoming connection"))?
+            .map_err(SessionError::Incoming)?;
+        let result = async {
+            let receipt = self.host.handshake_connection(&connection).await?;
+            let membership = self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .admit(
+                    receipt.admitted_peer_id.clone(),
+                    receipt.endpoint_addr.clone(),
+                )?;
+
+            // Existing members see the authoritative membership commit before the joining
+            // member receives its snapshot. The joiner snapshot already contains that commit.
+            self.broadcast_commit(membership.commit.clone());
+            if let Some(reject) = membership.invalidated_reservation {
+                self.send_reject(reject);
+            }
+
+            let (writer, reader) = self.transport_open_control(&connection).await?;
+            let peer_id = receipt.admitted_peer_id.clone();
+            let (outbound_tx, outbound_rx) = mpsc::channel(64);
+            self.peers
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .insert(peer_id.clone(), outbound_tx.clone());
+            let snapshot = self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .session_snapshot()?;
+            let _ = outbound_tx.try_send(coordinator_envelope(
+                self.host.ticket().endpoint_addr().id.as_bytes(),
+                envelope::Body::SessionSnapshot(snapshot),
+            ));
+
+            tokio::spawn(layout_writer_task(writer, outbound_rx));
+            tokio::spawn(layout_host_reader_task(
+                reader,
+                peer_id,
+                self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+                self.coordinator.clone(),
+                self.peers.clone(),
+            ));
+            Ok(receipt)
+        }
+        .await;
+        if result.is_err() {
+            connection.close(0u8.into(), b"");
+        }
+        result
+    }
+
+    pub async fn close(&self) {
+        self.host.close().await;
+    }
+
+    async fn transport_open_control(
+        &self,
+        connection: &Connection,
+    ) -> Result<(crate::transport::FrameWriter, crate::transport::FrameReader), SessionError> {
+        self.host
+            .transport
+            .open_framed_bi(connection)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn broadcast_commit(&self, commit: LayoutCommit) {
+        broadcast_envelope(
+            &self.peers,
+            coordinator_envelope(
+                self.host.ticket().endpoint_addr().id.as_bytes(),
+                envelope::Body::LayoutCommit(commit),
+            ),
+        );
+    }
+
+    fn send_reject(&self, targeted: TargetedLayoutReject) {
+        send_to_peer(
+            &self.peers,
+            &targeted.peer_id,
+            coordinator_envelope(
+                self.host.ticket().endpoint_addr().id.as_bytes(),
+                envelope::Body::LayoutReject(targeted.reject),
+            ),
+        );
+    }
+}
+
+fn layout_queue_error<T>(error: mpsc::error::TrySendError<T>) -> LayoutControlQueueError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => LayoutControlQueueError::Full,
+        mpsc::error::TrySendError::Closed(_) => LayoutControlQueueError::Closed,
+    }
+}
+
+fn coordinator_envelope(sender_peer_id: &[u8], body: envelope::Body) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        sender_peer_id: sender_peer_id.to_vec(),
+        body: Some(body),
+    }
+}
+
+fn broadcast_envelope(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    envelope: Envelope,
+) {
+    let mut peers = match peers.lock() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+    peers.retain(|_, sender| sender.try_send(envelope.clone()).is_ok());
+}
+
+fn send_to_peer(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    peer_id: &[u8],
+    envelope: Envelope,
+) {
+    let mut peers = match peers.lock() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+    if peers
+        .get(peer_id)
+        .is_some_and(|sender| sender.try_send(envelope).is_err())
+    {
+        peers.remove(peer_id);
+    }
+}
+
+/// Join a coordinator and establish the persistent member-to-coordinator layout stream.
+pub async fn join_layout(
+    transport: Transport,
+    ticket: JoinTicket,
+) -> Result<SharedLayoutMember, SessionError> {
+    let connection = transport.connect(ticket.endpoint_addr().clone()).await?;
+    let result = async {
+        let receipt = join_handshake(&transport, &connection, &ticket).await?;
+        let (writer, reader) = transport.accept_framed_bi(&connection).await?;
+        let (events_tx, events) = mpsc::channel(128);
+        let (outbound, outbound_rx) = mpsc::channel(64);
+        let peer_id = transport.endpoint_id().as_bytes().to_vec();
+        let coordinator_peer_id = receipt.coordinator_peer_id;
+        let tasks = vec![
+            tokio::spawn(layout_member_reader_task(
+                reader,
+                events_tx,
+                coordinator_peer_id.clone(),
+            )),
+            tokio::spawn(layout_member_writer_task(
+                writer,
+                outbound_rx,
+                peer_id.clone(),
+            )),
+        ];
+        Ok(SharedLayoutMember {
+            peer_id,
+            coordinator_peer_id,
+            events,
+            outbound,
+            transport: transport.clone(),
+            connection: connection.clone(),
+            tasks,
+        })
+    }
+    .await;
+    if result.is_err() {
+        connection.close(0u8.into(), b"");
+        transport.close().await;
+    }
+    result
+}
+
+async fn layout_writer_task(
+    mut writer: crate::transport::FrameWriter,
+    mut outbound: mpsc::Receiver<Envelope>,
+) {
+    while let Some(envelope) = outbound.recv().await {
+        if writer.write_next(&envelope).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn layout_member_writer_task(
+    mut writer: crate::transport::FrameWriter,
+    mut outbound: mpsc::Receiver<LayoutClientMessage>,
+    peer_id: Vec<u8>,
+) {
+    while let Some(message) = outbound.recv().await {
+        let body = match message {
+            LayoutClientMessage::Request(request) => envelope::Body::LayoutRequest(request),
+            LayoutClientMessage::Ready(ready) => envelope::Body::PaneReady(ready),
+            LayoutClientMessage::Failed(failed) => envelope::Body::PaneFailed(failed),
+        };
+        if writer
+            .write_next(&coordinator_envelope(&peer_id, body))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn layout_member_reader_task(
+    mut reader: crate::transport::FrameReader,
+    events_tx: mpsc::Sender<LayoutControlEvent>,
+    coordinator_peer_id: Vec<u8>,
+) {
+    while let Ok(Some(envelope)) = reader.read_next().await {
+        if envelope.sender_peer_id != coordinator_peer_id {
+            break;
+        }
+        let event = match envelope.body {
+            Some(envelope::Body::SessionSnapshot(snapshot)) => {
+                LayoutControlEvent::Snapshot(snapshot)
+            }
+            Some(envelope::Body::PaneReservation(reservation)) => {
+                LayoutControlEvent::Reservation(reservation)
+            }
+            Some(envelope::Body::LayoutCommit(commit)) => LayoutControlEvent::Commit(commit),
+            Some(envelope::Body::LayoutReject(reject)) => LayoutControlEvent::Reject(reject),
+            _ => break,
+        };
+        if events_tx.send(event).await.is_err() {
+            return;
+        }
+    }
+    let _ = events_tx.send(LayoutControlEvent::Disconnected).await;
+}
+
+async fn layout_host_reader_task(
+    mut reader: crate::transport::FrameReader,
+    peer_id: Vec<u8>,
+    coordinator_peer_id: Vec<u8>,
+    coordinator: Arc<Mutex<LayoutCoordinator>>,
+    peers: Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+) {
+    while let Ok(Some(envelope)) = reader.read_next().await {
+        if envelope.sender_peer_id != peer_id {
+            break;
+        }
+        match envelope.body {
+            Some(envelope::Body::LayoutRequest(request)) => {
+                let response = match coordinator.lock() {
+                    Ok(mut coordinator) => coordinator.handle_request(&peer_id, request),
+                    Err(_) => break,
+                };
+                dispatch_coordinator_response(&peers, &peer_id, &coordinator_peer_id, response);
+            }
+            Some(envelope::Body::PaneReady(ready)) => {
+                let response = match coordinator.lock() {
+                    Ok(mut coordinator) => coordinator.handle_pane_ready(&peer_id, ready),
+                    Err(_) => break,
+                };
+                dispatch_coordinator_response(&peers, &peer_id, &coordinator_peer_id, response);
+            }
+            Some(envelope::Body::PaneFailed(failed)) => {
+                let reject = match coordinator.lock() {
+                    Ok(mut coordinator) => coordinator.handle_pane_failed(&peer_id, failed),
+                    Err(_) => break,
+                };
+                send_to_peer(
+                    &peers,
+                    &reject.peer_id,
+                    coordinator_envelope(
+                        &coordinator_peer_id,
+                        envelope::Body::LayoutReject(reject.reject),
+                    ),
+                );
+            }
+            _ => break,
+        }
+    }
+    if let Ok(mut peers) = peers.lock() {
+        peers.remove(&peer_id);
+    }
+}
+
+fn dispatch_coordinator_response(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    requester_peer_id: &[u8],
+    coordinator_peer_id: &[u8],
+    response: CoordinatorResponse,
+) {
+    match response {
+        CoordinatorResponse::Reservation(reservation) => send_to_peer(
+            peers,
+            requester_peer_id,
+            coordinator_envelope(
+                coordinator_peer_id,
+                envelope::Body::PaneReservation(reservation),
+            ),
+        ),
+        CoordinatorResponse::Commit(commit) => broadcast_envelope(
+            peers,
+            coordinator_envelope(coordinator_peer_id, envelope::Body::LayoutCommit(commit)),
+        ),
+        CoordinatorResponse::Reject(reject) => send_to_peer(
+            peers,
+            requester_peer_id,
+            coordinator_envelope(coordinator_peer_id, envelope::Body::LayoutReject(reject)),
+        ),
     }
 }
 
