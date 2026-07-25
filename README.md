@@ -76,14 +76,16 @@ Only one peer controls each pane at a time: after about eight seconds of idle ti
 can type to hop in. Active typing is protected, so there is no forced takeover. Ctrl+Q exits only
 the local p2pmux view; F9 and F10 continue through to the focused PTY.
 
-Shared-layout commands are local mux chords and never reach a PTY:
+Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
+enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
+to leave the mode and send that key to the focused PTY.
 
 - `Ctrl+P`, then `N` — split the focused pane. The new fixed-grid PTY runs on the requester’s Mac.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then arrows — move focus.
 - `Ctrl+T`, then `N` — create a tab with a local PTY on the requester’s Mac.
 - `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
-- `Ctrl+T`, then left/right — switch tabs; `Esc` cancels a chord.
+- `Ctrl+T`, then left/right — switch tabs.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
 Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
