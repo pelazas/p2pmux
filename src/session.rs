@@ -33,7 +33,8 @@ use crate::{
         LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
         LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-        SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome, envelope,
+        ReleaseControl, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
+        envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -809,6 +810,9 @@ pub enum HostControlEvent {
         peer_id: Vec<u8>,
         request: TakeControl,
     },
+    ReleaseControl {
+        peer_id: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -845,8 +849,13 @@ pub enum GuestEvent {
 pub struct GuestControlSender {
     peer_id: Vec<u8>,
     pane_id: Vec<u8>,
-    take_control_tx: mpsc::Sender<u64>,
-    input_tx: mpsc::Sender<(u64, Vec<u8>)>,
+    control_tx: mpsc::Sender<GuestControlCommand>,
+}
+
+enum GuestControlCommand {
+    TakeControl(u64),
+    Input(u64, Vec<u8>),
+    ReleaseControl,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -857,14 +866,20 @@ pub enum ControlQueueError {
 
 impl GuestControlSender {
     pub fn try_take_control(&self, known_lease_epoch: u64) -> Result<(), ControlQueueError> {
-        self.take_control_tx
-            .try_send(known_lease_epoch)
+        self.control_tx
+            .try_send(GuestControlCommand::TakeControl(known_lease_epoch))
             .map_err(queue_error)
     }
 
     pub fn try_input(&self, lease_epoch: u64, data: Vec<u8>) -> Result<(), ControlQueueError> {
-        self.input_tx
-            .try_send((lease_epoch, data))
+        self.control_tx
+            .try_send(GuestControlCommand::Input(lease_epoch, data))
+            .map_err(queue_error)
+    }
+
+    pub fn try_release_control(&self) -> Result<(), ControlQueueError> {
+        self.control_tx
+            .try_send(GuestControlCommand::ReleaseControl)
             .map_err(queue_error)
     }
 
@@ -2798,6 +2813,11 @@ async fn control_reader_task(
                     request,
                 }
             }
+            Some(envelope::Body::ReleaseControl(release)) if release.pane_id == pane_id => {
+                HostControlEvent::ReleaseControl {
+                    peer_id: peer_id.clone(),
+                }
+            }
             _ => return Err(SessionError::InvalidPostWelcome),
         };
         if active
@@ -2840,8 +2860,7 @@ pub async fn join_pane(
         let (_screen_send, screen_reader) = transport.accept_framed_bi(&connection).await?;
         let (control_writer, control_reader) = transport.accept_framed_bi(&connection).await?;
         let (events_tx, events) = mpsc::channel(128);
-        let (take_control_tx, take_control_rx) = mpsc::channel(16);
-        let (input_tx, input_rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::channel(256);
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let pane_id = DEFAULT_PANE_ID.to_vec();
         let tasks = vec![
@@ -2859,8 +2878,7 @@ pub async fn join_pane(
             )),
             tokio::spawn(guest_control_writer_task(
                 control_writer,
-                take_control_rx,
-                input_rx,
+                control_rx,
                 peer_id.clone(),
                 pane_id.clone(),
             )),
@@ -2872,8 +2890,7 @@ pub async fn join_pane(
             controls: GuestControlSender {
                 peer_id,
                 pane_id,
-                take_control_tx,
-                input_tx,
+                control_tx,
             },
             transport: transport.clone(),
             connection: connection.clone(),
@@ -2928,8 +2945,7 @@ pub async fn subscribe_pane(
         let (_lease_writer, lease_reader) = transport.accept_framed_bi(&connection).await?;
         let (control_writer, _control_reader) = transport.open_framed_bi(&connection).await?;
         let (events_tx, events) = mpsc::channel(128);
-        let (take_control_tx, take_control_rx) = mpsc::channel(16);
-        let (input_tx, input_rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::channel(256);
         let pane_id = pane_wire_id(descriptor.pane_id);
         let host_peer_id = descriptor.host_peer_id;
         let tasks = vec![
@@ -2947,8 +2963,7 @@ pub async fn subscribe_pane(
             )),
             tokio::spawn(guest_control_writer_task(
                 control_writer,
-                take_control_rx,
-                input_rx,
+                control_rx,
                 peer_id.clone(),
                 pane_id.clone(),
             )),
@@ -2960,8 +2975,7 @@ pub async fn subscribe_pane(
             controls: GuestControlSender {
                 peer_id,
                 pane_id,
-                take_control_tx,
-                input_tx,
+                control_tx,
             },
             transport: transport.clone(),
             connection: connection.clone(),
@@ -3095,33 +3109,38 @@ async fn guest_lease_reader_task(
 
 async fn guest_control_writer_task(
     mut writer: crate::transport::FrameWriter,
-    mut take_control_rx: mpsc::Receiver<u64>,
-    mut input_rx: mpsc::Receiver<(u64, Vec<u8>)>,
+    mut control_rx: mpsc::Receiver<GuestControlCommand>,
     peer_id: Vec<u8>,
     pane_id: Vec<u8>,
 ) {
-    loop {
-        tokio::select! {
-            biased;
-            Some(known_lease_epoch) = take_control_rx.recv() => {
-                let _ = writer.write_next(&Envelope {
-                    version: PROTOCOL_VERSION,
-                    sender_peer_id: peer_id.clone(),
-                    body: Some(envelope::Body::TakeControl(TakeControl {
-                        pane_id: pane_id.clone(),
-                        requester_peer_id: peer_id.clone(),
-                        known_lease_epoch,
-                    })),
-                }).await;
+    while let Some(command) = control_rx.recv().await {
+        let body = match command {
+            GuestControlCommand::TakeControl(known_lease_epoch) => {
+                envelope::Body::TakeControl(TakeControl {
+                    pane_id: pane_id.clone(),
+                    requester_peer_id: peer_id.clone(),
+                    known_lease_epoch,
+                })
             }
-            Some((lease_epoch, data)) = input_rx.recv() => {
-                let _ = writer.write_next(&Envelope {
-                    version: PROTOCOL_VERSION,
-                    sender_peer_id: peer_id.clone(),
-                    body: Some(envelope::Body::Input(Input { pane_id: pane_id.clone(), lease_epoch, data })),
-                }).await;
-            }
-            else => return,
+            GuestControlCommand::Input(lease_epoch, data) => envelope::Body::Input(Input {
+                pane_id: pane_id.clone(),
+                lease_epoch,
+                data,
+            }),
+            GuestControlCommand::ReleaseControl => envelope::Body::ReleaseControl(ReleaseControl {
+                pane_id: pane_id.clone(),
+            }),
+        };
+        if writer
+            .write_next(&Envelope {
+                version: PROTOCOL_VERSION,
+                sender_peer_id: peer_id.clone(),
+                body: Some(body),
+            })
+            .await
+            .is_err()
+        {
+            return;
         }
     }
 }

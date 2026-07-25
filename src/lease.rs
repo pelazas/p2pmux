@@ -90,6 +90,13 @@ impl LeaseManager {
         if self.state.controller_peer_id.is_empty() || !self.state.is_idle_at(now) {
             return Ok(None);
         }
+        self.clear_controller(now)
+    }
+
+    pub fn clear_controller(&mut self, now: Instant) -> Result<Option<LeaseState>, LeaseError> {
+        if self.state.controller_peer_id.is_empty() {
+            return Ok(None);
+        }
         match self.change_controller(Vec::new(), now)? {
             LeaseDecision::Publish(state) => Ok(Some(state)),
             _ => unreachable!("changing controller always publishes"),

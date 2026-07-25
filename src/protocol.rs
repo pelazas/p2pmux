@@ -108,7 +108,7 @@ pub struct Envelope {
     pub sender_peer_id: Vec<u8>,
     #[prost(
         oneof = "envelope::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -146,6 +146,8 @@ pub mod envelope {
         PaneSubscribe(super::PaneSubscribe),
         #[prost(message, tag = "24")]
         PaneFailed(super::PaneFailed),
+        #[prost(message, tag = "25")]
+        ReleaseControl(super::ReleaseControl),
     }
 }
 
@@ -189,6 +191,12 @@ pub struct TakeControl {
     pub requester_peer_id: Vec<u8>,
     #[prost(uint64, tag = "3")]
     pub known_lease_epoch: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReleaseControl {
+    #[prost(bytes = "vec", tag = "1")]
+    pub pane_id: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -592,6 +600,13 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
                 "take_control.requester_peer_id",
                 &take_control.requester_peer_id,
                 MAX_PEER_ID_BYTES,
+            )?;
+        }
+        envelope::Body::ReleaseControl(release_control) => {
+            validate_id(
+                "release_control.pane_id",
+                &release_control.pane_id,
+                MAX_PANE_ID_BYTES,
             )?;
         }
         envelope::Body::ControlLease(control_lease) => {

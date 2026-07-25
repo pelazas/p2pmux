@@ -1411,6 +1411,14 @@ impl SharedLocalPane {
                         | LeaseDecision::RejectStaleRequest => {}
                     }
                 }
+                HostControlEvent::ReleaseControl { peer_id } => {
+                    if self.lease.state().controller_peer_id == peer_id
+                        && let Some(state) = self.lease.clear_controller(Instant::now())?
+                    {
+                        self.lease_tx.send_replace(state);
+                        changed = true;
+                    }
+                }
             }
         }
         let started = Instant::now();
@@ -1444,6 +1452,17 @@ impl SharedLocalPane {
             | LeaseDecision::RejectActiveController => {}
         }
         Ok(())
+    }
+
+    fn release_controller(&mut self, peer_id: &[u8]) -> Result<bool, Box<dyn Error>> {
+        if self.lease.state().controller_peer_id != peer_id {
+            return Ok(false);
+        }
+        let Some(state) = self.lease.clear_controller(Instant::now())? else {
+            return Ok(false);
+        };
+        self.lease_tx.send_replace(state);
+        Ok(true)
     }
 
     fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
@@ -1599,6 +1618,21 @@ impl SharedRemotePane {
                 self.held_input.clear();
             }
         }
+    }
+
+    fn release_controller(&mut self) -> bool {
+        let Some(lease) = self.lease.as_mut() else {
+            return false;
+        };
+        if lease.controller_peer_id != self.pane.controls.peer_id()
+            || self.pane.controls.try_release_control().is_err()
+        {
+            return false;
+        }
+        lease.controller_peer_id.clear();
+        self.pending_control = false;
+        self.held_input.clear();
+        true
     }
 }
 
@@ -1888,8 +1922,9 @@ impl SharedLayoutRuntime {
     }
 
     fn handle_key(&mut self, key: KeyEvent, area: Rect) -> Result<bool, Box<dyn Error>> {
-        match self.tui.handle_key(key, area) {
-            KeyHandling::Quit => Ok(true),
+        let previously_focused = self.tui.focused_pane();
+        let quit = match self.tui.handle_key(key, area) {
+            KeyHandling::Quit => Ok::<bool, Box<dyn Error>>(true),
             KeyHandling::Consumed(intents) => {
                 for intent in intents {
                     self.handle_intent(intent)?;
@@ -1900,7 +1935,23 @@ impl SharedLayoutRuntime {
                 self.forward_key(key)?;
                 Ok(false)
             }
+        }?;
+        self.release_blurred_pane(previously_focused)?;
+        Ok(quit)
+    }
+
+    fn release_blurred_pane(&mut self, previously_focused: PaneId) -> Result<(), Box<dyn Error>> {
+        if self.tui.focused_pane() == previously_focused {
+            return Ok(());
         }
+        let peer_id = self.control.peer_id();
+        if let Some(pane) = self.local.get_mut(&previously_focused) {
+            pane.release_controller(&peer_id)?;
+        }
+        if let Some(pane) = self.remote.get_mut(&previously_focused) {
+            pane.release_controller();
+        }
+        Ok(())
     }
 
     pub fn run(mut self) -> Result<(), Box<dyn Error>> {
@@ -2000,6 +2051,7 @@ impl SharedLayoutRuntime {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
                     let area = Rect::new(0, 0, cols, rows);
+                    let previously_focused = self.tui.focused_pane();
                     dirty |= self.tui.clear_selection();
                     if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
                         self.handle_intent(intent)?;
@@ -2008,6 +2060,7 @@ impl SharedLayoutRuntime {
                         dirty |= self.tui.focus_pane_at(mouse.column, mouse.row, area);
                         dirty |= self.tui.begin_selection_at(mouse.column, mouse.row, area);
                     }
+                    self.release_blurred_pane(previously_focused)?;
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
@@ -2209,9 +2262,11 @@ impl SharedLayoutRuntime {
                 self.spawn_remote_shutdown(pane.pane);
             }
         }
+        let previously_focused = self.tui.focused_pane();
         self.tui
             .apply_snapshot(snapshot.clone())
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
+        self.release_blurred_pane(previously_focused)?;
         let me = self.control.peer_id();
         self.remote_descriptors.clear();
         for pane in state.panes.iter().filter(|pane| pane.host_peer_id != me) {
@@ -2933,6 +2988,13 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                         | LeaseDecision::RejectStaleRequest => {}
                     }
                 }
+                HostControlEvent::ReleaseControl { peer_id } => {
+                    if runtime.lease.state().controller_peer_id == peer_id
+                        && let Some(state) = runtime.lease.clear_controller(Instant::now())?
+                    {
+                        runtime.lease_tx.send_replace(state);
+                    }
+                }
             }
         }
         let drain_started = Instant::now();
@@ -3366,6 +3428,21 @@ mod tests {
         assert_eq!(runtime.tui.snapshot().panes.len(), 2);
         assert_eq!(runtime.tui.focused_pane(), 2);
 
+        let peer_id = runtime.control.peer_id();
+        let pane = runtime.local.get_mut(&2).expect("created local pane");
+        pane.lease = LeaseManager::new(peer_id, Instant::now());
+        let mut lease_rx = pane.lease_tx.subscribe();
+        assert!(
+            !runtime
+                .handle_key(
+                    KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+                    Rect::new(0, 0, 80, 24),
+                )
+                .expect("focus change")
+        );
+        assert!(lease_rx.has_changed().expect("lease published immediately"));
+        assert!(lease_rx.borrow_and_update().controller_peer_id.is_empty());
+
         runtime
             .handle_intent(UiIntent::DeletePane { pane_id: 2 })
             .expect("host-owned deletion commits");
@@ -3697,6 +3774,27 @@ mod tests {
         let lease = lease_rx.borrow_and_update().clone();
         assert!(lease.controller_peer_id.is_empty());
         assert_eq!(lease.epoch, 2);
+    }
+
+    #[test]
+    fn remote_release_clears_the_host_lease_immediately() {
+        let host_id = b"host".to_vec();
+        let guest_id = b"guest".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::new(guest_id.clone(), Instant::now());
+        pane.control_tx
+            .try_send(HostControlEvent::ReleaseControl { peer_id: guest_id })
+            .expect("remote release event");
+
+        pane.drain().expect("drain remote release");
+
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        let lease = lease_rx.borrow_and_update().clone();
+        assert!(lease.controller_peer_id.is_empty());
+        assert_eq!(lease.epoch, 2);
+
+        pane.shutdown().expect("shutdown local pane");
     }
 
     #[test]

@@ -81,6 +81,20 @@ fn normal_take_control_requires_an_idle_controller() {
 }
 
 #[test]
+fn force_clear_releases_an_active_controller_and_advances_the_epoch() {
+    let now = Instant::now();
+    let mut lease = LeaseManager::new(vec![1], now);
+
+    let cleared = lease
+        .clear_controller(now + Duration::from_secs(1))
+        .expect("clearing an active controller");
+
+    assert!(cleared.is_some());
+    assert!(lease.state().controller_peer_id.is_empty());
+    assert_eq!(lease.state().epoch, 2);
+}
+
+#[test]
 fn epoch_exhaustion_is_an_error_not_a_wrap() {
     let now = Instant::now();
     let mut lease = LeaseManager::with_epoch_for_test(vec![1], u64::MAX, now);
