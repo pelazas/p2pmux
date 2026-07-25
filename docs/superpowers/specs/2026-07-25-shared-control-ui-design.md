@@ -2,21 +2,27 @@
 
 ## Goal
 
-Make the host and guest experience describe and enforce the same shared-control
-model, make control state unmistakable in the pane chrome, and remove
-function-key shortcuts that collide with macOS media keys.
+Make every member render and operate the same shared tab/split layout while preserving the
+authority of the member that hosts each PTY. This is the Spike 3 localhost design; later
+internet, presence, disconnect-grace, and failover work must not be implied as complete.
 
 ## Interaction model
 
-There is no forced takeover command. A member gains control by sending ordinary
-input to a pane whose current controller has been idle for the existing eight
-second timeout. The claiming input, including its first character, is buffered
-until the host accepts the lease claim, then forwarded to the shell. While a
-controller is actively typing, other members cannot interrupt; their input is
-not forwarded and they wait until the pane becomes idle before trying again.
-`Ctrl+Q` is the only TUI command and exits p2pmux. The TUI consumes it before
-forwarding any other input to the hosted shell, including a nested Zellij
-session.
+One controller leases each pane. A member gains control by ordinary input when the current
+controller has been idle for the existing eight-second timeout; the claiming input is buffered
+until the host accepts the lease claim. While a controller is actively typing, F9 forces Take
+control of the **focused** pane. F10 exits only the local p2pmux view.
+
+The local mux consumes its commands before any focused PTY receives them:
+
+- `Ctrl+P`, then `N` splits the focused pane; `X` requests deletion; arrows move focus.
+- `Ctrl+T`, then `N` creates a tab; `X` requests tab deletion; left/right switch tabs.
+- `Esc` cancels a pending chord.
+
+The new PTY for a split or tab runs on the requester’s Mac with a fixed creation grid. A pane’s
+host alone may delete it. A tab deletion succeeds only when the requester hosts every pane in
+that tab. The last pane in a tab is removed by deleting the tab; the final tab cannot be deleted.
+All splits are nested 50/50 (depth 4; up to 8 panes/tab and 9 tabs).
 
 The pane host's existing `LeaseManager` remains authoritative. It serializes
 concurrent idle claims; the first accepted claim advances the lease epoch and
@@ -26,30 +32,22 @@ same manager. This change does not make the timeout configurable.
 
 ## Shared help and permissions
 
-Host and guest render the identical control-help text: `type to claim idle |
-active typing is protected | Ctrl+Q quit`. The host may retain its join ticket
-in a separate status prefix, but it must not replace or alter that control help.
-The current prototype has one shared pane, so its UI must not imply host-only
-privilege or advertise a manual handoff action.
+Every member renders the same tab bar, focused-pane chrome, host badge, and controller state.
+The footer communicates `Ctrl+P panes | Ctrl+T tabs | F9 control | F10 quit`; the coordinator
+may append its join code. Focus never grants control. The UI shows reservation, rejection, and
+waiting-for-snapshot/lease status without blocking pane drain or layout control.
 
 ## Control-pane chrome
 
-The controlled pane has a distinct border in both renderers. When the controller
-is actively typing, use a vivid red-orange border and the top-left label `this
-user is typing`. When the same controller remains assigned but becomes idle,
-retain the border, use a muted gray-orange color, and label it `this user has
-control`. This differentiates active input from idle ownership without changing
-the lease protocol. Before a guest receives its first lease, render no
-control-state border and prefix the same shared help with `waiting for control
-state | `; a disconnect continues to terminate the TUI with its existing error.
+The focused pane has a distinct border. Pane chrome identifies its host and the current controller
+as typing, idle, or waiting for the first lease. Before screen/lease bootstrap, the leaf remains in
+the authoritative layout with a compact waiting state. Remote screen data is letterboxed or
+clipped inside its leaf; no client resizes the host PTY.
 
 ## Testing
 
-Add unit coverage around TUI-facing control state and input-command selection so
-the shared help, Ctrl+Q handling, and active/idle chrome cannot regress. Cover
-the first keystroke following an idle claim, concurrent/stale claim rejection,
-and the pre-lease state. Update README instructions so neither F9/F10 nor forced
-takeover is advertised. Run the full Cargo test suite. Finally run `p2pmux
-create` in one terminal and `p2pmux join <ticket>` in another, exercising idle
-automatic handoff, active-input protection, the two border states, common footer
-text, and Ctrl+Q shutdown on both sides.
+Cover chord consumption, focus, fixed-grid geometry, lease transitions, coordinator request /
+reservation / ready / commit lifecycle, host-only deletion, all-host tab deletion, and remote
+subscription retry after a transient failure. Run the full Cargo suite and strict clippy. Finally
+run `p2pmux create` in one terminal and `p2pmux join <ticket>` in another, exercising split,
+pane delete, tab create/delete, F9, and F10 on both processes.
