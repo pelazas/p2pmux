@@ -2,6 +2,7 @@ use std::{
     fs,
     net::SocketAddr,
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -160,13 +161,16 @@ fn local_rendezvous_rejects_unknown_codes_without_echoing_them() {
     fs::remove_dir_all(directory).expect("temporary directory should remove");
 }
 
+static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn temporary_directory() -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
         .as_nanos();
+    let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "p2pmux-rendezvous-test-{}-{nonce}",
+        "p2pmux-rendezvous-test-{}-{nonce}-{sequence}",
         std::process::id()
     ))
 }
