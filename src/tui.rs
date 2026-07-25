@@ -160,6 +160,10 @@ impl MultiPaneTui {
         self.chord_mode
     }
 
+    fn exit_chord_mode(&mut self) {
+        self.chord_mode = ChordMode::None;
+    }
+
     pub fn pane_view(&self, pane_id: PaneId) -> Option<&PaneViewState> {
         self.pane_views.get(&pane_id)
     }
@@ -1309,6 +1313,7 @@ impl SharedLayoutRuntime {
                     dirty = true;
                 }
                 Event::Paste(text) => {
+                    self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
                     dirty = true;
                 }
@@ -3121,6 +3126,20 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
             KeyHandling::Forward
         );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn paste_exits_sticky_chord_mode_before_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        tui.exit_chord_mode();
+
         assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 
