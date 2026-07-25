@@ -1767,13 +1767,6 @@ impl SharedLayoutRuntime {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if key.code == KeyCode::Esc
-                        && key.modifiers.is_empty()
-                        && self.tui.clear_selection()
-                    {
-                        dirty = true;
-                        continue;
-                    }
                     match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
                         KeyHandling::Quit => break,
                         KeyHandling::Consumed(intents) => {
@@ -4521,6 +4514,10 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
             KeyHandling::Forward
         );
         let _ = tui.handle_key(
