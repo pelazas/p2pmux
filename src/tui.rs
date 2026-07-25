@@ -1,6 +1,7 @@
 //! The fixed-grid local terminal renderer and input loop.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     io,
     time::{Duration, Instant},
@@ -21,10 +22,11 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::Widget,
+    widgets::{Block, Paragraph, Widget},
 };
 
 use crate::{
+    layout::{Axis, LayoutError, LayoutSnapshot, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, ScreenFrame},
@@ -33,6 +35,538 @@ use crate::{
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
+
+/// The in-progress multi-pane command prefix, kept entirely local to one terminal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ChordMode {
+    #[default]
+    None,
+    Pane,
+    Tab,
+}
+
+/// Metadata used to draw a pane before its runtime has delivered a screen and lease.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PaneViewState {
+    pub ready: bool,
+    pub host_peer_id: Vec<u8>,
+    pub controller_peer_id: Option<Vec<u8>>,
+    pub controller_active: bool,
+}
+
+/// User operations emitted by the TUI. Session code owns all resulting mutations and PTYs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiIntent {
+    CreatePane {
+        target_pane_id: PaneId,
+        axis: Axis,
+        grid_rows: u16,
+        grid_cols: u16,
+    },
+    DeletePane {
+        pane_id: PaneId,
+    },
+    CreateTab {
+        grid_rows: u16,
+        grid_cols: u16,
+    },
+    DeleteTab {
+        tab_id: TabId,
+    },
+    FocusPane {
+        pane_id: PaneId,
+    },
+    SwitchTab {
+        tab_id: TabId,
+    },
+}
+
+/// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyHandling {
+    Forward,
+    Consumed(Vec<UiIntent>),
+    TakeControl,
+    Quit,
+}
+
+/// Rectangles for one rendered terminal frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneGeometry {
+    pub tab_bar: Rect,
+    pub content: Rect,
+    pub footer: Rect,
+    pub panes: BTreeMap<PaneId, Rect>,
+}
+
+/// Pure local rendering and selection state for a revisioned shared layout.
+#[derive(Clone, Debug)]
+pub struct MultiPaneTui {
+    snapshot: LayoutSnapshot,
+    current_tab: TabId,
+    focused_pane: PaneId,
+    chord_mode: ChordMode,
+    pane_views: BTreeMap<PaneId, PaneViewState>,
+}
+
+impl MultiPaneTui {
+    pub fn new(snapshot: LayoutSnapshot) -> Result<Self, LayoutError> {
+        crate::layout::SessionState::validate_snapshot(&snapshot)?;
+        let current_tab = snapshot.tabs[0].tab_id;
+        let focused_pane = first_leaf(&snapshot.tabs[0].root).expect("validated layout has a leaf");
+        let pane_views = snapshot
+            .panes
+            .values()
+            .map(|pane| {
+                (
+                    pane.pane_id,
+                    PaneViewState {
+                        host_peer_id: pane.host_peer_id.clone(),
+                        ..PaneViewState::default()
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            snapshot,
+            current_tab,
+            focused_pane,
+            chord_mode: ChordMode::None,
+            pane_views,
+        })
+    }
+
+    pub fn snapshot(&self) -> &LayoutSnapshot {
+        &self.snapshot
+    }
+
+    pub fn current_tab(&self) -> TabId {
+        self.current_tab
+    }
+
+    pub fn focused_pane(&self) -> PaneId {
+        self.focused_pane
+    }
+
+    pub fn chord_mode(&self) -> ChordMode {
+        self.chord_mode
+    }
+
+    pub fn pane_view(&self, pane_id: PaneId) -> Option<&PaneViewState> {
+        self.pane_views.get(&pane_id)
+    }
+
+    pub fn set_pane_view(&mut self, pane_id: PaneId, state: PaneViewState) {
+        if self.snapshot.panes.contains_key(&pane_id) {
+            self.pane_views.insert(pane_id, state);
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: LayoutSnapshot) -> Result<(), LayoutError> {
+        crate::layout::SessionState::validate_snapshot(&snapshot)?;
+        let old_views = std::mem::take(&mut self.pane_views);
+        self.pane_views = snapshot
+            .panes
+            .values()
+            .map(|pane| {
+                let mut state = old_views.get(&pane.pane_id).cloned().unwrap_or_default();
+                state.host_peer_id = pane.host_peer_id.clone();
+                (pane.pane_id, state)
+            })
+            .collect();
+        self.snapshot = snapshot;
+        self.repair_selection();
+        Ok(())
+    }
+
+    pub fn select_tab(&mut self, tab_id: TabId) -> Result<(), LayoutError> {
+        let tab = self
+            .snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .ok_or(LayoutError::UnknownTab { tab_id })?;
+        self.current_tab = tab_id;
+        self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
+        Ok(())
+    }
+
+    pub fn geometry(&self, area: Rect) -> PaneGeometry {
+        let tab_bar = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        let footer_height = area.height.saturating_sub(tab_bar.height).min(1);
+        let footer = Rect::new(
+            area.x,
+            area.y
+                .saturating_add(area.height.saturating_sub(footer_height)),
+            area.width,
+            footer_height,
+        );
+        let content = Rect::new(
+            area.x,
+            area.y.saturating_add(tab_bar.height),
+            area.width,
+            area.height.saturating_sub(tab_bar.height + footer_height),
+        );
+        let mut panes = BTreeMap::new();
+        if let Some(tab) = self.current_tab_layout() {
+            allocate_node(&tab.root, content, &mut panes);
+        }
+        PaneGeometry {
+            tab_bar,
+            content,
+            footer,
+            panes,
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
+        if is_quit(key) {
+            self.chord_mode = ChordMode::None;
+            return KeyHandling::Quit;
+        }
+        if is_take_control(key) {
+            self.chord_mode = ChordMode::None;
+            return KeyHandling::TakeControl;
+        }
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self.chord_mode != ChordMode::None
+        {
+            self.chord_mode = ChordMode::None;
+            return KeyHandling::Consumed(vec![]);
+        }
+        if self.chord_mode == ChordMode::None {
+            if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
+                self.chord_mode = ChordMode::Pane;
+                return KeyHandling::Consumed(vec![]);
+            }
+            if key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL {
+                self.chord_mode = ChordMode::Tab;
+                return KeyHandling::Consumed(vec![]);
+            }
+            return KeyHandling::Forward;
+        }
+
+        let chord = self.chord_mode;
+        self.chord_mode = ChordMode::None;
+        let intent = match chord {
+            ChordMode::Pane => self.handle_pane_chord(key, area),
+            ChordMode::Tab => self.handle_tab_chord(key, area),
+            ChordMode::None => None,
+        };
+        KeyHandling::Consumed(intent.into_iter().collect())
+    }
+
+    fn handle_pane_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
+        match key.code {
+            KeyCode::Char('n') if key.modifiers.is_empty() => {
+                let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
+                let (grid_rows, grid_cols) = grid_for_pane(rect);
+                Some(UiIntent::CreatePane {
+                    target_pane_id: self.focused_pane,
+                    axis: if rect.width >= rect.height {
+                        Axis::LeftRight
+                    } else {
+                        Axis::TopBottom
+                    },
+                    grid_rows,
+                    grid_cols,
+                })
+            }
+            KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeletePane {
+                pane_id: self.focused_pane,
+            }),
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                if key.modifiers.is_empty() =>
+            {
+                self.move_focus(key.code, area)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_tab_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
+        match key.code {
+            KeyCode::Char('n') if key.modifiers.is_empty() => {
+                let (grid_rows, grid_cols) = grid_for_pane(self.geometry(area).content);
+                Some(UiIntent::CreateTab {
+                    grid_rows,
+                    grid_cols,
+                })
+            }
+            KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeleteTab {
+                tab_id: self.current_tab,
+            }),
+            KeyCode::Left if key.modifiers.is_empty() => self.switch_tab(false),
+            KeyCode::Right if key.modifiers.is_empty() => self.switch_tab(true),
+            _ => None,
+        }
+    }
+
+    fn move_focus(&mut self, direction: KeyCode, area: Rect) -> Option<UiIntent> {
+        let geometry = self.geometry(area);
+        let source = *geometry.panes.get(&self.focused_pane)?;
+        let source_center = rect_center(source);
+        let mut candidates = geometry
+            .panes
+            .iter()
+            .filter(|(pane_id, _)| **pane_id != self.focused_pane)
+            .map(|(pane_id, rect)| (*pane_id, *rect))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        let directed = candidates
+            .iter()
+            .copied()
+            .filter(|(_, rect)| is_in_direction(source_center, rect_center(*rect), direction))
+            .min_by_key(|(pane_id, rect)| {
+                direction_distance(source_center, rect_center(*rect), direction, *pane_id)
+            });
+        let pane_id = directed
+            .or_else(|| {
+                candidates.sort_by_key(|(pane_id, rect)| {
+                    let center = rect_center(*rect);
+                    (
+                        source_center.0.abs_diff(center.0) + source_center.1.abs_diff(center.1),
+                        *pane_id,
+                    )
+                });
+                candidates.first().copied()
+            })?
+            .0;
+        self.focused_pane = pane_id;
+        Some(UiIntent::FocusPane { pane_id })
+    }
+
+    fn switch_tab(&mut self, forward: bool) -> Option<UiIntent> {
+        let index = self
+            .snapshot
+            .tabs
+            .iter()
+            .position(|tab| tab.tab_id == self.current_tab)?;
+        let len = self.snapshot.tabs.len();
+        let next = if forward {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        };
+        let tab_id = self.snapshot.tabs[next].tab_id;
+        self.select_tab(tab_id)
+            .expect("tab came from current snapshot");
+        Some(UiIntent::SwitchTab { tab_id })
+    }
+
+    fn current_tab_layout(&self) -> Option<&crate::layout::Tab> {
+        self.snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == self.current_tab)
+    }
+
+    fn repair_selection(&mut self) {
+        let current_tab = self.current_tab_layout();
+        let current_tab = if let Some(tab) = current_tab {
+            tab
+        } else {
+            self.current_tab = self.snapshot.tabs[0].tab_id;
+            &self.snapshot.tabs[0]
+        };
+        if !contains_leaf(&current_tab.root, self.focused_pane) {
+            self.focused_pane = first_leaf(&current_tab.root).expect("validated layout has a leaf");
+        }
+    }
+}
+
+fn first_leaf(node: &Node) -> Option<PaneId> {
+    match node {
+        Node::Leaf { pane_id } => Some(*pane_id),
+        Node::Split { first, .. } => first_leaf(first),
+    }
+}
+
+fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
+    match node {
+        Node::Leaf { pane_id: candidate } => *candidate == pane_id,
+        Node::Split { first, second, .. } => {
+            contains_leaf(first, pane_id) || contains_leaf(second, pane_id)
+        }
+    }
+}
+
+fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
+    match node {
+        Node::Leaf { pane_id } => {
+            panes.insert(*pane_id, area);
+        }
+        Node::Split {
+            axis,
+            first,
+            second,
+        } => {
+            let (first_area, second_area) = match axis {
+                Axis::LeftRight => {
+                    let first_width = area.width / 2;
+                    (
+                        Rect::new(area.x, area.y, first_width, area.height),
+                        Rect::new(
+                            area.x.saturating_add(first_width),
+                            area.y,
+                            area.width - first_width,
+                            area.height,
+                        ),
+                    )
+                }
+                Axis::TopBottom => {
+                    let first_height = area.height / 2;
+                    (
+                        Rect::new(area.x, area.y, area.width, first_height),
+                        Rect::new(
+                            area.x,
+                            area.y.saturating_add(first_height),
+                            area.width,
+                            area.height - first_height,
+                        ),
+                    )
+                }
+            };
+            allocate_node(first, first_area, panes);
+            allocate_node(second, second_area, panes);
+        }
+    }
+}
+
+fn grid_for_pane(rect: Rect) -> (u16, u16) {
+    (
+        rect.height.saturating_sub(2).max(1),
+        rect.width.saturating_sub(2).max(1),
+    )
+}
+
+fn rect_center(rect: Rect) -> (u32, u32) {
+    (
+        u32::from(rect.x) * 2 + u32::from(rect.width),
+        u32::from(rect.y) * 2 + u32::from(rect.height),
+    )
+}
+
+fn is_in_direction(source: (u32, u32), target: (u32, u32), direction: KeyCode) -> bool {
+    match direction {
+        KeyCode::Left => target.0 < source.0,
+        KeyCode::Right => target.0 > source.0,
+        KeyCode::Up => target.1 < source.1,
+        KeyCode::Down => target.1 > source.1,
+        _ => false,
+    }
+}
+
+fn direction_distance(
+    source: (u32, u32),
+    target: (u32, u32),
+    direction: KeyCode,
+    pane_id: PaneId,
+) -> (u32, u32, u32, PaneId) {
+    match direction {
+        KeyCode::Left | KeyCode::Right => {
+            let primary = source.0.abs_diff(target.0);
+            let secondary = source.1.abs_diff(target.1);
+            (primary + secondary, secondary, primary, pane_id)
+        }
+        KeyCode::Up | KeyCode::Down => {
+            let primary = source.1.abs_diff(target.1);
+            let secondary = source.0.abs_diff(target.0);
+            (primary + secondary, secondary, primary, pane_id)
+        }
+        _ => (u32::MAX, u32::MAX, u32::MAX, pane_id),
+    }
+}
+
+fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
+    let width = inner.width.min(cols);
+    let height = inner.height.min(rows);
+    Rect::new(
+        inner
+            .x
+            .saturating_add(inner.width.saturating_sub(width) / 2),
+        inner
+            .y
+            .saturating_add(inner.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+/// Renders layout chrome plus any currently available fixed-size VT screens.
+pub fn render_multi_pane(
+    frame: &mut Frame<'_>,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
+) {
+    let geometry = tui.geometry(frame.area());
+    let tabs = tui
+        .snapshot
+        .tabs
+        .iter()
+        .map(|tab| {
+            if tab.tab_id == tui.current_tab {
+                format!("[*{}]", tab.tab_id)
+            } else {
+                format!("[{}]", tab.tab_id)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if geometry.tab_bar.width > 0 && geometry.tab_bar.height > 0 {
+        frame.buffer_mut().set_string(
+            geometry.tab_bar.x,
+            geometry.tab_bar.y,
+            tabs,
+            Style::default().fg(Color::Cyan),
+        );
+    }
+    if geometry.footer.width > 0 && geometry.footer.height > 0 {
+        frame.buffer_mut().set_string(
+            geometry.footer.x,
+            geometry.footer.y,
+            "Ctrl+P panes | Ctrl+T tabs | F9 control | F10 quit",
+            Style::default().fg(Color::DarkGray),
+        );
+    }
+
+    for (pane_id, rect) in geometry.panes {
+        let pane = &tui.snapshot.panes[&pane_id];
+        let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
+        let focused = pane_id == tui.focused_pane;
+        let lease = match view.controller_peer_id.as_deref() {
+            Some(peer) if view.controller_active => format!("ctrl:{} typing", short_peer(peer)),
+            Some(peer) => format!("ctrl:{} idle", short_peer(peer)),
+            None => String::from("lease: waiting"),
+        };
+        let title = format!(
+            "{} host:{} {lease}",
+            if focused { "*" } else { " " },
+            short_peer(&view.host_peer_id)
+        );
+        let border_color = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(border_color));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        if let Some(screen) = screens.get(&pane_id) {
+            frame.render_widget(
+                VtScreen::new(screen),
+                fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols),
+            );
+        } else if !view.ready {
+            frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), inner);
+        }
+    }
+}
 
 pub struct HostPaneRuntime {
     host: PtyHost,
@@ -746,16 +1280,324 @@ fn short_peer(peer_id: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
         Terminal,
         backend::TestBackend,
+        layout::Rect,
         style::{Color, Modifier},
     };
 
+    use crate::layout::{Axis, LayoutSnapshot, Node, Pane, Tab};
     use crate::screen::{GuestScreen, HostScreen};
 
-    use super::{VtScreen, encode_key, encode_paste, render_guest_screen};
+    use super::{
+        ChordMode, KeyHandling, MultiPaneTui, PaneViewState, UiIntent, VtScreen, encode_key,
+        encode_paste, render_guest_screen, render_multi_pane,
+    };
+
+    fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
+        LayoutSnapshot {
+            revision: 1,
+            members: vec![crate::layout::Member {
+                peer_id: b"host".to_vec(),
+                endpoint_addr: b"endpoint".to_vec(),
+            }],
+            tabs,
+            panes: panes
+                .iter()
+                .map(|(pane_id, rows, cols)| {
+                    (
+                        *pane_id,
+                        Pane {
+                            pane_id: *pane_id,
+                            host_peer_id: b"host".to_vec(),
+                            grid_rows: *rows,
+                            grid_cols: *cols,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    fn split_layout() -> LayoutSnapshot {
+        layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Split {
+                        axis: Axis::TopBottom,
+                        first: Box::new(Node::Leaf { pane_id: 2 }),
+                        second: Box::new(Node::Leaf { pane_id: 3 }),
+                    }),
+                },
+            }],
+            &[(1, 4, 10), (2, 4, 10), (3, 4, 10)],
+        )
+    }
+
+    #[test]
+    fn multi_pane_geometry_recursively_splits_the_content_area() {
+        let tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let geometry = tui.geometry(Rect::new(0, 0, 80, 24));
+
+        assert_eq!(geometry.tab_bar, Rect::new(0, 0, 80, 1));
+        assert_eq!(geometry.footer, Rect::new(0, 23, 80, 1));
+        assert_eq!(geometry.panes[&1], Rect::new(0, 1, 40, 22));
+        assert_eq!(geometry.panes[&2], Rect::new(40, 1, 40, 11));
+        assert_eq!(geometry.panes[&3], Rect::new(40, 12, 40, 11));
+    }
+
+    #[test]
+    fn tiny_terminal_geometry_stays_in_bounds() {
+        let tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let geometry = tui.geometry(Rect::new(u16::MAX, u16::MAX, 1, 1));
+
+        assert_eq!(geometry.tab_bar, Rect::new(u16::MAX, u16::MAX, 1, 1));
+        assert_eq!(geometry.footer, Rect::new(u16::MAX, u16::MAX, 1, 0));
+        assert_eq!(geometry.content, Rect::new(u16::MAX, u16::MAX, 1, 0));
+        assert!(
+            geometry
+                .panes
+                .values()
+                .all(|rect| rect.x == u16::MAX && rect.y == u16::MAX)
+        );
+    }
+
+    #[test]
+    fn snapshot_commit_repairs_removed_tab_and_pane_selection() {
+        let initial = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        );
+        let mut tui = MultiPaneTui::new(initial).expect("valid layout");
+        tui.select_tab(2).expect("select second tab");
+
+        tui.apply_snapshot(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid commit");
+
+        assert_eq!(tui.current_tab(), 1);
+        assert_eq!(tui.focused_pane(), 1);
+    }
+
+    #[test]
+    fn chrome_marks_focus_and_reports_host_and_lease() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState {
+                ready: true,
+                host_peer_id: b"host".to_vec(),
+                controller_peer_id: Some(b"peer".to_vec()),
+                controller_active: true,
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(36, 6)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(0, 1)].symbol(), "┌");
+        assert_eq!(buffer[(1, 1)].symbol(), "*");
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
+    }
+
+    #[test]
+    fn fixed_grid_view_is_centered_and_clipped_inside_pane_chrome() {
+        let mut parser = vt100::Parser::new(1, 5, 0);
+        parser.process(b"abcde");
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 5)],
+        ))
+        .expect("valid layout");
+        let screens = BTreeMap::from([(1, parser.screen())]);
+        let mut terminal = Terminal::new(TestBackend::new(6, 5)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &screens))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(1, 2)].symbol(), "a");
+        assert_eq!(buffer[(4, 2)].symbol(), "d");
+        assert_eq!(buffer[(5, 2)].symbol(), "│");
+    }
+
+    #[test]
+    fn pane_chord_consumes_commands_and_uses_focused_rect_aspect() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::LeftRight,
+                grid_rows: 20,
+                grid_cols: 38,
+            }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn pane_focus_uses_nearest_directional_leaf_then_a_stable_fallback() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+        );
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+    }
+
+    #[test]
+    fn tab_chord_switches_and_creates_or_deletes_tabs_without_forwarding_keys() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 12, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SwitchTab { tab_id: 2 }])
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreateTab {
+                grid_rows: 4,
+                grid_cols: 10,
+            }])
+        );
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 2 }])
+        );
+    }
+
+    #[test]
+    fn normal_keys_escape_and_function_keys_are_classified_without_pty_encoding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), area),
+            KeyHandling::TakeControl
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), area),
+            KeyHandling::Quit
+        );
+    }
 
     #[test]
     fn remote_renderer_keeps_host_grid_fixed_and_draws_a_footer() {
