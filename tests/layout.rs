@@ -1,6 +1,6 @@
 use p2pmux::layout::{
     Axis, LayoutError, LayoutSnapshot, MAX_ENDPOINT_ADDR_BYTES, MAX_MEMBERS, MAX_PANES_PER_TAB,
-    MAX_PEER_ID_BYTES, MAX_TABS, Node, ReservationCommit, SessionState,
+    MAX_PEER_ID_BYTES, MAX_TABS, NewPanePosition, Node, ReservationCommit, SessionState,
 };
 
 const HOST_A: &[u8] = b"host-a";
@@ -144,6 +144,42 @@ fn creating_panes_uses_the_requested_split_axis() {
 }
 
 #[test]
+fn creating_panes_honors_first_or_second_placement_and_defaults_to_second() {
+    let mut state = state();
+    let second_pane = state
+        .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("default second split");
+    assert!(matches!(
+        snapshot(&state).tabs[0].root,
+        Node::Split { ref first, ref second, .. }
+            if matches!(first.as_ref(), Node::Leaf { pane_id: 1 })
+                && matches!(second.as_ref(), Node::Leaf { pane_id } if *pane_id == second_pane)
+    ));
+
+    let first = state
+        .create_pane_at(
+            HOST_A,
+            state.revision(),
+            second_pane,
+            Axis::TopBottom,
+            NewPanePosition::First,
+            24,
+            80,
+        )
+        .expect("first split");
+    assert!(matches!(
+        snapshot(&state).tabs[0].root,
+        Node::Split { second: ref right_split, .. }
+            if matches!(
+                right_split.as_ref(),
+                Node::Split { first: child_first, second: child_second, .. }
+                    if matches!(child_first.as_ref(), Node::Leaf { pane_id } if *pane_id == first)
+                        && matches!(child_second.as_ref(), Node::Leaf { pane_id } if *pane_id == second_pane)
+            )
+    ));
+}
+
+#[test]
 fn deleting_a_pane_expands_its_sibling() {
     let mut state = state();
     let sibling = state
@@ -211,22 +247,36 @@ fn membership_tab_pane_and_depth_limits_are_enforced() {
     let mut leaf = 1;
     for _ in 0..4 {
         leaf = depth_state
-            .create_pane(
+            .create_pane_at(
                 HOST_A,
                 depth_state.revision(),
                 leaf,
                 Axis::TopBottom,
+                NewPanePosition::Second,
                 24,
                 80,
             )
             .expect("within depth limit");
     }
     assert_eq!(
-        depth_state.create_pane(
+        depth_state.create_pane_at(
             HOST_A,
             depth_state.revision(),
             leaf,
             Axis::TopBottom,
+            NewPanePosition::First,
+            24,
+            80
+        ),
+        Err(LayoutError::SplitDepthLimit)
+    );
+    assert_eq!(
+        depth_state.create_pane_at(
+            HOST_A,
+            depth_state.revision(),
+            leaf,
+            Axis::TopBottom,
+            NewPanePosition::Second,
             24,
             80
         ),

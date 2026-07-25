@@ -3,9 +3,9 @@ use p2pmux::protocol::{
     LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
     LayoutState, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES,
     MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SNAPSHOT_BYTES, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady,
-    PaneReservation, PaneSubscribe, ProtocolError, SessionSnapshot, Snapshot, SplitAxis,
-    TabDescriptor, TakeControl, Welcome, decode_frame, encode_frame, envelope,
+    MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor,
+    PaneFailed, PaneReady, PaneReservation, PaneSubscribe, ProtocolError, SessionSnapshot,
+    Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -25,8 +25,8 @@ fn envelope(body: envelope::Body) -> Envelope {
 }
 
 #[test]
-fn protocol_version_is_v2() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+fn protocol_version_is_v3() {
+    assert_eq!(PROTOCOL_VERSION, 3);
 }
 
 #[test]
@@ -249,6 +249,7 @@ fn v2_envelopes() -> Vec<Envelope> {
                 axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: 24,
                 grid_cols: 80,
+                position: None,
             }),
             delete_pane: None,
             create_tab: None,
@@ -342,6 +343,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             axis: Some(SplitAxis::LeftRight as i32),
             grid_rows: 24,
             grid_cols: 80,
+            position: None,
         }),
         delete_pane: Some(DeletePane { pane_id: 1 }),
         ..empty_action.clone()
@@ -526,8 +528,8 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
 }
 
 #[test]
-fn create_and_split_axes_must_be_explicitly_present_and_valid() {
-    fn create_request(axis: Option<i32>) -> Envelope {
+fn create_pane_axis_and_position_are_validated() {
+    fn create_request(axis: Option<i32>, position: Option<i32>) -> Envelope {
         envelope(envelope::Body::LayoutRequest(LayoutRequest {
             request_id: 1,
             base_revision: 1,
@@ -536,6 +538,7 @@ fn create_and_split_axes_must_be_explicitly_present_and_valid() {
                 axis,
                 grid_rows: 24,
                 grid_cols: 80,
+                position,
             }),
             delete_pane: None,
             create_tab: None,
@@ -578,14 +581,15 @@ fn create_and_split_axes_must_be_explicitly_present_and_valid() {
     }
 
     for invalid in [
-        create_request(None),
-        create_request(Some(99)),
+        create_request(None, None),
+        create_request(Some(99), None),
+        create_request(Some(SplitAxis::LeftRight as i32), Some(99)),
         split_snapshot(None),
         split_snapshot(Some(99)),
     ] {
         assert!(
             encode_frame(&invalid).is_err(),
-            "layout axes must not silently default to LeftRight"
+            "layout axes and placement must be valid"
         );
         let mut raw = Vec::new();
         invalid
@@ -593,6 +597,34 @@ fn create_and_split_axes_must_be_explicitly_present_and_valid() {
             .expect("raw invalid frame should encode");
         assert!(decode_frame(&raw).is_err());
     }
+}
+
+#[test]
+fn create_pane_position_has_a_stable_new_wire_tag_and_defaults_to_second() {
+    let default = CreatePane {
+        target_pane_id: 1,
+        axis: Some(SplitAxis::LeftRight as i32),
+        grid_rows: 24,
+        grid_cols: 80,
+        position: None,
+    };
+    assert_eq!(
+        field_shape(&parse_fields(&default.encode_to_vec())),
+        vec![(1, 0), (2, 0), (3, 0), (4, 0)]
+    );
+
+    let first = CreatePane {
+        position: Some(NewPanePosition::First as i32),
+        ..default.clone()
+    };
+    assert_eq!(
+        field_shape(&parse_fields(&first.encode_to_vec())),
+        vec![(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]
+    );
+    assert_eq!(
+        CreatePane::decode(first.encode_to_vec().as_slice()).unwrap(),
+        first
+    );
 }
 
 #[test]
@@ -616,6 +648,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
                 axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: maximum,
                 grid_cols: maximum,
+                position: None,
             }),
             ..empty_action.clone()
         })),
@@ -650,6 +683,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
                 axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: oversized,
                 grid_cols: 80,
+                position: None,
             }),
             ..empty_action.clone()
         })),
@@ -659,6 +693,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
                 axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: 24,
                 grid_cols: oversized,
+                position: None,
             }),
             ..empty_action.clone()
         })),

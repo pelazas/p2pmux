@@ -79,6 +79,7 @@ fn create_request(request_id: u64, base_revision: u64) -> LayoutRequest {
             axis: Some(SplitAxis::LeftRight as i32),
             grid_rows: 24,
             grid_cols: 80,
+            position: None,
         }),
         delete_pane: None,
         create_tab: None,

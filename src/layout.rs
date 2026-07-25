@@ -19,6 +19,13 @@ pub enum Axis {
     TopBottom,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewPanePosition {
+    First,
+    #[default]
+    Second,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Node {
     Leaf {
@@ -85,6 +92,7 @@ enum PendingReservationKind {
         pane_id: PaneId,
         target_pane_id: PaneId,
         axis: Axis,
+        position: NewPanePosition,
         grid_rows: u16,
         grid_cols: u16,
     },
@@ -381,6 +389,28 @@ impl SessionState {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<PaneReservation, LayoutError> {
+        self.reserve_pane_at(
+            creator,
+            base_revision,
+            target_pane_id,
+            axis,
+            NewPanePosition::Second,
+            grid_rows,
+            grid_cols,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_pane_at(
+        &mut self,
+        creator: &[u8],
+        base_revision: u64,
+        target_pane_id: PaneId,
+        axis: Axis,
+        position: NewPanePosition,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<PaneReservation, LayoutError> {
         self.check_reservation(base_revision)?;
         self.require_member(creator)?;
         validate_grid(grid_rows, grid_cols)?;
@@ -400,6 +430,7 @@ impl SessionState {
                 pane_id,
                 target_pane_id,
                 axis,
+                position,
                 grid_rows,
                 grid_cols,
             },
@@ -471,6 +502,7 @@ impl SessionState {
                 pane_id,
                 target_pane_id,
                 axis,
+                position,
                 grid_rows,
                 grid_cols,
             } => {
@@ -478,12 +510,18 @@ impl SessionState {
                 let tab_index = self
                     .tab_index_for_pane(target_pane_id)
                     .ok_or(LayoutError::ReservationInvalid)?;
+                let target = Box::new(Node::Leaf {
+                    pane_id: target_pane_id,
+                });
+                let new_pane = Box::new(Node::Leaf { pane_id });
+                let (first, second) = match position {
+                    NewPanePosition::First => (new_pane, target),
+                    NewPanePosition::Second => (target, new_pane),
+                };
                 let split = Node::Split {
                     axis,
-                    first: Box::new(Node::Leaf {
-                        pane_id: target_pane_id,
-                    }),
-                    second: Box::new(Node::Leaf { pane_id }),
+                    first,
+                    second,
                 };
                 if !self.tabs[tab_index]
                     .root
@@ -581,11 +619,34 @@ impl SessionState {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<PaneId, LayoutError> {
-        let reservation = self.reserve_pane(
+        self.create_pane_at(
             requester,
             base_revision,
             target_pane_id,
             axis,
+            NewPanePosition::Second,
+            grid_rows,
+            grid_cols,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_pane_at(
+        &mut self,
+        requester: &[u8],
+        base_revision: u64,
+        target_pane_id: PaneId,
+        axis: Axis,
+        position: NewPanePosition,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<PaneId, LayoutError> {
+        let reservation = self.reserve_pane_at(
+            requester,
+            base_revision,
+            target_pane_id,
+            axis,
+            position,
             grid_rows,
             grid_cols,
         )?;

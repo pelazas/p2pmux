@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -300,6 +300,13 @@ pub enum SplitAxis {
     TopBottom = 1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NewPanePosition {
+    First = 0,
+    Second = 1,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LayoutRequest {
     #[prost(uint64, tag = "1")]
@@ -326,6 +333,8 @@ pub struct CreatePane {
     pub grid_rows: u32,
     #[prost(uint32, tag = "4")]
     pub grid_cols: u32,
+    #[prost(enumeration = "NewPanePosition", optional, tag = "5")]
+    pub position: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -715,6 +724,13 @@ fn validate_axis(field: &'static str, axis: Option<i32>) -> Result<(), ProtocolE
     Ok(())
 }
 
+fn validate_pane_position(field: &'static str, position: Option<i32>) -> Result<(), ProtocolError> {
+    if let Some(position) = position {
+        NewPanePosition::try_from(position).map_err(|_| ProtocolError::InvalidLayout(field))?;
+    }
+    Ok(())
+}
+
 fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError> {
     validate_nonzero("layout_request.request_id", request.request_id)?;
     validate_nonzero("layout_request.base_revision", request.base_revision)?;
@@ -733,6 +749,7 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
             create_pane.target_pane_id,
         )?;
         validate_axis("layout_request.create_pane.axis", create_pane.axis)?;
+        validate_pane_position("layout_request.create_pane.position", create_pane.position)?;
         validate_grid(
             "layout_request.create_pane.grid",
             create_pane.grid_rows,
