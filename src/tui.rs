@@ -440,10 +440,7 @@ impl MultiPaneTui {
             area.width,
             footer_height,
         );
-        let tab_bar_gap = area
-            .height
-            .saturating_sub(tab_bar.height + footer_height)
-            .min(0);
+        let tab_bar_gap = 0;
         let content = Rect::new(
             area.x,
             area.y.saturating_add(tab_bar.height + tab_bar_gap),

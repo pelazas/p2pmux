@@ -400,6 +400,7 @@ impl SessionState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_pane_at(
         &mut self,
         creator: &[u8],
@@ -629,6 +630,7 @@ impl SessionState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_pane_at(
         &mut self,
         requester: &[u8],
