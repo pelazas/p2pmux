@@ -29,7 +29,9 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
   fixed-grid PTY runs on that requester’s Mac. Only a pane’s host may delete that pane. A tab may
   be deleted only by a member that hosts every pane in it. There is no close confirmation in this
   spike; stale requests are rejected rather than replayed.
-- **Input:** one controller per pane; **idle → hop in and type, no approval**; if controller is **actively typing**, explicit **Take control** required.
+- **Input:** a pane has a controller only while that peer is actively typing. After about eight
+  seconds idle, the host clears the controller and the pane is free; the next ordinary key claims
+  it and is delivered as the first input. Active typing is protected; there is no forced takeover.
 - **Later-spike disconnect behavior:** 5-minute unavailable placeholders and coordinator failover
   are MVP goals, not implemented by Spike 3.
 - **Layout:** nested binary 50/50; **depth ≤ 4**; **≤ 8 panes/tab**; max **9 tabs**.
@@ -40,8 +42,12 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 
 1. You `create` → reusable join ticket → first shell on your Mac. You start as coordinator.
 2. Others `join <ticket>` (up to 8). Everyone sees the same tabs/panes.
-3. Shells run on whoever **hosts** that pane’s Mac. Others watch; when idle they hop in and type; active typing is protected until the controller becomes idle.
-4. Any member can split an available pane or create a tab; the requester hosts the new PTY. Only the host can delete a pane. A member can delete a tab only when it owns every pane in that tab.
+3. Shells run on whoever **hosts** that pane’s Mac. Others watch; an idle pane is free for the
+   next member's ordinary key to claim and deliver. Active typing is protected until the host clears
+   the controller after the idle timeout.
+4. Any member can split an available pane or create a tab; the requester hosts the new PTY, but is
+   not its controller and the new pane starts free. Only the host can delete a pane. A member can
+   delete a tab only when it owns every pane in that tab.
 5. Spike 3 is localhost layout/control work. Disconnect grace and coordinator failover remain later spikes.
 
 ## 4. Architecture
@@ -77,10 +83,11 @@ If coordinator disconnects:
 
 ### Input control
 
-- `controller` + idle(~8s)/typing; focus ≠ control.
-- Idle: another member may take over by hopping in / typing — **no approval**.
-- Typing: explicit **Take control** (visible handoff).
-- Control serialized so two streams never hit one PTY.
+- `controller` exists only during active typing; focus ≠ control.
+- After ~8 seconds idle, the host publishes an empty controller and a new lease epoch: the pane is
+  free. The next ordinary input claims it and carries its first key.
+- Active typing rejects other ordinary input; no forced takeover exists.
+- Claims are serialized so two streams never hit one PTY.
 
 ### Spike 3 layout and deletion
 
@@ -102,7 +109,12 @@ the local view; F9 and F10 reach the focused PTY. Pane grids never resize.
 
 ## 5. UI / presence
 
-Tabs + nested splits as above. Tab bar: who is on which tab. Pane: host badge, focus, **controller/driver**, idle vs typing cue. Direct | relayed indicator.
+Tabs + nested splits as above. Tab labels are clickable for local tab switching. Each pane title is
+`Pane #N  host: <name>  control: free|<name>|…`; a focused free pane has a white border, an
+actively controlled pane a red-orange border, and an unbootstrapped lease a yellow focused border.
+The dark contextual footer uses red key accents: normal mode shows
+`Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free`; pane and tab modes show their
+focus/switch, new, close, and back commands. Direct | relayed indicator.
 
 ## 6. Wire sketch
 
@@ -129,8 +141,8 @@ See [SPIKE_PLAN.md](./SPIKE_PLAN.md).
 ## 10. MVP success criteria
 
 Two (then more) Macs join via reusable ticket; shared layout; both host panes; anyone can split
-available panes; pane hosts delete their own panes; all-host tabs can be deleted; idle hop-in
-typing; Take control when busy; presence; locality of processes; encrypted P2P/relay; ≈ SSH feel;
+available panes; pane hosts delete their own panes; all-host tabs can be deleted; free-pane first-
+key claims and protected active typing; presence; locality of processes; encrypted P2P/relay; ≈ SSH feel;
 disconnect grace works; coordinator leave does not kill whole session.
 
 ## Caveat (honest)

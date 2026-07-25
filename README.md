@@ -77,9 +77,12 @@ Short join codes resolve through a restrictive local cache on the same Mac, so t
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
 
-Only one peer controls each pane at a time: after about eight seconds of idle time another member
-can type to hop in. Active typing is protected, so there is no forced takeover. Ctrl+Q exits only
-the local p2pmux view; F9 and F10 continue through to the focused PTY.
+Only one peer controls a pane while they are actively typing. After about eight seconds without
+activity, the host clears the controller and the pane becomes free. The next member's ordinary key
+claims the free pane and is delivered as its first input; active typing is protected, so there is
+no forced takeover. A pane's host owns its PTY, not its control lease: newly created split and tab
+panes start free. Ctrl+Q exits only the local p2pmux view; F9 and F10 continue through to the
+focused PTY.
 
 Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
@@ -98,9 +101,12 @@ passthrough configuration.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
 Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
-pane reports whether its controller is actively typing or merely retains idle control, and every
-member sees the same footer: `Ctrl+P panes | Ctrl+T tabs | type to claim when free | active typing is
-protected | Ctrl+Q quit`.
+pane title shows `Pane #N  host: <name>  control: free|<name>|…`; free focused panes use a white
+border and actively controlled panes use red-orange. Click tab labels to switch tabs without
+claiming control or sending input. The dark contextual footer uses red key accents: normal mode is
+`Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free`; pane mode is
+`Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK`; tab mode is
+`Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal crops or letterboxes the immutable host grid; it never resizes the host PTY.

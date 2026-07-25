@@ -7,7 +7,7 @@ Polish shared-layout UX after sticky chords / display names:
 1. Control means **actively typing only**; idle panes are **free**
 2. Pane titles: `Pane #N  host: <name>  control: …`
 3. Click tab labels to switch tabs
-4. Non-typing focused border is white (no brown idle-owner state)
+4. A focused free pane has a white border
 5. Zellij-inspired contextual footer with accent keys
 
 ## Non-goals
@@ -33,7 +33,7 @@ Polish shared-layout UX after sticky chords / display names:
 - `ControlLease.controller_peer_id` may be empty ⇒ free.
 - Clearing on idle bumps `lease_epoch` and republishes to watchers (same path as today’s lease publish).
 - Guests: empty controller ⇒ free chrome; do not show a retained owner.
-- Remove UI copy about “has control” while idle; remove brown idle-owner border state.
+- Free panes show `control: free`.
 
 ### Initial pane state
 
@@ -58,7 +58,7 @@ Pane #3  host: pelazas  control: …
 | Typing | display name (disambiguated if needed) | Red-orange `Rgb(255,69,0)` | same red-orange or slightly dim |
 | Waiting for lease bootstrap | `…` | Yellow or white | Dark gray |
 
-Drop brown `Rgb(140,91,68)` idle-owner styling.
+Free panes use the colors in the table.
 
 ## Tab click
 
@@ -93,7 +93,7 @@ Coordinator join code remains a quiet right-side / truncated suffix when present
 
 ## Docs
 
-Update README + shared-control / MVP snippets that still say idle retained control or brown “has control” chrome.
+Keep README, shared-control, and MVP snippets aligned with free panes and the current chrome.
 
 ## Testing
 
