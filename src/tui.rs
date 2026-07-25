@@ -21,7 +21,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::Widget,
+    widgets::{Block, Widget},
 };
 
 use crate::{
@@ -137,6 +137,44 @@ impl<'a> VtScreen<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlChrome {
+    Active,
+    Idle,
+}
+
+impl ControlChrome {
+    fn from_lease(lease: Option<&LeaseState>, now: Instant) -> Option<Self> {
+        lease.map(|lease| {
+            if lease.is_idle_at(now) {
+                Self::Idle
+            } else {
+                Self::Active
+            }
+        })
+    }
+
+    fn from_receipt(last_receipt: Option<Instant>, now: Instant) -> Option<Self> {
+        last_receipt.map(|receipt| {
+            if now.saturating_duration_since(receipt) >= IDLE_AFTER {
+                Self::Idle
+            } else {
+                Self::Active
+            }
+        })
+    }
+
+    fn block(self) -> Block<'static> {
+        let (color, label) = match self {
+            Self::Active => (Color::Rgb(255, 69, 0), "this user is typing"),
+            Self::Idle => (Color::Rgb(140, 91, 68), "this user has control"),
+        };
+        Block::bordered()
+            .border_style(Style::default().fg(color))
+            .title(label)
+    }
+}
+
 impl Widget for VtScreen<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (rows, cols) = self.screen.size();
@@ -188,25 +226,42 @@ fn vt_color(color: vt100::Color) -> Color {
     }
 }
 
-fn render_guest_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &str) {
+fn render_guest_screen(
+    frame: &mut Frame<'_>,
+    screen: &vt100::Screen,
+    footer: &str,
+    chrome: Option<ControlChrome>,
+) {
     let area = frame.area();
-    let screen_height = screen.size().0.min(area.height.saturating_sub(1));
-    let screen_area = Rect::new(area.x, area.y, area.width, screen_height);
+    let pane_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let screen_area = if let Some(chrome) = chrome {
+        let block = chrome.block();
+        let inner = block.inner(pane_area);
+        frame.render_widget(block, pane_area);
+        inner
+    } else {
+        pane_area
+    };
     frame.render_widget(VtScreen::new(screen), screen_area);
     let (row, col) = screen.cursor_position();
-    if !screen.hide_cursor() && row < screen_height && col < area.width {
-        frame.set_cursor_position((area.x + col, area.y + row));
+    if !screen.hide_cursor() && row < screen_area.height && col < screen_area.width {
+        frame.set_cursor_position((screen_area.x + col, screen_area.y + row));
     }
     if area.height > 0 {
-        let footer_y = area.y + screen_area.height;
+        let footer_y = area.y + pane_area.height;
         frame
             .buffer_mut()
             .set_string(area.x, footer_y, footer, Style::default());
     }
 }
 
-fn render_host_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &str) {
-    render_guest_screen(frame, screen, footer);
+fn render_host_screen(
+    frame: &mut Frame<'_>,
+    screen: &vt100::Screen,
+    footer: &str,
+    chrome: ControlChrome,
+) {
+    render_guest_screen(frame, screen, footer, Some(chrome));
 }
 
 fn is_quit(key: KeyEvent) -> bool {
@@ -456,6 +511,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     )?;
     let footer = format!("join: p2pmux join {} | F10 quit", runtime.join_code);
     let mut dirty = true;
+    let mut chrome = None;
     loop {
         while let Ok(event) = runtime.control_rx.try_recv() {
             match event {
@@ -498,15 +554,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         if runtime.host.output_closed() {
             break;
         }
+        let next_chrome = ControlChrome::from_lease(Some(runtime.lease.state()), Instant::now());
+        if chrome != next_chrome {
+            dirty = true;
+            chrome = next_chrome;
+        }
         if dirty {
             terminal.draw(|frame| {
                 let screen = runtime.screen.screen();
-                render_host_screen(frame, screen, &footer);
-                let (row, col) = screen.cursor_position();
-                let screen_height = screen.size().0.min(frame.area().height.saturating_sub(1));
-                if !screen.hide_cursor() && row < screen_height && col < frame.area().width {
-                    frame.set_cursor_position((frame.area().x + col, frame.area().y + row));
-                }
+                render_host_screen(frame, screen, &footer, chrome.expect("host lease state"));
             })?;
             dirty = false;
         }
@@ -596,10 +652,11 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut remote = GuestScreen::new();
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;
-    let mut last_lease = Instant::now();
+    let mut last_lease = None;
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
+    let mut previous_chrome = None;
 
     loop {
         loop {
@@ -626,7 +683,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         "controller: {} typing",
                         short_peer(&state.controller_peer_id)
                     );
-                    last_lease = Instant::now();
+                    last_lease = Some(Instant::now());
                     if let Some(bytes) = resolve_guest_claim(
                         &mut pending_control,
                         &mut held_input,
@@ -668,10 +725,16 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        let chrome = ControlChrome::from_receipt(last_lease, Instant::now());
+        if chrome != previous_chrome {
+            dirty = true;
+            previous_chrome = chrome;
+        }
+
         if dirty {
             terminal.draw(|frame| {
                 if let Some(screen) = remote.screen() {
-                    render_guest_screen(frame, screen, &footer);
+                    render_guest_screen(frame, screen, &footer, chrome);
                 }
             })?;
             dirty = false;
@@ -697,7 +760,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_input.extend_from_slice(&bytes);
                         }
-                    } else if last_lease.elapsed() >= IDLE_AFTER {
+                    } else if last_lease.is_some_and(|receipt| receipt.elapsed() >= IDLE_AFTER) {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
                             pending_control = true;
@@ -718,7 +781,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_input.extend_from_slice(&bytes);
                         }
-                    } else if last_lease.elapsed() >= IDLE_AFTER {
+                    } else if last_lease.is_some_and(|receipt| receipt.elapsed() >= IDLE_AFTER) {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
                             pending_control = true;
@@ -757,16 +820,142 @@ mod tests {
     };
 
     use crate::{
-        lease::LeaseManager,
+        lease::{LeaseManager, LeaseState},
         protocol::TakeControl,
         screen::{GuestScreen, HostScreen},
     };
     use tokio::sync::watch;
 
     use super::{
-        VtScreen, encode_key, encode_paste, handle_input_event, handle_take_control_event,
-        render_guest_screen, resolve_guest_claim,
+        ControlChrome, VtScreen, encode_key, encode_paste, handle_input_event,
+        handle_take_control_event, render_guest_screen, resolve_guest_claim,
     };
+
+    #[test]
+    fn renders_control_chrome_for_an_active_controller() {
+        let now = Instant::now();
+        let chrome = ControlChrome::from_lease(
+            Some(&LeaseState {
+                controller_peer_id: b"host".to_vec(),
+                epoch: 1,
+                last_activity: now,
+            }),
+            now,
+        );
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process(b"abc");
+        let mut terminal = Terminal::new(TestBackend::new(30, 5)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_guest_screen(frame, parser.screen(), "footer", chrome))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(255, 69, 0));
+        let title: String = (1..20).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(title, "this user is typing");
+        assert_eq!(buffer[(1, 1)].symbol(), "a");
+        assert_eq!(buffer[(3, 1)].symbol(), "c");
+        assert_eq!(buffer[(0, 4)].symbol(), "f");
+    }
+
+    #[test]
+    fn renders_control_chrome_for_an_idle_controller() {
+        let now = Instant::now();
+        let chrome = ControlChrome::from_lease(
+            Some(&LeaseState {
+                controller_peer_id: b"host".to_vec(),
+                epoch: 1,
+                last_activity: now - Duration::from_secs(8),
+            }),
+            now,
+        );
+        let parser = vt100::Parser::new(1, 1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(30, 3)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_guest_screen(frame, parser.screen(), "footer", chrome))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(140, 91, 68));
+        let title: String = (1..22).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(title, "this user has control");
+    }
+
+    #[test]
+    fn guest_pre_lease_renders_without_a_control_border() {
+        let mut parser = vt100::Parser::new(1, 1, 0);
+        parser.process(b"x");
+        let mut terminal = Terminal::new(TestBackend::new(4, 3)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_guest_screen(frame, parser.screen(), "footer", None))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "x");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn bordered_renderer_crops_the_fixed_grid_to_its_inner_rect() {
+        let mut parser = vt100::Parser::new(3, 4, 0);
+        parser.process(b"abcd\r\nefgh\r\nijkl");
+        let now = Instant::now();
+        let chrome = ControlChrome::from_lease(
+            Some(&LeaseState {
+                controller_peer_id: b"host".to_vec(),
+                epoch: 1,
+                last_activity: now,
+            }),
+            now,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(5, 5)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_guest_screen(frame, parser.screen(), "footer", chrome))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].symbol(), "a");
+        assert_eq!(buffer[(2, 1)].symbol(), "b");
+        assert_eq!(buffer[(3, 1)].symbol(), "c");
+        assert_eq!(buffer[(1, 2)].symbol(), "e");
+        assert_eq!(buffer[(3, 2)].symbol(), "g");
+    }
+
+    #[test]
+    fn bordered_renderer_shifts_and_clips_the_cursor_to_its_inner_rect() {
+        let now = Instant::now();
+        let chrome = ControlChrome::from_lease(
+            Some(&LeaseState {
+                controller_peer_id: b"host".to_vec(),
+                epoch: 1,
+                last_activity: now,
+            }),
+            now,
+        );
+        let mut parser = vt100::Parser::new(2, 4, 0);
+        parser.process(b"ab");
+        let mut terminal = Terminal::new(TestBackend::new(5, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_guest_screen(frame, parser.screen(), "footer", chrome))
+            .expect("render");
+
+        terminal.backend_mut().assert_cursor_position((3, 1));
+
+        parser.process(b"cd");
+        let mut clipped_terminal = Terminal::new(TestBackend::new(5, 4)).expect("test terminal");
+        clipped_terminal
+            .draw(|frame| render_guest_screen(frame, parser.screen(), "footer", chrome))
+            .expect("render");
+
+        clipped_terminal
+            .backend_mut()
+            .assert_cursor_position((0, 0));
+    }
 
     #[test]
     fn remote_renderer_keeps_host_grid_fixed_and_draws_a_footer() {
@@ -783,6 +972,7 @@ mod tests {
                     frame,
                     guest.screen().expect("guest screen"),
                     "controller: abcdef idle",
+                    None,
                 )
             })
             .expect("render");
@@ -790,8 +980,8 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), "a");
         assert_eq!(buffer[(2, 0)].symbol(), "c");
         assert_eq!(buffer[(3, 0)].symbol(), " ");
-        assert_eq!(buffer[(0, 1)].symbol(), "c");
-        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_eq!(buffer[(0, 2)].symbol(), "c");
     }
 
     #[test]
@@ -810,6 +1000,7 @@ mod tests {
                     frame,
                     guest.screen().expect("guest screen"),
                     "controller: peer typing",
+                    None,
                 );
             })
             .expect("render");
