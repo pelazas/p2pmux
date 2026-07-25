@@ -2,7 +2,7 @@ use iroh::{EndpointAddr, SecretKey};
 use p2pmux::{
     protocol::{
         CreatePane, CreateTab, DeletePane, DeleteTab, LayoutCommit, LayoutRejectReason,
-        LayoutRequest, PaneFailed, PaneReady, SplitAxis,
+        LayoutRequest, NewPanePosition, PaneFailed, PaneReady, SplitAxis,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -105,6 +105,7 @@ fn pane_creation_is_hidden_until_its_creator_marks_the_reservation_ready() {
         axis: Some(SplitAxis::LeftRight as i32),
         grid_rows: 30,
         grid_cols: 100,
+        position: None,
     });
 
     let reservation = match coordinator.handle_request(&host_a(), create) {
@@ -141,6 +142,46 @@ fn pane_creation_is_hidden_until_its_creator_marks_the_reservation_ready() {
 }
 
 #[test]
+fn pane_creation_maps_protocol_placement_to_authoritative_child_order() {
+    let mut coordinator = coordinator();
+    let mut create = request(15, 1);
+    create.create_pane = Some(CreatePane {
+        target_pane_id: 1,
+        axis: Some(SplitAxis::LeftRight as i32),
+        grid_rows: 24,
+        grid_cols: 80,
+        position: Some(NewPanePosition::First as i32),
+    });
+    let reservation = match coordinator.handle_request(&host_a(), create) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+
+    let state = commit(coordinator.handle_pane_ready(
+        &host_a(),
+        PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 1,
+            request_id: 15,
+        },
+    ))
+    .state
+    .expect("state present");
+    let split = state.tabs[0]
+        .root
+        .as_ref()
+        .expect("root present")
+        .split
+        .as_ref();
+    let split = split.expect("split present");
+    assert_eq!(
+        split.first.as_ref().unwrap().leaf_pane_id,
+        Some(reservation.pane_id)
+    );
+    assert_eq!(split.second.as_ref().unwrap().leaf_pane_id, Some(1));
+}
+
+#[test]
 fn ready_cannot_commit_a_reservation_after_membership_advances_its_revision() {
     let mut coordinator = coordinator();
     let mut create = request(101, 1);
@@ -149,6 +190,7 @@ fn ready_cannot_commit_a_reservation_after_membership_advances_its_revision() {
         axis: Some(SplitAxis::LeftRight as i32),
         grid_rows: 30,
         grid_cols: 100,
+        position: None,
     });
     let reservation = match coordinator.handle_request(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -200,6 +242,7 @@ fn admitted_guest_hosts_its_own_pane_after_ready() {
         axis: Some(SplitAxis::TopBottom as i32),
         grid_rows: 31,
         grid_cols: 101,
+        position: None,
     });
     let reservation = match coordinator.handle_request(&host_b(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -270,6 +313,7 @@ fn mixed_host_tab_deletion_is_rejected() {
         axis: Some(SplitAxis::LeftRight as i32),
         grid_rows: 24,
         grid_cols: 80,
+        position: None,
     });
     let reservation = match coordinator.handle_request(&host_b(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,

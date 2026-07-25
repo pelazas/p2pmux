@@ -23,14 +23,17 @@ use tokio::{
 };
 
 use crate::{
-    layout::{Axis, LayoutError, LayoutSnapshot, Member, Node, Pane, SessionState, Tab},
+    layout::{
+        Axis, LayoutError, LayoutSnapshot, Member, NewPanePosition as LayoutNewPanePosition, Node,
+        Pane, SessionState, Tab,
+    },
     lease::LeaseState,
     protocol::{
         ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
         LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
-        LayoutState, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady,
-        PaneReservation, PaneSubscribe, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor,
-        TakeControl, Welcome, envelope,
+        LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
+        PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
+        SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -430,15 +433,17 @@ impl LayoutCoordinator {
         now: Instant,
     ) -> Result<CoordinatorResponse, LayoutError> {
         let axis = protocol_axis(create.axis)?;
+        let position = protocol_pane_position(create.position)?;
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
         if create.target_pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
-        let reservation = self.state.reserve_pane(
+        let reservation = self.state.reserve_pane_at(
             authenticated_peer_id,
             base_revision,
             create.target_pane_id,
             axis,
+            position,
             grid_rows,
             grid_cols,
         )?;
@@ -598,6 +603,19 @@ fn protocol_axis(axis: Option<i32>) -> Result<Axis, LayoutError> {
         Some(SplitAxis::LeftRight) => Ok(Axis::LeftRight),
         Some(SplitAxis::TopBottom) => Ok(Axis::TopBottom),
         None => Err(LayoutError::InvalidSnapshot),
+    }
+}
+
+fn protocol_pane_position(position: Option<i32>) -> Result<LayoutNewPanePosition, LayoutError> {
+    match position {
+        None => Ok(LayoutNewPanePosition::Second),
+        Some(value) if value == ProtocolNewPanePosition::Second as i32 => {
+            Ok(LayoutNewPanePosition::Second)
+        }
+        Some(value) if value == ProtocolNewPanePosition::First as i32 => {
+            Ok(LayoutNewPanePosition::First)
+        }
+        Some(_) => Err(LayoutError::InvalidSnapshot),
     }
 }
 

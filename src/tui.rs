@@ -2191,6 +2191,7 @@ impl SharedLayoutRuntime {
                 }),
                 grid_rows: u32::from(grid_rows),
                 grid_cols: u32::from(grid_cols),
+                position: None,
             }),
             delete_pane: None,
             create_tab: pane.is_none().then_some(CreateTab {
