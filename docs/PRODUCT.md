@@ -10,7 +10,7 @@ The multiplexer is a **shared control surface, not a shared computer**.
 - Every user in a session can create their own panes and tabs.
 - Each pane is backed by a local PTY on that user’s machine.
 - Processes in that pane (shell, Docker, Claude Code, etc.) run on the owner’s hardware, with their PATH, env, API keys, and subscriptions.
-- Other users can attach as guests: see live output, and work on that pane (via take-control — see MVP design).
+- Other users can attach as guests: see live output, then claim a free pane with ordinary input.
 - The same person is host of their panes and guest on everyone else’s. Host/guest is **per pane**, not per person.
 
 Example: Pelazas starts Claude Code in his pane (his subscription). Tis hops into that pane and prompts to do a code change. Pelazas never sees Tis’ keys; nothing runs on Tis’ machine for that pane. A code change has been made on Pelazas’ machine. At the same time, Tis can host panes that Pelazas guests into.
@@ -36,7 +36,7 @@ Example: Pelazas starts Claude Code in his pane (his subscription). Tis hops int
 - Create a session; peers join P2P.
 - Open tabs and split panes like a modern mux (Zellij-style).
 - Create a pane → it runs locally on you.
-- Click/hop into a teammate’s pane → live view + input via take-control rules.
+- Click a teammate’s pane to focus it locally; type to claim it once it is free.
 - Presence indicators show who is active where.
 - If a host disconnects or sleeps their machine, their panes become unavailable for a grace period; guests cannot keep a host pane alive without the host machine.
 

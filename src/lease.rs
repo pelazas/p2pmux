@@ -13,7 +13,8 @@ pub struct LeaseState {
 
 impl LeaseState {
     pub fn is_idle_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_activity) >= IDLE_AFTER
+        self.controller_peer_id.is_empty()
+            || now.saturating_duration_since(self.last_activity) >= IDLE_AFTER
     }
 }
 
@@ -65,11 +66,34 @@ impl LeaseManager {
         data: Vec<u8>,
         now: Instant,
     ) -> LeaseDecision {
-        if data.is_empty() || sender != self.state.controller_peer_id || epoch != self.state.epoch {
+        if data.is_empty() || epoch != self.state.epoch {
+            return LeaseDecision::RejectStaleInput;
+        }
+        if !self.state.controller_peer_id.is_empty()
+            && self.state.is_idle_at(now)
+            && self.change_controller(Vec::new(), now).is_err()
+        {
+            return LeaseDecision::RejectStaleInput;
+        }
+        if self.state.controller_peer_id.is_empty() {
+            if self.change_controller(sender.to_vec(), now).is_err() {
+                return LeaseDecision::RejectStaleInput;
+            }
+        } else if sender != self.state.controller_peer_id {
             return LeaseDecision::RejectStaleInput;
         }
         self.state.last_activity = now;
         LeaseDecision::AcceptInput(data)
+    }
+
+    pub fn clear_if_idle(&mut self, now: Instant) -> Result<Option<LeaseState>, LeaseError> {
+        if self.state.controller_peer_id.is_empty() || !self.state.is_idle_at(now) {
+            return Ok(None);
+        }
+        match self.change_controller(Vec::new(), now)? {
+            LeaseDecision::Publish(state) => Ok(Some(state)),
+            _ => unreachable!("changing controller always publishes"),
+        }
     }
 
     pub fn take_control(
@@ -83,6 +107,9 @@ impl LeaseManager {
         }
         if self.state.epoch == u64::MAX {
             return Err(LeaseError::EpochExhausted);
+        }
+        if self.state.controller_peer_id.is_empty() {
+            return self.change_controller(sender, now);
         }
         if !self.state.is_idle_at(now) {
             return Ok(LeaseDecision::RejectActiveController);

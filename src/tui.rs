@@ -50,7 +50,44 @@ use crate::{
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
-const CONTROL_HELP: &str = "type to claim idle | active typing is protected | Ctrl+Q quit";
+const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
+const FOOTER_MUTED: Color = Color::DarkGray;
+const FOOTER_ACCENT: Color = Color::Red;
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
+
+type FooterSegment = (&'static str, bool);
+
+const NORMAL_FOOTER: &[FooterSegment] = &[
+    ("Ctrl+ <", false),
+    ("p", true),
+    ("> PANE   <", false),
+    ("t", true),
+    ("> TAB   <", false),
+    ("q", true),
+    ("> QUIT    type to claim when free", false),
+];
+const PANE_FOOTER: &[FooterSegment] = &[
+    ("Pane  <", false),
+    ("←↓↑→", true),
+    ("> FOCUS   <", false),
+    ("n", true),
+    ("> NEW   <", false),
+    ("x", true),
+    ("> CLOSE   <", false),
+    ("Esc", true),
+    ("> BACK", false),
+];
+const TAB_FOOTER: &[FooterSegment] = &[
+    ("Tab  <", false),
+    ("←→", true),
+    ("> SWITCH   <", false),
+    ("n", true),
+    ("> NEW   <", false),
+    ("x", true),
+    ("> CLOSE   <", false),
+    ("Esc", true),
+    ("> BACK", false),
+];
 
 /// The in-progress multi-pane command prefix, kept entirely local to one terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -108,6 +145,7 @@ pub enum KeyHandling {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneGeometry {
     pub tab_bar: Rect,
+    pub tab_labels: BTreeMap<TabId, Rect>,
     pub content: Rect,
     pub footer: Rect,
     pub panes: BTreeMap<PaneId, Rect>,
@@ -223,6 +261,17 @@ impl MultiPaneTui {
         true
     }
 
+    fn switch_tab_at(&mut self, column: u16, row: u16, area: Rect) -> Option<UiIntent> {
+        let tab_id = self
+            .geometry(area)
+            .tab_labels
+            .iter()
+            .find_map(|(tab_id, rect)| rect_contains(*rect, column, row).then_some(*tab_id))?;
+        self.select_tab(tab_id)
+            .expect("tab came from current snapshot");
+        Some(UiIntent::SwitchTab { tab_id })
+    }
+
     pub fn geometry(&self, area: Rect) -> PaneGeometry {
         let tab_bar = Rect::new(area.x, area.y, area.width, area.height.min(1));
         let footer_height = area.height.saturating_sub(tab_bar.height).min(1);
@@ -245,10 +294,31 @@ impl MultiPaneTui {
         }
         PaneGeometry {
             tab_bar,
+            tab_labels: self.tab_label_rects(tab_bar),
             content,
             footer,
             panes,
         }
+    }
+
+    fn tab_label_rects(&self, tab_bar: Rect) -> BTreeMap<TabId, Rect> {
+        let mut x = tab_bar.x;
+        let right = tab_bar.x.saturating_add(tab_bar.width);
+        self.snapshot
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                if index > 0 {
+                    x = x.saturating_add(1);
+                }
+                let label_width = format!("Tab #{}", index + 1).len() as u16;
+                let width = right.saturating_sub(x).min(label_width);
+                let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
+                x = x.saturating_add(label_width);
+                (tab.tab_id, rect)
+            })
+            .collect()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
@@ -444,14 +514,58 @@ fn first_leaf(node: &Node) -> Option<PaneId> {
     }
 }
 
+fn visible_leaf_panes(node: &Node) -> Vec<PaneId> {
+    match node {
+        Node::Leaf { pane_id } => vec![*pane_id],
+        Node::Split { first, second, .. } => {
+            let mut panes = visible_leaf_panes(first);
+            panes.extend(visible_leaf_panes(second));
+            panes
+        }
+    }
+}
+
 fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<PaneId> {
-    panes.iter().find_map(|(pane_id, rect)| {
-        let inside = u32::from(column) >= u32::from(rect.x)
-            && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
-            && u32::from(row) >= u32::from(rect.y)
-            && u32::from(row) < u32::from(rect.y) + u32::from(rect.height);
-        inside.then_some(*pane_id)
-    })
+    panes
+        .iter()
+        .find_map(|(pane_id, rect)| rect_contains(*rect, column, row).then_some(*pane_id))
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    u32::from(column) >= u32::from(rect.x)
+        && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
+        && u32::from(row) >= u32::from(rect.y)
+        && u32::from(row) < u32::from(rect.y) + u32::from(rect.height)
+}
+
+fn pane_title(
+    index: usize,
+    host_peer_id: &[u8],
+    controller_peer_id: Option<&[u8]>,
+    members: &[crate::layout::Member],
+) -> String {
+    let control = match controller_peer_id {
+        Some([]) => "free".to_owned(),
+        Some(peer_id) => member_label(peer_id, members),
+        None => "…".to_owned(),
+    };
+    format!(
+        "Pane #{index}  host: {}  control: {control}",
+        member_label(host_peer_id, members)
+    )
+}
+
+fn pane_border_color(
+    controller_peer_id: Option<&[u8]>,
+    _controller_active: bool,
+    focused: bool,
+) -> Color {
+    match controller_peer_id {
+        Some([]) if focused => Color::White,
+        None if focused => Color::Yellow,
+        Some([]) | None => Color::DarkGray,
+        Some(_) => Color::Rgb(255, 69, 0),
+    }
 }
 
 fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
@@ -578,21 +692,99 @@ pub fn render_multi_pane(
     render_shared_multi_pane(frame, tui, screens, "", None);
 }
 
-fn shared_footer_text(status: &str, join_code: Option<&str>, chord_mode: ChordMode) -> String {
-    let controls = match chord_mode {
-        ChordMode::None => format!("Ctrl+P panes | Ctrl+T tabs | {CONTROL_HELP}"),
-        ChordMode::Pane => {
-            String::from("arrows move focus | N new pane | X delete pane | Esc cancel")
-        }
-        ChordMode::Tab => String::from("←/→ switch tab | N new tab | X delete tab | Esc cancel"),
-    };
-    match (status.is_empty(), join_code) {
-        (false, Some(join_code)) => {
-            format!("{status} | {controls} | join: p2pmux join {join_code}")
-        }
-        (false, None) => format!("{status} | {controls}"),
-        (true, Some(join_code)) => format!("{controls} | join: p2pmux join {join_code}"),
-        (true, None) => controls,
+fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
+    match chord_mode {
+        ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
+        ChordMode::Pane => (
+            "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
+            PANE_FOOTER,
+        ),
+        ChordMode::Tab => (
+            "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
+            TAB_FOOTER,
+        ),
+    }
+}
+
+fn render_footer_segments(
+    buffer: &mut Buffer,
+    mut x: u16,
+    y: u16,
+    end_x: u16,
+    segments: &[FooterSegment],
+) -> u16 {
+    for (text, accent) in segments {
+        let style = Style::default()
+            .fg(if *accent { FOOTER_ACCENT } else { FOOTER_MUTED })
+            .bg(FOOTER_BACKGROUND);
+        x = buffer
+            .set_stringn(x, y, text, usize::from(end_x.saturating_sub(x)), style)
+            .0;
+    }
+    x
+}
+
+fn footer_suffix(text: &str, width: usize) -> &str {
+    if width == 0 {
+        return "";
+    }
+    let start = text
+        .char_indices()
+        .nth(text.chars().count().saturating_sub(width))
+        .map_or(0, |(index, _)| index);
+    &text[start..]
+}
+
+fn render_contextual_footer(
+    buffer: &mut Buffer,
+    area: Rect,
+    status: &str,
+    join_code: Option<&str>,
+    chord_mode: ChordMode,
+) {
+    buffer.set_stringn(
+        area.x,
+        area.y,
+        " ".repeat(usize::from(area.width)),
+        usize::from(area.width),
+        Style::default().bg(FOOTER_BACKGROUND),
+    );
+
+    let end_x = area.right();
+    let mut x = area.x;
+    if !status.is_empty() {
+        x = buffer
+            .set_stringn(
+                x,
+                area.y,
+                format!("{status}  "),
+                usize::from(end_x.saturating_sub(x)),
+                Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+            )
+            .0;
+    }
+
+    let join = join_code.map(|code| format!("join: p2pmux join {code}"));
+    let (join_x, join_text) = join
+        .as_deref()
+        .map(|text| {
+            let text = footer_suffix(text, usize::from(end_x.saturating_sub(x)));
+            (
+                end_x.saturating_sub(text.chars().count() as u16),
+                Some(text),
+            )
+        })
+        .unwrap_or((end_x, None));
+    let (_, segments) = contextual_footer(chord_mode);
+    render_footer_segments(buffer, x, area.y, join_x, segments);
+    if let Some(text) = join_text {
+        buffer.set_stringn(
+            join_x,
+            area.y,
+            text,
+            usize::from(end_x.saturating_sub(join_x)),
+            Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+        );
     }
 }
 
@@ -623,49 +815,51 @@ fn render_shared_multi_pane(
                 Style::default().fg(Color::DarkGray)
             };
             let label = format!("Tab #{}", index + 1);
-            frame
-                .buffer_mut()
-                .set_string(x, geometry.tab_bar.y, &label, style);
+            let label_rect = geometry.tab_labels[&tab.tab_id];
+            if label_rect.width == 0 {
+                continue;
+            }
+            frame.buffer_mut().set_string(
+                label_rect.x,
+                label_rect.y,
+                &label[..usize::from(label_rect.width)],
+                style,
+            );
             x = x.saturating_add(label.len() as u16);
         }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
-        frame.buffer_mut().set_string(
-            geometry.footer.x,
-            geometry.footer.y,
-            shared_footer_text(status, join_code, tui.chord_mode),
-            Style::default().fg(Color::DarkGray),
+        render_contextual_footer(
+            frame.buffer_mut(),
+            geometry.footer,
+            status,
+            join_code,
+            tui.chord_mode,
         );
     }
 
-    for (pane_id, rect) in geometry.panes {
+    let pane_ids = tui
+        .current_tab_layout()
+        .map(|tab| visible_leaf_panes(&tab.root))
+        .unwrap_or_default();
+    for (index, pane_id) in pane_ids.into_iter().enumerate() {
+        let Some(rect) = geometry.panes.get(&pane_id).copied() else {
+            continue;
+        };
         let pane = &tui.snapshot.panes[&pane_id];
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
-        let lease = match view.controller_peer_id.as_deref() {
-            Some(peer) if view.controller_active => {
-                format!(
-                    "ctrl:{} this user is typing",
-                    member_label(peer, &tui.snapshot.members)
-                )
-            }
-            Some(peer) => format!(
-                "ctrl:{} this user has control",
-                member_label(peer, &tui.snapshot.members)
-            ),
-            None => String::from("lease: waiting"),
-        };
-        let title = format!(
-            "{} host:{} {lease}",
-            if focused { "*" } else { " " },
-            member_label(&pane.host_peer_id, &tui.snapshot.members)
+        let title = pane_title(
+            index + 1,
+            &pane.host_peer_id,
+            view.controller_peer_id.as_deref(),
+            &tui.snapshot.members,
         );
-        let border_color = match view.controller_peer_id.as_ref() {
-            Some(_) if view.controller_active => Color::Rgb(255, 69, 0),
-            Some(_) => Color::Rgb(140, 91, 68),
-            None if focused => Color::Yellow,
-            None => Color::DarkGray,
-        };
+        let border_color = pane_border_color(
+            view.controller_peer_id.as_deref(),
+            view.controller_active,
+            focused,
+        );
         let block = Block::bordered()
             .title(title)
             .border_style(Style::default().fg(border_color));
@@ -721,7 +915,7 @@ impl SharedLocalPane {
         };
         let screen = HostScreen::new(grid_rows, grid_cols)?;
         let (screen_tx, _) = watch::channel(screen.current_frame().clone());
-        let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
+        let lease = LeaseManager::new(Vec::new(), Instant::now());
         let (lease_tx, _) = watch::channel(lease.state().clone());
         let (control_tx, control_rx) = mpsc::channel(256);
         Ok(Self {
@@ -757,6 +951,10 @@ impl SharedLocalPane {
 
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = false;
+        if let Some(state) = self.lease.clear_if_idle(Instant::now())? {
+            self.lease_tx.send_replace(state);
+            changed = true;
+        }
         while let Ok(event) = self.control_rx.try_recv() {
             match event {
                 HostControlEvent::Input { peer_id, input } => {
@@ -811,22 +1009,15 @@ impl SharedLocalPane {
 
     fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
         let epoch = self.lease.state().epoch;
-        let decision = if self.lease.state().controller_peer_id == self.host_peer_id {
-            self.lease
-                .input(&self.host_peer_id, epoch, bytes.clone(), Instant::now())
-        } else {
-            self.lease
-                .take_control(self.host_peer_id.clone(), epoch, Instant::now())?
-        };
+        let decision = self
+            .lease
+            .input(&self.host_peer_id, epoch, bytes, Instant::now());
         match decision {
             LeaseDecision::AcceptInput(bytes) => {
                 self.host.write_input(&bytes)?;
                 self.lease_tx.send_replace(self.lease.state().clone());
             }
-            LeaseDecision::Publish(state) => {
-                self.lease_tx.send_replace(state);
-                self.host.write_input(&bytes)?;
-            }
+            LeaseDecision::Publish(_) => {}
             LeaseDecision::RejectStaleInput
             | LeaseDecision::RejectStaleRequest
             | LeaseDecision::RejectActiveController => {}
@@ -853,6 +1044,22 @@ enum RemotePaneDrain {
     Unchanged,
     Changed,
     Disconnected,
+}
+
+fn lease_allows_held_input(controller_peer_id: &[u8], peer_id: &[u8]) -> bool {
+    controller_peer_id.is_empty() || controller_peer_id == peer_id
+}
+
+fn reconcile_remote_control_attempt(
+    pending_control: &mut bool,
+    held_input: &mut Vec<u8>,
+    controller_peer_id: &[u8],
+    peer_id: &[u8],
+) {
+    *pending_control = false;
+    if !lease_allows_held_input(controller_peer_id, peer_id) {
+        held_input.clear();
+    }
 }
 
 impl SharedRemotePane {
@@ -883,6 +1090,7 @@ impl SharedRemotePane {
 
     fn drain(&mut self) -> RemotePaneDrain {
         let mut changed = false;
+        let mut received_lease = false;
         loop {
             match self.pane.events.try_recv() {
                 Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
@@ -898,20 +1106,14 @@ impl SharedRemotePane {
                         .is_ok();
                 }
                 Ok(GuestEvent::Lease(lease)) => {
-                    let controls_this_pane =
-                        lease.controller_peer_id == self.pane.controls.peer_id();
+                    received_lease = true;
                     self.lease = Some(LeaseState {
                         controller_peer_id: lease.controller_peer_id,
                         epoch: lease.lease_epoch,
                         last_activity: Instant::now(),
                     });
                     self.last_lease = Instant::now();
-                    if self.pending_control {
-                        self.pending_control = false;
-                        if !controls_this_pane {
-                            self.held_input.clear();
-                        }
-                    }
+                    self.pending_control = false;
                     changed = true;
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
@@ -922,12 +1124,19 @@ impl SharedRemotePane {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             }
         }
+        if received_lease && let Some(lease) = self.lease.as_ref() {
+            reconcile_remote_control_attempt(
+                &mut self.pending_control,
+                &mut self.held_input,
+                &lease.controller_peer_id,
+                self.pane.controls.peer_id(),
+            );
+        }
         if !self.pending_control
             && !self.held_input.is_empty()
-            && self
-                .lease
-                .as_ref()
-                .is_some_and(|lease| lease.controller_peer_id == self.pane.controls.peer_id())
+            && self.lease.as_ref().is_some_and(|lease| {
+                lease_allows_held_input(&lease.controller_peer_id, self.pane.controls.peer_id())
+            })
         {
             let bytes = std::mem::take(&mut self.held_input);
             if self
@@ -959,6 +1168,8 @@ impl SharedRemotePane {
             } else {
                 self.held_input.extend_from_slice(&bytes);
             }
+        } else if lease.controller_peer_id.is_empty() {
+            let _ = self.pane.controls.try_input(lease.epoch, bytes);
         } else if self.last_lease.elapsed() >= IDLE_AFTER && !self.pending_control {
             self.held_input.extend_from_slice(&bytes);
             self.pending_control = self.pane.controls.try_take_control(lease.epoch).is_ok();
@@ -1320,11 +1531,13 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
-                    dirty |= self.tui.focus_pane_at(
-                        mouse.column,
-                        mouse.row,
-                        Rect::new(0, 0, cols, rows),
-                    );
+                    let area = Rect::new(0, 0, cols, rows);
+                    if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
+                        self.handle_intent(intent)?;
+                        dirty = true;
+                    } else {
+                        dirty |= self.tui.focus_pane_at(mouse.column, mouse.row, area);
+                    }
                 }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -1738,7 +1951,8 @@ impl HostPaneRuntime {
         join_code: String,
     ) -> Result<Self, Box<dyn Error>> {
         let screen = HostScreen::new(size.rows, size.cols)?;
-        let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
+        let lease = LeaseManager::new(Vec::new(), Instant::now());
+        lease_tx.send_replace(lease.state().clone());
         Ok(Self {
             host: PtyHost::spawn_default_shell(size)?,
             screen,
@@ -2087,6 +2301,9 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
     let mut dirty = true;
     loop {
+        if let Some(state) = runtime.lease.clear_if_idle(Instant::now())? {
+            runtime.lease_tx.send_replace(state);
+        }
         while let Ok(event) = runtime.control_rx.try_recv() {
             match event {
                 HostControlEvent::Input { peer_id, input } => match runtime.lease.input(
@@ -2163,25 +2380,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
-                    let decision =
-                        if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
-                            runtime
-                                .lease
-                                .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
-                        } else {
-                            runtime
-                                .lease
-                                .take_control(runtime.host_peer_id.clone(), epoch, now)?
-                        };
+                    let decision = runtime
+                        .lease
+                        .input(&runtime.host_peer_id, epoch, bytes, now);
                     match decision {
                         LeaseDecision::AcceptInput(bytes) => {
                             runtime.host.write_input(&bytes)?;
                             runtime.lease_tx.send_replace(runtime.lease.state().clone());
                         }
-                        LeaseDecision::Publish(state) => {
-                            runtime.lease_tx.send_replace(state);
-                            runtime.host.write_input(&bytes)?;
-                        }
+                        LeaseDecision::Publish(_) => {}
                         LeaseDecision::RejectStaleInput
                         | LeaseDecision::RejectStaleRequest
                         | LeaseDecision::RejectActiveController => {}
@@ -2192,24 +2399,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
                 let now = Instant::now();
                 let epoch = runtime.lease.state().epoch;
-                let decision = if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
-                    runtime
-                        .lease
-                        .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
-                } else {
-                    runtime
-                        .lease
-                        .take_control(runtime.host_peer_id.clone(), epoch, now)?
-                };
+                let decision = runtime
+                    .lease
+                    .input(&runtime.host_peer_id, epoch, bytes, now);
                 match decision {
                     LeaseDecision::AcceptInput(bytes) => {
                         runtime.host.write_input(&bytes)?;
                         runtime.lease_tx.send_replace(runtime.lease.state().clone());
                     }
-                    LeaseDecision::Publish(state) => {
-                        runtime.lease_tx.send_replace(state);
-                        runtime.host.write_input(&bytes)?;
-                    }
+                    LeaseDecision::Publish(_) => {}
                     LeaseDecision::RejectStaleInput
                     | LeaseDecision::RejectStaleRequest
                     | LeaseDecision::RejectActiveController => {}
@@ -2244,12 +2442,12 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;
     let mut last_lease = Instant::now();
-    let mut received_host_lease = false;
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
 
     loop {
+        let mut received_lease = false;
         loop {
             match pane.events.try_recv() {
                 Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
@@ -2270,19 +2468,13 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
                 Ok(GuestEvent::Lease(state)) => {
-                    let already_received_host_lease = received_host_lease;
-                    received_host_lease = true;
+                    received_lease = true;
                     footer = format!(
                         "controller: {} typing",
                         short_peer(&state.controller_peer_id)
                     );
                     last_lease = Instant::now();
-                    if pending_control && state.controller_peer_id == pane.controls.peer_id() {
-                        pending_control = false;
-                    } else if pending_control && already_received_host_lease {
-                        pending_control = false;
-                        held_input.clear();
-                    }
+                    pending_control = false;
                     lease = Some(state);
                     dirty = true;
                 }
@@ -2298,10 +2490,19 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        if received_lease && let Some(state) = lease.as_ref() {
+            reconcile_remote_control_attempt(
+                &mut pending_control,
+                &mut held_input,
+                &state.controller_peer_id,
+                pane.controls.peer_id(),
+            );
+        }
+
         if !pending_control
             && !held_input.is_empty()
             && let Some(state) = lease.as_ref()
-            && state.controller_peer_id == pane.controls.peer_id()
+            && lease_allows_held_input(&state.controller_peer_id, pane.controls.peer_id())
         {
             let bytes = std::mem::take(&mut held_input);
             if pane
@@ -2342,6 +2543,8 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_input.extend_from_slice(&bytes);
                         }
+                    } else if state.controller_peer_id.is_empty() {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
                     } else if last_lease.elapsed() >= IDLE_AFTER {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
@@ -2363,6 +2566,8 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_input.extend_from_slice(&bytes);
                         }
+                    } else if state.controller_peer_id.is_empty() {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
                     } else if last_lease.elapsed() >= IDLE_AFTER {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
@@ -2413,11 +2618,13 @@ mod tests {
     use std::{
         collections::BTreeMap,
         net::Ipv4Addr,
+        thread,
         time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, watch};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use portable_pty::PtySize;
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -2436,11 +2643,12 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, KeyHandling,
+        ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
-        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, member_label, pane_wire_id, render_guest_screen,
-        render_multi_pane, render_shared_multi_pane, shared_footer_text,
+        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, contextual_footer, encode_key,
+        encode_paste, grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label,
+        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2690,14 +2898,49 @@ mod tests {
 
     #[test]
     fn shared_footer_keeps_status_visible_when_a_join_code_is_present() {
-        let footer =
-            shared_footer_text("layout request rejected", Some("TESTCODE"), ChordMode::None);
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        );
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "layout request rejected",
+                    Some("TESTCODE"),
+                );
+            })
+            .expect("draw");
+        let footer = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
+            .collect::<String>();
         assert!(footer.starts_with("layout request rejected"));
-        assert!(footer.contains("Ctrl+P panes"));
-        assert!(footer.contains(CONTROL_HELP));
-        assert!(!footer.contains("F9"));
-        assert!(!footer.contains("F10"));
-        assert!(footer.contains("join: p2pmux join TESTCODE"));
+        assert!(footer.ends_with("join: p2pmux join TESTCODE"));
+
+        let mut narrow_terminal = Terminal::new(TestBackend::new(20, 5)).expect("terminal");
+        narrow_terminal
+            .draw(|frame| {
+                render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "layout request rejected",
+                    Some("TESTCODE"),
+                );
+            })
+            .expect("draw");
+        let narrow_footer = (0..20)
+            .map(|x| narrow_terminal.backend().buffer()[(x, 4)].symbol())
+            .collect::<String>();
+        assert!(narrow_footer.starts_with("layout request"));
+        assert!(!narrow_footer.contains("join"));
     }
 
     #[test]
@@ -2765,6 +3008,7 @@ mod tests {
         let requester = b"guest".to_vec();
         let mut pane = SharedLocalPane::spawn(99, 1, 1, owner.clone()).expect("local pane");
         let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::new(owner.clone(), Instant::now());
         pane.control_tx
             .try_send(HostControlEvent::TakeControl {
                 peer_id: requester.clone(),
@@ -2790,13 +3034,127 @@ mod tests {
                 request: crate::protocol::TakeControl {
                     pane_id: pane_wire_id(99),
                     requester_peer_id: requester.clone(),
-                    known_lease_epoch: 1,
+                    known_lease_epoch: 2,
                 },
             })
             .expect("idle takeover event");
         pane.drain().expect("drain idle takeover");
         assert_eq!(pane.lease.state().controller_peer_id, requester);
-        assert_eq!(pane.lease.state().epoch, 2);
+        assert_eq!(pane.lease.state().epoch, 3);
+    }
+
+    #[test]
+    fn idle_controller_is_cleared_and_published_to_watchers() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::with_epoch_for_test(host_id, 1, Instant::now() - IDLE_AFTER);
+
+        pane.drain().expect("drain idle controller");
+
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        let lease = lease_rx.borrow_and_update().clone();
+        assert!(lease.controller_peer_id.is_empty());
+        assert_eq!(lease.epoch, 2);
+    }
+
+    #[test]
+    fn local_input_crossing_the_idle_timeout_reclaims_and_delivers_it() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease =
+            LeaseManager::with_epoch_for_test(b"remote".to_vec(), 1, Instant::now() - IDLE_AFTER);
+
+        pane.input(b"printf boundary-input-delivered\\n".to_vec())
+            .expect("first input at idle boundary");
+
+        assert_eq!(pane.lease.state().controller_peer_id, host_id);
+        assert_eq!(pane.lease.state().epoch, 3);
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        let lease = lease_rx.borrow_and_update().clone();
+        assert_eq!(lease.controller_peer_id, b"host");
+        assert_eq!(lease.epoch, 3);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            while let Some(bytes) = pane.host.try_read_output().expect("PTY reader") {
+                output.extend(bytes);
+            }
+            if String::from_utf8_lossy(&output).contains("boundary-input-delivered") {
+                pane.shutdown().expect("shutdown local pane");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        pane.shutdown().expect("shutdown local pane");
+        panic!(
+            "first input was not delivered to the PTY: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn new_local_pane_starts_free_while_the_host_retains_pty_ownership() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+
+        assert!(pane.lease.state().controller_peer_id.is_empty());
+        assert_eq!(pane.host_peer_id, host_id);
+
+        pane.shutdown().expect("shutdown local pane");
+    }
+
+    #[test]
+    fn new_host_runtime_starts_free_while_the_host_retains_pty_ownership() {
+        let host_id = b"host".to_vec();
+        let screen = HostScreen::new(1, 1).expect("screen");
+        let (screen_tx, _) = watch::channel(screen.current_frame().clone());
+        let (lease_tx, lease_rx) = watch::channel(LeaseState {
+            controller_peer_id: host_id.clone(),
+            epoch: 1,
+            last_activity: Instant::now(),
+        });
+        let (_control_tx, control_rx) = mpsc::channel(8);
+        let mut runtime = HostPaneRuntime::new(
+            PtySize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            host_id.clone(),
+            screen_tx,
+            lease_tx,
+            control_rx,
+            String::from("TESTCODE"),
+        )
+        .expect("host runtime");
+
+        assert!(runtime.lease.state().controller_peer_id.is_empty());
+        assert_eq!(runtime.host_peer_id, host_id);
+        assert!(lease_rx.borrow().controller_peer_id.is_empty());
+
+        runtime.host.shutdown().expect("shutdown host runtime");
+    }
+
+    #[test]
+    fn remote_held_input_follows_the_final_lease_owner() {
+        let peer = b"requester";
+        let mut pending_control = true;
+        let mut held_input = b"first".to_vec();
+
+        assert!(lease_allows_held_input(b"", peer));
+        reconcile_remote_control_attempt(&mut pending_control, &mut held_input, b"", peer);
+        assert!(!pending_control, "free leases release the retry gate");
+        assert_eq!(held_input, b"first", "free leases retain queued input");
+
+        reconcile_remote_control_attempt(&mut pending_control, &mut held_input, b"other", peer);
+        assert!(
+            held_input.is_empty(),
+            "a later controller wins and discards stale input"
+        );
     }
 
     fn split_layout() -> LayoutSnapshot {
@@ -2815,6 +3173,58 @@ mod tests {
             }],
             &[(1, 4, 10), (2, 4, 10), (3, 4, 10)],
         )
+    }
+
+    #[test]
+    fn pane_title_uses_stable_leaf_order_and_control_state() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first: Box::new(Node::Leaf { pane_id: 8 }),
+                    second: Box::new(Node::Leaf { pane_id: 3 }),
+                },
+            }],
+            &[(3, 1, 1), (8, 1, 1)],
+        );
+        let mut members = snapshot.members.clone();
+        members[0].display_name = String::from("Host");
+        members.push(crate::layout::Member {
+            peer_id: b"guest".to_vec(),
+            endpoint_addr: b"guest-endpoint".to_vec(),
+            display_name: String::from("Guest"),
+        });
+
+        assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
+        assert_eq!(
+            pane_title(1, b"host", Some(b""), &members),
+            "Pane #1  host: Host  control: free"
+        );
+        assert_eq!(
+            pane_title(2, b"host", Some(b"guest"), &members),
+            "Pane #2  host: Host  control: Guest"
+        );
+        assert_eq!(
+            pane_title(2, b"host", None, &members),
+            "Pane #2  host: Host  control: …"
+        );
+    }
+
+    #[test]
+    fn free_panes_use_white_when_focused_and_dark_gray_when_unfocused() {
+        assert_eq!(pane_border_color(Some(b""), false, true), Color::White);
+        assert_eq!(pane_border_color(Some(b""), false, false), Color::DarkGray);
+        assert_eq!(pane_border_color(None, false, true), Color::Yellow);
+        assert_eq!(pane_border_color(None, false, false), Color::DarkGray);
+        assert_eq!(
+            pane_border_color(Some(b"guest"), true, true),
+            Color::Rgb(255, 69, 0)
+        );
+        assert_ne!(
+            pane_border_color(Some(b"guest"), false, false),
+            Color::Rgb(140, 91, 68)
+        );
     }
 
     #[test]
@@ -2843,6 +3253,39 @@ mod tests {
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
         assert!(!tui.focus_pane_at(10, 0, area));
         assert_eq!(tui.focused_pane(), 3);
+    }
+
+    #[test]
+    fn tab_hit_testing_switches_the_clicked_rendered_label_without_exiting_tab_mode() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 20, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        assert_eq!(
+            tui.switch_tab_at(8, 0, area),
+            Some(UiIntent::SwitchTab { tab_id: 2 })
+        );
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        assert_eq!(tui.switch_tab_at(6, 0, area), None);
     }
 
     #[test]
@@ -2893,7 +3336,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_marks_focus_and_reports_host_and_lease() {
+    fn chrome_reports_the_pane_host_and_controller() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -2918,7 +3361,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(1, 1)].symbol(), "*");
+        assert_eq!(buffer[(1, 1)].symbol(), "P");
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
@@ -2950,8 +3393,8 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
 
-        assert!(title.contains("host:686f7374"));
-        assert!(!title.contains("host:66616b65"));
+        assert!(title.contains("host: 686f7374"));
+        assert!(!title.contains("host: 66616b65"));
     }
 
     #[test]
@@ -3158,15 +3601,15 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+P panes | Ctrl+T tabs | type to claim idle | active typing is protected | Ctrl+Q quit",
+                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free",
             ),
             (
                 ChordMode::Pane,
-                "arrows move focus | N new pane | X delete pane | Esc cancel",
+                "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
-                "←/→ switch tab | N new tab | X delete tab | Esc cancel",
+                "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
         ] {
             tui.chord_mode = mode;
@@ -3180,6 +3623,38 @@ mod tests {
                 footer.starts_with(expected),
                 "mode: {mode:?}, footer: {footer}"
             );
+        }
+    }
+
+    #[test]
+    fn shared_footer_accents_key_glyphs_on_a_dark_background() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
+
+        for mode in [ChordMode::None, ChordMode::Pane, ChordMode::Tab] {
+            tui.chord_mode = mode;
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+                .expect("render");
+            let footer = terminal.backend().buffer();
+            assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
+            let (_, segments) = contextual_footer(mode);
+            let mut x = 0;
+            for (text, accent) in segments {
+                for key in text.chars() {
+                    if *accent {
+                        assert_eq!(footer[(x, 3)].fg, Color::Red, "mode: {mode:?}, key: {key}");
+                    }
+                    x += 1;
+                }
+            }
         }
     }
 

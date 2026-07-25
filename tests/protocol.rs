@@ -1208,6 +1208,19 @@ fn decoder_accepts_maximum_payloads() {
 }
 
 #[test]
+fn control_lease_allows_an_empty_controller_for_a_free_pane() {
+    let free_lease = envelope(envelope::Body::ControlLease(ControlLease {
+        pane_id: b"pane-a".to_vec(),
+        controller_peer_id: Vec::new(),
+        lease_epoch: 2,
+    }));
+    let mut frame = Vec::new();
+    free_lease.encode_length_delimited(&mut frame).unwrap();
+
+    assert_eq!(decode_frame(&frame).unwrap(), free_lease);
+}
+
+#[test]
 fn encode_frame_rejects_invalid_envelopes() {
     let mut wrong_version = sample_envelopes()[0].clone();
     wrong_version.version = PROTOCOL_VERSION + 1;

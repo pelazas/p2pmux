@@ -46,9 +46,9 @@ Three footers (join code still appendable for coordinator as today):
 
 | Mode | Footer text |
 |------|-------------|
-| Normal | `Ctrl+P panes \| Ctrl+T tabs \| type to claim idle \| active typing is protected \| Ctrl+Q quit` |
-| Pane | `arrows move focus \| N new pane \| X delete pane \| Esc cancel` |
-| Tab | `←/→ switch tab \| N new tab \| X delete tab \| Esc cancel` |
+| Normal | `Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free` |
+| Pane | `Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK` |
+| Tab | `Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK` |
 
 Status prefixes (rejection / waiting) still win left side when present; mode help replaces the controls segment.
 
@@ -58,7 +58,7 @@ Status prefixes (rejection / waiting) still win left side when present; mode hel
 - Left-click inside a pane’s content/chrome rectangle → set local `focused_pane` to that pane.
 - Click does **not** take control, claim lease, or send input.
 - Clicking while in pane/tab mode may keep the mode (navigation convenience) or leave it; prefer **keep mode** so click + arrows still work.
-- Click on tab bar: optional MVP stretch — if easy, click `Tab #N` switches tab; otherwise keyboard-only tabs are fine for this PR.
+- Click on a tab label: switch to that tab locally. It does not claim a lease or send input.
 - Document: under Zellij, mouse may be swallowed; try `zellij` with mouse mode off / locked passthrough.
 
 ### Tab chrome
