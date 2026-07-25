@@ -17,7 +17,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode,
+        enable_raw_mode,
     },
 };
 use iroh::EndpointAddr;
@@ -26,7 +27,7 @@ use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::Rect,
+    layout::{Margin, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Paragraph, Widget},
 };
@@ -297,11 +298,8 @@ impl MultiPaneTui {
             rect_contains(*rect, column, row).then_some((*pane_id, *rect))
         })?;
         let pane = self.snapshot.panes.get(&pane_id)?;
-        let viewport = fixed_grid_viewport(
-            Block::bordered().inner(pane_rect),
-            pane.grid_rows,
-            pane.grid_cols,
-        );
+        let viewport =
+            fixed_grid_viewport(pane_content_rect(pane_rect), pane.grid_rows, pane.grid_cols);
         mouse_to_screen_cell(viewport, column, row).map(|cell| (pane_id, cell))
     }
 
@@ -774,10 +772,8 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
 }
 
 pub(crate) fn grid_for_pane(rect: Rect) -> (u16, u16) {
-    (
-        rect.height.saturating_sub(2).max(1),
-        rect.width.saturating_sub(2).max(1),
-    )
+    let content = pane_content_rect(rect);
+    (content.height.max(1), content.width.max(1))
 }
 
 pub(crate) fn initial_root_pane_grid(cols: u16, rows: u16) -> (u16, u16) {
@@ -835,6 +831,10 @@ fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
         width,
         height,
     )
+}
+
+fn pane_content_rect(pane_rect: Rect) -> Rect {
+    Block::bordered().inner(pane_rect).inner(Margin::new(1, 1))
 }
 
 fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
@@ -895,6 +895,11 @@ fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     } else {
         Err(io::Error::other("pbcopy failed"))
     }
+}
+
+fn copied_status(text: &str) -> String {
+    let lines = text.split('\n').count().max(1);
+    format!("copied {lines} line{}", if lines == 1 { "" } else { "s" })
 }
 
 /// Renders layout chrome plus any currently available fixed-size VT screens.
@@ -1108,10 +1113,10 @@ fn render_shared_multi_pane(
         let block = Block::bordered()
             .title(format!(" {title} "))
             .border_style(Style::default().fg(border_color));
-        let inner = block.inner(rect);
+        let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
         if let Some(screen) = screens.get(&pane_id) {
-            let viewport = fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols);
+            let viewport = fixed_grid_viewport(content, pane.grid_rows, pane.grid_cols);
             let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
             frame.render_widget(
                 VtScreen::new(&screen).with_selection(
@@ -1134,7 +1139,7 @@ fn render_shared_multi_pane(
                 ));
             }
         } else if !view.ready {
-            frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), inner);
+            frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), content);
         }
     }
 }
@@ -1723,6 +1728,7 @@ impl SharedLayoutRuntime {
         let mut guard = TerminalGuard::new();
         enable_raw_mode()?;
         guard.raw_mode = true;
+        execute!(io::stdout(), SetTitle("p2pmux"))?;
         guard.alternate_screen = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.bracketed_paste = true;
@@ -1868,8 +1874,9 @@ impl SharedLayoutRuntime {
         let Some(text) = text else {
             return;
         };
-        if let Err(error) = copy_to_macos_clipboard(&text) {
-            self.status = format!("clipboard copy failed: {error}");
+        match copy_to_macos_clipboard(&text) {
+            Ok(()) => self.status = copied_status(&text),
+            Err(error) => self.status = format!("clipboard copy failed: {error}"),
         }
     }
 
@@ -2579,6 +2586,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
+    execute!(io::stdout(), SetTitle("p2pmux"))?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
@@ -3012,7 +3020,7 @@ mod tests {
         ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
         RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
-        VtScreen, contextual_footer, encode_key, encode_paste, grid_for_pane,
+        VtScreen, contextual_footer, copied_status, encode_key, encode_paste, grid_for_pane,
         initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
         render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
@@ -3640,6 +3648,25 @@ mod tests {
     }
 
     #[test]
+    fn selection_hit_testing_uses_the_padded_pane_content_area() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 18, 76)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(tui.screen_cell_at(1, 2, area), None);
+        assert_eq!(
+            tui.screen_cell_at(2, 3, area),
+            Some((1, ScreenCell { row: 0, col: 0 }))
+        );
+    }
+
+    #[test]
     fn mouse_wheel_adjusts_the_hovered_pane_scrollback_with_clamping() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -3705,6 +3732,13 @@ mod tests {
         };
 
         assert_eq!(selection_text(parser.screen(), selection), None);
+    }
+
+    #[test]
+    fn copied_status_reports_the_number_of_newline_separated_lines() {
+        assert_eq!(copied_status("one line"), "copied 1 line");
+        assert_eq!(copied_status("first\nsecond\nthird"), "copied 3 lines");
+        assert_eq!(copied_status(""), "copied 1 line");
     }
 
     #[test]
@@ -3930,16 +3964,16 @@ mod tests {
         ))
         .expect("valid layout");
         let screens = BTreeMap::from([(1, parser.screen())]);
-        let mut terminal = Terminal::new(TestBackend::new(6, 5)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(8, 7)).expect("test terminal");
 
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &screens))
             .expect("render");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(1, 2)].symbol(), "a");
-        assert_eq!(buffer[(4, 2)].symbol(), "d");
-        assert_eq!(buffer[(5, 2)].symbol(), "│");
+        assert_eq!(buffer[(2, 3)].symbol(), "a");
+        assert_eq!(buffer[(5, 3)].symbol(), "d");
+        assert_eq!(buffer[(7, 3)].symbol(), "│");
     }
 
     #[test]
@@ -3960,8 +3994,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::LeftRight,
-                grid_rows: 20,
-                grid_cols: 38,
+                grid_rows: 18,
+                grid_cols: 36,
             }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
@@ -4201,8 +4235,8 @@ mod tests {
             .get(&1)
             .copied()
             .expect("root pane");
-        assert_eq!(grid_for_pane(pane), (20, 78));
-        assert_eq!(initial_root_pane_grid(80, 24), (20, 78));
+        assert_eq!(grid_for_pane(pane), (18, 76));
+        assert_eq!(initial_root_pane_grid(80, 24), (18, 76));
     }
 
     #[test]
@@ -4226,8 +4260,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
-                grid_rows: 10,
-                grid_cols: 10,
+                grid_rows: 8,
+                grid_cols: 8,
             }])
         );
     }
@@ -4274,8 +4308,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
-                grid_rows: 36,
-                grid_cols: 18,
+                grid_rows: 34,
+                grid_cols: 16,
             }])
         );
     }
@@ -4457,8 +4491,8 @@ mod tests {
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::CreateTab {
-                grid_rows: 4,
-                grid_cols: 10,
+                grid_rows: 2,
+                grid_cols: 8,
             }])
         );
 
