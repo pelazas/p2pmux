@@ -61,7 +61,7 @@ const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <⌥⇧←↓↑→> FOCUS   <q> QUIT";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <⌥> + <⇧> + <↑↓←→> FOCUS   <q> QUIT";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 
 type FooterSegment = (&'static str, bool);
@@ -71,8 +71,13 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     ("p", true),
     ("> PANE   <", false),
     ("t", true),
-    ("> TAB   <", false),
-    ("⌥⇧←↓↑→", true),
+    ("> TAB   ", false),
+    ("<", false),
+    ("⌥", true),
+    ("> + <", false),
+    ("⇧", true),
+    ("> + <", false),
+    ("↑↓←→", true),
     ("> FOCUS   <", false),
     ("q", true),
     ("> QUIT", false),
@@ -1063,7 +1068,12 @@ fn render_footer_segments(
     for (text, accent) in segments {
         let style = Style::default()
             .fg(if *accent { FOOTER_ACCENT } else { FOOTER_MUTED })
-            .bg(FOOTER_BACKGROUND);
+            .bg(FOOTER_BACKGROUND)
+            .add_modifier(if *accent {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
         x = buffer
             .set_stringn(x, y, text, usize::from(end_x.saturating_sub(x)), style)
             .0;
@@ -4617,7 +4627,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <⌥⇧←↓↑→> FOCUS   <q> QUIT",
+                "Ctrl+ <p> PANE   <t> TAB   <⌥> + <⇧> + <↑↓←→> FOCUS   <q> QUIT",
             ),
             (
                 ChordMode::Pane,
@@ -4671,8 +4681,16 @@ mod tests {
                             Color::Rgb(220, 50, 47),
                             "mode: {mode:?}, key: {key}"
                         );
+                        assert!(
+                            footer[(x, 3)].modifier.contains(Modifier::BOLD),
+                            "mode: {mode:?}, key: {key}"
+                        );
                     } else {
                         assert_eq!(footer[(x, 3)].fg, Color::White, "mode: {mode:?}");
+                        assert!(
+                            !footer[(x, 3)].modifier.contains(Modifier::BOLD),
+                            "mode: {mode:?}, text: {text}"
+                        );
                     }
                     x += 1;
                 }
