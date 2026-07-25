@@ -210,6 +210,7 @@ pub struct MultiPaneTui {
     chord_mode: ChordMode,
     pane_views: BTreeMap<PaneId, PaneViewState>,
     pending_created_tab: Option<TabId>,
+    pending_created_pane: Option<PaneId>,
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
 }
@@ -232,6 +233,7 @@ impl MultiPaneTui {
             chord_mode: ChordMode::None,
             pane_views,
             pending_created_tab: None,
+            pending_created_pane: None,
             selection: None,
             selection_dragging: false,
         })
@@ -368,6 +370,12 @@ impl MultiPaneTui {
     /// Select a tab only when the coordinator publishes the exact ID reserved for this member.
     pub fn select_created_tab(&mut self, tab_id: TabId) {
         self.pending_created_tab = Some(tab_id);
+        self.repair_selection();
+    }
+
+    /// Select a pane only once an authoritative snapshot includes the reservation's pane ID.
+    pub fn select_created_pane(&mut self, pane_id: PaneId) {
+        self.pending_created_pane = Some(pane_id);
         self.repair_selection();
     }
 
@@ -673,8 +681,21 @@ impl MultiPaneTui {
             self.current_tab = self.snapshot.tabs[0].tab_id;
             &self.snapshot.tabs[0]
         };
-        if !contains_leaf(&current_tab.root, self.focused_pane) {
-            self.focused_pane = first_leaf(&current_tab.root).expect("validated layout has a leaf");
+        let (contains_focused_pane, first_pane, created_pane) = {
+            let root = &current_tab.root;
+            (
+                contains_leaf(root, self.focused_pane),
+                first_leaf(root).expect("validated layout has a leaf"),
+                self.pending_created_pane
+                    .filter(|pane_id| contains_leaf(root, *pane_id)),
+            )
+        };
+        if !contains_focused_pane {
+            self.focused_pane = first_pane;
+        }
+        if let Some(pane_id) = created_pane {
+            self.focused_pane = pane_id;
+            self.pending_created_pane = None;
         }
     }
 }
@@ -2305,6 +2326,8 @@ impl SharedLayoutRuntime {
         self.local.insert(reservation.pane_id, pane);
         if let Some(tab_id) = reservation.tab_id {
             self.tui.select_created_tab(tab_id);
+        } else {
+            self.tui.select_created_pane(reservation.pane_id);
         }
         match self.control.try_ready(PaneReady {
             reservation_id: reservation.reservation_id,
@@ -3261,6 +3284,7 @@ mod tests {
             "committed panes clear provisional state"
         );
         assert_eq!(runtime.tui.snapshot().panes.len(), 2);
+        assert_eq!(runtime.tui.focused_pane(), 2);
 
         runtime
             .handle_intent(UiIntent::DeletePane { pane_id: 2 })
