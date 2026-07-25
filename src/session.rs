@@ -29,8 +29,8 @@ use crate::{
         ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
         LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
         LayoutState, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady,
-        PaneReservation, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
-        envelope,
+        PaneReservation, PaneSubscribe, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor,
+        TakeControl, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -647,6 +647,7 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
     }
 }
 
+#[derive(Clone)]
 pub struct HostPaneChannels {
     pub pane_id: Vec<u8>,
     pub host_peer_id: Vec<u8>,
@@ -751,6 +752,7 @@ pub struct GuestPane {
     pub controls: GuestControlSender,
     transport: Transport,
     connection: Connection,
+    close_transport: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -763,6 +765,166 @@ impl GuestPane {
             let _ = task.await;
         }
         self.connection.close(0u8.into(), b"");
+        if self.close_transport {
+            self.transport.close().await;
+        }
+    }
+}
+
+/// Canonical on-stream representation for a layout pane ID.
+pub fn pane_wire_id(pane_id: u64) -> Vec<u8> {
+    pane_id.to_be_bytes().to_vec()
+}
+
+/// Direct pane service for one session member. Its roster is updated from the authoritative
+/// layout state before it accepts subscriptions.
+#[derive(Clone)]
+pub struct PaneServer {
+    transport: Transport,
+    session_id: Vec<u8>,
+    local_peer_id: Vec<u8>,
+    members: Arc<Mutex<BTreeMap<Vec<u8>, EndpointAddr>>>,
+    panes: Arc<Mutex<BTreeMap<u64, HostPaneChannels>>>,
+}
+
+impl PaneServer {
+    pub fn from_host_session(host: &HostSession) -> Self {
+        Self {
+            transport: host.transport.clone(),
+            session_id: host.ticket.session_id().to_vec(),
+            local_peer_id: host.transport.endpoint_id().as_bytes().to_vec(),
+            members: Arc::new(Mutex::new(BTreeMap::new())),
+            panes: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn new(transport: Transport, session_id: Vec<u8>) -> Result<Self, SessionError> {
+        if session_id.is_empty() {
+            return Err(SessionError::InvalidPostWelcome);
+        }
+        Ok(Self {
+            local_peer_id: transport.endpoint_id().as_bytes().to_vec(),
+            transport,
+            session_id,
+            members: Arc::new(Mutex::new(BTreeMap::new())),
+            panes: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub fn add_member(
+        &self,
+        peer_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+    ) -> Result<(), SessionError> {
+        if peer_id.is_empty() || endpoint_addr.is_empty() || peer_id != endpoint_addr.id.as_bytes()
+        {
+            return Err(SessionError::InvalidPostWelcome);
+        }
+        self.members
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .insert(peer_id, endpoint_addr);
+        Ok(())
+    }
+
+    pub fn replace_members(
+        &self,
+        members: Vec<(Vec<u8>, EndpointAddr)>,
+    ) -> Result<(), SessionError> {
+        let mut next = BTreeMap::new();
+        for (peer_id, endpoint_addr) in members {
+            if peer_id.is_empty()
+                || endpoint_addr.is_empty()
+                || peer_id != endpoint_addr.id.as_bytes()
+            {
+                return Err(SessionError::InvalidPostWelcome);
+            }
+            next.insert(peer_id, endpoint_addr);
+        }
+        *self.members.lock().map_err(|_| SessionError::PeerTask)? = next;
+        Ok(())
+    }
+
+    pub fn register_pane(
+        &self,
+        descriptor: PaneDescriptor,
+        channels: HostPaneChannels,
+    ) -> Result<(), SessionError> {
+        if descriptor.pane_id == 0
+            || descriptor.host_peer_id != self.local_peer_id
+            || channels.host_peer_id != self.local_peer_id
+            || channels.pane_id != pane_wire_id(descriptor.pane_id)
+        {
+            return Err(SessionError::InvalidPostWelcome);
+        }
+        self.panes
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .insert(descriptor.pane_id, channels);
+        Ok(())
+    }
+
+    pub fn remove_pane(&self, pane_id: u64) -> Result<Option<HostPaneChannels>, SessionError> {
+        Ok(self
+            .panes
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .remove(&pane_id))
+    }
+
+    pub async fn accept_one(&self) -> Result<(), SessionError> {
+        let incoming = self.transport.accept_incoming().await?;
+        self.serve_incoming(incoming).await
+    }
+
+    pub async fn serve_incoming(&self, incoming: Incoming) -> Result<(), SessionError> {
+        let connection = timeout(HANDSHAKE_TIMEOUT, incoming)
+            .await
+            .map_err(|_| SessionError::TimedOut("incoming pane connection"))?
+            .map_err(SessionError::Incoming)?;
+        let result = self.serve_connection(&connection).await;
+        if result.is_err() {
+            connection.close(0u8.into(), b"");
+        }
+        result
+    }
+
+    async fn serve_connection(&self, connection: &Connection) -> Result<(), SessionError> {
+        let remote_peer_id = connection.remote_id().as_bytes().to_vec();
+        let (_subscribe_writer, mut subscribe_reader) =
+            self.transport.accept_bi(connection).await?;
+        let envelope = self.transport.read_frame(&mut subscribe_reader).await?;
+        let subscribe = match envelope.body {
+            Some(envelope::Body::PaneSubscribe(subscribe)) => subscribe,
+            _ => return Err(SessionError::InvalidPostWelcome),
+        };
+        if envelope.sender_peer_id != remote_peer_id
+            || subscribe.peer_id != remote_peer_id
+            || subscribe.session_id != self.session_id
+            || !self
+                .members
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .contains_key(&remote_peer_id)
+        {
+            return Err(SessionError::UnauthenticatedPeer);
+        }
+        let pane = self
+            .panes
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .get(&subscribe.pane_id)
+            .cloned()
+            .ok_or(SessionError::InvalidPostWelcome)?;
+        if pane.host_peer_id != self.local_peer_id
+            || pane.pane_id != pane_wire_id(subscribe.pane_id)
+        {
+            return Err(SessionError::InvalidPostWelcome);
+        }
+        serve_direct_pane_streams(&self.transport, connection, remote_peer_id, pane).await
+    }
+
+    pub async fn close(&self) {
         self.transport.close().await;
     }
 }
@@ -911,6 +1073,11 @@ impl HostSession {
     pub async fn accept_one_join(&self) -> Result<JoinReceipt, SessionError> {
         let incoming = self.accept_incoming().await?;
         self.handle_incoming(incoming).await
+    }
+
+    /// Compatibility entry point for serving direct layout panes from a coordinator host.
+    pub fn pane_server(&self) -> PaneServer {
+        PaneServer::from_host_session(self)
     }
 
     pub async fn close(&self) {
@@ -1194,6 +1361,12 @@ pub struct SharedLayoutMember {
 }
 
 impl SharedLayoutMember {
+    /// Creates the member-side direct pane service; callers supply the session ID from their
+    /// authenticated join ticket and keep its roster synchronized with layout commits.
+    pub fn pane_server(&self, session_id: Vec<u8>) -> Result<PaneServer, SessionError> {
+        PaneServer::new(self.transport.clone(), session_id)
+    }
+
     pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
         self.outbound
             .try_send(LayoutClientMessage::Request(request))
@@ -1768,6 +1941,60 @@ fn join_peer_task(
     result.map_err(|_| SessionError::PeerTask)?
 }
 
+async fn serve_direct_pane_streams(
+    transport: &Transport,
+    connection: &Connection,
+    remote_peer_id: Vec<u8>,
+    pane: HostPaneChannels,
+) -> Result<(), SessionError> {
+    let (screen_writer, _) = transport.open_framed_bi(connection).await?;
+    let screen_task = tokio::spawn(screen_writer_task(
+        screen_writer,
+        pane.screen_rx,
+        pane.pane_id.clone(),
+        pane.host_peer_id.clone(),
+    ));
+    let (lease_writer, _) = match transport.open_framed_bi(connection).await {
+        Ok(streams) => streams,
+        Err(error) => {
+            screen_task.abort();
+            return Err(error.into());
+        }
+    };
+    let lease_task = tokio::spawn(lease_writer_task(
+        pane.host_peer_id.clone(),
+        pane.lease_rx,
+        pane.pane_id.clone(),
+        lease_writer,
+    ));
+    let control_transport = transport.clone();
+    let control_connection = connection.clone();
+    let control_task = tokio::spawn(async move {
+        let (_, control_reader) = control_transport
+            .accept_framed_bi_when_ready(&control_connection)
+            .await?;
+        control_reader_task(
+            control_reader,
+            remote_peer_id,
+            pane.pane_id,
+            pane.control_tx,
+        )
+        .await
+    });
+    let mut screen_task = screen_task;
+    let mut lease_task = lease_task;
+    let mut control_task = control_task;
+    let result = tokio::select! {
+        result = &mut screen_task => join_peer_task(result),
+        result = &mut lease_task => join_peer_task(result),
+        result = &mut control_task => join_peer_task(result),
+    };
+    screen_task.abort();
+    lease_task.abort();
+    control_task.abort();
+    result
+}
+
 async fn screen_writer_task(
     mut writer: crate::transport::FrameWriter,
     mut screen_rx: watch::Receiver<ScreenFrame>,
@@ -1962,6 +2189,7 @@ pub async fn join_pane(
             },
             transport: transport.clone(),
             connection: connection.clone(),
+            close_transport: true,
             tasks,
         })
     }
@@ -1969,6 +2197,93 @@ pub async fn join_pane(
     if result.is_err() {
         connection.close(0u8.into(), b"");
         transport.close().await;
+    }
+    result
+}
+
+/// Subscribe directly to a pane's registered owner. The caller retains ownership of `transport`
+/// so it can keep independent pane connections open to multiple hosts.
+pub async fn subscribe_pane(
+    transport: Transport,
+    session_id: Vec<u8>,
+    host_endpoint: EndpointAddr,
+    descriptor: PaneDescriptor,
+) -> Result<GuestPane, SessionError> {
+    if session_id.is_empty()
+        || descriptor.pane_id == 0
+        || descriptor.host_peer_id != host_endpoint.id.as_bytes()
+    {
+        return Err(SessionError::InvalidPostWelcome);
+    }
+    let connection = transport.connect(host_endpoint.clone()).await?;
+    let result = async {
+        if connection.remote_id() != host_endpoint.id {
+            return Err(SessionError::UnauthenticatedPeer);
+        }
+        let peer_id = transport.endpoint_id().as_bytes().to_vec();
+        let (mut subscribe_writer, _subscribe_reader) = transport.open_bi(&connection).await?;
+        transport
+            .write_frame(
+                &mut subscribe_writer,
+                &Envelope {
+                    version: PROTOCOL_VERSION,
+                    sender_peer_id: peer_id.clone(),
+                    body: Some(envelope::Body::PaneSubscribe(PaneSubscribe {
+                        session_id,
+                        peer_id: peer_id.clone(),
+                        pane_id: descriptor.pane_id,
+                    })),
+                },
+            )
+            .await?;
+        let (_screen_writer, screen_reader) = transport.accept_framed_bi(&connection).await?;
+        let (_lease_writer, lease_reader) = transport.accept_framed_bi(&connection).await?;
+        let (control_writer, _control_reader) = transport.open_framed_bi(&connection).await?;
+        let (events_tx, events) = mpsc::channel(128);
+        let (take_control_tx, take_control_rx) = mpsc::channel(16);
+        let (input_tx, input_rx) = mpsc::channel(256);
+        let pane_id = pane_wire_id(descriptor.pane_id);
+        let host_peer_id = descriptor.host_peer_id;
+        let tasks = vec![
+            tokio::spawn(guest_screen_reader_task(
+                screen_reader,
+                events_tx.clone(),
+                pane_id.clone(),
+                host_peer_id.clone(),
+            )),
+            tokio::spawn(guest_lease_reader_task(
+                lease_reader,
+                events_tx,
+                pane_id.clone(),
+                host_peer_id.clone(),
+            )),
+            tokio::spawn(guest_control_writer_task(
+                control_writer,
+                take_control_rx,
+                input_rx,
+                peer_id.clone(),
+                pane_id.clone(),
+            )),
+        ];
+        Ok(GuestPane {
+            pane_id: pane_id.clone(),
+            host_peer_id,
+            events,
+            controls: GuestControlSender {
+                peer_id,
+                pane_id,
+                take_control_tx,
+                input_tx,
+            },
+            transport: transport.clone(),
+            connection: connection.clone(),
+            close_transport: false,
+            tasks,
+        })
+    }
+    .await;
+    if result.is_err() {
+        connection.close(0u8.into(), b"");
     }
     result
 }
