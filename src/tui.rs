@@ -273,7 +273,7 @@ impl MultiPaneTui {
                 let (grid_rows, grid_cols) = grid_for_pane(rect);
                 Some(UiIntent::CreatePane {
                     target_pane_id: self.focused_pane,
-                    axis: if rect.width >= rect.height {
+                    axis: if rect.width > rect.height {
                         Axis::LeftRight
                     } else {
                         Axis::TopBottom
@@ -442,11 +442,15 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
     }
 }
 
-fn grid_for_pane(rect: Rect) -> (u16, u16) {
+pub(crate) fn grid_for_pane(rect: Rect) -> (u16, u16) {
     (
         rect.height.saturating_sub(2).max(1),
         rect.width.saturating_sub(2).max(1),
     )
+}
+
+pub(crate) fn initial_root_pane_grid(cols: u16, rows: u16) -> (u16, u16) {
+    grid_for_pane(Rect::new(0, 0, cols, rows.saturating_sub(2)))
 }
 
 fn rect_center(rect: Rect) -> (u32, u32) {
@@ -2390,8 +2394,9 @@ mod tests {
     use super::{
         ChordMode, HostControlEvent, HostPaneChannels, KeyHandling, LayoutControlEvent,
         MultiPaneTui, PaneViewState, RemoteSubscriptionState, SharedLayoutRuntime, SharedLocalPane,
-        UiIntent, VtScreen, encode_key, encode_paste, pane_wire_id, render_guest_screen,
-        render_multi_pane, render_shared_multi_pane, shared_footer_text,
+        UiIntent, VtScreen, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
+        pane_wire_id, render_guest_screen, render_multi_pane, render_shared_multi_pane,
+        shared_footer_text,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -2980,6 +2985,54 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
         assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn initial_root_pane_grid_matches_its_bordered_viewport() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        ))
+        .expect("valid layout");
+
+        let pane = tui
+            .geometry(Rect::new(0, 0, 80, 24))
+            .panes
+            .get(&1)
+            .copied()
+            .expect("root pane");
+        assert_eq!(grid_for_pane(pane), (20, 78));
+        assert_eq!(initial_root_pane_grid(80, 24), (20, 78));
+    }
+
+    #[test]
+    fn square_pane_create_chord_splits_top_to_bottom() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 12, 14);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::TopBottom,
+                grid_rows: 10,
+                grid_cols: 10,
+            }])
+        );
     }
 
     #[test]

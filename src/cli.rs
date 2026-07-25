@@ -70,18 +70,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 stdout.flush()?;
             }
             let (cols, rows) = crossterm::terminal::size()?;
-            let shell_rows = rows.max(3).saturating_sub(2);
-            let host = SharedLayoutHost::new(HostSession::create().await?, shell_rows, cols)?;
+            let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
+            let host = SharedLayoutHost::new(HostSession::create().await?, shell_rows, shell_cols)?;
             let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
-            let initial =
-                crate::tui::SharedLocalPane::spawn(1, shell_rows, cols, host_peer_id.clone())?;
+            let initial = crate::tui::SharedLocalPane::spawn(
+                1,
+                shell_rows,
+                shell_cols,
+                host_peer_id.clone(),
+            )?;
             let pane_server = host.pane_server();
             pane_server.register_local_pane(
                 crate::protocol::PaneDescriptor {
                     pane_id: 1,
                     host_peer_id,
                     grid_rows: u32::from(shell_rows),
-                    grid_cols: u32::from(cols),
+                    grid_cols: u32::from(shell_cols),
                 },
                 initial.channels(),
             )?;
