@@ -15,7 +15,7 @@ use std::{
 
 use iroh::{
     EndpointAddr, EndpointId,
-    endpoint::{ConnectingError, Connection, Incoming},
+    endpoint::{ConnectingError, Connection, Incoming, SendStream},
 };
 use tokio::{
     sync::{mpsc, watch},
@@ -845,6 +845,22 @@ impl PaneServer {
         Ok(())
     }
 
+    /// Replaces the admission roster from a verified authoritative layout commit. The caller's
+    /// layout reconciler is responsible for invoking this before accepting new direct panes.
+    pub fn replace_roster_from_layout(&self, state: &LayoutState) -> Result<(), SessionError> {
+        let members = state
+            .members
+            .iter()
+            .map(|member| {
+                serde_json::from_slice(&member.endpoint_addr)
+                    .map(|endpoint_addr| (member.peer_id.clone(), endpoint_addr))
+                    .map_err(|_| SessionError::InvalidPostWelcome)
+            })
+            .collect::<Result<Vec<(Vec<u8>, EndpointAddr)>, _>>();
+        let members = members?;
+        self.replace_members(members)
+    }
+
     pub fn register_pane(
         &self,
         descriptor: PaneDescriptor,
@@ -864,6 +880,16 @@ impl PaneServer {
         Ok(())
     }
 
+    /// Registers a locally hosted pane after its PTY is ready; the reconciler must remove it when
+    /// a later authoritative commit deletes the pane.
+    pub fn register_local_pane(
+        &self,
+        descriptor: PaneDescriptor,
+        channels: HostPaneChannels,
+    ) -> Result<(), SessionError> {
+        self.register_pane(descriptor, channels)
+    }
+
     pub fn remove_pane(&self, pane_id: u64) -> Result<Option<HostPaneChannels>, SessionError> {
         Ok(self
             .panes
@@ -872,9 +898,35 @@ impl PaneServer {
             .remove(&pane_id))
     }
 
+    pub fn remove_local_pane(
+        &self,
+        pane_id: u64,
+    ) -> Result<Option<HostPaneChannels>, SessionError> {
+        self.remove_pane(pane_id)
+    }
+
     pub async fn accept_one(&self) -> Result<(), SessionError> {
         let incoming = self.transport.accept_incoming().await?;
         self.serve_incoming(incoming).await
+    }
+
+    /// Owns an endpoint accept loop and keeps each pane subscription independent from later
+    /// arrivals. A runtime that multiplexes layout joins and panes should use
+    /// [`IncomingDispatcher`] instead of starting this loop alongside another acceptor.
+    pub async fn accept_loop(&self) -> Result<(), SessionError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                incoming = self.transport.accept_incoming() => {
+                    let incoming = incoming?;
+                    let server = self.clone();
+                    tasks.spawn(async move {
+                        let _ = server.serve_incoming(incoming).await;
+                    });
+                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
     }
 
     pub async fn serve_incoming(&self, incoming: Incoming) -> Result<(), SessionError> {
@@ -890,10 +942,18 @@ impl PaneServer {
     }
 
     async fn serve_connection(&self, connection: &Connection) -> Result<(), SessionError> {
-        let remote_peer_id = connection.remote_id().as_bytes().to_vec();
         let (_subscribe_writer, mut subscribe_reader) =
             self.transport.accept_bi(connection).await?;
         let envelope = self.transport.read_frame(&mut subscribe_reader).await?;
+        self.serve_subscribe_connection(connection, envelope).await
+    }
+
+    async fn serve_subscribe_connection(
+        &self,
+        connection: &Connection,
+        envelope: Envelope,
+    ) -> Result<(), SessionError> {
+        let remote_peer_id = connection.remote_id().as_bytes().to_vec();
         let subscribe = match envelope.body {
             Some(envelope::Body::PaneSubscribe(subscribe)) => subscribe,
             _ => return Err(SessionError::InvalidPostWelcome),
@@ -1154,9 +1214,18 @@ impl HostSession {
         &self,
         connection: &Connection,
     ) -> Result<JoinReceipt, SessionError> {
-        let remote_id = connection.remote_id();
         let (mut send, mut recv) = self.transport.accept_bi(connection).await?;
         let envelope = self.transport.read_frame(&mut recv).await?;
+        self.handshake_join(connection, &mut send, envelope).await
+    }
+
+    async fn handshake_join(
+        &self,
+        connection: &Connection,
+        send: &mut SendStream,
+        envelope: Envelope,
+    ) -> Result<JoinReceipt, SessionError> {
+        let remote_id = connection.remote_id();
         let join = match envelope.body {
             Some(envelope::Body::Join(join)) => join,
             _ => return Err(SessionError::InvalidJoin),
@@ -1186,7 +1255,7 @@ impl HostSession {
         };
         self.transport
             .write_frame(
-                &mut send,
+                send,
                 &Envelope {
                     version: PROTOCOL_VERSION,
                     sender_peer_id: coordinator.as_bytes().to_vec(),
@@ -1438,6 +1507,21 @@ impl SharedLayoutHost {
         self.host.ticket()
     }
 
+    /// Creates the coordinator-owned pane registry. The runtime must keep this registry's roster
+    /// and local pane registrations synchronized from authoritative layout commits.
+    pub fn pane_server(&self) -> PaneServer {
+        self.host.pane_server()
+    }
+
+    /// Creates the only incoming acceptor for an endpoint that serves both layout control and
+    /// direct panes. Do not run `accept_one_member` or `PaneServer::accept_loop` beside it.
+    pub fn incoming_dispatcher(
+        &self,
+        panes: PaneServer,
+    ) -> Result<IncomingDispatcher, SessionError> {
+        IncomingDispatcher::new(self.clone(), panes)
+    }
+
     /// Accept one authenticated member and then its persistent control stream.
     pub async fn accept_one_member(&self) -> Result<JoinReceipt, SessionError> {
         let incoming = self.host.accept_incoming().await?;
@@ -1445,9 +1529,32 @@ impl SharedLayoutHost {
             .await
             .map_err(|_| SessionError::TimedOut("incoming connection"))?
             .map_err(SessionError::Incoming)?;
+        let result = async {
+            let (mut join_writer, mut join_reader) =
+                self.host.transport.accept_bi(&connection).await?;
+            let envelope = self.host.transport.read_frame(&mut join_reader).await?;
+            self.accept_join_connection(connection.clone(), &mut join_writer, envelope)
+                .await
+        }
+        .await;
+        if result.is_err() {
+            connection.close(0u8.into(), b"");
+        }
+        result
+    }
+
+    async fn accept_join_connection(
+        &self,
+        connection: Connection,
+        join_writer: &mut SendStream,
+        envelope: Envelope,
+    ) -> Result<JoinReceipt, SessionError> {
         let mut admitted_peer_id = None;
         let result = async {
-            let receipt = self.host.handshake_connection(&connection).await?;
+            let receipt = self
+                .host
+                .handshake_join(&connection, join_writer, envelope)
+                .await?;
             {
                 let mut coordinator_guard = self
                     .coordinator
@@ -1565,6 +1672,79 @@ impl SharedLayoutHost {
                 envelope::Body::LayoutReject(targeted.reject),
             ),
         );
+    }
+}
+
+/// Sole endpoint-level acceptor for a shared-layout runtime. The caller owns roster replacement
+/// and local pane registration on `PaneServer`; this type only authenticates and routes each new
+/// connection.
+#[derive(Clone)]
+pub struct IncomingDispatcher {
+    layout: SharedLayoutHost,
+    panes: PaneServer,
+}
+
+impl IncomingDispatcher {
+    pub fn new(layout: SharedLayoutHost, panes: PaneServer) -> Result<Self, SessionError> {
+        if panes.local_peer_id != layout.host.transport.endpoint_id().as_bytes()
+            || panes.session_id.as_slice() != layout.ticket().session_id()
+        {
+            return Err(SessionError::InvalidPostWelcome);
+        }
+        Ok(Self { layout, panes })
+    }
+
+    /// Continually accepts connections and dispatches each to an independently managed task.
+    pub async fn accept_loop(&self) -> Result<(), SessionError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                incoming = self.layout.host.accept_incoming() => {
+                    let incoming = incoming?;
+                    let dispatcher = self.clone();
+                    tasks.spawn(async move {
+                        let _ = dispatcher.dispatch_incoming(incoming).await;
+                    });
+                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+    }
+
+    async fn dispatch_incoming(&self, incoming: Incoming) -> Result<(), SessionError> {
+        let connection = timeout(HANDSHAKE_TIMEOUT, incoming)
+            .await
+            .map_err(|_| SessionError::TimedOut("incoming connection"))?
+            .map_err(SessionError::Incoming)?;
+        let result = async {
+            let (mut first_writer, mut first_reader) =
+                self.layout.host.transport.accept_bi(&connection).await?;
+            let envelope = self
+                .layout
+                .host
+                .transport
+                .read_frame(&mut first_reader)
+                .await?;
+            match envelope.body.as_ref() {
+                Some(envelope::Body::Join(_)) => self
+                    .layout
+                    .accept_join_connection(connection.clone(), &mut first_writer, envelope)
+                    .await
+                    .map(|_| ()),
+                Some(envelope::Body::PaneSubscribe(_)) => {
+                    drop(first_writer);
+                    self.panes
+                        .serve_subscribe_connection(&connection, envelope)
+                        .await
+                }
+                _ => Err(SessionError::InvalidPostWelcome),
+            }
+        }
+        .await;
+        if result.is_err() {
+            connection.close(0u8.into(), b"");
+        }
+        result
     }
 }
 

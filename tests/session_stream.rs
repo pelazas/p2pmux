@@ -524,6 +524,98 @@ async fn rejected_direct_subscriber_cannot_inject_control_into_a_registered_pane
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pane_server_accept_loop_serves_two_viewers_without_waiting_for_the_first() {
+    let host = loopback_transport().await;
+    let first_viewer = loopback_transport().await;
+    let second_viewer = loopback_transport().await;
+    let server = PaneServer::new(host.clone(), b"shared-session".to_vec()).expect("server");
+    let host_id = host.endpoint_id().as_bytes().to_vec();
+    server
+        .add_member(
+            first_viewer.endpoint_id().as_bytes().to_vec(),
+            first_viewer.endpoint_addr(),
+        )
+        .expect("first member");
+    server
+        .add_member(
+            second_viewer.endpoint_id().as_bytes().to_vec(),
+            second_viewer.endpoint_addr(),
+        )
+        .expect("second member");
+    let screen = HostScreen::new(1, 1).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 5,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    let descriptor = PaneDescriptor {
+        pane_id: 151,
+        host_peer_id: host_id.clone(),
+        grid_rows: 1,
+        grid_cols: 1,
+    };
+    server
+        .register_pane(
+            descriptor.clone(),
+            HostPaneChannels {
+                pane_id: pane_wire_id(151),
+                host_peer_id: host_id,
+                screen_rx,
+                lease_rx,
+                control_tx,
+            },
+        )
+        .expect("register pane");
+    let accept_loop = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept_loop().await })
+    };
+    let (first, second) = tokio::join!(
+        subscribe_pane(
+            first_viewer.clone(),
+            b"shared-session".to_vec(),
+            host.endpoint_addr(),
+            descriptor.clone()
+        ),
+        subscribe_pane(
+            second_viewer.clone(),
+            b"shared-session".to_vec(),
+            host.endpoint_addr(),
+            descriptor
+        )
+    );
+    let mut first = first.expect("first subscription");
+    let mut second = second.expect("second subscription");
+    for pane in [&mut first, &mut second] {
+        let mut saw_snapshot = false;
+        let mut saw_lease = false;
+        for _ in 0..2 {
+            match timeout(TEST_TIMEOUT, pane.events.recv())
+                .await
+                .expect("pane event")
+            {
+                Some(GuestEvent::ScreenSnapshot(_)) => saw_snapshot = true,
+                Some(GuestEvent::Lease(lease)) if lease.lease_epoch == 5 => saw_lease = true,
+                other => panic!("unexpected pane event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_snapshot && saw_lease,
+            "each viewer gets independent streams"
+        );
+    }
+    first.shutdown().await;
+    second.shutdown().await;
+    accept_loop.abort();
+    let _ = accept_loop.await;
+    first_viewer.close().await;
+    second_viewer.close().await;
+    host.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
     let guest = loopback_transport().await;

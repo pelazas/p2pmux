@@ -2,11 +2,16 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
+    lease::LeaseState,
     protocol::{
         CreatePane, CreateTab, DeletePane, DeleteTab, Envelope, Join, LayoutRejectReason,
-        LayoutRequest, PROTOCOL_VERSION, PaneReady, SplitAxis, envelope,
+        LayoutRequest, PROTOCOL_VERSION, PaneDescriptor, PaneReady, SplitAxis, envelope,
     },
-    session::{HostSession, LayoutControlEvent, SharedLayoutHost, join_layout},
+    screen::HostScreen,
+    session::{
+        GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent, SharedLayoutHost,
+        join_layout, pane_wire_id, subscribe_pane,
+    },
     transport::{ALPN, Transport},
 };
 use tokio::time::timeout;
@@ -89,6 +94,88 @@ async fn joining_member_receives_a_snapshot_and_existing_members_receive_admissi
 
     first.shutdown().await;
     second.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_dispatcher_routes_layout_join_and_direct_pane_subscription_on_one_endpoint() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let guest = loopback_transport().await;
+    let pane_server = coordinator.pane_server();
+    pane_server
+        .add_member(
+            guest.endpoint_id().as_bytes().to_vec(),
+            guest.endpoint_addr(),
+        )
+        .expect("preload direct-pane roster");
+    let host_id = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
+    let descriptor = PaneDescriptor {
+        pane_id: 201,
+        host_peer_id: host_id.clone(),
+        grid_rows: 1,
+        grid_cols: 1,
+    };
+    let screen = HostScreen::new(1, 1).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 9,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    pane_server
+        .register_pane(
+            descriptor.clone(),
+            HostPaneChannels {
+                pane_id: pane_wire_id(201),
+                host_peer_id: host_id,
+                screen_rx,
+                lease_rx,
+                control_tx,
+            },
+        )
+        .expect("register local pane");
+    let dispatcher = coordinator
+        .incoming_dispatcher(pane_server)
+        .expect("matching dispatcher services");
+    let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
+
+    let (member, pane) = tokio::join!(
+        join_layout(guest.clone(), coordinator.ticket().clone()),
+        subscribe_pane(
+            guest.clone(),
+            coordinator.ticket().session_id().to_vec(),
+            coordinator.ticket().endpoint_addr().clone(),
+            descriptor,
+        )
+    );
+    let mut member = member.expect("layout join");
+    let mut pane = pane.expect("pane subscription");
+    assert!(matches!(
+        next_event(&mut member).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+    let mut saw_snapshot = false;
+    let mut saw_lease = false;
+    for _ in 0..2 {
+        match timeout(TEST_TIMEOUT, pane.events.recv())
+            .await
+            .expect("pane event")
+        {
+            Some(GuestEvent::ScreenSnapshot(_)) => saw_snapshot = true,
+            Some(GuestEvent::Lease(lease)) if lease.lease_epoch == 9 => saw_lease = true,
+            other => panic!("unexpected pane event: {other:?}"),
+        }
+    }
+    assert!(
+        saw_snapshot && saw_lease,
+        "direct pane remains independent of layout control"
+    );
+    pane.shutdown().await;
+    member.shutdown().await;
+    dispatcher_task.abort();
+    let _ = dispatcher_task.await;
     coordinator.close().await;
 }
 
