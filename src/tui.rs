@@ -757,6 +757,10 @@ impl SharedLocalPane {
 
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = false;
+        if let Some(state) = self.lease.clear_if_idle(Instant::now())? {
+            self.lease_tx.send_replace(state);
+            changed = true;
+        }
         while let Ok(event) = self.control_rx.try_recv() {
             match event {
                 HostControlEvent::Input { peer_id, input } => {
@@ -811,22 +815,15 @@ impl SharedLocalPane {
 
     fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
         let epoch = self.lease.state().epoch;
-        let decision = if self.lease.state().controller_peer_id == self.host_peer_id {
-            self.lease
-                .input(&self.host_peer_id, epoch, bytes.clone(), Instant::now())
-        } else {
-            self.lease
-                .take_control(self.host_peer_id.clone(), epoch, Instant::now())?
-        };
+        let decision = self
+            .lease
+            .input(&self.host_peer_id, epoch, bytes, Instant::now());
         match decision {
             LeaseDecision::AcceptInput(bytes) => {
                 self.host.write_input(&bytes)?;
                 self.lease_tx.send_replace(self.lease.state().clone());
             }
-            LeaseDecision::Publish(state) => {
-                self.lease_tx.send_replace(state);
-                self.host.write_input(&bytes)?;
-            }
+            LeaseDecision::Publish(_) => {}
             LeaseDecision::RejectStaleInput
             | LeaseDecision::RejectStaleRequest
             | LeaseDecision::RejectActiveController => {}
@@ -959,6 +956,8 @@ impl SharedRemotePane {
             } else {
                 self.held_input.extend_from_slice(&bytes);
             }
+        } else if lease.controller_peer_id.is_empty() {
+            let _ = self.pane.controls.try_input(lease.epoch, bytes);
         } else if self.last_lease.elapsed() >= IDLE_AFTER && !self.pending_control {
             self.held_input.extend_from_slice(&bytes);
             self.pending_control = self.pane.controls.try_take_control(lease.epoch).is_ok();
@@ -2087,6 +2086,9 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
     let mut dirty = true;
     loop {
+        if let Some(state) = runtime.lease.clear_if_idle(Instant::now())? {
+            runtime.lease_tx.send_replace(state);
+        }
         while let Ok(event) = runtime.control_rx.try_recv() {
             match event {
                 HostControlEvent::Input { peer_id, input } => match runtime.lease.input(
@@ -2163,25 +2165,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
-                    let decision =
-                        if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
-                            runtime
-                                .lease
-                                .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
-                        } else {
-                            runtime
-                                .lease
-                                .take_control(runtime.host_peer_id.clone(), epoch, now)?
-                        };
+                    let decision = runtime
+                        .lease
+                        .input(&runtime.host_peer_id, epoch, bytes, now);
                     match decision {
                         LeaseDecision::AcceptInput(bytes) => {
                             runtime.host.write_input(&bytes)?;
                             runtime.lease_tx.send_replace(runtime.lease.state().clone());
                         }
-                        LeaseDecision::Publish(state) => {
-                            runtime.lease_tx.send_replace(state);
-                            runtime.host.write_input(&bytes)?;
-                        }
+                        LeaseDecision::Publish(_) => {}
                         LeaseDecision::RejectStaleInput
                         | LeaseDecision::RejectStaleRequest
                         | LeaseDecision::RejectActiveController => {}
@@ -2192,24 +2184,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
                 let now = Instant::now();
                 let epoch = runtime.lease.state().epoch;
-                let decision = if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
-                    runtime
-                        .lease
-                        .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
-                } else {
-                    runtime
-                        .lease
-                        .take_control(runtime.host_peer_id.clone(), epoch, now)?
-                };
+                let decision = runtime
+                    .lease
+                    .input(&runtime.host_peer_id, epoch, bytes, now);
                 match decision {
                     LeaseDecision::AcceptInput(bytes) => {
                         runtime.host.write_input(&bytes)?;
                         runtime.lease_tx.send_replace(runtime.lease.state().clone());
                     }
-                    LeaseDecision::Publish(state) => {
-                        runtime.lease_tx.send_replace(state);
-                        runtime.host.write_input(&bytes)?;
-                    }
+                    LeaseDecision::Publish(_) => {}
                     LeaseDecision::RejectStaleInput
                     | LeaseDecision::RejectStaleRequest
                     | LeaseDecision::RejectActiveController => {}
@@ -2342,6 +2325,8 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_input.extend_from_slice(&bytes);
                         }
+                    } else if state.controller_peer_id.is_empty() {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
                     } else if last_lease.elapsed() >= IDLE_AFTER {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
@@ -2363,6 +2348,8 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_input.extend_from_slice(&bytes);
                         }
+                    } else if state.controller_peer_id.is_empty() {
+                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
                     } else if last_lease.elapsed() >= IDLE_AFTER {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
@@ -2790,13 +2777,28 @@ mod tests {
                 request: crate::protocol::TakeControl {
                     pane_id: pane_wire_id(99),
                     requester_peer_id: requester.clone(),
-                    known_lease_epoch: 1,
+                    known_lease_epoch: 2,
                 },
             })
             .expect("idle takeover event");
         pane.drain().expect("drain idle takeover");
         assert_eq!(pane.lease.state().controller_peer_id, requester);
-        assert_eq!(pane.lease.state().epoch, 2);
+        assert_eq!(pane.lease.state().epoch, 3);
+    }
+
+    #[test]
+    fn idle_controller_is_cleared_and_published_to_watchers() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::with_epoch_for_test(host_id, 1, Instant::now() - IDLE_AFTER);
+
+        pane.drain().expect("drain idle controller");
+
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        let lease = lease_rx.borrow_and_update().clone();
+        assert!(lease.controller_peer_id.is_empty());
+        assert_eq!(lease.epoch, 2);
     }
 
     fn split_layout() -> LayoutSnapshot {

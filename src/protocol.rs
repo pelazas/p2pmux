@@ -591,9 +591,9 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
                 &control_lease.pane_id,
                 MAX_PANE_ID_BYTES,
             )?;
-            validate_id(
+            validate_field_size(
                 "control_lease.controller_peer_id",
-                &control_lease.controller_peer_id,
+                control_lease.controller_peer_id.len(),
                 MAX_PEER_ID_BYTES,
             )?;
             if control_lease.lease_epoch == 0 {

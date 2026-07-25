@@ -24,6 +24,32 @@ fn controller_input_refreshes_activity_and_stale_input_is_rejected() {
 }
 
 #[test]
+fn free_pane_input_claims_control_and_delivers_the_first_input() {
+    let now = Instant::now();
+    let mut lease = LeaseManager::with_epoch_for_test(Vec::new(), 2, now);
+
+    assert_eq!(
+        lease.input(&[2], 2, b"first".to_vec(), now + Duration::from_secs(1)),
+        LeaseDecision::AcceptInput(b"first".to_vec())
+    );
+    assert_eq!(lease.state().controller_peer_id, vec![2]);
+    assert_eq!(lease.state().epoch, 3);
+}
+
+#[test]
+fn input_from_a_non_controller_is_rejected_while_control_is_active() {
+    let now = Instant::now();
+    let mut lease = LeaseManager::new(vec![1], now);
+
+    assert_eq!(
+        lease.input(&[2], 1, b"no".to_vec(), now + Duration::from_secs(1)),
+        LeaseDecision::RejectStaleInput
+    );
+    assert_eq!(lease.state().controller_peer_id, vec![1]);
+    assert_eq!(lease.state().epoch, 1);
+}
+
+#[test]
 fn take_control_advances_epoch_and_rejects_stale_requests() {
     let now = Instant::now();
     let mut lease = LeaseManager::new(vec![1], now);
