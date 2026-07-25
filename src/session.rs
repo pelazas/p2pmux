@@ -3,7 +3,7 @@
 use std::{error::Error, fmt, time::Duration};
 
 use iroh::{
-    EndpointId,
+    EndpointAddr, EndpointId,
     endpoint::{ConnectingError, Connection, Incoming},
 };
 use tokio::{
@@ -174,6 +174,7 @@ pub enum SessionError {
     Incoming(ConnectingError),
     TimedOut(&'static str),
     InvalidJoin,
+    InvalidJoinEndpointAddress,
     InvalidWelcome,
     UnauthenticatedPeer,
     InvalidPostWelcome,
@@ -188,6 +189,9 @@ impl fmt::Display for SessionError {
             Self::Incoming(error) => write!(formatter, "incoming handshake failed: {error}"),
             Self::TimedOut(operation) => write!(formatter, "session {operation} timed out"),
             Self::InvalidJoin => formatter.write_str("invalid Join handshake message"),
+            Self::InvalidJoinEndpointAddress => {
+                formatter.write_str("Join endpoint address is malformed or does not match the peer")
+            }
             Self::InvalidWelcome => formatter.write_str("invalid Welcome handshake message"),
             Self::UnauthenticatedPeer => {
                 formatter.write_str("handshake peer identity did not match")
@@ -206,6 +210,7 @@ impl Error for SessionError {
             Self::Incoming(error) => Some(error),
             Self::TimedOut(_)
             | Self::InvalidJoin
+            | Self::InvalidJoinEndpointAddress
             | Self::InvalidWelcome
             | Self::UnauthenticatedPeer
             | Self::InvalidPostWelcome
@@ -361,6 +366,15 @@ impl HostSession {
             || join.peer_id.as_slice() != remote_id.as_bytes()
         {
             return Err(SessionError::UnauthenticatedPeer);
+        }
+        let endpoint_addr: EndpointAddr = serde_json::from_slice(&join.endpoint_addr)
+            .map_err(|_| SessionError::InvalidJoinEndpointAddress)?;
+        if endpoint_addr.is_empty()
+            || endpoint_addr.id.as_bytes() != remote_id.as_bytes()
+            || endpoint_addr.id.as_bytes() != join.peer_id.as_slice()
+            || endpoint_addr.id.as_bytes() != envelope.sender_peer_id.as_slice()
+        {
+            return Err(SessionError::InvalidJoinEndpointAddress);
         }
 
         let coordinator = self.transport.endpoint_id();
@@ -625,7 +639,8 @@ async fn join_handshake(
                 body: Some(envelope::Body::Join(Join {
                     session_id: ticket.session_id().to_vec(),
                     peer_id: client_id.as_bytes().to_vec(),
-                    endpoint_addr: Vec::new(),
+                    endpoint_addr: serde_json::to_vec(&transport.endpoint_addr())
+                        .expect("endpoint address should serialize"),
                 })),
             },
         )

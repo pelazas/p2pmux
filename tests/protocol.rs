@@ -35,7 +35,7 @@ fn envelope_exposes_each_v1_body() {
         envelope(envelope::Body::Join(Join {
             session_id: b"session-a".to_vec(),
             peer_id: b"peer-a".to_vec(),
-            endpoint_addr: Vec::new(),
+            endpoint_addr: b"endpoint-a".to_vec(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -74,7 +74,7 @@ fn envelope_exposes_each_v1_body() {
     ];
 
     let expected_body_shapes: [&[(u32, u8)]; 7] = [
-        &[(1, 2), (2, 2)],
+        &[(1, 2), (2, 2), (3, 2)],
         &[(1, 2), (2, 2), (3, 2)],
         &[(1, 2), (2, 0), (3, 2)],
         &[(1, 2), (2, 2), (3, 0), (4, 0)],
@@ -160,7 +160,7 @@ fn sample_envelopes() -> Vec<Envelope> {
         envelope(envelope::Body::Join(Join {
             session_id: b"session-a".to_vec(),
             peer_id: b"peer-a".to_vec(),
-            endpoint_addr: Vec::new(),
+            endpoint_addr: b"endpoint-a".to_vec(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -245,7 +245,7 @@ fn v2_envelopes() -> Vec<Envelope> {
             base_revision: 1,
             create_pane: Some(CreatePane {
                 target_pane_id: 1,
-                axis: SplitAxis::LeftRight as i32,
+                axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: 24,
                 grid_cols: 80,
             }),
@@ -258,7 +258,10 @@ fn v2_envelopes() -> Vec<Envelope> {
             pane_id: 2,
             tab_id: None,
         })),
-        envelope(envelope::Body::PaneReady(PaneReady { reservation_id: 1 })),
+        envelope(envelope::Body::PaneReady(PaneReady {
+            reservation_id: 1,
+            base_revision: 1,
+        })),
         envelope(envelope::Body::LayoutCommit(LayoutCommit {
             revision: 1,
             state: Some(state),
@@ -281,7 +284,7 @@ fn envelope_exposes_each_v2_layout_body_with_stable_tags() {
         &[(1, 2)],
         &[(1, 0), (2, 0), (3, 2)],
         &[(1, 0), (2, 0)],
-        &[(1, 0)],
+        &[(1, 0), (2, 0)],
         &[(1, 0), (2, 2)],
         &[(1, 0), (2, 0)],
         &[(1, 2), (2, 2), (3, 0)],
@@ -328,7 +331,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
             target_pane_id: 1,
-            axis: SplitAxis::LeftRight as i32,
+            axis: Some(SplitAxis::LeftRight as i32),
             grid_rows: 24,
             grid_cols: 80,
         }),
@@ -351,7 +354,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             root: Some(LayoutNode {
                 leaf_pane_id: Some(1),
                 split: Some(Box::new(LayoutSplit {
-                    axis: SplitAxis::LeftRight as i32,
+                    axis: Some(SplitAxis::LeftRight as i32),
                     first: Some(leaf(1)),
                     second: Some(leaf(1)),
                 })),
@@ -447,7 +450,10 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             pane_id: 1,
             tab_id: None,
         })),
-        envelope(envelope::Body::PaneReady(PaneReady { reservation_id: 0 })),
+        envelope(envelope::Body::PaneReady(PaneReady {
+            reservation_id: 0,
+            base_revision: 1,
+        })),
         envelope(envelope::Body::LayoutReject(LayoutReject {
             request_id: 1,
             reason: 0,
@@ -464,6 +470,101 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             encode_frame(&invalid).is_err(),
             "{invalid:?} must be rejected"
         );
+    }
+}
+
+#[test]
+fn join_endpoint_and_pane_ready_revision_are_required() {
+    let empty_join_endpoint = envelope(envelope::Body::Join(Join {
+        session_id: b"session-a".to_vec(),
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: Vec::new(),
+    }));
+    let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
+        reservation_id: 1,
+        base_revision: 0,
+    }));
+
+    for invalid in [empty_join_endpoint, missing_ready_revision] {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "v2 Join endpoint addresses and PaneReady revisions are required"
+        );
+        let mut raw = Vec::new();
+        invalid
+            .encode_length_delimited(&mut raw)
+            .expect("raw invalid frame should encode");
+        assert!(decode_frame(&raw).is_err());
+    }
+}
+
+#[test]
+fn create_and_split_axes_must_be_explicitly_present_and_valid() {
+    fn create_request(axis: Option<i32>) -> Envelope {
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            request_id: 1,
+            base_revision: 1,
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis,
+                grid_rows: 24,
+                grid_cols: 80,
+            }),
+            delete_pane: None,
+            create_tab: None,
+            delete_tab: None,
+        }))
+    }
+
+    fn split_snapshot(axis: Option<i32>) -> Envelope {
+        let state = LayoutState {
+            panes: vec![
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: b"peer-a".to_vec(),
+                    grid_rows: 24,
+                    grid_cols: 80,
+                },
+                PaneDescriptor {
+                    pane_id: 2,
+                    host_peer_id: b"peer-a".to_vec(),
+                    grid_rows: 24,
+                    grid_cols: 80,
+                },
+            ],
+            tabs: vec![TabDescriptor {
+                tab_id: 1,
+                root: Some(LayoutNode {
+                    leaf_pane_id: None,
+                    split: Some(Box::new(LayoutSplit {
+                        axis,
+                        first: Some(leaf(1)),
+                        second: Some(leaf(2)),
+                    })),
+                }),
+            }],
+            ..layout_state(leaf(1))
+        };
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(state),
+        }))
+    }
+
+    for invalid in [
+        create_request(None),
+        create_request(Some(99)),
+        split_snapshot(None),
+        split_snapshot(Some(99)),
+    ] {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "layout axes must not silently default to LeftRight"
+        );
+        let mut raw = Vec::new();
+        invalid
+            .encode_length_delimited(&mut raw)
+            .expect("raw invalid frame should encode");
+        assert!(decode_frame(&raw).is_err());
     }
 }
 
@@ -485,7 +586,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         envelope(envelope::Body::LayoutRequest(LayoutRequest {
             create_pane: Some(CreatePane {
                 target_pane_id: 1,
-                axis: SplitAxis::LeftRight as i32,
+                axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: maximum,
                 grid_cols: maximum,
             }),
@@ -519,7 +620,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         envelope(envelope::Body::LayoutRequest(LayoutRequest {
             create_pane: Some(CreatePane {
                 target_pane_id: 1,
-                axis: SplitAxis::LeftRight as i32,
+                axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: oversized,
                 grid_cols: 80,
             }),
@@ -528,7 +629,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         envelope(envelope::Body::LayoutRequest(LayoutRequest {
             create_pane: Some(CreatePane {
                 target_pane_id: 1,
-                axis: SplitAxis::LeftRight as i32,
+                axis: Some(SplitAxis::LeftRight as i32),
                 grid_rows: 24,
                 grid_cols: oversized,
             }),
@@ -676,7 +777,7 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
             root: Some(LayoutNode {
                 leaf_pane_id: None,
                 split: Some(Box::new(LayoutSplit {
-                    axis: SplitAxis::LeftRight as i32,
+                    axis: Some(SplitAxis::LeftRight as i32),
                     first: Some(leaf(1)),
                     second: Some(leaf(1)),
                 })),
@@ -760,7 +861,7 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
             root: Some(LayoutNode {
                 leaf_pane_id: None,
                 split: Some(Box::new(LayoutSplit {
-                    axis: SplitAxis::TopBottom as i32,
+                    axis: Some(SplitAxis::TopBottom as i32),
                     first: Some(leaf(11)),
                     second: Some(leaf(11)),
                 })),
@@ -821,7 +922,7 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         LayoutNode {
             leaf_pane_id: None,
             split: Some(Box::new(LayoutSplit {
-                axis: SplitAxis::TopBottom as i32,
+                axis: Some(SplitAxis::TopBottom as i32),
                 first: Some(full_tree(depth - 1, next_pane_id)),
                 second: Some(full_tree(depth - 1, next_pane_id)),
             })),

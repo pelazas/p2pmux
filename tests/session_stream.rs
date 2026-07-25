@@ -25,6 +25,10 @@ async fn loopback_transport() -> Transport {
     Transport::from_endpoint(endpoint)
 }
 
+fn encoded_endpoint_addr(transport: &Transport) -> Vec<u8> {
+    serde_json::to_vec(&transport.endpoint_addr()).expect("endpoint address should serialize")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn join_pane_delivers_snapshot_then_delta_in_order() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
@@ -107,6 +111,7 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
         .await
         .expect("connect");
     let guest_id = guest.endpoint_id().as_bytes().to_vec();
+    let guest_endpoint_addr = encoded_endpoint_addr(&guest);
     let (mut handshake_send, mut handshake_recv) =
         guest.open_bi(&connection).await.expect("handshake");
     guest
@@ -118,7 +123,7 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
                 body: Some(envelope::Body::Join(Join {
                     session_id: host.ticket().session_id().to_vec(),
                     peer_id: guest_id.clone(),
-                    endpoint_addr: Vec::new(),
+                    endpoint_addr: guest_endpoint_addr,
                 })),
             },
         )
@@ -192,6 +197,7 @@ async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_wind
         .await
         .expect("connect");
     let guest_id = guest.endpoint_id().as_bytes().to_vec();
+    let guest_endpoint_addr = encoded_endpoint_addr(&guest);
     let (mut handshake_send, mut handshake_recv) =
         guest.open_bi(&connection).await.expect("handshake");
     guest
@@ -203,7 +209,7 @@ async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_wind
                 body: Some(envelope::Body::Join(Join {
                     session_id: host.ticket().session_id().to_vec(),
                     peer_id: guest_id,
-                    endpoint_addr: Vec::new(),
+                    endpoint_addr: guest_endpoint_addr,
                 })),
             },
         )

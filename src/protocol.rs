@@ -281,8 +281,8 @@ pub struct LayoutNode {
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LayoutSplit {
-    #[prost(enumeration = "SplitAxis", tag = "1")]
-    pub axis: i32,
+    #[prost(enumeration = "SplitAxis", optional, tag = "1")]
+    pub axis: Option<i32>,
     #[prost(message, optional, tag = "2")]
     pub first: Option<LayoutNode>,
     #[prost(message, optional, tag = "3")]
@@ -316,8 +316,8 @@ pub struct LayoutRequest {
 pub struct CreatePane {
     #[prost(uint64, tag = "1")]
     pub target_pane_id: u64,
-    #[prost(enumeration = "SplitAxis", tag = "2")]
-    pub axis: i32,
+    #[prost(enumeration = "SplitAxis", optional, tag = "2")]
+    pub axis: Option<i32>,
     #[prost(uint32, tag = "3")]
     pub grid_rows: u32,
     #[prost(uint32, tag = "4")]
@@ -358,6 +358,8 @@ pub struct PaneReservation {
 pub struct PaneReady {
     #[prost(uint64, tag = "1")]
     pub reservation_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub base_revision: u64,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -525,9 +527,9 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
         envelope::Body::Join(join) => {
             validate_id("join.session_id", &join.session_id, MAX_SESSION_ID_BYTES)?;
             validate_id("join.peer_id", &join.peer_id, MAX_PEER_ID_BYTES)?;
-            validate_field_size(
+            validate_id(
                 "join.endpoint_addr",
-                join.endpoint_addr.len(),
+                &join.endpoint_addr,
                 MAX_ENDPOINT_ADDR_BYTES,
             )?;
         }
@@ -628,6 +630,7 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
         }
         envelope::Body::PaneReady(ready) => {
             validate_nonzero("pane_ready.reservation_id", ready.reservation_id)?;
+            validate_nonzero("pane_ready.base_revision", ready.base_revision)?;
         }
         envelope::Body::LayoutCommit(commit) => {
             validate_nonzero("layout_commit.revision", commit.revision)?;
@@ -684,7 +687,8 @@ fn validate_grid(field: &'static str, rows: u32, cols: u32) -> Result<(), Protoc
     Ok(())
 }
 
-fn validate_axis(field: &'static str, axis: i32) -> Result<(), ProtocolError> {
+fn validate_axis(field: &'static str, axis: Option<i32>) -> Result<(), ProtocolError> {
+    let axis = axis.ok_or(ProtocolError::InvalidLayout(field))?;
     SplitAxis::try_from(axis).map_err(|_| ProtocolError::InvalidLayout(field))?;
     Ok(())
 }
