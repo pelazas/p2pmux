@@ -18,6 +18,7 @@
 - PTY grids are fixed at pane creation. Every viewer letterboxes or clips a fixed grid; no resize protocol is added.
 - `Ctrl+P`, then `N`/`X` creates/deletes the selected pane. `Ctrl+T`, then `N`/`X` creates/deletes the selected tab. `Ctrl+P`, arrows move pane selection; `Ctrl+T`, left/right switch tabs; `Esc` cancels a chord. `F9` and `F10` retain the currently locked take-control/quit behavior.
 - A request rejected for a stale revision refreshes the UI state but is never automatically replayed.
+- This spike's host-owned deletion and `F9`/`F10` controls supersede the older close-confirmation and `Ctrl+Q` shared-control design wording. The documentation task must make `docs/MVP_DESIGN.md`, `docs/SPIKE_PLAN.md`, and the shared-control design agree.
 
 ## Files and boundaries
 
@@ -57,6 +58,7 @@
 - [ ] Write failing frame round-trip and validation tests for `SessionSnapshot`, `LayoutRequest`, `PaneReservation`, `PaneReady`, `LayoutCommit`, `LayoutReject`, and `PaneSubscribe`.
 - [ ] Verify the tests fail because v1 has none of these bodies.
 - [ ] Bump protocol version and ALPN to v2. Keep screens out of state commits; member addresses are bounded serialized `EndpointAddr` data and pane descriptors refer to a member ID.
+- [ ] Define explicit action payloads: `LayoutRequest { request_id, base_revision, action }`, `CreatePane { target_pane_id, axis, grid_rows, grid_cols }`, `DeletePane { pane_id }`, `CreateTab { grid_rows, grid_cols }`, and `DeleteTab { tab_id }`. `PaneReservation` and `PaneReady` both carry the same coordinator-generated reservation ID. The coordinator rejects readiness for an expired, mismatched, or already-consumed reservation. It derives the owner from the authenticated control connection; it never trusts a host ID supplied by a request.
 - [ ] Preserve size, identity, and malformed-frame checks for every new message.
 - [ ] Run protocol and transport tests, then commit `feat: add shared-layout protocol v2`.
 
@@ -69,7 +71,7 @@
 - [ ] Write failing loopback tests for capped admission, initial snapshot, full commit broadcast, stale rejection, and foreign-delete rejection.
 - [ ] Verify the new tests fail against the single fixed-pane API.
 - [ ] Replace the one-shot post-Welcome setup with a persistent member-control stream. Authenticate the connection peer, record its endpoint address, and broadcast full commits after admission or structural changes.
-- [ ] Make the coordinator hold one pending create reservation. It validates a request, sends an ID reservation, accepts `PaneReady`, then atomically commits; timeout/failure leaves state unchanged.
+- [ ] Make the coordinator hold one pending create reservation. It validates a request, sends an ID reservation, accepts `PaneReady` only from the authenticated reservation creator, then atomically commits; timeout/failure leaves state unchanged. `CreateTab` uses the same reservation path and reserves both the tab and its required initial pane.
 - [ ] Run `cargo test --test session_layout` and the existing handshake tests; commit `feat: coordinate revisioned shared layouts`.
 
 ### Task 5: Generalize direct pane streams
@@ -79,6 +81,7 @@
 - [ ] Write failing loopback tests showing two arbitrary pane IDs can independently deliver an actual initial `ControlLease`, Snapshot, and Delta; reject a subscription from a nonmember or for a mismatched host/pane.
 - [ ] Verify they fail because `DEFAULT_PANE_ID` is hard-coded.
 - [ ] Add a registry of local pane channels and a `PaneSubscribe` handshake. Every process accepts pane connections; viewers reconcile commit descriptors to local panes or remote subscriptions.
+- [ ] A late joiner may see the snapshot before a pane host has processed the membership commit. Treat a host's `NotMember` subscription rejection as transient: retry after the next commit and with a bounded localhost backoff until the admission deadline. Cover that race in the loopback test.
 - [ ] Keep a dedicated direct connection/stream bundle per viewed remote pane in this initial localhost implementation. Do not allow one pane's writer to block another's screen or input path.
 - [ ] Remove the guest's synthetic initial lease and keep only host-emitted lease state.
 - [ ] Run session stream/layout tests; commit `feat: stream panes from their owning members`.
@@ -109,9 +112,9 @@
 
 ### Task 8: Documentation and automated verification
 
-**Files:** Modify `README.md`, `docs/MVP_DESIGN.md`, `docs/SPIKE_PLAN.md`.
+**Files:** Modify `README.md`, `docs/MVP_DESIGN.md`, `docs/SPIKE_PLAN.md`, `docs/superpowers/specs/2026-07-25-shared-control-ui-design.md`.
 
-- [ ] Add localhost instructions and the exact ownership/chord rules; move nested-split completion to Spike 3.
+- [ ] Add localhost instructions and the exact ownership/chord rules; move nested-split completion to Spike 3. Reconcile the existing shared-control design with the host-owned-delete and `F9`/`F10` rules before claiming the MVP document is authoritative.
 - [ ] Run `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Commit `docs: document localhost shared layout`.
 
