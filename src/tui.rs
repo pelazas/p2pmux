@@ -49,7 +49,6 @@ pub enum ChordMode {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PaneViewState {
     pub ready: bool,
-    pub host_peer_id: Vec<u8>,
     pub controller_peer_id: Option<Vec<u8>>,
     pub controller_active: bool,
 }
@@ -107,6 +106,7 @@ pub struct MultiPaneTui {
     focused_pane: PaneId,
     chord_mode: ChordMode,
     pane_views: BTreeMap<PaneId, PaneViewState>,
+    pending_created_tab: Option<TabId>,
 }
 
 impl MultiPaneTui {
@@ -116,16 +116,8 @@ impl MultiPaneTui {
         let focused_pane = first_leaf(&snapshot.tabs[0].root).expect("validated layout has a leaf");
         let pane_views = snapshot
             .panes
-            .values()
-            .map(|pane| {
-                (
-                    pane.pane_id,
-                    PaneViewState {
-                        host_peer_id: pane.host_peer_id.clone(),
-                        ..PaneViewState::default()
-                    },
-                )
-            })
+            .keys()
+            .map(|pane_id| (*pane_id, PaneViewState::default()))
             .collect();
         Ok(Self {
             snapshot,
@@ -133,6 +125,7 @@ impl MultiPaneTui {
             focused_pane,
             chord_mode: ChordMode::None,
             pane_views,
+            pending_created_tab: None,
         })
     }
 
@@ -162,6 +155,12 @@ impl MultiPaneTui {
         }
     }
 
+    /// Select a tab only when the coordinator publishes the exact ID reserved for this member.
+    pub fn select_created_tab(&mut self, tab_id: TabId) {
+        self.pending_created_tab = Some(tab_id);
+        self.repair_selection();
+    }
+
     pub fn apply_snapshot(&mut self, snapshot: LayoutSnapshot) -> Result<(), LayoutError> {
         crate::layout::SessionState::validate_snapshot(&snapshot)?;
         let old_views = std::mem::take(&mut self.pane_views);
@@ -169,8 +168,7 @@ impl MultiPaneTui {
             .panes
             .values()
             .map(|pane| {
-                let mut state = old_views.get(&pane.pane_id).cloned().unwrap_or_default();
-                state.host_peer_id = pane.host_peer_id.clone();
+                let state = old_views.get(&pane.pane_id).cloned().unwrap_or_default();
                 (pane.pane_id, state)
             })
             .collect();
@@ -307,7 +305,7 @@ impl MultiPaneTui {
         let geometry = self.geometry(area);
         let source = *geometry.panes.get(&self.focused_pane)?;
         let source_center = rect_center(source);
-        let mut candidates = geometry
+        let candidates = geometry
             .panes
             .iter()
             .filter(|(pane_id, _)| **pane_id != self.focused_pane)
@@ -316,23 +314,12 @@ impl MultiPaneTui {
         if candidates.is_empty() {
             return None;
         }
-        let directed = candidates
+        let pane_id = candidates
             .iter()
             .copied()
             .filter(|(_, rect)| is_in_direction(source_center, rect_center(*rect), direction))
             .min_by_key(|(pane_id, rect)| {
                 direction_distance(source_center, rect_center(*rect), direction, *pane_id)
-            });
-        let pane_id = directed
-            .or_else(|| {
-                candidates.sort_by_key(|(pane_id, rect)| {
-                    let center = rect_center(*rect);
-                    (
-                        source_center.0.abs_diff(center.0) + source_center.1.abs_diff(center.1),
-                        *pane_id,
-                    )
-                });
-                candidates.first().copied()
             })?
             .0;
         self.focused_pane = pane_id;
@@ -365,6 +352,14 @@ impl MultiPaneTui {
     }
 
     fn repair_selection(&mut self) {
+        if let Some(tab_id) = self.pending_created_tab
+            && let Some(tab) = self.snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)
+        {
+            self.current_tab = tab_id;
+            self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
+            self.pending_created_tab = None;
+            return;
+        }
         let current_tab = self.current_tab_layout();
         let current_tab = if let Some(tab) = current_tab {
             tab
@@ -545,7 +540,7 @@ pub fn render_multi_pane(
         let title = format!(
             "{} host:{} {lease}",
             if focused { "*" } else { " " },
-            short_peer(&view.host_peer_id)
+            short_peer(&pane.host_peer_id)
         );
         let border_color = if focused {
             Color::Yellow
@@ -558,10 +553,20 @@ pub fn render_multi_pane(
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if let Some(screen) = screens.get(&pane_id) {
-            frame.render_widget(
-                VtScreen::new(screen),
-                fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols),
-            );
+            let viewport = fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols);
+            frame.render_widget(VtScreen::new(screen), viewport);
+            let (row, col) = screen.cursor_position();
+            if focused
+                && view.ready
+                && !screen.hide_cursor()
+                && row < viewport.height
+                && col < viewport.width
+            {
+                frame.set_cursor_position((
+                    viewport.x.saturating_add(col),
+                    viewport.y.saturating_add(row),
+                ));
+            }
         } else if !view.ready {
             frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), inner);
         }
@@ -1414,7 +1419,6 @@ mod tests {
             1,
             PaneViewState {
                 ready: true,
-                host_peer_id: b"host".to_vec(),
                 controller_peer_id: Some(b"peer".to_vec()),
                 controller_active: true,
             },
@@ -1430,6 +1434,99 @@ mod tests {
         assert_eq!(buffer[(1, 1)].symbol(), "*");
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
+    }
+
+    #[test]
+    fn pane_badge_uses_the_snapshot_host_not_mutable_view_state() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState {
+                ready: true,
+                controller_peer_id: None,
+                controller_active: false,
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let title = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+
+        assert!(title.contains("host:686f7374"));
+        assert!(!title.contains("host:66616b65"));
+    }
+
+    #[test]
+    fn focused_ready_pane_maps_its_visible_vt_cursor_into_the_letterboxed_viewport() {
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process(b"ab");
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 3)],
+        ))
+        .expect("valid layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState {
+                ready: true,
+                controller_peer_id: None,
+                controller_active: false,
+            },
+        );
+        let screens = BTreeMap::from([(1, parser.screen())]);
+        let mut terminal = Terminal::new(TestBackend::new(9, 7)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &screens))
+            .expect("render");
+
+        terminal.backend_mut().assert_cursor_position((5, 3));
+    }
+
+    #[test]
+    fn focused_pane_never_draws_a_hidden_or_clipped_vt_cursor() {
+        for sequence in [b"\x1b[?25l".as_slice(), b"abcd".as_slice()] {
+            let mut parser = vt100::Parser::new(1, 5, 0);
+            parser.process(sequence);
+            let mut tui = MultiPaneTui::new(layout(
+                vec![Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                }],
+                &[(1, 1, 3)],
+            ))
+            .expect("valid layout");
+            tui.set_pane_view(
+                1,
+                PaneViewState {
+                    ready: true,
+                    controller_peer_id: None,
+                    controller_active: false,
+                },
+            );
+            let screens = BTreeMap::from([(1, parser.screen())]);
+            let mut terminal = Terminal::new(TestBackend::new(9, 7)).expect("test terminal");
+
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &screens))
+                .expect("render");
+
+            assert!(!terminal.backend().cursor_visible());
+        }
     }
 
     #[test]
@@ -1562,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_focus_uses_nearest_directional_leaf_then_a_stable_fallback() {
+    fn pane_focus_uses_the_nearest_directional_leaf_and_stops_at_edges() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
         let _ = tui.handle_key(
@@ -1587,8 +1684,98 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+            KeyHandling::Consumed(vec![])
         );
+        assert_eq!(tui.focused_pane(), 3);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.focused_pane(), 3);
+
+        let mut edge_tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let _ = edge_tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            edge_tui.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(edge_tui.focused_pane(), 1);
+
+        let _ = edge_tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = edge_tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        assert_eq!(edge_tui.focused_pane(), 2);
+        for key in [KeyCode::Up, KeyCode::Right] {
+            let _ = edge_tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            );
+            assert_eq!(
+                edge_tui.handle_key(KeyEvent::new(key, KeyModifiers::NONE), area),
+                KeyHandling::Consumed(vec![])
+            );
+            assert_eq!(edge_tui.focused_pane(), 2);
+        }
+    }
+
+    #[test]
+    fn creator_selects_only_its_explicitly_reserved_tab_after_that_tab_commits() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+
+        tui.select_created_tab(2);
+        tui.apply_snapshot(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 3,
+                    root: Node::Leaf { pane_id: 3 },
+                },
+            ],
+            &[(1, 2, 2), (3, 2, 2)],
+        ))
+        .expect("unrelated commit");
+        assert_eq!(tui.current_tab(), 1);
+
+        tui.apply_snapshot(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 3,
+                    root: Node::Leaf { pane_id: 3 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
+        ))
+        .expect("targeted tab commit");
+
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
     }
 
     #[test]
