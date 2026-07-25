@@ -108,6 +108,7 @@ pub enum KeyHandling {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneGeometry {
     pub tab_bar: Rect,
+    pub tab_labels: BTreeMap<TabId, Rect>,
     pub content: Rect,
     pub footer: Rect,
     pub panes: BTreeMap<PaneId, Rect>,
@@ -223,6 +224,17 @@ impl MultiPaneTui {
         true
     }
 
+    fn switch_tab_at(&mut self, column: u16, row: u16, area: Rect) -> Option<UiIntent> {
+        let tab_id = self
+            .geometry(area)
+            .tab_labels
+            .iter()
+            .find_map(|(tab_id, rect)| rect_contains(*rect, column, row).then_some(*tab_id))?;
+        self.select_tab(tab_id)
+            .expect("tab came from current snapshot");
+        Some(UiIntent::SwitchTab { tab_id })
+    }
+
     pub fn geometry(&self, area: Rect) -> PaneGeometry {
         let tab_bar = Rect::new(area.x, area.y, area.width, area.height.min(1));
         let footer_height = area.height.saturating_sub(tab_bar.height).min(1);
@@ -245,10 +257,31 @@ impl MultiPaneTui {
         }
         PaneGeometry {
             tab_bar,
+            tab_labels: self.tab_label_rects(tab_bar),
             content,
             footer,
             panes,
         }
+    }
+
+    fn tab_label_rects(&self, tab_bar: Rect) -> BTreeMap<TabId, Rect> {
+        let mut x = tab_bar.x;
+        let right = tab_bar.x.saturating_add(tab_bar.width);
+        self.snapshot
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                if index > 0 {
+                    x = x.saturating_add(1);
+                }
+                let label_width = format!("Tab #{}", index + 1).len() as u16;
+                let width = right.saturating_sub(x).min(label_width);
+                let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
+                x = x.saturating_add(label_width);
+                (tab.tab_id, rect)
+            })
+            .collect()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
@@ -456,13 +489,16 @@ fn visible_leaf_panes(node: &Node) -> Vec<PaneId> {
 }
 
 fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<PaneId> {
-    panes.iter().find_map(|(pane_id, rect)| {
-        let inside = u32::from(column) >= u32::from(rect.x)
-            && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
-            && u32::from(row) >= u32::from(rect.y)
-            && u32::from(row) < u32::from(rect.y) + u32::from(rect.height);
-        inside.then_some(*pane_id)
-    })
+    panes
+        .iter()
+        .find_map(|(pane_id, rect)| rect_contains(*rect, column, row).then_some(*pane_id))
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    u32::from(column) >= u32::from(rect.x)
+        && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
+        && u32::from(row) >= u32::from(rect.y)
+        && u32::from(row) < u32::from(rect.y) + u32::from(rect.height)
 }
 
 fn pane_title(
@@ -664,9 +700,16 @@ fn render_shared_multi_pane(
                 Style::default().fg(Color::DarkGray)
             };
             let label = format!("Tab #{}", index + 1);
-            frame
-                .buffer_mut()
-                .set_string(x, geometry.tab_bar.y, &label, style);
+            let label_rect = geometry.tab_labels[&tab.tab_id];
+            if label_rect.width == 0 {
+                continue;
+            }
+            frame.buffer_mut().set_string(
+                label_rect.x,
+                label_rect.y,
+                &label[..usize::from(label_rect.width)],
+                style,
+            );
             x = x.saturating_add(label.len() as u16);
         }
     }
@@ -1372,11 +1415,13 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
-                    dirty |= self.tui.focus_pane_at(
-                        mouse.column,
-                        mouse.row,
-                        Rect::new(0, 0, cols, rows),
-                    );
+                    let area = Rect::new(0, 0, cols, rows);
+                    if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
+                        self.handle_intent(intent)?;
+                        dirty = true;
+                    } else {
+                        dirty |= self.tui.focus_pane_at(mouse.column, mouse.row, area);
+                    }
                 }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -3058,6 +3103,39 @@ mod tests {
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
         assert!(!tui.focus_pane_at(10, 0, area));
         assert_eq!(tui.focused_pane(), 3);
+    }
+
+    #[test]
+    fn tab_hit_testing_switches_the_clicked_rendered_label_without_exiting_tab_mode() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 20, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        assert_eq!(
+            tui.switch_tab_at(8, 0, area),
+            Some(UiIntent::SwitchTab { tab_id: 2 })
+        );
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        assert_eq!(tui.switch_tab_at(6, 0, area), None);
     }
 
     #[test]
