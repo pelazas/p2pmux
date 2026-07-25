@@ -266,18 +266,12 @@ fn render_host_screen(
     render_guest_screen(frame, screen, footer, Some(chrome));
 }
 
-fn host_footer(join_code: &str) -> String {
-    format!("join: p2pmux join {join_code} | {CONTROL_HELP}")
+fn host_footer(_join_code: &str) -> String {
+    CONTROL_HELP.to_owned()
 }
 
-fn guest_footer(controller_peer_id: Option<&[u8]>) -> String {
-    match controller_peer_id {
-        Some(peer_id) => format!(
-            "controller: {} typing | {CONTROL_HELP}",
-            short_peer(peer_id)
-        ),
-        None => format!("waiting for control state | {CONTROL_HELP}"),
-    }
+fn guest_footer(_controller_peer_id: Option<&[u8]>) -> String {
+    CONTROL_HELP.to_owned()
 }
 
 fn is_quit(key: KeyEvent) -> bool {
@@ -813,14 +807,6 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn short_peer(peer_id: &[u8]) -> String {
-    peer_id
-        .iter()
-        .take(4)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -846,7 +832,7 @@ mod tests {
     };
 
     #[test]
-    fn shared_control_help_is_exact_and_used_by_every_footer() {
+    fn connected_host_and_guest_footers_are_shared_help_that_fits_80_columns() {
         assert_eq!(
             CONTROL_HELP,
             "type to claim idle | active typing is protected | Ctrl+Q quit"
@@ -854,14 +840,10 @@ mod tests {
 
         let host = host_footer("abc123");
         let guest = guest_footer(Some(b"controller"));
-        let pre_lease_guest = guest_footer(None);
 
-        assert!(host.starts_with("join: p2pmux join abc123 | "));
-        assert!(guest.starts_with("controller: 636f6e74 typing | "));
-        assert!(pre_lease_guest.starts_with("waiting for control state | "));
-        for footer in [&host, &guest, &pre_lease_guest] {
-            assert!(footer.ends_with(CONTROL_HELP));
-        }
+        assert_eq!(host, CONTROL_HELP);
+        assert_eq!(guest, CONTROL_HELP);
+        assert!(CONTROL_HELP.len() <= 80);
     }
 
     #[test]

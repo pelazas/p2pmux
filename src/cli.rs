@@ -136,7 +136,7 @@ fn wait_for_enter() -> io::Result<()> {
 
 async fn run_host(host: HostSession, join_code: String) -> Result<(), Box<dyn Error>> {
     let (cols, rows) = crossterm::terminal::size()?;
-    // Reserve one row for the join-code status bar.
+    // Reserve one row for the shared control footer.
     let shell_rows = rows.max(2).saturating_sub(1);
     let size = PtySize {
         rows: shell_rows,
