@@ -489,6 +489,7 @@ fn pane_border_color(
 ) -> Color {
     match controller_peer_id {
         Some([]) if focused => Color::White,
+        None if focused => Color::Yellow,
         Some([]) | None => Color::DarkGray,
         Some(_) => Color::Rgb(255, 69, 0),
     }
@@ -3019,6 +3020,8 @@ mod tests {
     fn free_panes_use_white_when_focused_and_dark_gray_when_unfocused() {
         assert_eq!(pane_border_color(Some(b""), false, true), Color::White);
         assert_eq!(pane_border_color(Some(b""), false, false), Color::DarkGray);
+        assert_eq!(pane_border_color(None, false, true), Color::Yellow);
+        assert_eq!(pane_border_color(None, false, false), Color::DarkGray);
         assert_eq!(
             pane_border_color(Some(b"guest"), true, true),
             Color::Rgb(255, 69, 0)
