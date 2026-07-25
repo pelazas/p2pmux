@@ -42,7 +42,6 @@ fn envelope_exposes_each_v1_body() {
             pane_id: b"pane-a".to_vec(),
             requester_peer_id: b"peer-b".to_vec(),
             known_lease_epoch: u32::MAX as u64 + 2,
-            force: true,
         })),
         envelope(envelope::Body::ControlLease(ControlLease {
             pane_id: b"pane-a".to_vec(),
@@ -68,7 +67,7 @@ fn envelope_exposes_each_v1_body() {
         &[(1, 2), (2, 2)],
         &[(1, 2), (2, 2), (3, 2)],
         &[(1, 2), (2, 0), (3, 2)],
-        &[(1, 2), (2, 2), (3, 0), (4, 0)],
+        &[(1, 2), (2, 2), (3, 0)],
         &[(1, 2), (2, 2), (3, 0)],
         &[(1, 2), (2, 2), (3, 0), (4, 2)],
         &[(1, 2), (2, 2), (3, 0), (4, 0), (5, 2)],
@@ -166,7 +165,6 @@ fn sample_envelopes() -> Vec<Envelope> {
             pane_id: b"pane-a".to_vec(),
             requester_peer_id: b"peer-b".to_vec(),
             known_lease_epoch: 0,
-            force: false,
         })),
         envelope(envelope::Body::ControlLease(ControlLease {
             pane_id: b"pane-a".to_vec(),

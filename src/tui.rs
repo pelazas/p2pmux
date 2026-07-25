@@ -155,12 +155,8 @@ fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::F(10) && key.modifiers.is_empty()
 }
 
-fn is_take_control(key: KeyEvent) -> bool {
-    key.code == KeyCode::F(9) && key.modifiers.is_empty()
-}
-
 fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
-    if is_quit(key) || is_take_control(key) {
+    if is_quit(key) {
         return None;
     }
 
@@ -400,10 +396,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
-    let footer = format!(
-        "join: p2pmux join {} | F9 take control | F10 quit",
-        runtime.join_code
-    );
+    let footer = format!("join: p2pmux join {} | F10 quit", runtime.join_code);
     let mut dirty = true;
     loop {
         while let Ok(event) = runtime.control_rx.try_recv() {
@@ -421,19 +414,11 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                     | LeaseDecision::RejectActiveController => {}
                 },
                 HostControlEvent::TakeControl { peer_id, request } => {
-                    let decision = if request.force {
-                        runtime.lease.force_take_control(
-                            peer_id,
-                            request.known_lease_epoch,
-                            Instant::now(),
-                        )?
-                    } else {
-                        runtime.lease.take_control(
-                            peer_id,
-                            request.known_lease_epoch,
-                            Instant::now(),
-                        )?
-                    };
+                    let decision = runtime.lease.take_control(
+                        peer_id,
+                        request.known_lease_epoch,
+                        Instant::now(),
+                    )?;
                     match decision {
                         LeaseDecision::Publish(state) => {
                             runtime.lease_tx.send_replace(state);
@@ -484,18 +469,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if is_quit(key) {
                     break;
                 }
-                if is_take_control(key) {
-                    if runtime.lease.state().controller_peer_id != runtime.host_peer_id {
-                        let known_epoch = runtime.lease.state().epoch;
-                        if let LeaseDecision::Publish(state) = runtime.lease.force_take_control(
-                            runtime.host_peer_id.clone(),
-                            known_epoch,
-                            Instant::now(),
-                        )? {
-                            runtime.lease_tx.send_replace(state);
-                        }
-                    }
-                } else if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
+                if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
                     let decision =
@@ -573,7 +547,6 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;
     let mut last_lease = Instant::now();
-    let mut received_host_lease = false;
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
@@ -598,18 +571,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Ok(GuestEvent::ScreenGap { .. }) => {}
-                Ok(GuestEvent::InitialLease(state)) => {
-                    footer = format!(
-                        "controller: {} typing",
-                        short_peer(&state.controller_peer_id)
-                    );
-                    lease = Some(state);
-                    last_lease = Instant::now();
-                    dirty = true;
-                }
                 Ok(GuestEvent::Lease(state)) => {
-                    let already_received_host_lease = received_host_lease;
-                    received_host_lease = true;
                     footer = format!(
                         "controller: {} typing",
                         short_peer(&state.controller_peer_id)
@@ -617,7 +579,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     last_lease = Instant::now();
                     if pending_control && state.controller_peer_id == pane.controls.peer_id() {
                         pending_control = false;
-                    } else if pending_control && already_received_host_lease {
+                    } else if pending_control {
                         pending_control = false;
                         held_input.clear();
                     }
@@ -671,15 +633,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                 break;
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_take_control(key) {
-                    if let Some(state) = lease.as_ref()
-                        && state.controller_peer_id != pane.controls.peer_id()
-                    {
-                        pending_control = false;
-                        held_input.clear();
-                        let _ = pane.controls.try_take_control(state.lease_epoch, true);
-                    }
-                } else if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
+                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
                     && let Some(bytes) = encode_key(key, screen)
                 {
                     if state.controller_peer_id == pane.controls.peer_id() {
@@ -692,11 +646,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
                             pending_control = true;
-                            if pane
-                                .controls
-                                .try_take_control(state.lease_epoch, false)
-                                .is_err()
-                            {
+                            if pane.controls.try_take_control(state.lease_epoch).is_err() {
                                 pending_control = false;
                                 held_input.clear();
                             }
@@ -717,11 +667,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         held_input.extend_from_slice(&bytes);
                         if !pending_control {
                             pending_control = true;
-                            if pane
-                                .controls
-                                .try_take_control(state.lease_epoch, false)
-                                .is_err()
-                            {
+                            if pane.controls.try_take_control(state.lease_epoch).is_err() {
                                 pending_control = false;
                                 held_input.clear();
                             }
@@ -890,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_supported_keys_and_reserves_f9_and_f10() {
+    fn encodes_supported_keys_and_reserves_f10() {
         let parser = vt100::Parser::new(1, 1, 0);
         let screen = parser.screen();
         let cases = [
@@ -947,7 +893,10 @@ mod tests {
                 KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
                 Some("\x1bOP"),
             ),
-            (KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), None),
+            (
+                KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+                Some("\x1b[20~"),
+            ),
             (KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), None),
             (
                 KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),

@@ -2,10 +2,12 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
-    lease::LeaseState,
+    lease::{LeaseDecision, LeaseManager, LeaseState},
     protocol::{ControlLease, Envelope, Join, PROTOCOL_VERSION, Snapshot, envelope},
     screen::HostScreen,
-    session::{DEFAULT_PANE_ID, GuestEvent, HostPaneChannels, HostSession, join_pane},
+    session::{
+        DEFAULT_PANE_ID, GuestEvent, HostControlEvent, HostPaneChannels, HostSession, join_pane,
+    },
     transport::{ALPN, Transport},
 };
 use tokio::time::{sleep, timeout};
@@ -31,11 +33,12 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
     let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
     let mut screen = HostScreen::new(1, 3).expect("screen");
     let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
-    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
-        controller_peer_id: host_id.clone(),
-        epoch: 1,
+    let initial_lease = LeaseState {
+        controller_peer_id: b"active-controller".to_vec(),
+        epoch: 41,
         last_activity: std::time::Instant::now(),
-    });
+    };
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(initial_lease.clone());
     let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
     let host_task = {
         let host = host.clone();
@@ -45,7 +48,7 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
                 incoming,
                 HostPaneChannels {
                     pane_id: DEFAULT_PANE_ID.to_vec(),
-                    host_peer_id: host_id,
+                    host_peer_id: host_id.clone(),
                     screen_rx,
                     lease_rx,
                     control_tx,
@@ -57,17 +60,111 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
     let mut pane = join_pane(loopback_transport().await, host.ticket().clone())
         .await
         .expect("join pane");
-    assert!(
-        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("lease timeout"), Some(GuestEvent::InitialLease(lease)) if lease.lease_epoch == 1)
-    );
-    assert!(
-        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenSnapshot(snapshot)) if snapshot.sequence == 1)
-    );
+    let mut received_initial_lease = false;
+    let mut received_snapshot = false;
+    while !received_initial_lease || !received_snapshot {
+        match timeout(TEST_TIMEOUT, pane.events.recv())
+            .await
+            .expect("initial event timeout")
+            .expect("host remains connected")
+        {
+            GuestEvent::Lease(lease) => {
+                assert_eq!(lease.controller_peer_id, initial_lease.controller_peer_id);
+                assert_eq!(lease.lease_epoch, initial_lease.epoch);
+                received_initial_lease = true;
+            }
+            GuestEvent::ScreenSnapshot(snapshot) => {
+                assert_eq!(snapshot.sequence, 1);
+                received_snapshot = true;
+            }
+            GuestEvent::ScreenDelta(_)
+            | GuestEvent::ScreenGap { .. }
+            | GuestEvent::Disconnected => {
+                panic!("unexpected event before initial host lease and snapshot")
+            }
+        }
+    }
     screen_tx.send_replace(screen.process_pty(b"abc").expect("screen update"));
     assert!(
         matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenDelta(delta)) if delta.base_sequence == 1 && delta.sequence == 2)
     );
     pane.shutdown().await;
+    let _ = timeout(TEST_TIMEOUT, host_task).await;
+    host.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn received_take_control_cannot_displace_an_active_controller() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+    let screen = HostScreen::new(1, 3).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+    let host_id_for_peer = host_id.clone();
+    let host_task = {
+        let host = host.clone();
+        tokio::spawn(async move {
+            let incoming = host.accept_incoming().await.expect("incoming");
+            host.serve_peer(
+                incoming,
+                HostPaneChannels {
+                    pane_id: DEFAULT_PANE_ID.to_vec(),
+                    host_peer_id: host_id_for_peer,
+                    screen_rx,
+                    lease_rx,
+                    control_tx,
+                },
+            )
+            .await
+        })
+    };
+    let mut pane = join_pane(loopback_transport().await, host.ticket().clone())
+        .await
+        .expect("join pane");
+
+    let initial_lease = loop {
+        match timeout(TEST_TIMEOUT, pane.events.recv())
+            .await
+            .expect("initial lease timeout")
+            .expect("host remains connected")
+        {
+            GuestEvent::Lease(lease) => break lease,
+            GuestEvent::ScreenSnapshot(_) => {}
+            GuestEvent::ScreenDelta(_)
+            | GuestEvent::ScreenGap { .. }
+            | GuestEvent::Disconnected => {
+                panic!("unexpected event before initial host lease")
+            }
+        }
+    };
+    pane.controls
+        .try_take_control(initial_lease.lease_epoch)
+        .expect("queue take-control request");
+    let HostControlEvent::TakeControl { peer_id, request } =
+        timeout(TEST_TIMEOUT, control_rx.recv())
+            .await
+            .expect("control request timeout")
+            .expect("control stream remains connected")
+    else {
+        panic!("expected a take-control request")
+    };
+    let mut lease = LeaseManager::new(host_id, std::time::Instant::now());
+    assert_eq!(
+        lease.take_control(
+            peer_id,
+            request.known_lease_epoch,
+            std::time::Instant::now()
+        ),
+        Ok(LeaseDecision::RejectActiveController)
+    );
+
+    pane.shutdown().await;
+    drop(lease_tx);
     let _ = timeout(TEST_TIMEOUT, host_task).await;
     host.close().await;
 }

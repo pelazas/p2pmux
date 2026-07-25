@@ -161,8 +161,6 @@ pub struct TakeControl {
     pub requester_peer_id: Vec<u8>,
     #[prost(uint64, tag = "3")]
     pub known_lease_epoch: u64,
-    #[prost(bool, tag = "4")]
-    pub force: bool,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
