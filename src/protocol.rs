@@ -678,7 +678,7 @@ fn validate_nonzero(field: &'static str, value: u64) -> Result<(), ProtocolError
 }
 
 fn validate_grid(field: &'static str, rows: u32, cols: u32) -> Result<(), ProtocolError> {
-    if rows == 0 || cols == 0 {
+    if rows == 0 || cols == 0 || rows > u32::from(u16::MAX) || cols > u32::from(u16::MAX) {
         return Err(ProtocolError::InvalidLayout(field));
     }
     Ok(())

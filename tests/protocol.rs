@@ -468,6 +468,115 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
 }
 
 #[test]
+fn layout_grids_must_fit_the_reducer_u16_grid() {
+    let maximum = u32::from(u16::MAX);
+    let oversized = maximum + 1;
+    let state = layout_state(leaf(1));
+    let empty_action = LayoutRequest {
+        request_id: 1,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+    };
+
+    for valid in [
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: SplitAxis::LeftRight as i32,
+                grid_rows: maximum,
+                grid_cols: maximum,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: maximum,
+                grid_cols: maximum,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(LayoutState {
+                panes: vec![PaneDescriptor {
+                    grid_rows: maximum,
+                    grid_cols: maximum,
+                    ..state.panes[0].clone()
+                }],
+                ..state.clone()
+            }),
+        })),
+    ] {
+        assert!(
+            encode_frame(&valid).is_ok(),
+            "u16 grid maximum must be valid"
+        );
+    }
+
+    let invalid = [
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: SplitAxis::LeftRight as i32,
+                grid_rows: oversized,
+                grid_cols: 80,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: SplitAxis::LeftRight as i32,
+                grid_rows: 24,
+                grid_cols: oversized,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: oversized,
+                grid_cols: 80,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: 24,
+                grid_cols: oversized,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(LayoutState {
+                panes: vec![PaneDescriptor {
+                    grid_rows: oversized,
+                    ..state.panes[0].clone()
+                }],
+                ..state.clone()
+            }),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(LayoutState {
+                panes: vec![PaneDescriptor {
+                    grid_cols: oversized,
+                    ..state.panes[0].clone()
+                }],
+                ..state
+            }),
+        })),
+    ];
+
+    for invalid in invalid {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "oversized layout grid must be rejected"
+        );
+    }
+}
+
+#[test]
 fn pane_reservation_rejects_a_zero_present_tab_id() {
     for tab_id in [None, Some(1)] {
         assert!(
