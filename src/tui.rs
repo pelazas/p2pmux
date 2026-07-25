@@ -34,11 +34,12 @@ use ratatui::{
 };
 
 use crate::{
-    layout::{Axis, LayoutError, LayoutSnapshot, Node, PaneId, TabId},
+    layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     protocol::{
-        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRequest, PaneDescriptor, PaneFailed,
-        PaneReady, SplitAxis,
+        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRequest,
+        NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
+        SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
@@ -120,6 +121,7 @@ pub enum UiIntent {
     CreatePane {
         target_pane_id: PaneId,
         axis: Axis,
+        position: NewPanePosition,
         grid_rows: u16,
         grid_cols: u16,
     },
@@ -493,6 +495,15 @@ impl MultiPaneTui {
             self.chord_mode = ChordMode::None;
             return KeyHandling::Consumed(vec![]);
         }
+        if matches!(self.chord_mode, ChordMode::None | ChordMode::Pane)
+            && key.modifiers == KeyModifiers::ALT
+            && matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            )
+        {
+            return KeyHandling::Consumed(self.move_focus(key.code, area).into_iter().collect());
+        }
         if self.chord_mode == ChordMode::None {
             if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
                 self.chord_mode = ChordMode::Pane;
@@ -531,17 +542,27 @@ impl MultiPaneTui {
         match key.code {
             KeyCode::Char('n') if key.modifiers.is_empty() => {
                 let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
-                let (grid_rows, grid_cols) = grid_for_pane(rect);
-                Some(UiIntent::CreatePane {
-                    target_pane_id: self.focused_pane,
-                    axis: if rect.width > rect.height {
+                self.create_pane(
+                    if rect.width > rect.height {
                         Axis::LeftRight
                     } else {
                         Axis::TopBottom
                     },
-                    grid_rows,
-                    grid_cols,
-                })
+                    NewPanePosition::Second,
+                    area,
+                )
+            }
+            KeyCode::Char('r') if key.modifiers.is_empty() => {
+                self.create_pane(Axis::LeftRight, NewPanePosition::Second, area)
+            }
+            KeyCode::Char('l') if key.modifiers.is_empty() => {
+                self.create_pane(Axis::LeftRight, NewPanePosition::First, area)
+            }
+            KeyCode::Char('d') if key.modifiers.is_empty() => {
+                self.create_pane(Axis::TopBottom, NewPanePosition::Second, area)
+            }
+            KeyCode::Char('u') if key.modifiers.is_empty() => {
+                self.create_pane(Axis::TopBottom, NewPanePosition::First, area)
             }
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeletePane {
                 pane_id: self.focused_pane,
@@ -553,6 +574,18 @@ impl MultiPaneTui {
             }
             _ => None,
         }
+    }
+
+    fn create_pane(&self, axis: Axis, position: NewPanePosition, area: Rect) -> Option<UiIntent> {
+        let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
+        let (grid_rows, grid_cols) = grid_for_pane(rect);
+        Some(UiIntent::CreatePane {
+            target_pane_id: self.focused_pane,
+            axis,
+            position,
+            grid_rows,
+            grid_cols,
+        })
     }
 
     fn handle_tab_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
@@ -653,6 +686,10 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
         ChordMode::Pane => matches!(
             key.code,
             KeyCode::Char('n')
+                | KeyCode::Char('r')
+                | KeyCode::Char('l')
+                | KeyCode::Char('d')
+                | KeyCode::Char('u')
                 | KeyCode::Char('x')
                 | KeyCode::Left
                 | KeyCode::Right
@@ -2124,10 +2161,11 @@ impl SharedLayoutRuntime {
             UiIntent::CreatePane {
                 target_pane_id,
                 axis,
+                position,
                 grid_rows,
                 grid_cols,
             } => {
-                self.begin_create(Some((target_pane_id, axis)), grid_rows, grid_cols)?;
+                self.begin_create(Some((target_pane_id, axis, position)), grid_rows, grid_cols)?;
             }
             UiIntent::CreateTab {
                 grid_rows,
@@ -2164,7 +2202,7 @@ impl SharedLayoutRuntime {
 
     fn begin_create(
         &mut self,
-        pane: Option<(PaneId, Axis)>,
+        pane: Option<(PaneId, Axis, NewPanePosition)>,
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<(), Box<dyn Error>> {
@@ -2183,7 +2221,7 @@ impl SharedLayoutRuntime {
         self.send_request(LayoutRequest {
             request_id,
             base_revision,
-            create_pane: pane.map(|(target_pane_id, axis)| CreatePane {
+            create_pane: pane.map(|(target_pane_id, axis, position)| CreatePane {
                 target_pane_id,
                 axis: Some(match axis {
                     Axis::LeftRight => SplitAxis::LeftRight as i32,
@@ -2191,7 +2229,10 @@ impl SharedLayoutRuntime {
                 }),
                 grid_rows: u32::from(grid_rows),
                 grid_cols: u32::from(grid_cols),
-                position: None,
+                position: Some(match position {
+                    NewPanePosition::First => ProtocolNewPanePosition::First as i32,
+                    NewPanePosition::Second => ProtocolNewPanePosition::Second as i32,
+                }),
             }),
             delete_pane: None,
             create_tab: pane.is_none().then_some(CreateTab {
@@ -3081,7 +3122,7 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use crate::layout::{Axis, LayoutSnapshot, Node, Pane, Tab};
+    use crate::layout::{Axis, LayoutSnapshot, NewPanePosition, Node, Pane, Tab};
     use crate::lease::{IDLE_AFTER, LeaseManager, LeaseState};
     use crate::screen::{GuestScreen, HostScreen};
     use crate::{
@@ -3096,10 +3137,10 @@ mod tests {
         LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
         RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
         VtScreen, contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
-        initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
-        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
-        viewed_screen, visible_leaf_panes,
+        initial_root_pane_grid, is_chord_command, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        render_shared_multi_pane, selection_text, viewed_screen, visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -3207,6 +3248,7 @@ mod tests {
             .handle_intent(UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::LeftRight,
+                position: NewPanePosition::Second,
                 grid_rows: 2,
                 grid_cols: 8,
             })
@@ -4138,6 +4180,7 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::LeftRight,
+                position: NewPanePosition::Second,
                 grid_rows: 20,
                 grid_cols: 38,
             }])
@@ -4153,6 +4196,73 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
         assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn option_arrows_focus_in_normal_and_pane_modes_without_forwarding_at_edges() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), area),
+            KeyHandling::Consumed(vec![]),
+            "an edge Option-arrow is still consumed"
+        );
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+    }
+
+    #[test]
+    fn pane_chord_directional_splits_select_axis_and_child_position() {
+        let area = Rect::new(0, 0, 80, 24);
+        for (key, axis, position) in [
+            ('r', Axis::LeftRight, NewPanePosition::Second),
+            ('l', Axis::LeftRight, NewPanePosition::First),
+            ('d', Axis::TopBottom, NewPanePosition::Second),
+            ('u', Axis::TopBottom, NewPanePosition::First),
+        ] {
+            let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+            let _ = tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            );
+            assert_eq!(
+                tui.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), area),
+                KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                    target_pane_id: 1,
+                    axis,
+                    position,
+                    grid_rows: 20,
+                    grid_cols: 38,
+                }]),
+                "key: {key}"
+            );
+            assert_eq!(tui.focused_pane(), 1, "key: {key}");
+            assert_eq!(tui.chord_mode(), ChordMode::Pane, "key: {key}");
+        }
+    }
+
+    #[test]
+    fn directional_split_keys_are_sticky_pane_commands_even_without_an_intent() {
+        for key in ['r', 'l', 'd', 'u'] {
+            assert!(is_chord_command(
+                ChordMode::Pane,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+            ));
+        }
     }
 
     #[test]
@@ -4401,6 +4511,7 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
+                position: NewPanePosition::Second,
                 grid_rows: 10,
                 grid_cols: 10,
             }])
@@ -4449,6 +4560,7 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
+                position: NewPanePosition::Second,
                 grid_rows: 36,
                 grid_cols: 18,
             }])
