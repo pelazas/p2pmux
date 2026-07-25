@@ -40,8 +40,14 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 
 ## Status
 
-Spike 2 provides one host-created, fixed-grid shared terminal pane over an authenticated Iroh
-connection. It intentionally has no tabs, splits, resize protocol, or multiple panes yet.
+Spike 3 provides a localhost shared layout for up to eight members. The coordinator owns a
+revisioned tab/split tree; every pane is a fixed-grid PTY owned by the member that created it.
+Each process serves its own locally hosted panes directly to the other admitted members.
+
+This is still a dogfooding spike: relay/internet validation, disconnect grace, coordinator
+failover, presence, and dynamic resize remain later work. The protocol deliberately has no
+resize message: each pane grid is fixed when that pane is created and is letterboxed or clipped
+by smaller local rectangles.
 
 ## Local Spike 1
 
@@ -52,7 +58,7 @@ the child shell or vt100 parser: larger windows leave extra cells blank and smal
 the upper-left fixed viewport. Dynamic resize is intentionally outside Spike 1 and the MVP wire
 protocol.
 
-To dogfood the shared host/guest pane:
+To dogfood the shared layout on one Mac:
 
 ```text
 Terminal 1: cargo run -- create
@@ -60,14 +66,27 @@ Terminal 2: cargo run -- join <printed 10-character code>
 ```
 
 `create` prints `Join with: p2pmux join <CODE>`, waits for Enter so you can copy it, then
-enters the host shell. The same code stays in the host status bar. `join` renders that remote pane.
+enters the shared-layout TUI. The same code stays in the footer. `join` first receives the
+authoritative layout, then attaches directly to every remote pane.
 Short join codes resolve through a restrictive local cache on the same Mac, so they are for current
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
 
-Only one peer controls input at a time: after about eight seconds of idle time another guest can
-type to hop in; while someone is actively typing, press F9 to take control. F10 exits only
-the local p2pmux view.
+Only one peer controls each pane at a time: after about eight seconds of idle time another member
+can type to hop in; while someone is actively typing, press F9 to force Take control of the
+**focused** pane. F10 exits only the local p2pmux view.
+
+Shared-layout commands are local mux chords and never reach a PTY:
+
+- `Ctrl+P`, then `N` — split the focused pane. The new fixed-grid PTY runs on the requester’s Mac.
+- `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
+- `Ctrl+P`, then arrows — move focus.
+- `Ctrl+T`, then `N` — create a tab with a local PTY on the requester’s Mac.
+- `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
+- `Ctrl+T`, then left/right — switch tabs; `Esc` cancels a chord.
+
+The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
+Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs).
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal crops or letterboxes the immutable host grid; it never resizes the host PTY.

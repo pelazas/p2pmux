@@ -2,22 +2,19 @@
 
 use std::{
     error::Error,
-    future::Future,
     io::{self, Write},
-    pin::Pin,
     str::FromStr,
 };
 
 use clap::{Parser, Subcommand};
-use portable_pty::PtySize;
 
 use crate::{
-    lease::LeaseManager,
     rendezvous::{LocalRendezvous, RendezvousError},
-    screen::HostScreen,
-    session::{DEFAULT_PANE_ID, HostPaneChannels, HostSession, SessionError, join_pane},
+    session::{
+        HostSession, LayoutControlEvent, SharedLayoutHost, join_layout, layout_snapshot_from_state,
+    },
     ticket::{JoinTicket, TICKET_PREFIX},
-    transport::{Transport, TransportError},
+    transport::Transport,
 };
 
 /// The temporary p2pmux command-line interface.
@@ -72,7 +69,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 writeln!(stdout, "{TRUST_WARNING}\n")?;
                 stdout.flush()?;
             }
-            let host = HostSession::create().await?;
+            let (cols, rows) = crossterm::terminal::size()?;
+            let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
+            let host = SharedLayoutHost::new(HostSession::create().await?, shell_rows, shell_cols)?;
+            let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+            let initial = crate::tui::SharedLocalPane::spawn(
+                1,
+                shell_rows,
+                shell_cols,
+                host_peer_id.clone(),
+            )?;
+            let pane_server = host.pane_server();
+            pane_server.register_local_pane(
+                crate::protocol::PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id,
+                    grid_rows: u32::from(shell_rows),
+                    grid_cols: u32::from(shell_cols),
+                },
+                initial.channels(),
+            )?;
+            let snapshot = host.session_snapshot()?;
+            let layout =
+                layout_snapshot_from_state(snapshot.state.as_ref().ok_or("missing host layout")?)
+                    .map_err(|error| io::Error::other(format!("invalid host layout: {error:?}")))?;
+            let dispatcher = host.incoming_dispatcher(pane_server.clone())?;
+            let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
             let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
             let join_code = rendezvous.code().to_string();
             {
@@ -93,10 +115,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 drop(stdout);
             }
             wait_for_enter()?;
-            // run_host moves terminal I/O to a blocking thread, so no StdoutLock may survive.
-            let result = run_host(host, join_code).await;
+            // SharedLayoutRuntime moves terminal I/O to a blocking thread, so no StdoutLock may survive.
+            let handle = tokio::runtime::Handle::current();
+            let session_id = host.ticket().session_id().to_vec();
+            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let mut runtime = crate::tui::SharedLayoutRuntime::host(
+                    host,
+                    pane_server,
+                    layout,
+                    initial,
+                    join_code,
+                    handle,
+                )
+                .map_err(|error| error.to_string())?;
+                runtime.set_session_id(session_id);
+                runtime.run().map_err(|error| error.to_string())
+            })
+            .await?;
+            dispatcher_task.abort();
+            let _ = dispatcher_task.await;
             rendezvous.remove()?;
-            result
+            result.map_err(io::Error::other)?;
+            Ok(())
         }
         Command::Join { ticket } => {
             {
@@ -105,11 +145,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 stdout.flush()?;
             }
             let ticket = resolve_join_ticket(&ticket)?;
-            let pane = join_pane(Transport::bind().await?, ticket).await?;
+            let transport = Transport::bind().await?;
+            let mut member = join_layout(transport, ticket.clone()).await?;
+            let state = match member.events.recv().await {
+                Some(LayoutControlEvent::Snapshot(snapshot)) => {
+                    snapshot.state.ok_or("missing layout snapshot")?
+                }
+                Some(_) => return Err(io::Error::other("expected initial layout snapshot").into()),
+                None => {
+                    return Err(
+                        io::Error::other("layout coordinator disconnected during join").into(),
+                    );
+                }
+            };
+            let pane_server = member.pane_server(ticket.session_id().to_vec())?;
+            pane_server.replace_roster_from_layout(&state)?;
+            let pane_acceptor = pane_server.clone();
+            let pane_accept_task = tokio::spawn(async move { pane_acceptor.accept_loop().await });
+            let handle = tokio::runtime::Handle::current();
             let guest_result = tokio::task::spawn_blocking(move || {
-                crate::tui::run_guest(pane).map_err(|error| error.to_string())
+                crate::tui::SharedLayoutRuntime::member_from_state(
+                    member,
+                    pane_server,
+                    ticket.session_id().to_vec(),
+                    state,
+                    handle,
+                )
+                .and_then(|runtime| runtime.run())
+                .map_err(|error| error.to_string())
             })
             .await?;
+            pane_accept_task.abort();
+            let _ = pane_accept_task.await;
             guest_result.map_err(io::Error::other)?;
             Ok(())
         }
@@ -134,139 +201,8 @@ fn wait_for_enter() -> io::Result<()> {
     Ok(())
 }
 
-async fn run_host(host: HostSession, join_code: String) -> Result<(), Box<dyn Error>> {
-    let (cols, rows) = crossterm::terminal::size()?;
-    // Reserve one row for the join-code status bar.
-    let shell_rows = rows.max(2).saturating_sub(1);
-    let size = PtySize {
-        rows: shell_rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
-    let screen = HostScreen::new(shell_rows, cols)?;
-    let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
-    let lease = LeaseManager::new(host_peer_id.clone(), std::time::Instant::now());
-    let (lease_tx, lease_rx) = tokio::sync::watch::channel(lease.state().clone());
-    let (control_tx, control_rx) = tokio::sync::mpsc::channel(256);
-    let runtime = crate::tui::HostPaneRuntime::new(
-        size,
-        host_peer_id.clone(),
-        screen_tx.clone(),
-        lease_tx,
-        control_rx,
-        join_code,
-    )?;
-    let accept_task = {
-        let accept_host = host.clone();
-        let serve_host = host.clone();
-        tokio::spawn(async move {
-            accept_until_closed(
-                move || {
-                    let host = accept_host.clone();
-                    Box::pin(async move { host.accept_incoming().await })
-                        as Pin<Box<dyn Future<Output = Result<_, SessionError>> + Send>>
-                },
-                move |incoming| {
-                    let pane = HostPaneChannels {
-                        pane_id: DEFAULT_PANE_ID.to_vec(),
-                        host_peer_id: host_peer_id.clone(),
-                        screen_rx: screen_rx.clone(),
-                        lease_rx: lease_rx.clone(),
-                        control_tx: control_tx.clone(),
-                    };
-                    let host = serve_host.clone();
-                    tokio::spawn(async move {
-                        let _ = host.serve_peer(incoming, pane).await;
-                    });
-                },
-            )
-            .await;
-        })
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        crate::tui::run_host(runtime).map_err(|error| error.to_string())
-    })
-    .await?;
-    accept_task.abort();
-    host.close().await;
-    result.map_err(io::Error::other)?;
-    Ok(())
-}
-
-async fn accept_until_closed<T, Accept, Handle>(mut accept: Accept, mut handle: Handle)
-where
-    Accept: FnMut() -> Pin<Box<dyn Future<Output = Result<T, SessionError>> + Send>>,
-    Handle: FnMut(T),
-{
-    loop {
-        match accept().await {
-            Ok(incoming) => handle(incoming),
-            Err(error) if endpoint_is_closed(&error) => return,
-            Err(error) if !idle_accept_timed_out(&error) => {
-                eprintln!("p2pmux accept failed; continuing to listen: {error}");
-            }
-            Err(_) => {}
-        }
-    }
-}
-
-fn endpoint_is_closed(error: &SessionError) -> bool {
-    matches!(error, SessionError::Transport(TransportError::Closed))
-}
-
-fn idle_accept_timed_out(error: &SessionError) -> bool {
-    matches!(
-        error,
-        SessionError::Transport(TransportError::TimedOut("incoming accept"))
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        future::Future,
-        pin::Pin,
-        sync::{Arc, Mutex},
-    };
-
-    use crate::{session::SessionError, transport::TransportError};
-
-    use super::accept_until_closed;
-
-    #[tokio::test]
-    async fn accept_loop_keeps_accepting_after_an_idle_timeout() {
-        let results = Arc::new(Mutex::new(VecDeque::from([
-            Err(SessionError::Transport(TransportError::TimedOut(
-                "incoming accept",
-            ))),
-            Ok("joined"),
-            Err(SessionError::Transport(TransportError::Closed)),
-        ])));
-        let accepted = Arc::new(Mutex::new(Vec::new()));
-        let next = results.clone();
-        let handled = accepted.clone();
-
-        accept_until_closed(
-            move || {
-                let next = next.clone();
-                Box::pin(async move {
-                    next.lock()
-                        .expect("results lock")
-                        .pop_front()
-                        .expect("loop should stop when endpoint closes")
-                })
-                    as Pin<Box<dyn Future<Output = Result<&'static str, SessionError>> + Send>>
-            },
-            move |incoming| handled.lock().expect("accepted lock").push(incoming),
-        )
-        .await;
-
-        assert_eq!(*accepted.lock().expect("accepted lock"), vec!["joined"]);
-    }
-
     #[test]
     fn create_releases_stdout_before_starting_the_host_tui() {
         let source = include_str!("cli.rs");
@@ -283,7 +219,7 @@ mod tests {
                 .find("drop(stdout);")
                 .expect("stdout is released")
                 < create_arm
-                    .find("run_host(host, join_code).await")
+                    .find("SharedLayoutRuntime::host(")
                     .expect("host TUI starts"),
             "create must release stdout before the host TUI runs on a blocking thread"
         );

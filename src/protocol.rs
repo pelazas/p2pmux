@@ -1,14 +1,15 @@
 //! Versioned, length-delimited messages for the future pane transport.
 
 use prost::Message;
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
 pub const MAX_SESSION_ID_BYTES: usize = 64;
 pub const MAX_PANE_ID_BYTES: usize = 64;
+pub const MAX_ENDPOINT_ADDR_BYTES: usize = 4096;
 pub const MAX_INPUT_BYTES: usize = 8 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
 pub const MAX_DELTA_BYTES: usize = 64 * 1024;
@@ -40,6 +41,7 @@ pub enum ProtocolError {
     },
     InvalidLeaseEpoch(&'static str),
     InvalidScreenSequence(&'static str),
+    InvalidLayout(&'static str),
 }
 
 impl fmt::Display for ProtocolError {
@@ -81,6 +83,9 @@ impl fmt::Display for ProtocolError {
             Self::InvalidScreenSequence(field) => {
                 write!(formatter, "protocol screen sequence {field} is invalid")
             }
+            Self::InvalidLayout(field) => {
+                write!(formatter, "protocol layout field {field} is invalid")
+            }
         }
     }
 }
@@ -101,7 +106,10 @@ pub struct Envelope {
     pub version: u32,
     #[prost(bytes = "vec", tag = "2")]
     pub sender_peer_id: Vec<u8>,
-    #[prost(oneof = "envelope::Body", tags = "10, 11, 12, 13, 14, 15, 16")]
+    #[prost(
+        oneof = "envelope::Body",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+    )]
     pub body: Option<envelope::Body>,
 }
 
@@ -122,6 +130,22 @@ pub mod envelope {
         Snapshot(super::Snapshot),
         #[prost(message, tag = "16")]
         Delta(super::Delta),
+        #[prost(message, tag = "17")]
+        SessionSnapshot(super::SessionSnapshot),
+        #[prost(message, tag = "18")]
+        LayoutRequest(super::LayoutRequest),
+        #[prost(message, tag = "19")]
+        PaneReservation(super::PaneReservation),
+        #[prost(message, tag = "20")]
+        PaneReady(super::PaneReady),
+        #[prost(message, tag = "21")]
+        LayoutCommit(super::LayoutCommit),
+        #[prost(message, tag = "22")]
+        LayoutReject(super::LayoutReject),
+        #[prost(message, tag = "23")]
+        PaneSubscribe(super::PaneSubscribe),
+        #[prost(message, tag = "24")]
+        PaneFailed(super::PaneFailed),
     }
 }
 
@@ -131,6 +155,8 @@ pub struct Join {
     pub session_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub peer_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub endpoint_addr: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -199,6 +225,194 @@ pub struct Delta {
     pub sequence: u64,
     #[prost(bytes = "vec", tag = "5")]
     pub changes: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionSnapshot {
+    #[prost(message, optional, tag = "1")]
+    pub state: Option<LayoutState>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LayoutState {
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub members: Vec<MemberDescriptor>,
+    #[prost(message, repeated, tag = "3")]
+    pub panes: Vec<PaneDescriptor>,
+    #[prost(message, repeated, tag = "4")]
+    pub tabs: Vec<TabDescriptor>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemberDescriptor {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub endpoint_addr: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneDescriptor {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub host_peer_id: Vec<u8>,
+    #[prost(uint32, tag = "3")]
+    pub grid_rows: u32,
+    #[prost(uint32, tag = "4")]
+    pub grid_cols: u32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabDescriptor {
+    #[prost(uint64, tag = "1")]
+    pub tab_id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub root: Option<LayoutNode>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LayoutNode {
+    #[prost(uint64, optional, tag = "1")]
+    pub leaf_pane_id: Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub split: Option<Box<LayoutSplit>>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LayoutSplit {
+    #[prost(enumeration = "SplitAxis", optional, tag = "1")]
+    pub axis: Option<i32>,
+    #[prost(message, optional, tag = "2")]
+    pub first: Option<LayoutNode>,
+    #[prost(message, optional, tag = "3")]
+    pub second: Option<LayoutNode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SplitAxis {
+    LeftRight = 0,
+    TopBottom = 1,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LayoutRequest {
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub base_revision: u64,
+    #[prost(message, optional, tag = "3")]
+    pub create_pane: Option<CreatePane>,
+    #[prost(message, optional, tag = "4")]
+    pub delete_pane: Option<DeletePane>,
+    #[prost(message, optional, tag = "5")]
+    pub create_tab: Option<CreateTab>,
+    #[prost(message, optional, tag = "6")]
+    pub delete_tab: Option<DeleteTab>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreatePane {
+    #[prost(uint64, tag = "1")]
+    pub target_pane_id: u64,
+    #[prost(enumeration = "SplitAxis", optional, tag = "2")]
+    pub axis: Option<i32>,
+    #[prost(uint32, tag = "3")]
+    pub grid_rows: u32,
+    #[prost(uint32, tag = "4")]
+    pub grid_cols: u32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeletePane {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTab {
+    #[prost(uint32, tag = "1")]
+    pub grid_rows: u32,
+    #[prost(uint32, tag = "2")]
+    pub grid_cols: u32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteTab {
+    #[prost(uint64, tag = "1")]
+    pub tab_id: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneReservation {
+    #[prost(uint64, tag = "1")]
+    pub reservation_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub pane_id: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub tab_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneReady {
+    #[prost(uint64, tag = "1")]
+    pub reservation_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub base_revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub request_id: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneFailed {
+    #[prost(uint64, tag = "1")]
+    pub reservation_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub request_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub base_revision: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LayoutCommit {
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+    #[prost(message, optional, tag = "2")]
+    pub state: Option<LayoutState>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LayoutReject {
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    #[prost(enumeration = "LayoutRejectReason", tag = "2")]
+    pub reason: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LayoutRejectReason {
+    Stale = 1,
+    NotHost = 2,
+    Limit = 3,
+    Malformed = 4,
+    MixedTab = 5,
+    UnknownId = 6,
+    LastPaneOrTab = 7,
+    ReservationFailure = 8,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneSubscribe {
+    #[prost(bytes = "vec", tag = "1")]
+    pub session_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub peer_id: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub pane_id: u64,
 }
 
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
@@ -327,6 +541,11 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
         envelope::Body::Join(join) => {
             validate_id("join.session_id", &join.session_id, MAX_SESSION_ID_BYTES)?;
             validate_id("join.peer_id", &join.peer_id, MAX_PEER_ID_BYTES)?;
+            validate_id(
+                "join.endpoint_addr",
+                &join.endpoint_addr,
+                MAX_ENDPOINT_ADDR_BYTES,
+            )?;
         }
         envelope::Body::Welcome(welcome) => {
             validate_id(
@@ -404,6 +623,64 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             }
             validate_field_size("delta.changes", delta.changes.len(), MAX_DELTA_BYTES)?;
         }
+        envelope::Body::SessionSnapshot(snapshot) => {
+            validate_layout_state(
+                snapshot
+                    .state
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidLayout("session_snapshot.state"))?,
+            )?;
+        }
+        envelope::Body::LayoutRequest(request) => validate_layout_request(request)?,
+        envelope::Body::PaneReservation(reservation) => {
+            validate_nonzero(
+                "pane_reservation.reservation_id",
+                reservation.reservation_id,
+            )?;
+            validate_nonzero("pane_reservation.pane_id", reservation.pane_id)?;
+            if let Some(tab_id) = reservation.tab_id {
+                validate_nonzero("pane_reservation.tab_id", tab_id)?;
+            }
+        }
+        envelope::Body::PaneReady(ready) => {
+            validate_nonzero("pane_ready.reservation_id", ready.reservation_id)?;
+            validate_nonzero("pane_ready.base_revision", ready.base_revision)?;
+            validate_nonzero("pane_ready.request_id", ready.request_id)?;
+        }
+        envelope::Body::PaneFailed(failed) => {
+            validate_nonzero("pane_failed.reservation_id", failed.reservation_id)?;
+            validate_nonzero("pane_failed.request_id", failed.request_id)?;
+            validate_nonzero("pane_failed.base_revision", failed.base_revision)?;
+        }
+        envelope::Body::LayoutCommit(commit) => {
+            validate_nonzero("layout_commit.revision", commit.revision)?;
+            let state = commit
+                .state
+                .as_ref()
+                .ok_or(ProtocolError::InvalidLayout("layout_commit.state"))?;
+            validate_layout_state(state)?;
+            if state.revision != commit.revision {
+                return Err(ProtocolError::InvalidLayout("layout_commit.revision"));
+            }
+        }
+        envelope::Body::LayoutReject(reject) => {
+            validate_nonzero("layout_reject.request_id", reject.request_id)?;
+            LayoutRejectReason::try_from(reject.reason)
+                .map_err(|_| ProtocolError::InvalidLayout("layout_reject.reason"))?;
+        }
+        envelope::Body::PaneSubscribe(subscribe) => {
+            validate_id(
+                "pane_subscribe.session_id",
+                &subscribe.session_id,
+                MAX_SESSION_ID_BYTES,
+            )?;
+            validate_id(
+                "pane_subscribe.peer_id",
+                &subscribe.peer_id,
+                MAX_PEER_ID_BYTES,
+            )?;
+            validate_nonzero("pane_subscribe.pane_id", subscribe.pane_id)?;
+        }
     }
 
     Ok(())
@@ -414,6 +691,172 @@ fn validate_id(field: &'static str, bytes: &[u8], limit: usize) -> Result<(), Pr
         return Err(ProtocolError::EmptyField(field));
     }
     validate_field_size(field, bytes.len(), limit)
+}
+
+fn validate_nonzero(field: &'static str, value: u64) -> Result<(), ProtocolError> {
+    if value == 0 {
+        return Err(ProtocolError::InvalidLayout(field));
+    }
+    Ok(())
+}
+
+fn validate_grid(field: &'static str, rows: u32, cols: u32) -> Result<(), ProtocolError> {
+    if rows == 0 || cols == 0 || rows > u32::from(u16::MAX) || cols > u32::from(u16::MAX) {
+        return Err(ProtocolError::InvalidLayout(field));
+    }
+    Ok(())
+}
+
+fn validate_axis(field: &'static str, axis: Option<i32>) -> Result<(), ProtocolError> {
+    let axis = axis.ok_or(ProtocolError::InvalidLayout(field))?;
+    SplitAxis::try_from(axis).map_err(|_| ProtocolError::InvalidLayout(field))?;
+    Ok(())
+}
+
+fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError> {
+    validate_nonzero("layout_request.request_id", request.request_id)?;
+    validate_nonzero("layout_request.base_revision", request.base_revision)?;
+
+    let actions = usize::from(request.create_pane.is_some())
+        + usize::from(request.delete_pane.is_some())
+        + usize::from(request.create_tab.is_some())
+        + usize::from(request.delete_tab.is_some());
+    if actions != 1 {
+        return Err(ProtocolError::InvalidLayout("layout_request.action"));
+    }
+
+    if let Some(create_pane) = &request.create_pane {
+        validate_nonzero(
+            "layout_request.create_pane.target_pane_id",
+            create_pane.target_pane_id,
+        )?;
+        validate_axis("layout_request.create_pane.axis", create_pane.axis)?;
+        validate_grid(
+            "layout_request.create_pane.grid",
+            create_pane.grid_rows,
+            create_pane.grid_cols,
+        )?;
+    }
+    if let Some(delete_pane) = &request.delete_pane {
+        validate_nonzero("layout_request.delete_pane.pane_id", delete_pane.pane_id)?;
+    }
+    if let Some(create_tab) = &request.create_tab {
+        validate_grid(
+            "layout_request.create_tab.grid",
+            create_tab.grid_rows,
+            create_tab.grid_cols,
+        )?;
+    }
+    if let Some(delete_tab) = &request.delete_tab {
+        validate_nonzero("layout_request.delete_tab.tab_id", delete_tab.tab_id)?;
+    }
+    Ok(())
+}
+
+fn validate_layout_state(state: &LayoutState) -> Result<(), ProtocolError> {
+    validate_nonzero("layout_state.revision", state.revision)?;
+    if !(1..=8).contains(&state.members.len()) {
+        return Err(ProtocolError::InvalidLayout("layout_state.members"));
+    }
+    if !(1..=72).contains(&state.panes.len()) {
+        return Err(ProtocolError::InvalidLayout("layout_state.panes"));
+    }
+    if !(1..=9).contains(&state.tabs.len()) {
+        return Err(ProtocolError::InvalidLayout("layout_state.tabs"));
+    }
+
+    let mut member_ids = HashSet::with_capacity(state.members.len());
+    for member in &state.members {
+        validate_id(
+            "layout_state.member.peer_id",
+            &member.peer_id,
+            MAX_PEER_ID_BYTES,
+        )?;
+        validate_id(
+            "layout_state.member.endpoint_addr",
+            &member.endpoint_addr,
+            MAX_ENDPOINT_ADDR_BYTES,
+        )?;
+        if !member_ids.insert(member.peer_id.as_slice()) {
+            return Err(ProtocolError::InvalidLayout("layout_state.member.peer_id"));
+        }
+    }
+
+    let mut pane_ids = HashSet::with_capacity(state.panes.len());
+    for pane in &state.panes {
+        validate_nonzero("layout_state.pane.pane_id", pane.pane_id)?;
+        validate_id(
+            "layout_state.pane.host_peer_id",
+            &pane.host_peer_id,
+            MAX_PEER_ID_BYTES,
+        )?;
+        validate_grid("layout_state.pane.grid", pane.grid_rows, pane.grid_cols)?;
+        if !pane_ids.insert(pane.pane_id) {
+            return Err(ProtocolError::InvalidLayout("layout_state.pane.pane_id"));
+        }
+        if !member_ids.contains(pane.host_peer_id.as_slice()) {
+            return Err(ProtocolError::InvalidLayout(
+                "layout_state.pane.host_peer_id",
+            ));
+        }
+    }
+
+    let mut tab_ids = HashSet::with_capacity(state.tabs.len());
+    let mut leaf_pane_ids = HashSet::with_capacity(state.panes.len());
+    for tab in &state.tabs {
+        validate_nonzero("layout_state.tab.tab_id", tab.tab_id)?;
+        if !tab_ids.insert(tab.tab_id) {
+            return Err(ProtocolError::InvalidLayout("layout_state.tab.tab_id"));
+        }
+        let root = tab
+            .root
+            .as_ref()
+            .ok_or(ProtocolError::InvalidLayout("layout_state.tab.root"))?;
+        let mut leaves = 0;
+        validate_layout_node(root, 0, &mut leaves, &mut leaf_pane_ids)?;
+    }
+    if leaf_pane_ids != pane_ids {
+        return Err(ProtocolError::InvalidLayout("layout_state.panes"));
+    }
+    Ok(())
+}
+
+fn validate_layout_node(
+    node: &LayoutNode,
+    depth: usize,
+    leaves: &mut usize,
+    leaf_pane_ids: &mut HashSet<u64>,
+) -> Result<(), ProtocolError> {
+    if depth > 4 {
+        return Err(ProtocolError::InvalidLayout("layout_state.node.depth"));
+    }
+    match (node.leaf_pane_id, node.split.as_ref()) {
+        (Some(pane_id), None) => {
+            validate_nonzero("layout_state.node.leaf_pane_id", pane_id)?;
+            if !leaf_pane_ids.insert(pane_id) {
+                return Err(ProtocolError::InvalidLayout(
+                    "layout_state.node.leaf_pane_id",
+                ));
+            }
+            *leaves += 1;
+            if *leaves > 8 {
+                return Err(ProtocolError::InvalidLayout("layout_state.node.leaves"));
+            }
+        }
+        (None, Some(split)) => {
+            validate_axis("layout_state.node.split.axis", split.axis)?;
+            let first = split.first.as_ref().ok_or(ProtocolError::InvalidLayout(
+                "layout_state.node.split.first",
+            ))?;
+            let second = split.second.as_ref().ok_or(ProtocolError::InvalidLayout(
+                "layout_state.node.split.second",
+            ))?;
+            validate_layout_node(first, depth + 1, leaves, leaf_pane_ids)?;
+            validate_layout_node(second, depth + 1, leaves, leaf_pane_ids)?;
+        }
+        _ => return Err(ProtocolError::InvalidLayout("layout_state.node.kind")),
+    }
+    Ok(())
 }
 
 fn validate_field_size(
