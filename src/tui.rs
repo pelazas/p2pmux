@@ -61,7 +61,7 @@ const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <Option (Alt)+←↓↑→> FOCUS   <q> QUIT";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <⌥⇧←↓↑→> FOCUS   <q> QUIT";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 
 type FooterSegment = (&'static str, bool);
@@ -72,7 +72,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     ("> PANE   <", false),
     ("t", true),
     ("> TAB   <", false),
-    ("Option (Alt)+←↓↑→", true),
+    ("⌥⇧←↓↑→", true),
     ("> FOCUS   <", false),
     ("q", true),
     ("> QUIT", false),
@@ -4617,7 +4617,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <Option (Alt)+←↓↑→> FOCUS   <q> QUIT",
+                "Ctrl+ <p> PANE   <t> TAB   <⌥⇧←↓↑→> FOCUS   <q> QUIT",
             ),
             (
                 ChordMode::Pane,
