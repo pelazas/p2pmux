@@ -95,7 +95,13 @@ passthrough configuration.
 Drag inside a pane's terminal content to select text; releasing the mouse copies it to the macOS
 clipboard.
 
-- `Ctrl+P`, then `N` — split the focused pane. The new fixed-grid PTY runs on the requester’s Mac.
+- `Option` (Alt) + arrows — move focus to the nearest pane in that direction in the current tab.
+  Some terminals and outer multiplexers do not send Option+arrow as an Alt-modified key, so this
+  binding may require terminal or mux configuration.
+- `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new
+  fixed-grid PTY runs on the requester’s Mac.
+- `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
+  focused pane.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then arrows — move focus.
 - `Ctrl+T`, then `N` — create a tab with a local PTY on the requester’s Mac.
@@ -107,8 +113,8 @@ Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at mo
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Click tab labels to switch tabs without
 claiming control or sending input. Mouse wheel scrolls pane history locally. The dark contextual footer uses red key accents: normal mode is
-`Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free`; pane mode is
-`Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK`; tab mode is
+`Ctrl+ <p> PANE   <t> TAB   <Alt+←↓↑→> FOCUS   <q> QUIT    type to claim when free`; pane mode is
+`Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK`; tab mode is
 `Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
