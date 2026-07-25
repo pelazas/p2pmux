@@ -1,7 +1,7 @@
 //! Versioned, length-delimited messages for the future pane transport.
 
 use prost::Message;
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -350,8 +350,8 @@ pub struct PaneReservation {
     pub reservation_id: u64,
     #[prost(uint64, tag = "2")]
     pub pane_id: u64,
-    #[prost(uint64, tag = "3")]
-    pub tab_id: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub tab_id: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -622,6 +622,9 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
                 reservation.reservation_id,
             )?;
             validate_nonzero("pane_reservation.pane_id", reservation.pane_id)?;
+            if let Some(tab_id) = reservation.tab_id {
+                validate_nonzero("pane_reservation.tab_id", tab_id)?;
+            }
         }
         envelope::Body::PaneReady(ready) => {
             validate_nonzero("pane_ready.reservation_id", ready.reservation_id)?;
@@ -728,16 +731,17 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
 
 fn validate_layout_state(state: &LayoutState) -> Result<(), ProtocolError> {
     validate_nonzero("layout_state.revision", state.revision)?;
-    if state.members.len() > 8 {
+    if !(1..=8).contains(&state.members.len()) {
         return Err(ProtocolError::InvalidLayout("layout_state.members"));
     }
-    if state.panes.len() > 72 {
+    if !(1..=72).contains(&state.panes.len()) {
         return Err(ProtocolError::InvalidLayout("layout_state.panes"));
     }
-    if state.tabs.len() > 9 {
+    if !(1..=9).contains(&state.tabs.len()) {
         return Err(ProtocolError::InvalidLayout("layout_state.tabs"));
     }
 
+    let mut member_ids = HashSet::with_capacity(state.members.len());
     for member in &state.members {
         validate_id(
             "layout_state.member.peer_id",
@@ -749,7 +753,12 @@ fn validate_layout_state(state: &LayoutState) -> Result<(), ProtocolError> {
             &member.endpoint_addr,
             MAX_ENDPOINT_ADDR_BYTES,
         )?;
+        if !member_ids.insert(member.peer_id.as_slice()) {
+            return Err(ProtocolError::InvalidLayout("layout_state.member.peer_id"));
+        }
     }
+
+    let mut pane_ids = HashSet::with_capacity(state.panes.len());
     for pane in &state.panes {
         validate_nonzero("layout_state.pane.pane_id", pane.pane_id)?;
         validate_id(
@@ -758,15 +767,32 @@ fn validate_layout_state(state: &LayoutState) -> Result<(), ProtocolError> {
             MAX_PEER_ID_BYTES,
         )?;
         validate_grid("layout_state.pane.grid", pane.grid_rows, pane.grid_cols)?;
+        if !pane_ids.insert(pane.pane_id) {
+            return Err(ProtocolError::InvalidLayout("layout_state.pane.pane_id"));
+        }
+        if !member_ids.contains(pane.host_peer_id.as_slice()) {
+            return Err(ProtocolError::InvalidLayout(
+                "layout_state.pane.host_peer_id",
+            ));
+        }
     }
+
+    let mut tab_ids = HashSet::with_capacity(state.tabs.len());
+    let mut leaf_pane_ids = HashSet::with_capacity(state.panes.len());
     for tab in &state.tabs {
         validate_nonzero("layout_state.tab.tab_id", tab.tab_id)?;
+        if !tab_ids.insert(tab.tab_id) {
+            return Err(ProtocolError::InvalidLayout("layout_state.tab.tab_id"));
+        }
         let root = tab
             .root
             .as_ref()
             .ok_or(ProtocolError::InvalidLayout("layout_state.tab.root"))?;
         let mut leaves = 0;
-        validate_layout_node(root, 0, &mut leaves)?;
+        validate_layout_node(root, 0, &mut leaves, &mut leaf_pane_ids)?;
+    }
+    if leaf_pane_ids != pane_ids {
+        return Err(ProtocolError::InvalidLayout("layout_state.panes"));
     }
     Ok(())
 }
@@ -775,6 +801,7 @@ fn validate_layout_node(
     node: &LayoutNode,
     depth: usize,
     leaves: &mut usize,
+    leaf_pane_ids: &mut HashSet<u64>,
 ) -> Result<(), ProtocolError> {
     if depth > 4 {
         return Err(ProtocolError::InvalidLayout("layout_state.node.depth"));
@@ -782,6 +809,11 @@ fn validate_layout_node(
     match (node.leaf_pane_id, node.split.as_ref()) {
         (Some(pane_id), None) => {
             validate_nonzero("layout_state.node.leaf_pane_id", pane_id)?;
+            if !leaf_pane_ids.insert(pane_id) {
+                return Err(ProtocolError::InvalidLayout(
+                    "layout_state.node.leaf_pane_id",
+                ));
+            }
             *leaves += 1;
             if *leaves > 8 {
                 return Err(ProtocolError::InvalidLayout("layout_state.node.leaves"));
@@ -795,8 +827,8 @@ fn validate_layout_node(
             let second = split.second.as_ref().ok_or(ProtocolError::InvalidLayout(
                 "layout_state.node.split.second",
             ))?;
-            validate_layout_node(first, depth + 1, leaves)?;
-            validate_layout_node(second, depth + 1, leaves)?;
+            validate_layout_node(first, depth + 1, leaves, leaf_pane_ids)?;
+            validate_layout_node(second, depth + 1, leaves, leaf_pane_ids)?;
         }
         _ => return Err(ProtocolError::InvalidLayout("layout_state.node.kind")),
     }

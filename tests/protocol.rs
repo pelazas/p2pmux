@@ -256,7 +256,7 @@ fn v2_envelopes() -> Vec<Envelope> {
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
             pane_id: 2,
-            tab_id: 0,
+            tab_id: None,
         })),
         envelope(envelope::Body::PaneReady(PaneReady { reservation_id: 1 })),
         envelope(envelope::Body::LayoutCommit(LayoutCommit {
@@ -445,7 +445,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 0,
             pane_id: 1,
-            tab_id: 0,
+            tab_id: None,
         })),
         envelope(envelope::Body::PaneReady(PaneReady { reservation_id: 0 })),
         envelope(envelope::Body::LayoutReject(LayoutReject {
@@ -465,6 +465,240 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             "{invalid:?} must be rejected"
         );
     }
+}
+
+#[test]
+fn pane_reservation_rejects_a_zero_present_tab_id() {
+    for tab_id in [None, Some(1)] {
+        assert!(
+            encode_frame(&envelope(envelope::Body::PaneReservation(
+                PaneReservation {
+                    reservation_id: 1,
+                    pane_id: 2,
+                    tab_id,
+                }
+            )))
+            .is_ok(),
+            "an absent or nonzero reservation tab ID must be accepted"
+        );
+    }
+
+    let reservation = envelope(envelope::Body::PaneReservation(PaneReservation {
+        reservation_id: 1,
+        pane_id: 2,
+        tab_id: Some(0),
+    }));
+
+    assert!(
+        encode_frame(&reservation).is_err(),
+        "a present reservation tab ID must be nonzero"
+    );
+}
+
+#[test]
+fn layout_state_rejects_empty_duplicate_and_dangling_references() {
+    let state = layout_state(leaf(1));
+    let zero_revision = LayoutState {
+        revision: 0,
+        ..state.clone()
+    };
+    let empty_members = LayoutState {
+        members: Vec::new(),
+        ..state.clone()
+    };
+    let empty_panes = LayoutState {
+        panes: Vec::new(),
+        ..state.clone()
+    };
+    let empty_tabs = LayoutState {
+        tabs: Vec::new(),
+        ..state.clone()
+    };
+    let duplicate_members = LayoutState {
+        members: vec![state.members[0].clone(), state.members[0].clone()],
+        ..state.clone()
+    };
+    let empty_member_id = LayoutState {
+        members: vec![MemberDescriptor {
+            peer_id: Vec::new(),
+            ..state.members[0].clone()
+        }],
+        ..state.clone()
+    };
+    let empty_member_endpoint = LayoutState {
+        members: vec![MemberDescriptor {
+            endpoint_addr: Vec::new(),
+            ..state.members[0].clone()
+        }],
+        ..state.clone()
+    };
+    let duplicate_tabs = LayoutState {
+        tabs: vec![state.tabs[0].clone(), state.tabs[0].clone()],
+        ..state.clone()
+    };
+    let duplicate_panes = LayoutState {
+        panes: vec![state.panes[0].clone(), state.panes[0].clone()],
+        ..state.clone()
+    };
+    let zero_pane_id = LayoutState {
+        panes: vec![PaneDescriptor {
+            pane_id: 0,
+            ..state.panes[0].clone()
+        }],
+        ..state.clone()
+    };
+    let zero_tab_id = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 0,
+            ..state.tabs[0].clone()
+        }],
+        ..state.clone()
+    };
+    let unknown_host = LayoutState {
+        panes: vec![PaneDescriptor {
+            host_peer_id: b"peer-b".to_vec(),
+            ..state.panes[0].clone()
+        }],
+        ..state.clone()
+    };
+    let duplicate_leaves = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(LayoutNode {
+                leaf_pane_id: None,
+                split: Some(Box::new(LayoutSplit {
+                    axis: SplitAxis::LeftRight as i32,
+                    first: Some(leaf(1)),
+                    second: Some(leaf(1)),
+                })),
+            }),
+        }],
+        ..state.clone()
+    };
+    let unknown_leaf = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(leaf(2)),
+        }],
+        ..state.clone()
+    };
+    let zero_leaf = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(leaf(0)),
+        }],
+        ..state.clone()
+    };
+    let unreferenced_pane = LayoutState {
+        panes: vec![
+            state.panes[0].clone(),
+            PaneDescriptor {
+                pane_id: 2,
+                host_peer_id: b"peer-a".to_vec(),
+                grid_rows: 24,
+                grid_cols: 80,
+            },
+        ],
+        ..state
+    };
+
+    for invalid in [
+        zero_revision,
+        empty_members,
+        empty_panes,
+        empty_tabs,
+        duplicate_members,
+        empty_member_id,
+        empty_member_endpoint,
+        duplicate_tabs,
+        duplicate_panes,
+        zero_pane_id,
+        zero_tab_id,
+        unknown_host,
+        duplicate_leaves,
+        unknown_leaf,
+        zero_leaf,
+        unreferenced_pane,
+    ] {
+        assert!(
+            encode_frame(&envelope(envelope::Body::SessionSnapshot(
+                SessionSnapshot {
+                    state: Some(invalid),
+                }
+            )))
+            .is_err(),
+            "inconsistent layout state must be rejected"
+        );
+    }
+}
+
+#[test]
+fn layout_state_wire_shape_includes_all_nested_fields() {
+    let state = LayoutState {
+        revision: 7,
+        members: vec![MemberDescriptor {
+            peer_id: b"peer-a".to_vec(),
+            endpoint_addr: b"endpoint-a".to_vec(),
+        }],
+        panes: vec![PaneDescriptor {
+            pane_id: 11,
+            host_peer_id: b"peer-a".to_vec(),
+            grid_rows: 24,
+            grid_cols: 80,
+        }],
+        tabs: vec![TabDescriptor {
+            tab_id: 13,
+            root: Some(LayoutNode {
+                leaf_pane_id: None,
+                split: Some(Box::new(LayoutSplit {
+                    axis: SplitAxis::TopBottom as i32,
+                    first: Some(leaf(11)),
+                    second: Some(leaf(11)),
+                })),
+            }),
+        }],
+    };
+    let state_fields = parse_fields(&state.encode_to_vec());
+    assert_eq!(
+        field_shape(&state_fields),
+        vec![(1, 0), (2, 2), (3, 2), (4, 2)]
+    );
+    assert_eq!(
+        field_shape(&parse_fields(&state_fields[1].value)),
+        vec![(1, 2), (2, 2)]
+    );
+    assert_eq!(
+        field_shape(&parse_fields(&state_fields[2].value)),
+        vec![(1, 0), (2, 2), (3, 0), (4, 0)]
+    );
+    let tab_fields = parse_fields(&state_fields[3].value);
+    assert_eq!(field_shape(&tab_fields), vec![(1, 0), (2, 2)]);
+    let node_fields = parse_fields(&tab_fields[1].value);
+    assert_eq!(field_shape(&node_fields), vec![(2, 2)]);
+    let split_fields = parse_fields(&node_fields[0].value);
+    assert_eq!(field_shape(&split_fields), vec![(1, 0), (2, 2), (3, 2)]);
+    assert_eq!(
+        field_shape(&parse_fields(&split_fields[1].value)),
+        vec![(1, 0)]
+    );
+    assert_eq!(
+        field_shape(&parse_fields(&split_fields[2].value)),
+        vec![(1, 0)]
+    );
+}
+
+#[test]
+fn join_wire_shape_encodes_a_present_endpoint_address() {
+    let join = Join {
+        session_id: b"session-a".to_vec(),
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: b"endpoint-a".to_vec(),
+    };
+
+    assert_eq!(
+        field_shape(&parse_fields(&join.encode_to_vec())),
+        vec![(1, 2), (2, 2), (3, 2)]
+    );
 }
 
 #[test]
