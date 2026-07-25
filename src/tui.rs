@@ -2444,6 +2444,8 @@ fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
             bytes
         }
         KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
+        // xterm modifyOtherKeys encodes Shift+Return distinctly for nested TUIs.
+        KeyCode::Enter if modifiers == 2 => b"\x1b[27;2;13~".to_vec(),
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
         KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
@@ -4817,5 +4819,22 @@ mod tests {
                 "{event:?}"
             );
         }
+    }
+
+    #[test]
+    fn shift_enter_is_distinct_from_plain_enter() {
+        let parser = vt100::Parser::new(1, 1, 0);
+        let plain = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            parser.screen(),
+        );
+        let shifted = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            parser.screen(),
+        );
+
+        assert_eq!(plain, Some(b"\r".to_vec()));
+        assert_eq!(shifted, Some(b"\x1b[27;2;13~".to_vec()));
+        assert_ne!(shifted, plain);
     }
 }
