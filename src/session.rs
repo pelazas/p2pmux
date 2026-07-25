@@ -625,6 +625,7 @@ async fn join_handshake(
                 body: Some(envelope::Body::Join(Join {
                     session_id: ticket.session_id().to_vec(),
                     peer_id: client_id.as_bytes().to_vec(),
+                    endpoint_addr: Vec::new(),
                 })),
             },
         )

@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::protocol::{Envelope, MAX_FRAME_BYTES, ProtocolError, decode_frame, encode_frame};
 
-pub const ALPN: &[u8] = b"p2pmux/1";
+pub const ALPN: &[u8] = b"p2pmux/2";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 

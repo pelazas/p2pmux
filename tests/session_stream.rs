@@ -118,6 +118,7 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
                 body: Some(envelope::Body::Join(Join {
                     session_id: host.ticket().session_id().to_vec(),
                     peer_id: guest_id.clone(),
+                    endpoint_addr: Vec::new(),
                 })),
             },
         )
@@ -202,6 +203,7 @@ async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_wind
                 body: Some(envelope::Body::Join(Join {
                     session_id: host.ticket().session_id().to_vec(),
                     peer_id: guest_id,
+                    endpoint_addr: Vec::new(),
                 })),
             },
         )
