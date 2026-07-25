@@ -1021,7 +1021,7 @@ impl HostSession {
 pub struct SharedLayoutHost {
     host: HostSession,
     coordinator: Arc<Mutex<LayoutCoordinator>>,
-    peers: Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    peers: Arc<Mutex<BTreeMap<Vec<u8>, mpsc::UnboundedSender<Envelope>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1143,7 +1143,7 @@ impl SharedLayoutHost {
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
             let peer_id = receipt.admitted_peer_id.clone();
-            let (outbound_tx, outbound_rx) = mpsc::channel(64);
+            let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             self.peers
                 .lock()
                 .map_err(|_| SessionError::PeerTask)?
@@ -1153,7 +1153,7 @@ impl SharedLayoutHost {
                 .lock()
                 .map_err(|_| SessionError::PeerTask)?
                 .session_snapshot()?;
-            let _ = outbound_tx.try_send(coordinator_envelope(
+            let _ = outbound_tx.send(coordinator_envelope(
                 self.host.ticket().endpoint_addr().id.as_bytes(),
                 envelope::Body::SessionSnapshot(snapshot),
             ));
@@ -1228,30 +1228,31 @@ fn coordinator_envelope(sender_peer_id: &[u8], body: envelope::Body) -> Envelope
 }
 
 fn broadcast_envelope(
-    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::UnboundedSender<Envelope>>>>,
     envelope: Envelope,
 ) {
-    let mut peers = match peers.lock() {
+    let peers = match peers.lock() {
         Ok(peers) => peers,
         Err(_) => return,
     };
-    peers.retain(|_, sender| sender.try_send(envelope.clone()).is_ok());
+    for sender in peers.values() {
+        // The unbounded queue isolates this reducer from writer I/O without losing a commit to
+        // temporary backpressure on another admitted member's stream.
+        let _ = sender.send(envelope.clone());
+    }
 }
 
 fn send_to_peer(
-    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::UnboundedSender<Envelope>>>>,
     peer_id: &[u8],
     envelope: Envelope,
 ) {
-    let mut peers = match peers.lock() {
+    let peers = match peers.lock() {
         Ok(peers) => peers,
         Err(_) => return,
     };
-    if peers
-        .get(peer_id)
-        .is_some_and(|sender| sender.try_send(envelope).is_err())
-    {
-        peers.remove(peer_id);
+    if let Some(sender) = peers.get(peer_id) {
+        let _ = sender.send(envelope);
     }
 }
 
@@ -1300,7 +1301,7 @@ pub async fn join_layout(
 
 async fn layout_writer_task(
     mut writer: crate::transport::FrameWriter,
-    mut outbound: mpsc::Receiver<Envelope>,
+    mut outbound: mpsc::UnboundedReceiver<Envelope>,
 ) {
     while let Some(envelope) = outbound.recv().await {
         if writer.write_next(&envelope).await.is_err() {
@@ -1362,7 +1363,7 @@ async fn layout_host_reader_task(
     peer_id: Vec<u8>,
     coordinator_peer_id: Vec<u8>,
     coordinator: Arc<Mutex<LayoutCoordinator>>,
-    peers: Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    peers: Arc<Mutex<BTreeMap<Vec<u8>, mpsc::UnboundedSender<Envelope>>>>,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != peer_id {
@@ -1406,7 +1407,7 @@ async fn layout_host_reader_task(
 }
 
 fn dispatch_coordinator_response(
-    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::Sender<Envelope>>>>,
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, mpsc::UnboundedSender<Envelope>>>>,
     requester_peer_id: &[u8],
     coordinator_peer_id: &[u8],
     response: CoordinatorResponse,
@@ -1798,4 +1799,31 @@ fn validate_welcome(
         return Err(SessionError::UnauthenticatedPeer);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod control_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_control_peer_keeps_its_ordered_commit_while_other_peers_receive() {
+        let (slow_tx, mut slow_rx) = mpsc::unbounded_channel();
+        let (fast_tx, mut fast_rx) = mpsc::unbounded_channel();
+        let peers = Arc::new(Mutex::new(BTreeMap::from([
+            (b"slow".to_vec(), slow_tx),
+            (b"fast".to_vec(), fast_tx),
+        ])));
+        let commit = coordinator_envelope(
+            b"coordinator",
+            envelope::Body::LayoutReject(LayoutReject {
+                request_id: 9,
+                reason: LayoutRejectReason::Stale as i32,
+            }),
+        );
+
+        broadcast_envelope(&peers, commit.clone());
+        assert_eq!(fast_rx.recv().await, Some(commit.clone()));
+        assert!(peers.lock().unwrap().contains_key(b"slow".as_slice()));
+        assert_eq!(slow_rx.recv().await, Some(commit));
+    }
 }

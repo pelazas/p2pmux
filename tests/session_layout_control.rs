@@ -2,7 +2,10 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
-    protocol::{CreatePane, DeletePane, LayoutRejectReason, LayoutRequest, PaneReady, SplitAxis},
+    protocol::{
+        CreatePane, CreateTab, DeletePane, DeleteTab, Envelope, Join, LayoutRejectReason,
+        LayoutRequest, PROTOCOL_VERSION, PaneReady, SplitAxis, envelope,
+    },
     session::{HostSession, LayoutControlEvent, SharedLayoutHost, join_layout},
     transport::{ALPN, Transport},
 };
@@ -83,6 +86,175 @@ async fn joining_member_receives_a_snapshot_and_existing_members_receive_admissi
     assert!(
         matches!(next_event(&mut second).await, LayoutControlEvent::Snapshot(snapshot) if snapshot.state.as_ref().is_some_and(|state| state.revision == 3))
     );
+
+    first.shutdown().await;
+    second.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let raw = loopback_transport().await;
+    let raw_id = raw.endpoint_id().as_bytes().to_vec();
+    let connection = raw
+        .connect(coordinator.ticket().endpoint_addr().clone())
+        .await
+        .expect("connect");
+    let (mut handshake_send, mut handshake_recv) = raw.open_bi(&connection).await.expect("join");
+    raw.write_frame(
+        &mut handshake_send,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            sender_peer_id: raw_id.clone(),
+            body: Some(envelope::Body::Join(Join {
+                session_id: coordinator.ticket().session_id().to_vec(),
+                peer_id: raw_id.clone(),
+                endpoint_addr: serde_json::to_vec(&raw.endpoint_addr()).expect("endpoint"),
+            })),
+        },
+    )
+    .await
+    .expect("send Join");
+    let _welcome = raw.read_frame(&mut handshake_recv).await.expect("welcome");
+    let (mut writer, mut reader) = raw
+        .accept_framed_bi(&connection)
+        .await
+        .expect("control stream");
+    assert!(matches!(
+        reader.read_next().await.expect("snapshot read"),
+        Some(Envelope {
+            body: Some(envelope::Body::SessionSnapshot(_)),
+            ..
+        })
+    ));
+    accept_first.await.unwrap().unwrap();
+
+    writer
+        .write_next(&Envelope {
+            version: PROTOCOL_VERSION,
+            sender_peer_id: b"forged-peer".to_vec(),
+            body: Some(envelope::Body::LayoutRequest(LayoutRequest {
+                request_id: 77,
+                base_revision: 2,
+                create_pane: None,
+                delete_pane: None,
+                create_tab: Some(CreateTab {
+                    grid_rows: 24,
+                    grid_cols: 80,
+                }),
+                delete_tab: None,
+            })),
+        })
+        .await
+        .expect("write forged request");
+    let forged_outcome = timeout(TEST_TIMEOUT, reader.read_next()).await;
+    assert!(
+        matches!(forged_outcome, Ok(Ok(None)) | Ok(Err(_))),
+        "forged outcome: {forged_outcome:?}; the coordinator must close a forged control stream without replying"
+    );
+
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second joins");
+    accept_second.await.unwrap().unwrap();
+    assert!(matches!(
+        next_event(&mut second).await,
+        LayoutControlEvent::Snapshot(snapshot)
+            if snapshot.state.as_ref().is_some_and(|state| state.revision == 3 && state.tabs.len() == 1 && state.panes.len() == 1)
+    ));
+
+    connection.close(0u8.into(), b"");
+    raw.close().await;
+    second.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut first = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("first");
+    accept_first.await.unwrap().unwrap();
+    let _ = next_event(&mut first).await;
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second");
+    accept_second.await.unwrap().unwrap();
+    let _ = next_event(&mut first).await;
+    let _ = next_event(&mut second).await;
+
+    second
+        .try_request(LayoutRequest {
+            request_id: 12,
+            base_revision: 3,
+            create_pane: None,
+            delete_pane: None,
+            create_tab: Some(CreateTab {
+                grid_rows: 24,
+                grid_cols: 80,
+            }),
+            delete_tab: None,
+        })
+        .expect("queue tab request");
+    let reservation = match next_event(&mut second).await {
+        LayoutControlEvent::Reservation(reservation) => reservation,
+        event => panic!("expected tab reservation, got {event:?}"),
+    };
+    second
+        .try_ready(PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 3,
+            request_id: 12,
+        })
+        .expect("ready tab");
+    let commit = match next_event(&mut first).await {
+        LayoutControlEvent::Commit(commit) => commit,
+        event => panic!("expected tab commit, got {event:?}"),
+    };
+    assert_eq!(commit.revision, 4);
+    assert_eq!(commit.state.as_ref().expect("state").tabs.len(), 2);
+    let _ = next_event(&mut second).await;
+
+    second
+        .try_request(LayoutRequest {
+            request_id: 13,
+            base_revision: 4,
+            create_pane: None,
+            delete_pane: None,
+            create_tab: None,
+            delete_tab: Some(DeleteTab {
+                tab_id: reservation.tab_id.expect("tab reservation"),
+            }),
+        })
+        .expect("queue tab delete");
+    for member in [&mut first, &mut second] {
+        let commit = match next_event(member).await {
+            LayoutControlEvent::Commit(commit) => commit,
+            event => panic!("expected delete commit, got {event:?}"),
+        };
+        assert_eq!(commit.revision, 5);
+        assert_eq!(commit.state.expect("full state").tabs.len(), 1);
+    }
 
     first.shutdown().await;
     second.shutdown().await;
