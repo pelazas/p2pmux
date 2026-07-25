@@ -92,6 +92,9 @@ Clicking a pane focuses it locally without taking control or sending input. When
 inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
 passthrough configuration.
 
+Drag inside a pane's terminal content to select text; releasing the mouse copies it to the macOS
+clipboard.
+
 - `Ctrl+P`, then `N` — split the focused pane. The new fixed-grid PTY runs on the requester’s Mac.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then arrows — move focus.

@@ -4,6 +4,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     io,
+    io::Write,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -154,6 +156,35 @@ pub struct PaneGeometry {
     pub panes: BTreeMap<PaneId, Rect>,
 }
 
+/// One cell in a pane's fixed VT grid.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ScreenCell {
+    row: u16,
+    col: u16,
+}
+
+/// A local, pane-scoped text selection. Both ends are inclusive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PaneTextSelection {
+    pane_id: PaneId,
+    anchor: ScreenCell,
+    cursor: ScreenCell,
+}
+
+impl PaneTextSelection {
+    fn is_empty(self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    fn contains(self, cell: ScreenCell) -> bool {
+        let min_row = self.anchor.row.min(self.cursor.row);
+        let max_row = self.anchor.row.max(self.cursor.row);
+        let min_col = self.anchor.col.min(self.cursor.col);
+        let max_col = self.anchor.col.max(self.cursor.col);
+        (min_row..=max_row).contains(&cell.row) && (min_col..=max_col).contains(&cell.col)
+    }
+}
+
 /// Pure local rendering and selection state for a revisioned shared layout.
 #[derive(Clone, Debug)]
 pub struct MultiPaneTui {
@@ -163,6 +194,8 @@ pub struct MultiPaneTui {
     chord_mode: ChordMode,
     pane_views: BTreeMap<PaneId, PaneViewState>,
     pending_created_tab: Option<TabId>,
+    selection: Option<PaneTextSelection>,
+    selection_dragging: bool,
 }
 
 impl MultiPaneTui {
@@ -182,6 +215,8 @@ impl MultiPaneTui {
             chord_mode: ChordMode::None,
             pane_views,
             pending_created_tab: None,
+            selection: None,
+            selection_dragging: false,
         })
     }
 
@@ -203,6 +238,64 @@ impl MultiPaneTui {
 
     fn exit_chord_mode(&mut self) {
         self.chord_mode = ChordMode::None;
+    }
+
+    fn clear_selection(&mut self) -> bool {
+        let changed = self.selection.take().is_some();
+        self.selection_dragging = false;
+        changed
+    }
+
+    fn begin_selection_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let Some((pane_id, cell)) = self.screen_cell_at(column, row, area) else {
+            return false;
+        };
+        self.selection = Some(PaneTextSelection {
+            pane_id,
+            anchor: cell,
+            cursor: cell,
+        });
+        self.selection_dragging = true;
+        true
+    }
+
+    fn extend_selection_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if !self.selection_dragging {
+            return false;
+        }
+        let Some((pane_id, cell)) = self.screen_cell_at(column, row, area) else {
+            return false;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        if selection.pane_id != pane_id || selection.cursor == cell {
+            return false;
+        }
+        selection.cursor = cell;
+        true
+    }
+
+    fn end_selection_drag(&mut self) -> bool {
+        std::mem::replace(&mut self.selection_dragging, false)
+    }
+
+    fn selection(&self) -> Option<PaneTextSelection> {
+        self.selection.filter(|selection| !selection.is_empty())
+    }
+
+    fn screen_cell_at(&self, column: u16, row: u16, area: Rect) -> Option<(PaneId, ScreenCell)> {
+        let geometry = self.geometry(area);
+        let (pane_id, pane_rect) = geometry.panes.iter().find_map(|(pane_id, rect)| {
+            rect_contains(*rect, column, row).then_some((*pane_id, *rect))
+        })?;
+        let pane = self.snapshot.panes.get(&pane_id)?;
+        let viewport = fixed_grid_viewport(
+            Block::bordered().inner(pane_rect),
+            pane.grid_rows,
+            pane.grid_cols,
+        );
+        mouse_to_screen_cell(viewport, column, row).map(|cell| (pane_id, cell))
     }
 
     pub fn pane_view(&self, pane_id: PaneId) -> Option<&PaneViewState> {
@@ -698,6 +791,67 @@ fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
     )
 }
 
+fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
+    rect_contains(viewport, column, row).then_some(ScreenCell {
+        row: row.saturating_sub(viewport.y),
+        col: column.saturating_sub(viewport.x),
+    })
+}
+
+fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Option<String> {
+    if selection.is_empty() {
+        return None;
+    }
+    let (rows, cols) = screen.size();
+    let min_row = selection.anchor.row.min(selection.cursor.row).min(rows);
+    let max_row = selection
+        .anchor
+        .row
+        .max(selection.cursor.row)
+        .min(rows.saturating_sub(1));
+    let min_col = selection.anchor.col.min(selection.cursor.col).min(cols);
+    let max_col = selection
+        .anchor
+        .col
+        .max(selection.cursor.col)
+        .min(cols.saturating_sub(1));
+    if min_row > max_row || min_col > max_col {
+        return None;
+    }
+
+    let lines = (min_row..=max_row)
+        .map(|row| {
+            let mut line = String::new();
+            for col in min_col..=max_col {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if !cell.is_wide_continuation() {
+                    let contents = cell.contents();
+                    line.push_str(if contents.is_empty() { " " } else { contents });
+                }
+            }
+            line.trim_end().to_owned()
+        })
+        .collect::<Vec<_>>();
+    Some(lines.join("\n"))
+}
+
+fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("pbcopy stdin unavailable"))?;
+    stdin.write_all(text.as_bytes())?;
+    drop(stdin);
+    if child.wait()?.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("pbcopy failed"))
+    }
+}
+
 /// Renders layout chrome plus any currently available fixed-size VT screens.
 pub fn render_multi_pane(
     frame: &mut Frame<'_>,
@@ -913,7 +1067,13 @@ fn render_shared_multi_pane(
         frame.render_widget(block, rect);
         if let Some(screen) = screens.get(&pane_id) {
             let viewport = fixed_grid_viewport(inner, pane.grid_rows, pane.grid_cols);
-            frame.render_widget(VtScreen::new(screen), viewport);
+            frame.render_widget(
+                VtScreen::new(screen).with_selection(
+                    tui.selection()
+                        .filter(|selection| selection.pane_id == pane_id),
+                ),
+                viewport,
+            );
             let (row, col) = screen.cursor_position();
             if focused
                 && view.ready
@@ -1558,6 +1718,13 @@ impl SharedLayoutRuntime {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
+                    if key.code == KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && self.tui.clear_selection()
+                    {
+                        dirty = true;
+                        continue;
+                    }
                     match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
                         KeyHandling::Quit => break,
                         KeyHandling::Consumed(intents) => {
@@ -1578,12 +1745,31 @@ impl SharedLayoutRuntime {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
                     let area = Rect::new(0, 0, cols, rows);
+                    dirty |= self.tui.clear_selection();
                     if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
                         self.handle_intent(intent)?;
                         dirty = true;
                     } else {
                         dirty |= self.tui.focus_pane_at(mouse.column, mouse.row, area);
+                        dirty |= self.tui.begin_selection_at(mouse.column, mouse.row, area);
                     }
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
+                {
+                    dirty |= self.tui.extend_selection_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, cols, rows),
+                    );
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
+                {
+                    if self.tui.end_selection_drag() {
+                        self.copy_selection_to_clipboard();
+                    }
+                    dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -1591,6 +1777,28 @@ impl SharedLayoutRuntime {
         }
         self.shutdown();
         Ok(())
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(selection) = self.tui.selection() else {
+            return;
+        };
+        let text = self
+            .local
+            .get(&selection.pane_id)
+            .and_then(|pane| selection_text(pane.screen.screen(), selection))
+            .or_else(|| {
+                self.remote
+                    .get(&selection.pane_id)
+                    .and_then(|pane| pane.screen.screen())
+                    .and_then(|screen| selection_text(screen, selection))
+            });
+        let Some(text) = text else {
+            return;
+        };
+        if let Err(error) = copy_to_macos_clipboard(&text) {
+            self.status = format!("clipboard copy failed: {error}");
+        }
     }
 
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
@@ -2014,11 +2222,20 @@ impl HostPaneRuntime {
 
 struct VtScreen<'a> {
     screen: &'a vt100::Screen,
+    selection: Option<PaneTextSelection>,
 }
 
 impl<'a> VtScreen<'a> {
     fn new(screen: &'a vt100::Screen) -> Self {
-        Self { screen }
+        Self {
+            screen,
+            selection: None,
+        }
+    }
+
+    fn with_selection(mut self, selection: Option<PaneTextSelection>) -> Self {
+        self.selection = selection;
+        self
     }
 }
 
@@ -2036,7 +2253,17 @@ impl Widget for VtScreen<'_> {
                 let target = &mut buf[(area.x + col, area.y + row)];
                 let contents = source.contents();
                 target.set_symbol(if contents.is_empty() { " " } else { contents });
-                target.set_style(vt_style(source));
+                let style = if self
+                    .selection
+                    .is_some_and(|selection| selection.contains(ScreenCell { row, col }))
+                {
+                    vt_style(source)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::REVERSED)
+                } else {
+                    vt_style(source)
+                };
+                target.set_style(style);
             }
         }
     }
@@ -2690,11 +2917,13 @@ mod tests {
 
     use super::{
         ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
-        LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
-        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, contextual_footer, encode_key,
-        encode_paste, grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label,
+        LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
+        RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
+        VtScreen, contextual_footer, encode_key, encode_paste, grid_for_pane,
+        initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        render_guest_screen, render_multi_pane, render_shared_multi_pane, visible_leaf_panes,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
+        visible_leaf_panes,
     };
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
@@ -3302,6 +3531,46 @@ mod tests {
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
         assert!(!tui.focus_pane_at(10, 0, area));
         assert_eq!(tui.focused_pane(), 3);
+    }
+
+    #[test]
+    fn mouse_coordinates_map_to_visible_screen_cells_only() {
+        let viewport = Rect::new(10, 5, 3, 2);
+
+        assert_eq!(
+            mouse_to_screen_cell(viewport, 12, 6),
+            Some(ScreenCell { row: 1, col: 2 })
+        );
+        assert_eq!(mouse_to_screen_cell(viewport, 9, 5), None);
+        assert_eq!(mouse_to_screen_cell(viewport, 13, 6), None);
+    }
+
+    #[test]
+    fn selection_text_extracts_the_selected_grid_cells() {
+        let mut parser = vt100::Parser::new(2, 4, 0);
+        parser.process(b"ab  \r\ncdef");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 1 },
+            cursor: ScreenCell { row: 1, col: 2 },
+        };
+
+        assert_eq!(
+            selection_text(parser.screen(), selection),
+            Some("b\nde".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_selection_has_no_clipboard_text() {
+        let parser = vt100::Parser::new(1, 1, 0);
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 0 },
+        };
+
+        assert_eq!(selection_text(parser.screen(), selection), None);
     }
 
     #[test]
@@ -4199,6 +4468,32 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(1));
         assert_eq!(buffer[(0, 0)].bg, Color::Indexed(4));
         assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn renderer_highlights_selected_cells() {
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process(b"abc");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 1 },
+        };
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    VtScreen::new(parser.screen()).with_selection(Some(selection)),
+                    frame.area(),
+                )
+            })
+            .expect("render should work");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, Color::DarkGray);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert_ne!(buffer[(2, 0)].bg, Color::DarkGray);
     }
 
     #[test]
