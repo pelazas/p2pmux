@@ -484,6 +484,83 @@ async fn simultaneous_member_requests_publish_only_monotonic_commits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_after_welcome_rolls_back_admission_before_control_setup() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut first = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("first joins");
+    accept_first.await.unwrap().unwrap();
+    let _ = next_event(&mut first).await;
+
+    let accept_raw = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let raw = loopback_transport().await;
+    let raw_id = raw.endpoint_id().as_bytes().to_vec();
+    let connection = raw
+        .connect(coordinator.ticket().endpoint_addr().clone())
+        .await
+        .expect("connect");
+    let (mut send, mut recv) = raw.open_bi(&connection).await.expect("handshake");
+    raw.write_frame(
+        &mut send,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            sender_peer_id: raw_id.clone(),
+            body: Some(envelope::Body::Join(Join {
+                session_id: coordinator.ticket().session_id().to_vec(),
+                peer_id: raw_id,
+                endpoint_addr: serde_json::to_vec(&raw.endpoint_addr()).expect("endpoint"),
+            })),
+        },
+    )
+    .await
+    .expect("Join");
+    let _ = raw.read_frame(&mut recv).await.expect("Welcome");
+    connection.close(0u8.into(), b"");
+    raw.close().await;
+    let _ = accept_raw.await.unwrap();
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Commit(commit) if commit.revision == 3
+    ));
+    let rollback = match next_event(&mut first).await {
+        LayoutControlEvent::Commit(commit) => commit,
+        event => panic!("expected rollback commit, got {event:?}"),
+    };
+    assert_eq!(rollback.revision, 4);
+    assert_eq!(rollback.state.expect("state").members.len(), 2);
+
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second joins after rollback");
+    accept_second.await.unwrap().unwrap();
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Commit(commit) if commit.revision == 5
+    ));
+    assert!(matches!(
+        next_event(&mut second).await,
+        LayoutControlEvent::Snapshot(snapshot)
+            if snapshot.state.as_ref().is_some_and(|state| state.revision == 5 && state.members.len() == 3)
+    ));
+
+    first.shutdown().await;
+    second.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_invalidates_a_member_reservation_and_notifies_its_creator() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
     let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");

@@ -1272,6 +1272,7 @@ impl SharedLayoutHost {
             .await
             .map_err(|_| SessionError::TimedOut("incoming connection"))?
             .map_err(SessionError::Incoming)?;
+        let mut admitted_peer_id = None;
         let result = async {
             let receipt = self.host.handshake_connection(&connection).await?;
             {
@@ -1291,6 +1292,7 @@ impl SharedLayoutHost {
                     self.send_reject(reject);
                 }
             }
+            admitted_peer_id = Some(receipt.admitted_peer_id.clone());
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
             let peer_id = receipt.admitted_peer_id.clone();
@@ -1341,6 +1343,16 @@ impl SharedLayoutHost {
         }
         .await;
         if result.is_err() {
+            if let Some(peer_id) = admitted_peer_id {
+                disconnect_or_remove(
+                    &self.peers,
+                    Some(&(
+                        self.coordinator.clone(),
+                        self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+                    )),
+                    &peer_id,
+                );
+            }
             connection.close(0u8.into(), b"");
         }
         result
