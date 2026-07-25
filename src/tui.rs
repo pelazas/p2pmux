@@ -61,7 +61,8 @@ const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <Alt+←↓↑→> FOCUS   <q> QUIT";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <Option (Alt)+←↓↑→> FOCUS   <q> QUIT";
+const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 
 type FooterSegment = (&'static str, bool);
 
@@ -71,7 +72,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     ("> PANE   <", false),
     ("t", true),
     ("> TAB   <", false),
-    ("Alt+←↓↑→", true),
+    ("Option (Alt)+←↓↑→", true),
     ("> FOCUS   <", false),
     ("q", true),
     ("> QUIT", false),
@@ -504,13 +505,7 @@ impl MultiPaneTui {
             self.chord_mode = ChordMode::None;
             return KeyHandling::Consumed(vec![]);
         }
-        if matches!(self.chord_mode, ChordMode::None | ChordMode::Pane)
-            && key.modifiers == KeyModifiers::ALT
-            && matches!(
-                key.code,
-                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-            )
-        {
+        if matches!(self.chord_mode, ChordMode::None | ChordMode::Pane) && is_option_arrow(key) {
             return KeyHandling::Consumed(self.move_focus(key.code, area).into_iter().collect());
         }
         if self.chord_mode == ChordMode::None {
@@ -697,6 +692,56 @@ impl MultiPaneTui {
             self.focused_pane = pane_id;
             self.pending_created_pane = None;
         }
+    }
+}
+
+fn is_option_arrow(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+        )
+}
+
+#[derive(Default)]
+struct PendingEscape {
+    started: Option<Instant>,
+}
+
+impl PendingEscape {
+    fn start(&mut self, now: Instant) {
+        self.started = Some(now);
+    }
+
+    fn take_if_expired(&mut self, now: Instant) -> bool {
+        if !self
+            .started
+            .is_some_and(|started| now.saturating_duration_since(started) >= ESC_PREFIX_WINDOW)
+        {
+            return false;
+        }
+        self.started = None;
+        true
+    }
+
+    fn take_option_arrow(&mut self, key: KeyEvent) -> Option<KeyEvent> {
+        (self.started.is_some() && key.modifiers.is_empty())
+            .then_some(key.code)
+            .filter(|code| {
+                matches!(
+                    code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                )
+            })
+            .map(|code| {
+                self.started = None;
+                KeyEvent::new(code, KeyModifiers::ALT)
+            })
+    }
+
+    fn take(&mut self) -> bool {
+        self.started.take().is_some()
     }
 }
 
@@ -1842,6 +1887,22 @@ impl SharedLayoutRuntime {
         self.session_id = session_id;
     }
 
+    fn handle_key(&mut self, key: KeyEvent, area: Rect) -> Result<bool, Box<dyn Error>> {
+        match self.tui.handle_key(key, area) {
+            KeyHandling::Quit => Ok(true),
+            KeyHandling::Consumed(intents) => {
+                for intent in intents {
+                    self.handle_intent(intent)?;
+                }
+                Ok(false)
+            }
+            KeyHandling::Forward => {
+                self.forward_key(key)?;
+                Ok(false)
+            }
+        }
+    }
+
     pub fn run(mut self) -> Result<(), Box<dyn Error>> {
         let (cols, rows) = terminal::size()?;
         let mut guard = TerminalGuard::new();
@@ -1862,8 +1923,18 @@ impl SharedLayoutRuntime {
             },
         )?;
         let mut dirty = true;
+        let mut pending_escape = PendingEscape::default();
         loop {
             dirty |= self.drain()?;
+            if pending_escape.take_if_expired(Instant::now()) {
+                if self.handle_key(
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    Rect::new(0, 0, cols, rows),
+                )? {
+                    break;
+                }
+                dirty = true;
+            }
             if dirty {
                 let mut screens = BTreeMap::new();
                 for (pane_id, pane) in &self.local {
@@ -1893,14 +1964,23 @@ impl SharedLayoutRuntime {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
-                        KeyHandling::Quit => break,
-                        KeyHandling::Consumed(intents) => {
-                            for intent in intents {
-                                self.handle_intent(intent)?;
-                            }
+                    let area = Rect::new(0, 0, cols, rows);
+                    if let Some(option_arrow) = pending_escape.take_option_arrow(key) {
+                        if self.handle_key(option_arrow, area)? {
+                            break;
                         }
-                        KeyHandling::Forward => self.forward_key(key)?,
+                    } else {
+                        if pending_escape.take()
+                            && self
+                                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area)?
+                        {
+                            break;
+                        }
+                        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+                            pending_escape.start(Instant::now());
+                        } else if self.handle_key(key, area)? {
+                            break;
+                        }
                     }
                     dirty = true;
                 }
@@ -3157,12 +3237,12 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
-        LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
-        RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
-        VtScreen, contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
-        initial_root_pane_grid, is_chord_command, lease_allows_held_input, member_label,
-        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        ChordMode, ESC_PREFIX_WINDOW, HostControlEvent, HostPaneChannels, HostPaneRuntime,
+        KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
+        PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane,
+        UiIntent, VtScreen, contextual_footer, copied_line_count, encode_key, encode_paste,
+        grid_for_pane, initial_root_pane_grid, is_chord_command, lease_allows_held_input,
+        member_label, mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
         reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
@@ -4251,6 +4331,57 @@ mod tests {
     }
 
     #[test]
+    fn option_arrows_accept_extra_modifiers_but_not_control() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
+                area,
+            ),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Forward
+        );
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn esc_then_arrow_uses_option_focus_and_expired_esc_keeps_its_prior_behavior() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let now = Instant::now();
+        let mut pending_escape = PendingEscape::default();
+
+        pending_escape.start(now);
+        let option_arrow = pending_escape
+            .take_option_arrow(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .expect("Esc followed by an arrow becomes Option-arrow focus");
+        assert_eq!(
+            tui.handle_key(option_arrow, area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        pending_escape.start(now);
+        assert!(pending_escape.take_if_expired(now + ESC_PREFIX_WINDOW));
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
     fn pane_chord_directional_splits_select_axis_and_child_position() {
         let area = Rect::new(0, 0, 80, 24);
         for (key, axis, position) in [
@@ -4372,7 +4503,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <Alt+←↓↑→> FOCUS   <q> QUIT",
+                "Ctrl+ <p> PANE   <t> TAB   <Option (Alt)+←↓↑→> FOCUS   <q> QUIT",
             ),
             (
                 ChordMode::Pane,
