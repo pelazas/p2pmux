@@ -67,6 +67,42 @@ fn handle_take_control_event(
     Ok(())
 }
 
+fn handle_input_event(
+    lease: &mut LeaseManager,
+    lease_tx: &watch::Sender<LeaseState>,
+    peer_id: &[u8],
+    lease_epoch: u64,
+    data: Vec<u8>,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    match lease.input(peer_id, lease_epoch, data, now) {
+        LeaseDecision::AcceptInput(bytes) => {
+            lease_tx.send_replace(lease.state().clone());
+            Some(bytes)
+        }
+        LeaseDecision::Publish(_)
+        | LeaseDecision::RejectStaleInput
+        | LeaseDecision::RejectStaleRequest
+        | LeaseDecision::RejectActiveController => None,
+    }
+}
+
+fn resolve_guest_claim(
+    pending_control: &mut bool,
+    held_input: &mut Vec<u8>,
+    claimant_won: bool,
+) -> Option<Vec<u8>> {
+    if !std::mem::replace(pending_control, false) {
+        return None;
+    }
+    if claimant_won {
+        (!held_input.is_empty()).then(|| std::mem::take(held_input))
+    } else {
+        held_input.clear();
+        None
+    }
+}
+
 impl HostPaneRuntime {
     pub fn new(
         size: PtySize,
@@ -423,18 +459,18 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     loop {
         while let Ok(event) = runtime.control_rx.try_recv() {
             match event {
-                HostControlEvent::Input { peer_id, input } => match runtime.lease.input(
-                    &peer_id,
-                    input.lease_epoch,
-                    input.data,
-                    Instant::now(),
-                ) {
-                    LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
-                    LeaseDecision::Publish(_)
-                    | LeaseDecision::RejectStaleInput
-                    | LeaseDecision::RejectStaleRequest
-                    | LeaseDecision::RejectActiveController => {}
-                },
+                HostControlEvent::Input { peer_id, input } => {
+                    if let Some(bytes) = handle_input_event(
+                        &mut runtime.lease,
+                        &runtime.lease_tx,
+                        &peer_id,
+                        input.lease_epoch,
+                        input.data,
+                        Instant::now(),
+                    ) {
+                        runtime.host.write_input(&bytes)?;
+                    }
+                }
                 HostControlEvent::TakeControl { peer_id, request } => {
                     handle_take_control_event(
                         &mut runtime.lease,
@@ -485,25 +521,24 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
-                    let decision =
-                        if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
-                            runtime
-                                .lease
-                                .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
-                        } else {
-                            runtime
-                                .lease
-                                .take_control(runtime.host_peer_id.clone(), epoch, now)?
-                        };
-                    match decision {
-                        LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
-                        LeaseDecision::Publish(state) => {
-                            runtime.lease_tx.send_replace(state);
+                    if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
+                        if let Some(bytes) = handle_input_event(
+                            &mut runtime.lease,
+                            &runtime.lease_tx,
+                            &runtime.host_peer_id,
+                            epoch,
+                            bytes,
+                            now,
+                        ) {
                             runtime.host.write_input(&bytes)?;
                         }
-                        LeaseDecision::RejectStaleInput
-                        | LeaseDecision::RejectStaleRequest
-                        | LeaseDecision::RejectActiveController => {}
+                    } else if let LeaseDecision::Publish(state) =
+                        runtime
+                            .lease
+                            .take_control(runtime.host_peer_id.clone(), epoch, now)?
+                    {
+                        runtime.lease_tx.send_replace(state);
+                        runtime.host.write_input(&bytes)?;
                     }
                 }
             }
@@ -511,24 +546,26 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
                 let now = Instant::now();
                 let epoch = runtime.lease.state().epoch;
-                let decision = if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
-                    runtime
-                        .lease
-                        .input(&runtime.host_peer_id, epoch, bytes.clone(), now)
+                if runtime.lease.state().controller_peer_id == runtime.host_peer_id {
+                    if let Some(bytes) = handle_input_event(
+                        &mut runtime.lease,
+                        &runtime.lease_tx,
+                        &runtime.host_peer_id,
+                        epoch,
+                        bytes,
+                        now,
+                    ) {
+                        runtime.host.write_input(&bytes)?;
+                    }
                 } else {
-                    runtime
-                        .lease
-                        .take_control(runtime.host_peer_id.clone(), epoch, now)?
-                };
-                match decision {
-                    LeaseDecision::AcceptInput(bytes) => runtime.host.write_input(&bytes)?,
-                    LeaseDecision::Publish(state) => {
+                    let decision =
+                        runtime
+                            .lease
+                            .take_control(runtime.host_peer_id.clone(), epoch, now)?;
+                    if let LeaseDecision::Publish(state) = decision {
                         runtime.lease_tx.send_replace(state);
                         runtime.host.write_input(&bytes)?;
                     }
-                    LeaseDecision::RejectStaleInput
-                    | LeaseDecision::RejectStaleRequest
-                    | LeaseDecision::RejectActiveController => {}
                 }
             }
             Event::Resize(_, _) => {}
@@ -590,11 +627,16 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         short_peer(&state.controller_peer_id)
                     );
                     last_lease = Instant::now();
-                    if pending_control && state.controller_peer_id == pane.controls.peer_id() {
-                        pending_control = false;
-                    } else if pending_control {
-                        pending_control = false;
-                        held_input.clear();
+                    if let Some(bytes) = resolve_guest_claim(
+                        &mut pending_control,
+                        &mut held_input,
+                        state.controller_peer_id == pane.controls.peer_id(),
+                    ) && pane
+                        .controls
+                        .try_input(state.lease_epoch, bytes.clone())
+                        .is_err()
+                    {
+                        held_input = bytes;
                     }
                     lease = Some(state);
                     dirty = true;
@@ -722,7 +764,8 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        VtScreen, encode_key, encode_paste, handle_take_control_event, render_guest_screen,
+        VtScreen, encode_key, encode_paste, handle_input_event, handle_take_control_event,
+        render_guest_screen, resolve_guest_claim,
     };
 
     #[test]
@@ -968,5 +1011,65 @@ mod tests {
         assert_eq!(lease.state().epoch, 1);
         assert_eq!(lease_rx.borrow().controller_peer_id, host_peer_id);
         assert_eq!(lease_rx.borrow().epoch, 1);
+    }
+
+    #[test]
+    fn accepted_host_control_input_republishes_the_current_lease() {
+        let now = Instant::now();
+        let controller_peer_id = b"guest".to_vec();
+        let mut lease = LeaseManager::new(controller_peer_id.clone(), now);
+        let (lease_tx, mut lease_rx) = watch::channel(lease.state().clone());
+
+        assert_eq!(
+            handle_input_event(
+                &mut lease,
+                &lease_tx,
+                &controller_peer_id,
+                1,
+                b"x".to_vec(),
+                now + Duration::from_secs(1),
+            ),
+            Some(b"x".to_vec())
+        );
+
+        assert!(lease_rx.has_changed().expect("lease sender remains open"));
+        let published = lease_rx.borrow_and_update().clone();
+        assert_eq!(published.controller_peer_id, controller_peer_id);
+        assert_eq!(published.epoch, 1);
+    }
+
+    #[test]
+    fn accepted_guest_claim_releases_the_buffered_first_byte_once() {
+        let mut pending_control = true;
+        let mut held_input = b"x".to_vec();
+
+        assert_eq!(
+            resolve_guest_claim(&mut pending_control, &mut held_input, true),
+            Some(b"x".to_vec())
+        );
+        assert!(!pending_control);
+        assert!(held_input.is_empty());
+        assert_eq!(
+            resolve_guest_claim(&mut pending_control, &mut held_input, true),
+            None
+        );
+    }
+
+    #[test]
+    fn serialized_idle_claim_winner_keeps_its_byte_and_loser_buffer_is_cleared() {
+        let mut winner_pending_control = true;
+        let mut winner_held_input = b"w".to_vec();
+        let mut loser_pending_control = true;
+        let mut loser_held_input = b"l".to_vec();
+
+        assert_eq!(
+            resolve_guest_claim(&mut winner_pending_control, &mut winner_held_input, true,),
+            Some(b"w".to_vec())
+        );
+        assert_eq!(
+            resolve_guest_claim(&mut loser_pending_control, &mut loser_held_input, false),
+            None
+        );
+        assert!(loser_held_input.is_empty());
     }
 }
