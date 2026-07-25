@@ -1921,6 +1921,12 @@ impl SharedLayoutRuntime {
         self.session_id = session_id;
     }
 
+    fn clear_selection(&mut self) -> bool {
+        let selection_cleared = self.tui.clear_selection();
+        let copy_feedback_cleared = self.copied_lines.take().is_some();
+        selection_cleared || copy_feedback_cleared
+    }
+
     fn handle_key(&mut self, key: KeyEvent, area: Rect) -> Result<bool, Box<dyn Error>> {
         let previously_focused = self.tui.focused_pane();
         let quit = match self.tui.handle_key(key, area) {
@@ -2052,7 +2058,7 @@ impl SharedLayoutRuntime {
                 {
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
-                    dirty |= self.tui.clear_selection();
+                    dirty |= self.clear_selection();
                     if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
                         self.handle_intent(intent)?;
                         dirty = true;
@@ -3409,6 +3415,16 @@ mod tests {
         )
         .expect("runtime");
         runtime.set_session_id(b"session".to_vec());
+
+        runtime.tui.selection = Some(PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 1 },
+        });
+        runtime.copied_lines = Some(2);
+        assert!(runtime.clear_selection());
+        assert!(runtime.tui.selection.is_none());
+        assert_eq!(runtime.copied_lines, None);
 
         runtime
             .handle_intent(UiIntent::CreatePane {
