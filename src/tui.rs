@@ -25,7 +25,8 @@ use ratatui::{
 };
 
 use crate::{
-    lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
+    lease::{IDLE_AFTER, LeaseDecision, LeaseError, LeaseManager, LeaseState},
+    protocol::TakeControl,
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, ScreenFrame},
     session::{GuestEvent, GuestPane, HostControlEvent},
@@ -43,6 +44,27 @@ pub struct HostPaneRuntime {
     lease_tx: watch::Sender<LeaseState>,
     control_rx: mpsc::Receiver<HostControlEvent>,
     join_code: String,
+}
+
+fn handle_take_control_event(
+    lease: &mut LeaseManager,
+    lease_tx: &watch::Sender<LeaseState>,
+    peer_id: Vec<u8>,
+    request: TakeControl,
+    now: Instant,
+) -> Result<(), LeaseError> {
+    match lease.take_control(peer_id, request.known_lease_epoch, now)? {
+        LeaseDecision::Publish(state) => {
+            lease_tx.send_replace(state);
+        }
+        LeaseDecision::RejectActiveController => {
+            lease_tx.send_replace(lease.state().clone());
+        }
+        LeaseDecision::AcceptInput(_)
+        | LeaseDecision::RejectStaleInput
+        | LeaseDecision::RejectStaleRequest => {}
+    }
+    Ok(())
 }
 
 impl HostPaneRuntime {
@@ -414,22 +436,13 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                     | LeaseDecision::RejectActiveController => {}
                 },
                 HostControlEvent::TakeControl { peer_id, request } => {
-                    let decision = runtime.lease.take_control(
+                    handle_take_control_event(
+                        &mut runtime.lease,
+                        &runtime.lease_tx,
                         peer_id,
-                        request.known_lease_epoch,
+                        request,
                         Instant::now(),
                     )?;
-                    match decision {
-                        LeaseDecision::Publish(state) => {
-                            runtime.lease_tx.send_replace(state);
-                        }
-                        LeaseDecision::RejectActiveController => {
-                            runtime.lease_tx.send_replace(runtime.lease.state().clone());
-                        }
-                        LeaseDecision::AcceptInput(_)
-                        | LeaseDecision::RejectStaleInput
-                        | LeaseDecision::RejectStaleRequest => {}
-                    }
                 }
             }
         }
@@ -692,6 +705,8 @@ fn short_peer(peer_id: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
         Terminal,
@@ -699,9 +714,16 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use crate::screen::{GuestScreen, HostScreen};
+    use crate::{
+        lease::LeaseManager,
+        protocol::TakeControl,
+        screen::{GuestScreen, HostScreen},
+    };
+    use tokio::sync::watch;
 
-    use super::{VtScreen, encode_key, encode_paste, render_guest_screen};
+    use super::{
+        VtScreen, encode_key, encode_paste, handle_take_control_event, render_guest_screen,
+    };
 
     #[test]
     fn remote_renderer_keeps_host_grid_fixed_and_draws_a_footer() {
@@ -920,5 +942,31 @@ mod tests {
                 "{event:?}"
             );
         }
+    }
+
+    #[test]
+    fn host_take_control_dispatch_rejects_an_active_controller() {
+        let now = Instant::now();
+        let host_peer_id = b"host".to_vec();
+        let mut lease = LeaseManager::new(host_peer_id.clone(), now);
+        let (lease_tx, lease_rx) = watch::channel(lease.state().clone());
+
+        handle_take_control_event(
+            &mut lease,
+            &lease_tx,
+            b"guest".to_vec(),
+            TakeControl {
+                pane_id: b"default-pane".to_vec(),
+                requester_peer_id: b"guest".to_vec(),
+                known_lease_epoch: 1,
+            },
+            now + Duration::from_secs(1),
+        )
+        .expect("active claim is handled");
+
+        assert_eq!(lease.state().controller_peer_id, host_peer_id);
+        assert_eq!(lease.state().epoch, 1);
+        assert_eq!(lease_rx.borrow().controller_peer_id, host_peer_id);
+        assert_eq!(lease_rx.borrow().epoch, 1);
     }
 }

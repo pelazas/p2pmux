@@ -173,18 +173,6 @@ impl Transport {
         Ok((FrameWriter { send }, FrameReader::new(recv)))
     }
 
-    /// Accept a post-handshake stream that may remain dormant until a peer needs it.
-    pub async fn accept_framed_bi_when_ready(
-        &self,
-        connection: &Connection,
-    ) -> Result<(FrameWriter, FrameReader), TransportError> {
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(TransportError::Stream)?;
-        Ok((FrameWriter { send }, FrameReader::new(recv)))
-    }
-
     pub async fn write_frame(
         &self,
         send: &mut SendStream,
