@@ -22,7 +22,16 @@ The pane host's existing `LeaseManager` remains authoritative. It serializes
 concurrent idle claims; the first accepted claim advances the lease epoch and
 the other claimant receives the published current lease, clears its buffered
 input, and remains a spectator. Stale claim and input epochs are rejected by the
-same manager. This change does not make the timeout configurable.
+same manager. Every accepted input republishes the current lease; guests use the
+receipt time of that update as their activity clock. Both render loops compare
+their activity clock against the timeout every event-poll cycle and redraw when
+the active/idle state changes. This change does not make the timeout
+configurable.
+
+Remove forced takeover from the wire command as well as the keyboard UI. A
+take-control request has no force flag, so all claims use the ordinary idle-only
+lease operation and an active controller cannot be bypassed by a crafted peer
+message.
 
 ## Shared help and permissions
 
@@ -42,6 +51,9 @@ control`. This differentiates active input from idle ownership without changing
 the lease protocol. Before a guest receives its first lease, render no
 control-state border and prefix the same shared help with `waiting for control
 state | `; a disconnect continues to terminate the TUI with its existing error.
+`join_pane` must not synthesize a local initial lease: the first host-published
+lease is authoritative for the controller and epoch, and guest input remains
+disabled until it arrives.
 
 ## Testing
 
