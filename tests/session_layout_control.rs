@@ -416,6 +416,74 @@ async fn expired_reservation_rejects_its_creator_and_unblocks_the_next_request()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_member_requests_publish_only_monotonic_commits() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut first = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("first");
+    accept_first.await.unwrap().unwrap();
+    let _ = next_event(&mut first).await;
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second");
+    accept_second.await.unwrap().unwrap();
+    let _ = next_event(&mut first).await;
+    let _ = next_event(&mut second).await;
+
+    first
+        .try_request(create_request(31, 3))
+        .expect("first request");
+    second
+        .try_request(create_request(32, 3))
+        .expect("second request");
+    let first_result = next_event(&mut first).await;
+    let second_result = next_event(&mut second).await;
+    let reservation = match (first_result, second_result) {
+        (LayoutControlEvent::Reservation(reservation), LayoutControlEvent::Reject(_)) => {
+            first
+                .try_ready(PaneReady {
+                    reservation_id: reservation.reservation_id,
+                    base_revision: 3,
+                    request_id: 31,
+                })
+                .expect("first ready");
+            reservation
+        }
+        (LayoutControlEvent::Reject(_), LayoutControlEvent::Reservation(reservation)) => {
+            second
+                .try_ready(PaneReady {
+                    reservation_id: reservation.reservation_id,
+                    base_revision: 3,
+                    request_id: 32,
+                })
+                .expect("second ready");
+            reservation
+        }
+        events => panic!("expected one reservation and one reject, got {events:?}"),
+    };
+    assert_ne!(reservation.reservation_id, 0);
+    for member in [&mut first, &mut second] {
+        assert!(matches!(
+            next_event(member).await,
+            LayoutControlEvent::Commit(commit) if commit.revision == 4
+        ));
+    }
+
+    first.shutdown().await;
+    second.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_invalidates_a_member_reservation_and_notifies_its_creator() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
     let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
