@@ -61,6 +61,22 @@ fn initial_layout_rejects_zero_sized_grids_and_invalid_endpoint_addresses() {
         ),
         Err(LayoutError::InvalidEndpointAddress)
     );
+    assert_eq!(
+        SessionState::new(Vec::new(), ADDR_A.to_vec(), 24, 80),
+        Err(LayoutError::InvalidPeerId)
+    );
+}
+
+#[test]
+fn member_setup_rejects_empty_peer_ids_without_mutating_the_snapshot() {
+    let mut state = state();
+    let before = snapshot(&state);
+
+    assert_eq!(
+        state.add_member(state.revision(), Vec::new(), ADDR_B.to_vec()),
+        Err(LayoutError::InvalidPeerId)
+    );
+    assert_eq!(snapshot(&state), before);
 }
 
 #[test]
@@ -454,10 +470,10 @@ fn snapshots_associate_pane_hosts_with_bounded_member_addresses_and_reject_malfo
     let pane_id = state
         .create_pane(HOST_B, state.revision(), 1, Axis::LeftRight, 24, 80)
         .expect("B pane");
-    let snapshot = snapshot(&state);
-    assert_eq!(snapshot.panes[&pane_id].host_peer_id, HOST_B);
+    let valid_snapshot = snapshot(&state);
+    assert_eq!(valid_snapshot.panes[&pane_id].host_peer_id, HOST_B);
     assert_eq!(
-        snapshot
+        valid_snapshot
             .members
             .iter()
             .find(|member| member.peer_id == HOST_B)
@@ -465,12 +481,33 @@ fn snapshots_associate_pane_hosts_with_bounded_member_addresses_and_reject_malfo
             .endpoint_addr,
         b"updated-addr-b"
     );
-    SessionState::validate_snapshot(&snapshot).expect("valid snapshot");
+    SessionState::validate_snapshot(&valid_snapshot).expect("valid snapshot");
 
-    let mut malformed = snapshot;
+    let mut malformed = valid_snapshot;
     malformed.tabs.clear();
     assert_eq!(
         SessionState::validate_snapshot(&malformed),
+        Err(LayoutError::InvalidSnapshot)
+    );
+
+    let mut zero_tab_id = snapshot(&state);
+    zero_tab_id.tabs[0].tab_id = 0;
+    assert_eq!(
+        SessionState::validate_snapshot(&zero_tab_id),
+        Err(LayoutError::InvalidSnapshot)
+    );
+
+    let mut zero_pane_id = snapshot(&state);
+    let pane = zero_pane_id
+        .panes
+        .remove(&pane_id)
+        .expect("pane exists in snapshot");
+    zero_pane_id
+        .panes
+        .insert(0, p2pmux::layout::Pane { pane_id: 0, ..pane });
+    zero_pane_id.tabs[0].root = Node::Leaf { pane_id: 0 };
+    assert_eq!(
+        SessionState::validate_snapshot(&zero_pane_id),
         Err(LayoutError::InvalidSnapshot)
     );
 }

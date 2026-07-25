@@ -113,6 +113,7 @@ pub enum LayoutError {
     MemberLimit,
     AlreadyMember,
     NotMember,
+    InvalidPeerId,
     InvalidEndpointAddress,
     TabLimit,
     PaneLimit,
@@ -140,6 +141,7 @@ impl SessionState {
         grid_cols: u16,
     ) -> Result<Self, LayoutError> {
         validate_grid(grid_rows, grid_cols)?;
+        validate_peer_id(&initial_host)?;
         validate_endpoint_addr(&endpoint_addr)?;
         let initial_pane = Pane {
             pane_id: 1,
@@ -217,7 +219,7 @@ impl SessionState {
         let mut tab_ids = BTreeSet::new();
         let mut pane_ids = BTreeSet::new();
         for tab in &snapshot.tabs {
-            if !tab_ids.insert(tab.tab_id) {
+            if tab.tab_id == 0 || !tab_ids.insert(tab.tab_id) {
                 return Err(LayoutError::InvalidSnapshot);
             }
             let before = pane_ids.len();
@@ -251,6 +253,7 @@ impl SessionState {
         endpoint_addr: Vec<u8>,
     ) -> Result<(), LayoutError> {
         self.check_mutation(base_revision)?;
+        validate_peer_id(&peer_id)?;
         validate_endpoint_addr(&endpoint_addr)?;
         if self.members.iter().any(|member| member.peer_id == peer_id) {
             return Err(LayoutError::AlreadyMember);
@@ -695,7 +698,7 @@ impl Node {
 
     fn collect_pane_ids(&self, depth: usize, pane_ids: &mut BTreeSet<PaneId>) -> bool {
         match self {
-            Self::Leaf { pane_id } => pane_ids.insert(*pane_id),
+            Self::Leaf { pane_id } => *pane_id != 0 && pane_ids.insert(*pane_id),
             Self::Split { first, second, .. } => {
                 depth < MAX_SPLIT_DEPTH
                     && first.collect_pane_ids(depth + 1, pane_ids)
@@ -766,4 +769,10 @@ fn validate_endpoint_addr(endpoint_addr: &[u8]) -> Result<(), LayoutError> {
     (!endpoint_addr.is_empty() && endpoint_addr.len() <= MAX_ENDPOINT_ADDR_BYTES)
         .then_some(())
         .ok_or(LayoutError::InvalidEndpointAddress)
+}
+
+fn validate_peer_id(peer_id: &[u8]) -> Result<(), LayoutError> {
+    (!peer_id.is_empty())
+        .then_some(())
+        .ok_or(LayoutError::InvalidPeerId)
 }
