@@ -27,8 +27,9 @@ use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::{Margin, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Paragraph, Widget},
 };
 
@@ -59,7 +60,7 @@ const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT";
 
 type FooterSegment = (&'static str, bool);
 
@@ -70,7 +71,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     ("t", true),
     ("> TAB   <", false),
     ("q", true),
-    ("> QUIT    type to claim when free", false),
+    ("> QUIT", false),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     ("Pane  <", false),
@@ -199,6 +200,7 @@ pub struct MultiPaneTui {
     snapshot: LayoutSnapshot,
     current_tab: TabId,
     focused_pane: PaneId,
+    hovered_pane: Option<PaneId>,
     chord_mode: ChordMode,
     pane_views: BTreeMap<PaneId, PaneViewState>,
     pending_created_tab: Option<TabId>,
@@ -220,6 +222,7 @@ impl MultiPaneTui {
             snapshot,
             current_tab,
             focused_pane,
+            hovered_pane: None,
             chord_mode: ChordMode::None,
             pane_views,
             pending_created_tab: None,
@@ -401,6 +404,15 @@ impl MultiPaneTui {
         true
     }
 
+    fn hover_pane_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let hovered_pane = pane_at(&self.geometry(area).panes, column, row);
+        if self.hovered_pane == hovered_pane {
+            return false;
+        }
+        self.hovered_pane = hovered_pane;
+        true
+    }
+
     fn switch_tab_at(&mut self, column: u16, row: u16, area: Rect) -> Option<UiIntent> {
         let tab_id = self
             .geometry(area)
@@ -422,11 +434,16 @@ impl MultiPaneTui {
             area.width,
             footer_height,
         );
+        let tab_bar_gap = area
+            .height
+            .saturating_sub(tab_bar.height + footer_height)
+            .min(1);
         let content = Rect::new(
             area.x,
-            area.y.saturating_add(tab_bar.height),
+            area.y.saturating_add(tab_bar.height + tab_bar_gap),
             area.width,
-            area.height.saturating_sub(tab_bar.height + footer_height),
+            area.height
+                .saturating_sub(tab_bar.height + tab_bar_gap + footer_height),
         );
         let mut panes = BTreeMap::new();
         if let Some(tab) = self.current_tab_layout() {
@@ -695,26 +712,34 @@ fn pane_title(
     host_peer_id: &[u8],
     controller_peer_id: Option<&[u8]>,
     members: &[crate::layout::Member],
-) -> String {
+) -> Line<'static> {
     let control = match controller_peer_id {
         Some([]) => "free".to_owned(),
         Some(peer_id) => member_label(peer_id, members),
         None => "…".to_owned(),
     };
-    format!(
-        "Pane #{index} host: {} control: {control}",
-        member_label(host_peer_id, members)
-    )
+    Line::from(vec![
+        Span::styled(
+            format!("Pane #{index}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " host: {} control: {control}",
+            member_label(host_peer_id, members)
+        )),
+    ])
 }
 
 fn pane_border_color(
     controller_peer_id: Option<&[u8]>,
     _controller_active: bool,
     focused: bool,
+    hovered: bool,
 ) -> Color {
     match controller_peer_id {
         Some([]) if focused => Color::White,
         None if focused => Color::Yellow,
+        Some([]) | None if hovered => Color::Gray,
         Some([]) | None => Color::DarkGray,
         Some(_) => Color::Rgb(255, 69, 0),
     }
@@ -777,7 +802,7 @@ pub(crate) fn grid_for_pane(rect: Rect) -> (u16, u16) {
 }
 
 pub(crate) fn initial_root_pane_grid(cols: u16, rows: u16) -> (u16, u16) {
-    grid_for_pane(Rect::new(0, 0, cols, rows.saturating_sub(2)))
+    grid_for_pane(Rect::new(0, 0, cols, rows.saturating_sub(3)))
 }
 
 fn rect_center(rect: Rect) -> (u32, u32) {
@@ -834,7 +859,7 @@ fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
 }
 
 fn pane_content_rect(pane_rect: Rect) -> Rect {
-    Block::bordered().inner(pane_rect).inner(Margin::new(1, 1))
+    Block::bordered().inner(pane_rect)
 }
 
 fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
@@ -897,9 +922,8 @@ fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     }
 }
 
-fn copied_status(text: &str) -> String {
-    let lines = text.split('\n').count().max(1);
-    format!("copied {lines} line{}", if lines == 1 { "" } else { "s" })
+fn copied_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
 }
 
 /// Renders layout chrome plus any currently available fixed-size VT screens.
@@ -908,7 +932,7 @@ pub fn render_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", None);
+    render_shared_multi_pane(frame, tui, screens, "", None, None);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -943,6 +967,27 @@ fn render_footer_segments(
     x
 }
 
+fn render_copy_feedback(buffer: &mut Buffer, mut x: u16, y: u16, end_x: u16, lines: usize) {
+    x = buffer
+        .set_stringn(
+            x,
+            y,
+            "  copied ",
+            usize::from(end_x.saturating_sub(x)),
+            Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+        )
+        .0;
+    buffer.set_stringn(
+        x,
+        y,
+        format!("{lines} line{}", if lines == 1 { "" } else { "s" }),
+        usize::from(end_x.saturating_sub(x)),
+        Style::default()
+            .fg(Color::Rgb(255, 69, 0))
+            .bg(FOOTER_BACKGROUND),
+    );
+}
+
 fn footer_suffix(text: &str, width: usize) -> &str {
     if width == 0 {
         return "";
@@ -958,6 +1003,7 @@ fn render_contextual_footer(
     buffer: &mut Buffer,
     area: Rect,
     status: &str,
+    copied_lines: Option<usize>,
     join_code: Option<&str>,
     chord_mode: ChordMode,
 ) {
@@ -995,7 +1041,14 @@ fn render_contextual_footer(
         })
         .unwrap_or((end_x, None));
     let (_, segments) = contextual_footer(chord_mode);
-    render_footer_segments(buffer, x, area.y, join_x, segments);
+    let x = render_footer_segments(buffer, x, area.y, join_x, segments);
+    // Chord help takes precedence over copy feedback so its commands stay contiguous.
+    if status.is_empty()
+        && chord_mode == ChordMode::None
+        && let Some(lines) = copied_lines
+    {
+        render_copy_feedback(buffer, x, area.y, join_x, lines);
+    }
     if let Some(text) = join_text {
         buffer.set_stringn(
             join_x,
@@ -1012,6 +1065,7 @@ fn render_shared_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     status: &str,
+    copied_lines: Option<usize>,
     join_code: Option<&str>,
 ) {
     let geometry = tui.geometry(frame.area());
@@ -1083,6 +1137,7 @@ fn render_shared_multi_pane(
             frame.buffer_mut(),
             geometry.footer,
             status,
+            copied_lines,
             join_code,
             tui.chord_mode,
         );
@@ -1099,19 +1154,22 @@ fn render_shared_multi_pane(
         let pane = &tui.snapshot.panes[&pane_id];
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
-        let title = pane_title(
+        let mut title = pane_title(
             index + 1,
             &pane.host_peer_id,
             view.controller_peer_id.as_deref(),
             &tui.snapshot.members,
         );
+        title.spans.insert(0, Span::raw(" "));
+        title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
             view.controller_peer_id.as_deref(),
             view.controller_active,
             focused,
+            tui.hovered_pane == Some(pane_id),
         );
         let block = Block::bordered()
-            .title(format!(" {title} "))
+            .title(title)
             .border_style(Style::default().fg(border_color));
         let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
@@ -1615,6 +1673,7 @@ pub struct SharedLayoutRuntime {
     provisional: BTreeMap<u64, PaneId>,
     next_request_id: u64,
     status: String,
+    copied_lines: Option<usize>,
     join_code: Option<String>,
 }
 
@@ -1713,6 +1772,7 @@ impl SharedLayoutRuntime {
             provisional: BTreeMap::new(),
             next_request_id: 1,
             status: String::new(),
+            copied_lines: None,
             join_code,
         };
         value.refresh_local_views();
@@ -1761,6 +1821,7 @@ impl SharedLayoutRuntime {
                         &self.tui,
                         &screens,
                         &self.status,
+                        self.copied_lines,
                         self.join_code.as_deref(),
                     );
                 })?;
@@ -1788,6 +1849,13 @@ impl SharedLayoutRuntime {
                     self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
                     dirty = true;
+                }
+                Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                    dirty |= self.tui.hover_pane_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, cols, rows),
+                    );
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
@@ -1875,8 +1943,14 @@ impl SharedLayoutRuntime {
             return;
         };
         match copy_to_macos_clipboard(&text) {
-            Ok(()) => self.status = copied_status(&text),
-            Err(error) => self.status = format!("clipboard copy failed: {error}"),
+            Ok(()) => {
+                self.status.clear();
+                self.copied_lines = Some(copied_line_count(&text));
+            }
+            Err(error) => {
+                self.copied_lines = None;
+                self.status = format!("clipboard copy failed: {error}");
+            }
         }
     }
 
@@ -3020,7 +3094,7 @@ mod tests {
         ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState,
         RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
-        VtScreen, contextual_footer, copied_status, encode_key, encode_paste, grid_for_pane,
+        VtScreen, contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
         initial_root_pane_grid, lease_allows_held_input, member_label, mouse_to_screen_cell,
         pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
         render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
@@ -3290,6 +3364,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     "layout request rejected",
+                    None,
                     Some("TESTCODE"),
                 );
             })
@@ -3311,6 +3386,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     "layout request rejected",
+                    None,
                     Some("TESTCODE"),
                 );
             })
@@ -3367,6 +3443,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     "layout request rejected",
+                    None,
                     Some("TESTCODE"),
                 );
             })
@@ -3380,6 +3457,42 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("layout request rejected"));
         assert!(rendered.contains("join: p2pmux join TESTCODE"));
+    }
+
+    #[test]
+    fn shared_footer_places_copy_feedback_after_quit_with_a_red_line_count() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 1, 1)],
+        );
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(120, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_shared_multi_pane(frame, &tui, &BTreeMap::new(), "", Some(3), None);
+            })
+            .expect("draw");
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
+            .collect::<String>();
+        let quit = footer.find("> QUIT").expect("quit help rendered");
+        let copied = footer
+            .find("copied 3 lines")
+            .expect("copy feedback rendered");
+        let count = footer.find("3 lines").expect("line count rendered");
+
+        assert!(copied > quit + "> QUIT".len());
+        assert_eq!(
+            terminal.backend().buffer()[(copied as u16, 4)].fg,
+            Color::White
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(count as u16, 4)].fg,
+            Color::Rgb(255, 69, 0)
+        );
     }
 
     #[test]
@@ -3578,32 +3691,46 @@ mod tests {
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
-            pane_title(1, b"host", Some(b""), &members),
+            pane_title(1, b"host", Some(b""), &members).to_string(),
             "Pane #1 host: Host control: free"
         );
         assert_eq!(
-            pane_title(2, b"host", Some(b"guest"), &members),
+            pane_title(2, b"host", Some(b"guest"), &members).to_string(),
             "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
-            pane_title(2, b"host", None, &members),
+            pane_title(2, b"host", None, &members).to_string(),
             "Pane #2 host: Host control: …"
         );
     }
 
     #[test]
-    fn free_panes_use_white_when_focused_and_dark_gray_when_unfocused() {
-        assert_eq!(pane_border_color(Some(b""), false, true), Color::White);
-        assert_eq!(pane_border_color(Some(b""), false, false), Color::DarkGray);
-        assert_eq!(pane_border_color(None, false, true), Color::Yellow);
-        assert_eq!(pane_border_color(None, false, false), Color::DarkGray);
+    fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         assert_eq!(
-            pane_border_color(Some(b"guest"), true, true),
+            pane_border_color(Some(b""), false, true, false),
+            Color::White
+        );
+        assert_eq!(
+            pane_border_color(Some(b""), false, false, true),
+            Color::Gray
+        );
+        assert_eq!(
+            pane_border_color(Some(b""), false, false, false),
+            Color::DarkGray
+        );
+        assert_eq!(pane_border_color(None, false, true, false), Color::Yellow);
+        assert_eq!(pane_border_color(None, false, false, true), Color::Gray);
+        assert_eq!(
+            pane_border_color(None, false, false, false),
+            Color::DarkGray
+        );
+        assert_eq!(
+            pane_border_color(Some(b"guest"), true, true, true),
             Color::Rgb(255, 69, 0)
         );
-        assert_ne!(
-            pane_border_color(Some(b"guest"), false, false),
-            Color::Rgb(140, 91, 68)
+        assert_eq!(
+            pane_border_color(Some(b"guest"), false, false, true),
+            Color::Rgb(255, 69, 0)
         );
     }
 
@@ -3614,8 +3741,9 @@ mod tests {
 
         assert_eq!(geometry.tab_bar, Rect::new(0, 0, 80, 1));
         assert_eq!(geometry.footer, Rect::new(0, 23, 80, 1));
-        assert_eq!(geometry.panes[&1], Rect::new(0, 1, 40, 22));
-        assert_eq!(geometry.panes[&2], Rect::new(40, 1, 40, 11));
+        assert_eq!(geometry.content, Rect::new(0, 2, 80, 21));
+        assert_eq!(geometry.panes[&1], Rect::new(0, 2, 40, 21));
+        assert_eq!(geometry.panes[&2], Rect::new(40, 2, 40, 10));
         assert_eq!(geometry.panes[&3], Rect::new(40, 12, 40, 11));
     }
 
@@ -3636,6 +3764,19 @@ mod tests {
     }
 
     #[test]
+    fn hovering_an_unfocused_pane_does_not_move_focus() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert!(tui.hover_pane_at(60, 17, area));
+        assert_eq!(tui.hovered_pane, Some(3));
+        assert_eq!(tui.focused_pane(), 1);
+        assert!(tui.hover_pane_at(10, 0, area));
+        assert_eq!(tui.hovered_pane, None);
+        assert_eq!(tui.focused_pane(), 1);
+    }
+
+    #[test]
     fn mouse_coordinates_map_to_visible_screen_cells_only() {
         let viewport = Rect::new(10, 5, 3, 2);
 
@@ -3648,20 +3789,20 @@ mod tests {
     }
 
     #[test]
-    fn selection_hit_testing_uses_the_padded_pane_content_area() {
+    fn selection_hit_testing_uses_the_bordered_pane_content_area() {
         let tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
             }],
-            &[(1, 18, 76)],
+            &[(1, 19, 78)],
         ))
         .expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
-        assert_eq!(tui.screen_cell_at(1, 2, area), None);
+        assert_eq!(tui.screen_cell_at(0, 2, area), None);
         assert_eq!(
-            tui.screen_cell_at(2, 3, area),
+            tui.screen_cell_at(1, 3, area),
             Some((1, ScreenCell { row: 0, col: 0 }))
         );
     }
@@ -3735,10 +3876,10 @@ mod tests {
     }
 
     #[test]
-    fn copied_status_reports_the_number_of_newline_separated_lines() {
-        assert_eq!(copied_status("one line"), "copied 1 line");
-        assert_eq!(copied_status("first\nsecond\nthird"), "copied 3 lines");
-        assert_eq!(copied_status(""), "copied 1 line");
+    fn copied_line_count_reports_newline_separated_lines() {
+        assert_eq!(copied_line_count("one line"), 1);
+        assert_eq!(copied_line_count("first\nsecond\nthird"), 3);
+        assert_eq!(copied_line_count(""), 1);
     }
 
     #[test]
@@ -3848,9 +3989,11 @@ mod tests {
             .expect("render");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(1, 1)].symbol(), " ");
-        assert_eq!(buffer[(2, 1)].symbol(), "P");
+        assert_eq!(buffer[(0, 2)].symbol(), "┌");
+        assert_eq!(buffer[(1, 2)].symbol(), " ");
+        assert_eq!(buffer[(2, 2)].symbol(), "P");
+        assert!((2..9).all(|x| buffer[(x, 2)].modifier.contains(Modifier::BOLD)));
+        assert!(!buffer[(9, 2)].modifier.contains(Modifier::BOLD));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
@@ -3880,7 +4023,7 @@ mod tests {
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         let title = (0..40)
-            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
             .collect::<String>();
 
         assert!(title.contains("host: 686f7374"));
@@ -3971,8 +4114,8 @@ mod tests {
             .expect("render");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(2, 3)].symbol(), "a");
-        assert_eq!(buffer[(5, 3)].symbol(), "d");
+        assert_eq!(buffer[(1, 3)].symbol(), "a");
+        assert_eq!(buffer[(4, 3)].symbol(), "d");
         assert_eq!(buffer[(7, 3)].symbol(), "│");
     }
 
@@ -3994,8 +4137,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::LeftRight,
-                grid_rows: 18,
-                grid_cols: 36,
+                grid_rows: 19,
+                grid_cols: 38,
             }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
@@ -4006,9 +4149,9 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
         );
-        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.focused_pane(), 3);
     }
 
     #[test]
@@ -4022,12 +4165,12 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+            KeyHandling::Consumed(vec![])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
     }
@@ -4091,10 +4234,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
 
         for (mode, expected) in [
-            (
-                ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free",
-            ),
+            (ChordMode::None, "Ctrl+ <p> PANE   <t> TAB   <q> QUIT"),
             (
                 ChordMode::Pane,
                 "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
@@ -4235,12 +4375,12 @@ mod tests {
             .get(&1)
             .copied()
             .expect("root pane");
-        assert_eq!(grid_for_pane(pane), (18, 76));
-        assert_eq!(initial_root_pane_grid(80, 24), (18, 76));
+        assert_eq!(grid_for_pane(pane), (19, 78));
+        assert_eq!(initial_root_pane_grid(80, 24), (19, 78));
     }
 
     #[test]
-    fn square_pane_create_chord_splits_top_to_bottom() {
+    fn square_pane_create_chord_splits_left_to_right_after_tab_bar_spacing() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -4259,9 +4399,9 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
-                axis: Axis::TopBottom,
-                grid_rows: 8,
-                grid_cols: 8,
+                axis: Axis::LeftRight,
+                grid_rows: 9,
+                grid_cols: 10,
             }])
         );
     }
@@ -4275,7 +4415,7 @@ mod tests {
             area,
         );
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
-        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.focused_pane(), 3);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
@@ -4283,7 +4423,7 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 2 }])
+            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 3 }])
         );
     }
 
@@ -4308,8 +4448,8 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
-                grid_rows: 34,
-                grid_cols: 16,
+                grid_rows: 35,
+                grid_cols: 18,
             }])
         );
     }
@@ -4345,14 +4485,6 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
-        );
-        let _ = tui.handle_key(
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-            area,
-        );
-        assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
         );
         let _ = tui.handle_key(
@@ -4360,19 +4492,27 @@ mod tests {
             area,
         );
         assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![])
+            tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
-        assert_eq!(tui.focused_pane(), 3);
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             area,
         );
         assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![])
+            tui.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 1 }])
         );
-        assert_eq!(tui.focused_pane(), 3);
+        assert_eq!(tui.focused_pane(), 1);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.focused_pane(), 2);
 
         let mut edge_tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let _ = edge_tui.handle_key(
@@ -4390,8 +4530,8 @@ mod tests {
             area,
         );
         let _ = edge_tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
-        assert_eq!(edge_tui.focused_pane(), 2);
-        for key in [KeyCode::Up, KeyCode::Right] {
+        assert_eq!(edge_tui.focused_pane(), 3);
+        for key in [KeyCode::Down, KeyCode::Right] {
             let _ = edge_tui.handle_key(
                 KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
                 area,
@@ -4400,7 +4540,7 @@ mod tests {
                 edge_tui.handle_key(KeyEvent::new(key, KeyModifiers::NONE), area),
                 KeyHandling::Consumed(vec![])
             );
-            assert_eq!(edge_tui.focused_pane(), 2);
+            assert_eq!(edge_tui.focused_pane(), 3);
         }
     }
 
@@ -4491,8 +4631,8 @@ mod tests {
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::CreateTab {
-                grid_rows: 2,
-                grid_cols: 8,
+                grid_rows: 3,
+                grid_cols: 10,
             }])
         );
 
