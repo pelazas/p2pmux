@@ -51,8 +51,8 @@ use crate::{
 pub struct Tui;
 
 const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
-const FOOTER_MUTED: Color = Color::DarkGray;
-const FOOTER_ACCENT: Color = Color::Red;
+const FOOTER_MUTED: Color = Color::White;
+const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
 
 type FooterSegment = (&'static str, bool);
@@ -2923,6 +2923,9 @@ mod tests {
             .collect::<String>();
         assert!(footer.starts_with("layout request rejected"));
         assert!(footer.ends_with("join: p2pmux join TESTCODE"));
+        assert_eq!(terminal.backend().buffer()[(0, 4)].fg, Color::White);
+        let join_x = footer.find("join:").expect("join code rendered") as u16;
+        assert_eq!(terminal.backend().buffer()[(join_x, 4)].fg, Color::White);
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(20, 5)).expect("terminal");
         narrow_terminal
@@ -3650,7 +3653,13 @@ mod tests {
             for (text, accent) in segments {
                 for key in text.chars() {
                     if *accent {
-                        assert_eq!(footer[(x, 3)].fg, Color::Red, "mode: {mode:?}, key: {key}");
+                        assert_eq!(
+                            footer[(x, 3)].fg,
+                            Color::Rgb(220, 50, 47),
+                            "mode: {mode:?}, key: {key}"
+                        );
+                    } else {
+                        assert_eq!(footer[(x, 3)].fg, Color::White, "mode: {mode:?}");
                     }
                     x += 1;
                 }
