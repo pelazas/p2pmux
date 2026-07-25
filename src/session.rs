@@ -803,6 +803,7 @@ struct PaneRegistry {
 
 struct PaneSubscription {
     connection: Connection,
+    peer_id: Vec<u8>,
     active: Arc<AtomicBool>,
 }
 
@@ -885,7 +886,29 @@ impl PaneServer {
             }
             next.insert(peer_id, endpoint_addr);
         }
-        *self.members.lock().map_err(|_| SessionError::PeerTask)? = next;
+        *self.members.lock().map_err(|_| SessionError::PeerTask)? = next.clone();
+        let revoked = {
+            let mut registry = self.registry.lock().map_err(|_| SessionError::PeerTask)?;
+            let mut revoked = Vec::new();
+            for subscribers in registry.subscriptions.values_mut() {
+                subscribers.retain(|_, subscription| {
+                    if next.contains_key(&subscription.peer_id) {
+                        true
+                    } else {
+                        subscription.active.store(false, Ordering::Release);
+                        revoked.push(subscription.connection.clone());
+                        false
+                    }
+                });
+            }
+            registry
+                .subscriptions
+                .retain(|_, subscribers| !subscribers.is_empty());
+            revoked
+        };
+        for connection in revoked {
+            connection.close(0u8.into(), b"member departed");
+        }
         Ok(())
     }
 
@@ -1058,6 +1081,7 @@ impl PaneServer {
                     subscription_id,
                     PaneSubscription {
                         connection: connection.clone(),
+                        peer_id: remote_peer_id.clone(),
                         active: active.clone(),
                     },
                 );
@@ -1585,6 +1609,12 @@ impl SharedLayoutMember {
             .map_err(layout_queue_error)
     }
 
+    /// Closes only the persistent coordinator-control connection. Direct pane subscriptions use
+    /// separate connections and must be revoked by the coordinator's authoritative roster update.
+    pub fn disconnect_control(&self) {
+        self.connection.close(0u8.into(), b"control disconnected");
+    }
+
     pub async fn shutdown(mut self) {
         for task in &self.tasks {
             task.abort();
@@ -1758,6 +1788,7 @@ impl SharedLayoutHost {
                 Some((
                     self.coordinator.clone(),
                     self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+                    self.pane_server.clone(),
                 )),
             ));
             Ok(receipt)
@@ -1770,6 +1801,7 @@ impl SharedLayoutHost {
                     Some(&(
                         self.coordinator.clone(),
                         self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+                        self.pane_server.clone(),
                     )),
                     &peer_id,
                 );
@@ -1979,12 +2011,14 @@ fn remove_control_peer(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, peer_
     }
 }
 
+type CoordinatorDeparture = (Arc<Mutex<LayoutCoordinator>>, Vec<u8>, PaneServer);
+
 fn disconnect_or_remove(
     peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
-    coordinator: Option<&(Arc<Mutex<LayoutCoordinator>>, Vec<u8>)>,
+    coordinator: Option<&CoordinatorDeparture>,
     peer_id: &[u8],
 ) {
-    let Some((coordinator, coordinator_peer_id)) = coordinator else {
+    let Some((coordinator, coordinator_peer_id, pane_server)) = coordinator else {
         remove_control_peer(peers, peer_id);
         return;
     };
@@ -1994,6 +2028,9 @@ fn disconnect_or_remove(
     };
     remove_control_peer(peers, peer_id);
     if let Ok(change) = coordinator.remove_member(peer_id) {
+        if let Some(state) = change.commit.state.as_ref() {
+            let _ = pane_server.replace_roster_from_layout(state);
+        }
         broadcast_envelope(
             peers,
             coordinator_envelope(
@@ -2064,7 +2101,7 @@ async fn layout_peer_writer_task<W>(
     mut targeted_rx: mpsc::Receiver<SequencedEnvelope>,
     peer_id: Vec<u8>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
-    coordinator: Option<(Arc<Mutex<LayoutCoordinator>>, Vec<u8>)>,
+    coordinator: Option<CoordinatorDeparture>,
 ) where
     W: ControlFrameSink + 'static,
 {
@@ -2249,7 +2286,11 @@ async fn layout_host_reader_task(
             _ => break,
         }
     }
-    disconnect_or_remove(&peers, Some(&(coordinator, coordinator_peer_id)), &peer_id);
+    disconnect_or_remove(
+        &peers,
+        Some(&(coordinator, coordinator_peer_id, pane_server)),
+        &peer_id,
+    );
 }
 
 async fn reservation_expiry_task(

@@ -174,6 +174,115 @@ async fn late_joiner_subscribes_after_snapshot_without_preloaded_host_roster() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn departed_member_loses_direct_pane_access_while_healthy_member_receives_departure_commit() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let pane_server = coordinator.pane_server();
+    let host_id = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
+    let descriptor = PaneDescriptor {
+        pane_id: 211,
+        host_peer_id: host_id.clone(),
+        grid_rows: 1,
+        grid_cols: 1,
+    };
+    let screen = HostScreen::new(1, 1).expect("screen");
+    let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(LeaseState {
+        controller_peer_id: host_id.clone(),
+        epoch: 1,
+        last_activity: std::time::Instant::now(),
+    });
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+    pane_server
+        .register_pane(
+            descriptor.clone(),
+            HostPaneChannels {
+                pane_id: pane_wire_id(211),
+                host_peer_id: host_id,
+                screen_rx,
+                lease_rx,
+                control_tx,
+            },
+        )
+        .expect("register pane");
+    let dispatcher = coordinator
+        .incoming_dispatcher(pane_server)
+        .expect("dispatcher");
+    let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
+    let departed_transport = loopback_transport().await;
+    let healthy_transport = loopback_transport().await;
+    let mut departed = join_layout(departed_transport.clone(), coordinator.ticket().clone())
+        .await
+        .expect("departed joins");
+    assert!(matches!(
+        next_event(&mut departed).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+    let mut healthy = join_layout(healthy_transport.clone(), coordinator.ticket().clone())
+        .await
+        .expect("healthy joins");
+    assert!(matches!(
+        next_event(&mut healthy).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+    let mut pane = subscribe_pane(
+        departed_transport.clone(),
+        coordinator.ticket().session_id().to_vec(),
+        coordinator.ticket().endpoint_addr().clone(),
+        descriptor.clone(),
+    )
+    .await
+    .expect("direct subscribe");
+    for _ in 0..2 {
+        let _ = timeout(TEST_TIMEOUT, pane.events.recv())
+            .await
+            .expect("initial pane event");
+    }
+    departed.disconnect_control();
+    assert!(
+        matches!(next_event(&mut healthy).await, LayoutControlEvent::Commit(commit) if commit.state.as_ref().is_some_and(|state| !state.members.iter().any(|member| member.peer_id == departed.peer_id)))
+    );
+    let mut disconnected = false;
+    for _ in 0..2 {
+        if matches!(
+            timeout(TEST_TIMEOUT, pane.events.recv())
+                .await
+                .expect("disconnect event"),
+            Some(GuestEvent::Disconnected)
+        ) {
+            disconnected = true;
+            break;
+        }
+    }
+    assert!(disconnected, "departure must close the direct pane stream");
+    let _ = pane.controls.try_input(1, b"late".to_vec());
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), control_rx.recv()).await,
+            Ok(Some(_))
+        ),
+        "departure must block late input"
+    );
+    assert!(
+        subscribe_pane(
+            departed_transport.clone(),
+            coordinator.ticket().session_id().to_vec(),
+            coordinator.ticket().endpoint_addr().clone(),
+            descriptor
+        )
+        .await
+        .is_err(),
+        "departed peer cannot resubscribe"
+    );
+    pane.shutdown().await;
+    departed_transport.close().await;
+    healthy.shutdown().await;
+    dispatcher_task.abort();
+    let _ = dispatcher_task.await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
     let host = HostSession::from_transport(loopback_transport().await).expect("host");
     let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
