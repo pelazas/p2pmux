@@ -565,7 +565,7 @@ fn pane_title(
         None => "…".to_owned(),
     };
     format!(
-        "Pane #{index}  host: {}  control: {control}",
+        "Pane #{index} host: {} control: {control}",
         member_label(host_peer_id, members)
     )
 }
@@ -907,7 +907,7 @@ fn render_shared_multi_pane(
             focused,
         );
         let block = Block::bordered()
-            .title(title)
+            .title(format!(" {title} "))
             .border_style(Style::default().fg(border_color));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
@@ -3248,15 +3248,15 @@ mod tests {
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
             pane_title(1, b"host", Some(b""), &members),
-            "Pane #1  host: Host  control: free"
+            "Pane #1 host: Host control: free"
         );
         assert_eq!(
             pane_title(2, b"host", Some(b"guest"), &members),
-            "Pane #2  host: Host  control: Guest"
+            "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
             pane_title(2, b"host", None, &members),
-            "Pane #2  host: Host  control: …"
+            "Pane #2 host: Host control: …"
         );
     }
 
@@ -3411,7 +3411,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(1, 1)].symbol(), "P");
+        assert_eq!(buffer[(1, 1)].symbol(), " ");
+        assert_eq!(buffer[(2, 1)].symbol(), "P");
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
