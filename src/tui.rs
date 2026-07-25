@@ -721,7 +721,7 @@ impl SharedLocalPane {
         };
         let screen = HostScreen::new(grid_rows, grid_cols)?;
         let (screen_tx, _) = watch::channel(screen.current_frame().clone());
-        let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
+        let lease = LeaseManager::new(Vec::new(), Instant::now());
         let (lease_tx, _) = watch::channel(lease.state().clone());
         let (control_tx, control_rx) = mpsc::channel(256);
         Ok(Self {
@@ -1755,7 +1755,8 @@ impl HostPaneRuntime {
         join_code: String,
     ) -> Result<Self, Box<dyn Error>> {
         let screen = HostScreen::new(size.rows, size.cols)?;
-        let lease = LeaseManager::new(host_peer_id.clone(), Instant::now());
+        let lease = LeaseManager::new(Vec::new(), Instant::now());
+        lease_tx.send_replace(lease.state().clone());
         Ok(Self {
             host: PtyHost::spawn_default_shell(size)?,
             screen,
@@ -2427,6 +2428,7 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use portable_pty::PtySize;
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -2445,7 +2447,7 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, KeyHandling,
+        CONTROL_HELP, ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneViewState, RemoteSubscriptionState,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, encode_key, encode_paste,
         grid_for_pane, initial_root_pane_grid, lease_allows_held_input, member_label, pane_wire_id,
@@ -2775,6 +2777,7 @@ mod tests {
         let requester = b"guest".to_vec();
         let mut pane = SharedLocalPane::spawn(99, 1, 1, owner.clone()).expect("local pane");
         let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::new(owner.clone(), Instant::now());
         pane.control_tx
             .try_send(HostControlEvent::TakeControl {
                 peer_id: requester.clone(),
@@ -2859,6 +2862,50 @@ mod tests {
             "first input was not delivered to the PTY: {:?}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    #[test]
+    fn new_local_pane_starts_free_while_the_host_retains_pty_ownership() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+
+        assert!(pane.lease.state().controller_peer_id.is_empty());
+        assert_eq!(pane.host_peer_id, host_id);
+
+        pane.shutdown().expect("shutdown local pane");
+    }
+
+    #[test]
+    fn new_host_runtime_starts_free_while_the_host_retains_pty_ownership() {
+        let host_id = b"host".to_vec();
+        let screen = HostScreen::new(1, 1).expect("screen");
+        let (screen_tx, _) = watch::channel(screen.current_frame().clone());
+        let (lease_tx, lease_rx) = watch::channel(LeaseState {
+            controller_peer_id: host_id.clone(),
+            epoch: 1,
+            last_activity: Instant::now(),
+        });
+        let (_control_tx, control_rx) = mpsc::channel(8);
+        let mut runtime = HostPaneRuntime::new(
+            PtySize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            host_id.clone(),
+            screen_tx,
+            lease_tx,
+            control_rx,
+            String::from("TESTCODE"),
+        )
+        .expect("host runtime");
+
+        assert!(runtime.lease.state().controller_peer_id.is_empty());
+        assert_eq!(runtime.host_peer_id, host_id);
+        assert!(lease_rx.borrow().controller_peer_id.is_empty());
+
+        runtime.host.shutdown().expect("shutdown host runtime");
     }
 
     #[test]
