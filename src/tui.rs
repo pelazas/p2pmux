@@ -200,6 +200,7 @@ pub struct MultiPaneTui {
     snapshot: LayoutSnapshot,
     current_tab: TabId,
     focused_pane: PaneId,
+    hovered_pane: Option<PaneId>,
     chord_mode: ChordMode,
     pane_views: BTreeMap<PaneId, PaneViewState>,
     pending_created_tab: Option<TabId>,
@@ -221,6 +222,7 @@ impl MultiPaneTui {
             snapshot,
             current_tab,
             focused_pane,
+            hovered_pane: None,
             chord_mode: ChordMode::None,
             pane_views,
             pending_created_tab: None,
@@ -399,6 +401,15 @@ impl MultiPaneTui {
             return false;
         }
         self.focused_pane = pane_id;
+        true
+    }
+
+    fn hover_pane_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let hovered_pane = pane_at(&self.geometry(area).panes, column, row);
+        if self.hovered_pane == hovered_pane {
+            return false;
+        }
+        self.hovered_pane = hovered_pane;
         true
     }
 
@@ -723,10 +734,12 @@ fn pane_border_color(
     controller_peer_id: Option<&[u8]>,
     _controller_active: bool,
     focused: bool,
+    hovered: bool,
 ) -> Color {
     match controller_peer_id {
         Some([]) if focused => Color::White,
         None if focused => Color::Yellow,
+        Some([]) | None if hovered => Color::Gray,
         Some([]) | None => Color::DarkGray,
         Some(_) => Color::Rgb(255, 69, 0),
     }
@@ -1153,6 +1166,7 @@ fn render_shared_multi_pane(
             view.controller_peer_id.as_deref(),
             view.controller_active,
             focused,
+            tui.hovered_pane == Some(pane_id),
         );
         let block = Block::bordered()
             .title(title)
@@ -1835,6 +1849,13 @@ impl SharedLayoutRuntime {
                     self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
                     dirty = true;
+                }
+                Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                    dirty |= self.tui.hover_pane_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, cols, rows),
+                    );
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
@@ -3684,18 +3705,32 @@ mod tests {
     }
 
     #[test]
-    fn free_panes_use_white_when_focused_and_dark_gray_when_unfocused() {
-        assert_eq!(pane_border_color(Some(b""), false, true), Color::White);
-        assert_eq!(pane_border_color(Some(b""), false, false), Color::DarkGray);
-        assert_eq!(pane_border_color(None, false, true), Color::Yellow);
-        assert_eq!(pane_border_color(None, false, false), Color::DarkGray);
+    fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         assert_eq!(
-            pane_border_color(Some(b"guest"), true, true),
+            pane_border_color(Some(b""), false, true, false),
+            Color::White
+        );
+        assert_eq!(
+            pane_border_color(Some(b""), false, false, true),
+            Color::Gray
+        );
+        assert_eq!(
+            pane_border_color(Some(b""), false, false, false),
+            Color::DarkGray
+        );
+        assert_eq!(pane_border_color(None, false, true, false), Color::Yellow);
+        assert_eq!(pane_border_color(None, false, false, true), Color::Gray);
+        assert_eq!(
+            pane_border_color(None, false, false, false),
+            Color::DarkGray
+        );
+        assert_eq!(
+            pane_border_color(Some(b"guest"), true, true, true),
             Color::Rgb(255, 69, 0)
         );
-        assert_ne!(
-            pane_border_color(Some(b"guest"), false, false),
-            Color::Rgb(140, 91, 68)
+        assert_eq!(
+            pane_border_color(Some(b"guest"), false, false, true),
+            Color::Rgb(255, 69, 0)
         );
     }
 
@@ -3726,6 +3761,19 @@ mod tests {
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
         assert!(!tui.focus_pane_at(10, 0, area));
         assert_eq!(tui.focused_pane(), 3);
+    }
+
+    #[test]
+    fn hovering_an_unfocused_pane_does_not_move_focus() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert!(tui.hover_pane_at(60, 17, area));
+        assert_eq!(tui.hovered_pane, Some(3));
+        assert_eq!(tui.focused_pane(), 1);
+        assert!(tui.hover_pane_at(10, 0, area));
+        assert_eq!(tui.hovered_pane, None);
+        assert_eq!(tui.focused_pane(), 1);
     }
 
     #[test]
