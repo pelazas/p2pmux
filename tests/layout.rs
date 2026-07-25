@@ -1,6 +1,6 @@
 use p2pmux::layout::{
     Axis, LayoutError, LayoutSnapshot, MAX_ENDPOINT_ADDR_BYTES, MAX_MEMBERS, MAX_PANES_PER_TAB,
-    MAX_TABS, Node, ReservationCommit, SessionState,
+    MAX_PEER_ID_BYTES, MAX_TABS, Node, ReservationCommit, SessionState,
 };
 
 const HOST_A: &[u8] = b"host-a";
@@ -65,6 +65,10 @@ fn initial_layout_rejects_zero_sized_grids_and_invalid_endpoint_addresses() {
         SessionState::new(Vec::new(), ADDR_A.to_vec(), 24, 80),
         Err(LayoutError::InvalidPeerId)
     );
+    assert_eq!(
+        SessionState::new(vec![0; MAX_PEER_ID_BYTES + 1], ADDR_A.to_vec(), 24, 80),
+        Err(LayoutError::InvalidPeerId)
+    );
 }
 
 #[test]
@@ -74,6 +78,16 @@ fn member_setup_rejects_empty_peer_ids_without_mutating_the_snapshot() {
 
     assert_eq!(
         state.add_member(state.revision(), Vec::new(), ADDR_B.to_vec()),
+        Err(LayoutError::InvalidPeerId)
+    );
+    assert_eq!(snapshot(&state), before);
+
+    assert_eq!(
+        state.add_member(
+            state.revision(),
+            vec![0; MAX_PEER_ID_BYTES + 1],
+            ADDR_B.to_vec()
+        ),
         Err(LayoutError::InvalidPeerId)
     );
     assert_eq!(snapshot(&state), before);
@@ -508,6 +522,20 @@ fn snapshots_associate_pane_hosts_with_bounded_member_addresses_and_reject_malfo
     zero_pane_id.tabs[0].root = Node::Leaf { pane_id: 0 };
     assert_eq!(
         SessionState::validate_snapshot(&zero_pane_id),
+        Err(LayoutError::InvalidSnapshot)
+    );
+
+    let mut oversized_peer = snapshot(&state);
+    let original_peer = oversized_peer.members[0].peer_id.clone();
+    let replacement_peer = vec![0; MAX_PEER_ID_BYTES + 1];
+    oversized_peer.members[0].peer_id = replacement_peer.clone();
+    for pane in oversized_peer.panes.values_mut() {
+        if pane.host_peer_id == original_peer {
+            pane.host_peer_id = replacement_peer.clone();
+        }
+    }
+    assert_eq!(
+        SessionState::validate_snapshot(&oversized_peer),
         Err(LayoutError::InvalidSnapshot)
     );
 }

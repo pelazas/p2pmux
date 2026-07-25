@@ -4,6 +4,8 @@ pub const MAX_MEMBERS: usize = 8;
 pub const MAX_TABS: usize = 9;
 pub const MAX_PANES_PER_TAB: usize = 8;
 pub const MAX_SPLIT_DEPTH: usize = 4;
+/// Maximum peer-identifier size, aligned with the protocol boundary.
+pub const MAX_PEER_ID_BYTES: usize = 64;
 /// Maximum serialized endpoint-address size accepted by this pure model.
 pub const MAX_ENDPOINT_ADDR_BYTES: usize = 4096;
 
@@ -209,7 +211,7 @@ impl SessionState {
         }
         let mut peer_ids = BTreeSet::new();
         for member in &snapshot.members {
-            if member.peer_id.is_empty()
+            if validate_peer_id(&member.peer_id).is_err()
                 || !peer_ids.insert(&member.peer_id)
                 || validate_endpoint_addr(&member.endpoint_addr).is_err()
             {
@@ -772,7 +774,7 @@ fn validate_endpoint_addr(endpoint_addr: &[u8]) -> Result<(), LayoutError> {
 }
 
 fn validate_peer_id(peer_id: &[u8]) -> Result<(), LayoutError> {
-    (!peer_id.is_empty())
+    (!peer_id.is_empty() && peer_id.len() <= MAX_PEER_ID_BYTES)
         .then_some(())
         .ok_or(LayoutError::InvalidPeerId)
 }
