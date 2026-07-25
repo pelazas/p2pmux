@@ -783,7 +783,6 @@ pub struct PaneServer {
     transport: Transport,
     session_id: Vec<u8>,
     local_peer_id: Vec<u8>,
-    members: Arc<Mutex<BTreeMap<Vec<u8>, EndpointAddr>>>,
     registry: Arc<Mutex<PaneRegistry>>,
     next_subscription_id: Arc<AtomicU64>,
     service_errors: broadcast::Sender<SessionServiceError>,
@@ -797,6 +796,7 @@ pub enum SessionServiceError {
 
 #[derive(Default)]
 struct PaneRegistry {
+    members: BTreeMap<Vec<u8>, EndpointAddr>,
     panes: BTreeMap<u64, HostPaneChannels>,
     subscriptions: BTreeMap<u64, BTreeMap<u64, PaneSubscription>>,
 }
@@ -814,7 +814,6 @@ impl PaneServer {
             transport: host.transport.clone(),
             session_id: host.ticket.session_id().to_vec(),
             local_peer_id: host.transport.endpoint_id().as_bytes().to_vec(),
-            members: Arc::new(Mutex::new(BTreeMap::new())),
             registry: Arc::new(Mutex::new(PaneRegistry::default())),
             next_subscription_id: Arc::new(AtomicU64::new(1)),
             service_errors,
@@ -830,7 +829,6 @@ impl PaneServer {
             local_peer_id: transport.endpoint_id().as_bytes().to_vec(),
             transport,
             session_id,
-            members: Arc::new(Mutex::new(BTreeMap::new())),
             registry: Arc::new(Mutex::new(PaneRegistry::default())),
             next_subscription_id: Arc::new(AtomicU64::new(1)),
             service_errors,
@@ -865,9 +863,10 @@ impl PaneServer {
         {
             return Err(SessionError::InvalidPostWelcome);
         }
-        self.members
+        self.registry
             .lock()
             .map_err(|_| SessionError::PeerTask)?
+            .members
             .insert(peer_id, endpoint_addr);
         Ok(())
     }
@@ -886,9 +885,9 @@ impl PaneServer {
             }
             next.insert(peer_id, endpoint_addr);
         }
-        *self.members.lock().map_err(|_| SessionError::PeerTask)? = next.clone();
         let revoked = {
             let mut registry = self.registry.lock().map_err(|_| SessionError::PeerTask)?;
+            registry.members = next.clone();
             let mut revoked = Vec::new();
             for subscribers in registry.subscriptions.values_mut() {
                 subscribers.retain(|_, subscription| {
@@ -1053,11 +1052,6 @@ impl PaneServer {
         if envelope.sender_peer_id != remote_peer_id
             || subscribe.peer_id != remote_peer_id
             || subscribe.session_id != self.session_id
-            || !self
-                .members
-                .lock()
-                .map_err(|_| SessionError::PeerTask)?
-                .contains_key(&remote_peer_id)
         {
             return Err(SessionError::UnauthenticatedPeer);
         }
@@ -1068,6 +1062,9 @@ impl PaneServer {
         let active = Arc::new(AtomicBool::new(true));
         let pane = {
             let mut registry = self.registry.lock().map_err(|_| SessionError::PeerTask)?;
+            if !registry.members.contains_key(&remote_peer_id) {
+                return Err(SessionError::UnauthenticatedPeer);
+            }
             let pane = registry
                 .panes
                 .get(&subscribe.pane_id)
