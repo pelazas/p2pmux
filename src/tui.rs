@@ -53,6 +53,9 @@ pub struct Tui;
 const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
 const FOOTER_MUTED: Color = Color::White;
 const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
+const TOP_BAR_BRAND: &str = "p2pmux";
+const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
+const TAB_BAR_SEPARATOR: &str = " · ";
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
 
 type FooterSegment = (&'static str, bool);
@@ -302,7 +305,10 @@ impl MultiPaneTui {
     }
 
     fn tab_label_rects(&self, tab_bar: Rect) -> BTreeMap<TabId, Rect> {
-        let mut x = tab_bar.x;
+        let mut x = tab_bar
+            .x
+            .saturating_add(text_width(TOP_BAR_BRAND))
+            .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR));
         let right = tab_bar.x.saturating_add(tab_bar.width);
         self.snapshot
             .tabs
@@ -310,9 +316,9 @@ impl MultiPaneTui {
             .enumerate()
             .map(|(index, tab)| {
                 if index > 0 {
-                    x = x.saturating_add(1);
+                    x = x.saturating_add(text_width(TAB_BAR_SEPARATOR));
                 }
-                let label_width = format!("Tab #{}", index + 1).len() as u16;
+                let label_width = text_width(&tab_label(index + 1, tab.tab_id == self.current_tab));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
@@ -536,6 +542,15 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
         && u32::from(row) >= u32::from(rect.y)
         && u32::from(row) < u32::from(rect.y) + u32::from(rect.height)
+}
+
+fn text_width(text: &str) -> u16 {
+    text.chars().count() as u16
+}
+
+fn tab_label(index: usize, active: bool) -> String {
+    let label = format!("Tab #{index}");
+    if active { format!(" {label} ") } else { label }
 }
 
 fn pane_title(
@@ -797,13 +812,43 @@ fn render_shared_multi_pane(
 ) {
     let geometry = tui.geometry(frame.area());
     if geometry.tab_bar.width > 0 && geometry.tab_bar.height > 0 {
-        let mut x = geometry.tab_bar.x;
+        let buffer = frame.buffer_mut();
+        buffer.set_stringn(
+            geometry.tab_bar.x,
+            geometry.tab_bar.y,
+            " ".repeat(usize::from(geometry.tab_bar.width)),
+            usize::from(geometry.tab_bar.width),
+            Style::default().bg(FOOTER_BACKGROUND),
+        );
+        let mut x = buffer
+            .set_stringn(
+                geometry.tab_bar.x,
+                geometry.tab_bar.y,
+                TOP_BAR_BRAND,
+                usize::from(geometry.tab_bar.width),
+                Style::default().fg(Color::White).bg(FOOTER_BACKGROUND),
+            )
+            .0;
+        x = buffer
+            .set_stringn(
+                x,
+                geometry.tab_bar.y,
+                TOP_BAR_BRAND_SEPARATOR,
+                usize::from(geometry.tab_bar.right().saturating_sub(x)),
+                Style::default().fg(Color::DarkGray).bg(FOOTER_BACKGROUND),
+            )
+            .0;
         for (index, tab) in tui.snapshot.tabs.iter().enumerate() {
             if index > 0 {
-                frame
-                    .buffer_mut()
-                    .set_string(x, geometry.tab_bar.y, " ", Style::default());
-                x = x.saturating_add(1);
+                x = buffer
+                    .set_stringn(
+                        x,
+                        geometry.tab_bar.y,
+                        TAB_BAR_SEPARATOR,
+                        usize::from(geometry.tab_bar.right().saturating_sub(x)),
+                        Style::default().fg(Color::DarkGray).bg(FOOTER_BACKGROUND),
+                    )
+                    .0;
             }
             let active = tab.tab_id == tui.current_tab;
             let style = if active {
@@ -812,20 +857,21 @@ fn render_shared_multi_pane(
                     .bg(Color::Rgb(220, 50, 47))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::White).bg(FOOTER_BACKGROUND)
             };
-            let label = format!("Tab #{}", index + 1);
+            let label = tab_label(index + 1, active);
             let label_rect = geometry.tab_labels[&tab.tab_id];
             if label_rect.width == 0 {
                 continue;
             }
-            frame.buffer_mut().set_string(
+            buffer.set_stringn(
                 label_rect.x,
                 label_rect.y,
-                &label[..usize::from(label_rect.width)],
+                &label,
+                usize::from(label_rect.width),
                 style,
             );
-            x = x.saturating_add(label.len() as u16);
+            x = x.saturating_add(text_width(&label));
         }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
@@ -3274,21 +3320,22 @@ mod tests {
             &[(1, 2, 2), (2, 2, 2)],
         ))
         .expect("valid layout");
-        let area = Rect::new(0, 0, 20, 8);
+        let area = Rect::new(0, 0, 32, 8);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
             area,
         );
 
+        let second_tab = tui.geometry(area).tab_labels[&2];
         assert_eq!(
-            tui.switch_tab_at(8, 0, area),
+            tui.switch_tab_at(second_tab.x, 0, area),
             Some(UiIntent::SwitchTab { tab_id: 2 })
         );
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
         assert_eq!(tui.chord_mode(), ChordMode::Tab);
-        assert_eq!(tui.switch_tab_at(6, 0, area), None);
+        assert_eq!(tui.switch_tab_at(0, 0, area), None);
     }
 
     #[test]
@@ -3668,7 +3715,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_uses_ordinal_labels_and_highlights_the_active_tab() {
+    fn tab_bar_uses_a_branded_footer_like_strip_and_highlights_the_active_tab() {
         let tui = MultiPaneTui::new(layout(
             vec![
                 Tab {
@@ -3691,10 +3738,15 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let tab_bar = (0..32).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
+        assert!(tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2"));
         assert!(tab_bar.contains("Tab #1"));
         assert!(tab_bar.contains("Tab #2"));
         assert_eq!(buffer[(0, 0)].fg, Color::White);
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(30, 30, 30));
+        assert_eq!(buffer[(9, 0)].fg, Color::White);
+        assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(20, 0)].fg, Color::White);
+        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
     }
 
     #[test]
