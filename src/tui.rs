@@ -437,7 +437,7 @@ impl MultiPaneTui {
         let tab_bar_gap = area
             .height
             .saturating_sub(tab_bar.height + footer_height)
-            .min(1);
+            .min(0);
         let content = Rect::new(
             area.x,
             area.y.saturating_add(tab_bar.height + tab_bar_gap),
@@ -802,7 +802,7 @@ pub(crate) fn grid_for_pane(rect: Rect) -> (u16, u16) {
 }
 
 pub(crate) fn initial_root_pane_grid(cols: u16, rows: u16) -> (u16, u16) {
-    grid_for_pane(Rect::new(0, 0, cols, rows.saturating_sub(3)))
+    grid_for_pane(Rect::new(0, 0, cols, rows.saturating_sub(2)))
 }
 
 fn rect_center(rect: Rect) -> (u32, u32) {
@@ -3741,9 +3741,9 @@ mod tests {
 
         assert_eq!(geometry.tab_bar, Rect::new(0, 0, 80, 1));
         assert_eq!(geometry.footer, Rect::new(0, 23, 80, 1));
-        assert_eq!(geometry.content, Rect::new(0, 2, 80, 21));
-        assert_eq!(geometry.panes[&1], Rect::new(0, 2, 40, 21));
-        assert_eq!(geometry.panes[&2], Rect::new(40, 2, 40, 10));
+        assert_eq!(geometry.content, Rect::new(0, 1, 80, 22));
+        assert_eq!(geometry.panes[&1], Rect::new(0, 1, 40, 22));
+        assert_eq!(geometry.panes[&2], Rect::new(40, 1, 40, 11));
         assert_eq!(geometry.panes[&3], Rect::new(40, 12, 40, 11));
     }
 
@@ -3800,9 +3800,9 @@ mod tests {
         .expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
-        assert_eq!(tui.screen_cell_at(0, 2, area), None);
+        assert_eq!(tui.screen_cell_at(0, 1, area), None);
         assert_eq!(
-            tui.screen_cell_at(1, 3, area),
+            tui.screen_cell_at(1, 2, area),
             Some((1, ScreenCell { row: 0, col: 0 }))
         );
     }
@@ -3989,11 +3989,11 @@ mod tests {
             .expect("render");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(0, 2)].symbol(), "┌");
-        assert_eq!(buffer[(1, 2)].symbol(), " ");
-        assert_eq!(buffer[(2, 2)].symbol(), "P");
-        assert!((2..9).all(|x| buffer[(x, 2)].modifier.contains(Modifier::BOLD)));
-        assert!(!buffer[(9, 2)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(0, 1)].symbol(), "┌");
+        assert_eq!(buffer[(1, 1)].symbol(), " ");
+        assert_eq!(buffer[(2, 1)].symbol(), "P");
+        assert!((2..9).all(|x| buffer[(x, 1)].modifier.contains(Modifier::BOLD)));
+        assert!(!buffer[(9, 1)].modifier.contains(Modifier::BOLD));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
@@ -4023,7 +4023,7 @@ mod tests {
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         let title = (0..40)
-            .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
 
         assert!(title.contains("host: 686f7374"));
@@ -4137,7 +4137,7 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::LeftRight,
-                grid_rows: 19,
+                grid_rows: 20,
                 grid_cols: 38,
             }])
         );
@@ -4149,9 +4149,9 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
-        assert_eq!(tui.focused_pane(), 3);
+        assert_eq!(tui.focused_pane(), 2);
     }
 
     #[test]
@@ -4165,12 +4165,12 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![])
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
     }
@@ -4375,12 +4375,12 @@ mod tests {
             .get(&1)
             .copied()
             .expect("root pane");
-        assert_eq!(grid_for_pane(pane), (19, 78));
-        assert_eq!(initial_root_pane_grid(80, 24), (19, 78));
+        assert_eq!(grid_for_pane(pane), (20, 78));
+        assert_eq!(initial_root_pane_grid(80, 24), (20, 78));
     }
 
     #[test]
-    fn square_pane_create_chord_splits_left_to_right_after_tab_bar_spacing() {
+    fn square_pane_create_chord_splits_top_to_bottom_without_a_tab_bar_gap() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -4399,8 +4399,8 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
-                axis: Axis::LeftRight,
-                grid_rows: 9,
+                axis: Axis::TopBottom,
+                grid_rows: 10,
                 grid_cols: 10,
             }])
         );
@@ -4415,7 +4415,7 @@ mod tests {
             area,
         );
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
-        assert_eq!(tui.focused_pane(), 3);
+        assert_eq!(tui.focused_pane(), 2);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
@@ -4423,7 +4423,7 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 3 }])
+            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 2 }])
         );
     }
 
@@ -4448,7 +4448,7 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::CreatePane {
                 target_pane_id: 1,
                 axis: Axis::TopBottom,
-                grid_rows: 35,
+                grid_rows: 36,
                 grid_cols: 18,
             }])
         );
@@ -4485,15 +4485,15 @@ mod tests {
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             area,
         );
         assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
         );
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
@@ -4530,6 +4530,12 @@ mod tests {
             area,
         );
         let _ = edge_tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        assert_eq!(edge_tui.focused_pane(), 2);
+        let _ = edge_tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = edge_tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
         assert_eq!(edge_tui.focused_pane(), 3);
         for key in [KeyCode::Down, KeyCode::Right] {
             let _ = edge_tui.handle_key(
@@ -4631,7 +4637,7 @@ mod tests {
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::CreateTab {
-                grid_rows: 3,
+                grid_rows: 4,
                 grid_cols: 10,
             }])
         );
