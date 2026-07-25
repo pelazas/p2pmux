@@ -123,6 +123,37 @@ fn pane_creation_is_hidden_until_its_creator_marks_the_reservation_ready() {
 }
 
 #[test]
+fn ready_cannot_commit_a_reservation_after_membership_advances_its_revision() {
+    let mut coordinator = coordinator();
+    let mut create = request(101, 1);
+    create.create_pane = Some(CreatePane {
+        target_pane_id: 1,
+        axis: Some(SplitAxis::LeftRight as i32),
+        grid_rows: 30,
+        grid_cols: 100,
+    });
+    let reservation = match coordinator.handle_request(HOST_A, create) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();
+
+    let rejection = reject(coordinator.handle_pane_ready(
+        HOST_A,
+        PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 2,
+        },
+    ));
+    assert_eq!(rejection.request_id, 101);
+    assert_eq!(rejection.reason, LayoutRejectReason::Stale as i32);
+    let state = coordinator.session_snapshot().unwrap().state.unwrap();
+    assert_eq!(state.revision, 2);
+    assert_eq!(state.tabs.len(), 1);
+    assert_eq!(state.panes.len(), 1);
+}
+
+#[test]
 fn admitted_guest_hosts_its_own_pane_after_ready() {
     let mut coordinator = coordinator();
     coordinator.admit(HOST_B.to_vec(), ADDR_B.to_vec()).unwrap();

@@ -93,6 +93,7 @@ enum PendingReservationKind {
 struct PendingReservation {
     reservation_id: ReservationId,
     creator_peer_id: Vec<u8>,
+    base_revision: u64,
     kind: PendingReservationKind,
 }
 
@@ -312,6 +313,7 @@ impl SessionState {
         self.pending_reservation = Some(PendingReservation {
             reservation_id,
             creator_peer_id: creator.to_vec(),
+            base_revision,
             kind: PendingReservationKind::Pane {
                 pane_id,
                 target_pane_id,
@@ -353,6 +355,7 @@ impl SessionState {
         self.pending_reservation = Some(PendingReservation {
             reservation_id,
             creator_peer_id: creator.to_vec(),
+            base_revision,
             kind: PendingReservationKind::Tab {
                 tab_id,
                 pane_id,
@@ -373,8 +376,14 @@ impl SessionState {
         base_revision: u64,
         reservation_id: ReservationId,
     ) -> Result<ReservationCommit, LayoutError> {
-        self.check_mutation(base_revision)?;
         let reservation = self.match_reservation(creator, reservation_id)?;
+        if reservation.base_revision != base_revision {
+            return Err(LayoutError::StaleRevision {
+                expected: reservation.base_revision,
+                got: base_revision,
+            });
+        }
+        self.check_mutation(base_revision)?;
         match reservation.kind {
             PendingReservationKind::Pane {
                 pane_id,
