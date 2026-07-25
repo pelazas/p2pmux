@@ -6,6 +6,11 @@ use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[test]
+fn transport_uses_v2_alpn() {
+    assert_eq!(ALPN, b"p2pmux/2");
+}
+
 async fn loopback_endpoint() -> Endpoint {
     Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)

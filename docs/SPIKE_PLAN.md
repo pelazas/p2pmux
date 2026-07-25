@@ -30,32 +30,39 @@ Include control lease basics.
 
 **Done when:** guest typing feels good on localhost; dropping an update forces resync; slow guest doesn’t stall the PTY.
 
-### Spike 3 — Real internet
+### Spike 3 — Localhost shared layout (host-owned delete)
 
-Same code, two Macs / different networks. Show **direct | relayed**. Reusable ticket join.
+Up to eight local processes share coordinator-authoritative tabs and nested 50/50 splits. Every
+new pane/tab PTY runs on the creating member’s Mac and serves direct pane streams from that member.
+The coordinator reserves a pane, the creator registers its PTY, then reports ready before the
+layout commit exposes it.
 
-**Done when:** typing works over relay if needed; disconnect grace behavior matches the design.
+Commands: `Ctrl+P` then `N`/`X`/arrows; `Ctrl+T` then `N`/`X`/left/right; `Esc` cancels; Ctrl+Q
+exits. F9 and F10 pass through to the focused PTY. Pane grids are fixed at creation. Pane deletion is host-only;
+tab deletion requires every pane in that tab to be hosted by the requester. Maximums: 8 members,
+9 tabs, 8 panes/tab, split depth 4.
 
-### Spike 4 — N-member roster + split-any + presence + idle hop-in
+**Done when:** `create` plus one or more local `join` processes show the same tree; each creator
+hosts only its own new PTYs; late join receives layout then direct snapshots/leases; deletion
+authority and stale/limit rejection work; retrying direct subscription survives a transient roster
+race.
 
-Still dogfood with 2; exercise coordinator layout commits, anyone-can-split, presence, idle hop-in / Take control when typing.
+### Spike 4 — Real internet + presence
 
-**Done when:** joiner-created/split panes host on splitter’s machine; stale/over-limit layout ops rejected; leave behaviors match failure table.
+Run the shared-layout protocol on two Macs / different networks. Show **direct | relayed** and
+add presence without changing host-owned deletion or fixed grids.
 
-### Spike 5 — Tabs + nested splits
+**Done when:** pane control and layout work over relay if needed; presence is coherent.
 
-Exercise tree: L/R then split right top/bottom; max 9 tabs / depth 4 / ≤8 panes.
-
-**Done when:** all members see the same tree; late join gets one coherent bootstrap (layout + ownership + screen snapshots).
-
-### Spike 6 — Disconnect grace + coordinator failover
+### Spike 5 — Disconnect grace + coordinator failover
 
 5-minute placeholders; structural freeze during coordinator grace; earliest-join promotion.
 
-### Spike 7 — Brew formula
+### Spike 6 — Brew formula
 
 Last. Source-build tap is enough for dogfood.
 
 ## Non-goals during spikes
 
-Drag/resize, >8 peers, mosh prediction, custom relay deploy, short codes before Spike 3 works, sandbox/ACL tiers.
+Drag/resize, >8 peers, mosh prediction, custom relay deploy, sandbox/ACL tiers. Short local codes
+are only dogfooding convenience; portable ticket distribution is validated in Spike 4.

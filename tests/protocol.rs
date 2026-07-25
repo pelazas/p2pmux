@@ -1,8 +1,11 @@
 use p2pmux::protocol::{
-    ControlLease, Delta, Envelope, Input, Join, MAX_DELTA_BYTES, MAX_ENVELOPE_BYTES,
-    MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SNAPSHOT_BYTES, PROTOCOL_VERSION, ProtocolError, Snapshot, TakeControl, Welcome,
-    decode_frame, encode_frame, envelope,
+    ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
+    LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
+    LayoutState, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES,
+    MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_SESSION_ID_BYTES,
+    MAX_SNAPSHOT_BYTES, MemberDescriptor, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady,
+    PaneReservation, PaneSubscribe, ProtocolError, SessionSnapshot, Snapshot, SplitAxis,
+    TabDescriptor, TakeControl, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -22,11 +25,17 @@ fn envelope(body: envelope::Body) -> Envelope {
 }
 
 #[test]
+fn protocol_version_is_v2() {
+    assert_eq!(PROTOCOL_VERSION, 2);
+}
+
+#[test]
 fn envelope_exposes_each_v1_body() {
     let messages = [
         envelope(envelope::Body::Join(Join {
             session_id: b"session-a".to_vec(),
             peer_id: b"peer-a".to_vec(),
+            endpoint_addr: b"endpoint-a".to_vec(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -64,7 +73,7 @@ fn envelope_exposes_each_v1_body() {
     ];
 
     let expected_body_shapes: [&[(u32, u8)]; 7] = [
-        &[(1, 2), (2, 2)],
+        &[(1, 2), (2, 2), (3, 2)],
         &[(1, 2), (2, 2), (3, 2)],
         &[(1, 2), (2, 0), (3, 2)],
         &[(1, 2), (2, 2), (3, 0)],
@@ -150,6 +159,7 @@ fn sample_envelopes() -> Vec<Envelope> {
         envelope(envelope::Body::Join(Join {
             session_id: b"session-a".to_vec(),
             peer_id: b"peer-a".to_vec(),
+            endpoint_addr: b"endpoint-a".to_vec(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -195,17 +205,805 @@ fn framed_envelopes_round_trip_all_v1_bodies() {
     }
 }
 
+fn leaf(pane_id: u64) -> LayoutNode {
+    LayoutNode {
+        leaf_pane_id: Some(pane_id),
+        split: None,
+    }
+}
+
+fn layout_state(root: LayoutNode) -> LayoutState {
+    LayoutState {
+        revision: 1,
+        members: vec![MemberDescriptor {
+            peer_id: b"peer-a".to_vec(),
+            endpoint_addr: b"endpoint-a".to_vec(),
+        }],
+        panes: vec![PaneDescriptor {
+            pane_id: 1,
+            host_peer_id: b"peer-a".to_vec(),
+            grid_rows: 24,
+            grid_cols: 80,
+        }],
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(root),
+        }],
+    }
+}
+
+fn v2_envelopes() -> Vec<Envelope> {
+    let state = layout_state(leaf(1));
+    vec![
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(state.clone()),
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            request_id: 1,
+            base_revision: 1,
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: Some(SplitAxis::LeftRight as i32),
+                grid_rows: 24,
+                grid_cols: 80,
+            }),
+            delete_pane: None,
+            create_tab: None,
+            delete_tab: None,
+        })),
+        envelope(envelope::Body::PaneReservation(PaneReservation {
+            reservation_id: 1,
+            pane_id: 2,
+            tab_id: None,
+        })),
+        envelope(envelope::Body::PaneReady(PaneReady {
+            reservation_id: 1,
+            base_revision: 1,
+            request_id: 1,
+        })),
+        envelope(envelope::Body::LayoutCommit(LayoutCommit {
+            revision: 1,
+            state: Some(state),
+        })),
+        envelope(envelope::Body::LayoutReject(LayoutReject {
+            request_id: 1,
+            reason: LayoutRejectReason::NotHost as i32,
+        })),
+        envelope(envelope::Body::PaneSubscribe(PaneSubscribe {
+            session_id: b"session-a".to_vec(),
+            peer_id: b"peer-a".to_vec(),
+            pane_id: 1,
+        })),
+        envelope(envelope::Body::PaneFailed(PaneFailed {
+            reservation_id: 1,
+            request_id: 1,
+            base_revision: 1,
+        })),
+    ]
+}
+
+#[test]
+fn envelope_exposes_each_v2_layout_body_with_stable_tags() {
+    let expected_body_shapes: [&[(u32, u8)]; 8] = [
+        &[(1, 2)],
+        &[(1, 0), (2, 0), (3, 2)],
+        &[(1, 0), (2, 0)],
+        &[(1, 0), (2, 0), (3, 0)],
+        &[(1, 0), (2, 2)],
+        &[(1, 0), (2, 0)],
+        &[(1, 2), (2, 2), (3, 0)],
+        &[(1, 0), (2, 0), (3, 0)],
+    ];
+
+    for ((message, expected_body_field), expected_body_shape) in v2_envelopes()
+        .into_iter()
+        .zip(17..=24)
+        .zip(expected_body_shapes)
+    {
+        let wire = message.encode_to_vec();
+        let envelope_fields = parse_fields(&wire);
+        assert_eq!(
+            field_shape(&envelope_fields),
+            vec![(1, 0), (2, 2), (expected_body_field, 2)],
+        );
+        assert_eq!(
+            field_shape(&parse_fields(&envelope_fields[2].value)),
+            expected_body_shape,
+        );
+        assert_eq!(Envelope::decode(wire.as_slice()).unwrap(), message);
+    }
+}
+
+#[test]
+fn framed_envelopes_round_trip_all_v2_layout_bodies() {
+    for original in v2_envelopes() {
+        let frame = encode_frame(&original).expect("valid layout envelope encodes");
+        assert_eq!(decode_frame(&frame).expect("valid frame decodes"), original);
+    }
+}
+
+#[test]
+fn layout_messages_reject_invalid_shapes_and_bounds() {
+    let state = layout_state(leaf(1));
+    let empty_action = LayoutRequest {
+        request_id: 1,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+    };
+    let multiple_actions = LayoutRequest {
+        create_pane: Some(CreatePane {
+            target_pane_id: 1,
+            axis: Some(SplitAxis::LeftRight as i32),
+            grid_rows: 24,
+            grid_cols: 80,
+        }),
+        delete_pane: Some(DeletePane { pane_id: 1 }),
+        ..empty_action.clone()
+    };
+    let empty_node = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(LayoutNode {
+                leaf_pane_id: None,
+                split: None,
+            }),
+        }],
+        ..state.clone()
+    };
+    let multiple_nodes = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(LayoutNode {
+                leaf_pane_id: Some(1),
+                split: Some(Box::new(LayoutSplit {
+                    axis: Some(SplitAxis::LeftRight as i32),
+                    first: Some(leaf(1)),
+                    second: Some(leaf(1)),
+                })),
+            }),
+        }],
+        ..state.clone()
+    };
+    let too_many_members = LayoutState {
+        members: (0..9)
+            .map(|index| MemberDescriptor {
+                peer_id: format!("peer-{index}").into_bytes(),
+                endpoint_addr: b"endpoint".to_vec(),
+            })
+            .collect(),
+        ..state.clone()
+    };
+    let too_many_panes = LayoutState {
+        panes: (1..=73)
+            .map(|pane_id| PaneDescriptor {
+                pane_id,
+                host_peer_id: b"peer-a".to_vec(),
+                grid_rows: 24,
+                grid_cols: 80,
+            })
+            .collect(),
+        ..state.clone()
+    };
+    let too_many_tabs = LayoutState {
+        tabs: (1..=10)
+            .map(|tab_id| TabDescriptor {
+                tab_id,
+                root: Some(leaf(1)),
+            })
+            .collect(),
+        ..state.clone()
+    };
+    let zero_pane_grid = LayoutState {
+        panes: vec![PaneDescriptor {
+            pane_id: 1,
+            host_peer_id: b"peer-a".to_vec(),
+            grid_rows: 0,
+            grid_cols: 80,
+        }],
+        ..state.clone()
+    };
+    let invalid_grid = LayoutRequest {
+        create_tab: Some(CreateTab {
+            grid_rows: 0,
+            grid_cols: 80,
+        }),
+        ..empty_action.clone()
+    };
+    let invalid_delete = LayoutRequest {
+        delete_tab: Some(DeleteTab { tab_id: 0 }),
+        ..empty_action.clone()
+    };
+    let invalid_commit = LayoutCommit {
+        revision: 2,
+        state: Some(state.clone()),
+    };
+
+    let cases = vec![
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            request_id: 0,
+            base_revision: 1,
+            ..multiple_actions.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(empty_action)),
+        envelope(envelope::Body::LayoutRequest(multiple_actions)),
+        envelope(envelope::Body::LayoutRequest(invalid_grid)),
+        envelope(envelope::Body::LayoutRequest(invalid_delete)),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(empty_node),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(multiple_nodes),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(too_many_members),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(too_many_panes),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(too_many_tabs),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(zero_pane_grid),
+        })),
+        envelope(envelope::Body::LayoutCommit(invalid_commit)),
+        envelope(envelope::Body::PaneReservation(PaneReservation {
+            reservation_id: 0,
+            pane_id: 1,
+            tab_id: None,
+        })),
+        envelope(envelope::Body::PaneReady(PaneReady {
+            reservation_id: 0,
+            base_revision: 1,
+            request_id: 1,
+        })),
+        envelope(envelope::Body::LayoutReject(LayoutReject {
+            request_id: 1,
+            reason: 0,
+        })),
+        envelope(envelope::Body::PaneSubscribe(PaneSubscribe {
+            session_id: Vec::new(),
+            peer_id: b"peer-a".to_vec(),
+            pane_id: 1,
+        })),
+    ];
+
+    for invalid in cases {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "{invalid:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
+    let empty_join_endpoint = envelope(envelope::Body::Join(Join {
+        session_id: b"session-a".to_vec(),
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: Vec::new(),
+    }));
+    let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
+        reservation_id: 1,
+        base_revision: 0,
+        request_id: 1,
+    }));
+    let missing_ready_request = envelope(envelope::Body::PaneReady(PaneReady {
+        reservation_id: 1,
+        base_revision: 1,
+        request_id: 0,
+    }));
+    let missing_failed_request = envelope(envelope::Body::PaneFailed(PaneFailed {
+        reservation_id: 1,
+        request_id: 0,
+        base_revision: 1,
+    }));
+
+    for invalid in [
+        empty_join_endpoint,
+        missing_ready_revision,
+        missing_ready_request,
+        missing_failed_request,
+    ] {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "v2 Join endpoint addresses and PaneReady revisions are required"
+        );
+        let mut raw = Vec::new();
+        invalid
+            .encode_length_delimited(&mut raw)
+            .expect("raw invalid frame should encode");
+        assert!(decode_frame(&raw).is_err());
+    }
+}
+
+#[test]
+fn create_and_split_axes_must_be_explicitly_present_and_valid() {
+    fn create_request(axis: Option<i32>) -> Envelope {
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            request_id: 1,
+            base_revision: 1,
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis,
+                grid_rows: 24,
+                grid_cols: 80,
+            }),
+            delete_pane: None,
+            create_tab: None,
+            delete_tab: None,
+        }))
+    }
+
+    fn split_snapshot(axis: Option<i32>) -> Envelope {
+        let state = LayoutState {
+            panes: vec![
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: b"peer-a".to_vec(),
+                    grid_rows: 24,
+                    grid_cols: 80,
+                },
+                PaneDescriptor {
+                    pane_id: 2,
+                    host_peer_id: b"peer-a".to_vec(),
+                    grid_rows: 24,
+                    grid_cols: 80,
+                },
+            ],
+            tabs: vec![TabDescriptor {
+                tab_id: 1,
+                root: Some(LayoutNode {
+                    leaf_pane_id: None,
+                    split: Some(Box::new(LayoutSplit {
+                        axis,
+                        first: Some(leaf(1)),
+                        second: Some(leaf(2)),
+                    })),
+                }),
+            }],
+            ..layout_state(leaf(1))
+        };
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(state),
+        }))
+    }
+
+    for invalid in [
+        create_request(None),
+        create_request(Some(99)),
+        split_snapshot(None),
+        split_snapshot(Some(99)),
+    ] {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "layout axes must not silently default to LeftRight"
+        );
+        let mut raw = Vec::new();
+        invalid
+            .encode_length_delimited(&mut raw)
+            .expect("raw invalid frame should encode");
+        assert!(decode_frame(&raw).is_err());
+    }
+}
+
+#[test]
+fn layout_grids_must_fit_the_reducer_u16_grid() {
+    let maximum = u32::from(u16::MAX);
+    let oversized = maximum + 1;
+    let state = layout_state(leaf(1));
+    let empty_action = LayoutRequest {
+        request_id: 1,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+    };
+
+    for valid in [
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: Some(SplitAxis::LeftRight as i32),
+                grid_rows: maximum,
+                grid_cols: maximum,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: maximum,
+                grid_cols: maximum,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(LayoutState {
+                panes: vec![PaneDescriptor {
+                    grid_rows: maximum,
+                    grid_cols: maximum,
+                    ..state.panes[0].clone()
+                }],
+                ..state.clone()
+            }),
+        })),
+    ] {
+        assert!(
+            encode_frame(&valid).is_ok(),
+            "u16 grid maximum must be valid"
+        );
+    }
+
+    let invalid = [
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: Some(SplitAxis::LeftRight as i32),
+                grid_rows: oversized,
+                grid_cols: 80,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_pane: Some(CreatePane {
+                target_pane_id: 1,
+                axis: Some(SplitAxis::LeftRight as i32),
+                grid_rows: 24,
+                grid_cols: oversized,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: oversized,
+                grid_cols: 80,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::LayoutRequest(LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: 24,
+                grid_cols: oversized,
+            }),
+            ..empty_action.clone()
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(LayoutState {
+                panes: vec![PaneDescriptor {
+                    grid_rows: oversized,
+                    ..state.panes[0].clone()
+                }],
+                ..state.clone()
+            }),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(LayoutState {
+                panes: vec![PaneDescriptor {
+                    grid_cols: oversized,
+                    ..state.panes[0].clone()
+                }],
+                ..state
+            }),
+        })),
+    ];
+
+    for invalid in invalid {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "oversized layout grid must be rejected"
+        );
+    }
+}
+
+#[test]
+fn pane_reservation_rejects_a_zero_present_tab_id() {
+    for tab_id in [None, Some(1)] {
+        assert!(
+            encode_frame(&envelope(envelope::Body::PaneReservation(
+                PaneReservation {
+                    reservation_id: 1,
+                    pane_id: 2,
+                    tab_id,
+                }
+            )))
+            .is_ok(),
+            "an absent or nonzero reservation tab ID must be accepted"
+        );
+    }
+
+    let reservation = envelope(envelope::Body::PaneReservation(PaneReservation {
+        reservation_id: 1,
+        pane_id: 2,
+        tab_id: Some(0),
+    }));
+
+    assert!(
+        encode_frame(&reservation).is_err(),
+        "a present reservation tab ID must be nonzero"
+    );
+}
+
+#[test]
+fn layout_state_rejects_empty_duplicate_and_dangling_references() {
+    let state = layout_state(leaf(1));
+    let zero_revision = LayoutState {
+        revision: 0,
+        ..state.clone()
+    };
+    let empty_members = LayoutState {
+        members: Vec::new(),
+        ..state.clone()
+    };
+    let empty_panes = LayoutState {
+        panes: Vec::new(),
+        ..state.clone()
+    };
+    let empty_tabs = LayoutState {
+        tabs: Vec::new(),
+        ..state.clone()
+    };
+    let duplicate_members = LayoutState {
+        members: vec![state.members[0].clone(), state.members[0].clone()],
+        ..state.clone()
+    };
+    let empty_member_id = LayoutState {
+        members: vec![MemberDescriptor {
+            peer_id: Vec::new(),
+            ..state.members[0].clone()
+        }],
+        ..state.clone()
+    };
+    let empty_member_endpoint = LayoutState {
+        members: vec![MemberDescriptor {
+            endpoint_addr: Vec::new(),
+            ..state.members[0].clone()
+        }],
+        ..state.clone()
+    };
+    let duplicate_tabs = LayoutState {
+        tabs: vec![state.tabs[0].clone(), state.tabs[0].clone()],
+        ..state.clone()
+    };
+    let duplicate_panes = LayoutState {
+        panes: vec![state.panes[0].clone(), state.panes[0].clone()],
+        ..state.clone()
+    };
+    let zero_pane_id = LayoutState {
+        panes: vec![PaneDescriptor {
+            pane_id: 0,
+            ..state.panes[0].clone()
+        }],
+        ..state.clone()
+    };
+    let zero_tab_id = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 0,
+            ..state.tabs[0].clone()
+        }],
+        ..state.clone()
+    };
+    let unknown_host = LayoutState {
+        panes: vec![PaneDescriptor {
+            host_peer_id: b"peer-b".to_vec(),
+            ..state.panes[0].clone()
+        }],
+        ..state.clone()
+    };
+    let duplicate_leaves = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(LayoutNode {
+                leaf_pane_id: None,
+                split: Some(Box::new(LayoutSplit {
+                    axis: Some(SplitAxis::LeftRight as i32),
+                    first: Some(leaf(1)),
+                    second: Some(leaf(1)),
+                })),
+            }),
+        }],
+        ..state.clone()
+    };
+    let unknown_leaf = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(leaf(2)),
+        }],
+        ..state.clone()
+    };
+    let zero_leaf = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(leaf(0)),
+        }],
+        ..state.clone()
+    };
+    let unreferenced_pane = LayoutState {
+        panes: vec![
+            state.panes[0].clone(),
+            PaneDescriptor {
+                pane_id: 2,
+                host_peer_id: b"peer-a".to_vec(),
+                grid_rows: 24,
+                grid_cols: 80,
+            },
+        ],
+        ..state
+    };
+
+    for invalid in [
+        zero_revision,
+        empty_members,
+        empty_panes,
+        empty_tabs,
+        duplicate_members,
+        empty_member_id,
+        empty_member_endpoint,
+        duplicate_tabs,
+        duplicate_panes,
+        zero_pane_id,
+        zero_tab_id,
+        unknown_host,
+        duplicate_leaves,
+        unknown_leaf,
+        zero_leaf,
+        unreferenced_pane,
+    ] {
+        assert!(
+            encode_frame(&envelope(envelope::Body::SessionSnapshot(
+                SessionSnapshot {
+                    state: Some(invalid),
+                }
+            )))
+            .is_err(),
+            "inconsistent layout state must be rejected"
+        );
+    }
+}
+
+#[test]
+fn layout_state_wire_shape_includes_all_nested_fields() {
+    let state = LayoutState {
+        revision: 7,
+        members: vec![MemberDescriptor {
+            peer_id: b"peer-a".to_vec(),
+            endpoint_addr: b"endpoint-a".to_vec(),
+        }],
+        panes: vec![PaneDescriptor {
+            pane_id: 11,
+            host_peer_id: b"peer-a".to_vec(),
+            grid_rows: 24,
+            grid_cols: 80,
+        }],
+        tabs: vec![TabDescriptor {
+            tab_id: 13,
+            root: Some(LayoutNode {
+                leaf_pane_id: None,
+                split: Some(Box::new(LayoutSplit {
+                    axis: Some(SplitAxis::TopBottom as i32),
+                    first: Some(leaf(11)),
+                    second: Some(leaf(11)),
+                })),
+            }),
+        }],
+    };
+    let state_fields = parse_fields(&state.encode_to_vec());
+    assert_eq!(
+        field_shape(&state_fields),
+        vec![(1, 0), (2, 2), (3, 2), (4, 2)]
+    );
+    assert_eq!(
+        field_shape(&parse_fields(&state_fields[1].value)),
+        vec![(1, 2), (2, 2)]
+    );
+    assert_eq!(
+        field_shape(&parse_fields(&state_fields[2].value)),
+        vec![(1, 0), (2, 2), (3, 0), (4, 0)]
+    );
+    let tab_fields = parse_fields(&state_fields[3].value);
+    assert_eq!(field_shape(&tab_fields), vec![(1, 0), (2, 2)]);
+    let node_fields = parse_fields(&tab_fields[1].value);
+    assert_eq!(field_shape(&node_fields), vec![(2, 2)]);
+    let split_fields = parse_fields(&node_fields[0].value);
+    assert_eq!(field_shape(&split_fields), vec![(1, 0), (2, 2), (3, 2)]);
+    assert_eq!(
+        field_shape(&parse_fields(&split_fields[1].value)),
+        vec![(1, 0)]
+    );
+    assert_eq!(
+        field_shape(&parse_fields(&split_fields[2].value)),
+        vec![(1, 0)]
+    );
+}
+
+#[test]
+fn join_wire_shape_encodes_a_present_endpoint_address() {
+    let join = Join {
+        session_id: b"session-a".to_vec(),
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: b"endpoint-a".to_vec(),
+    };
+
+    assert_eq!(
+        field_shape(&parse_fields(&join.encode_to_vec())),
+        vec![(1, 2), (2, 2), (3, 2)]
+    );
+}
+
+#[test]
+fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
+    fn full_tree(depth: usize, next_pane_id: &mut u64) -> LayoutNode {
+        if depth == 0 {
+            let pane_id = *next_pane_id;
+            *next_pane_id += 1;
+            return leaf(pane_id);
+        }
+        LayoutNode {
+            leaf_pane_id: None,
+            split: Some(Box::new(LayoutSplit {
+                axis: Some(SplitAxis::TopBottom as i32),
+                first: Some(full_tree(depth - 1, next_pane_id)),
+                second: Some(full_tree(depth - 1, next_pane_id)),
+            })),
+        }
+    }
+
+    let mut next_pane_id = 1;
+    let wide_tree = full_tree(4, &mut next_pane_id);
+    let mut next_pane_id = 1;
+    let deep_tree = full_tree(5, &mut next_pane_id);
+    let too_wide = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(wide_tree),
+        }],
+        ..layout_state(leaf(1))
+    };
+    let too_deep = LayoutState {
+        tabs: vec![TabDescriptor {
+            tab_id: 1,
+            root: Some(deep_tree),
+        }],
+        ..layout_state(leaf(1))
+    };
+    let oversized_endpoint = envelope(envelope::Body::Join(Join {
+        session_id: b"session-a".to_vec(),
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: vec![0; MAX_ENDPOINT_ADDR_BYTES + 1],
+    }));
+
+    for invalid in [
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(too_wide),
+        })),
+        envelope(envelope::Body::SessionSnapshot(SessionSnapshot {
+            state: Some(too_deep),
+        })),
+        oversized_endpoint,
+    ] {
+        assert!(
+            encode_frame(&invalid).is_err(),
+            "{invalid:?} must be rejected"
+        );
+    }
+}
+
 #[test]
 fn decoder_rejects_unsupported_version() {
-    let mut wrong = sample_envelopes().remove(0);
-    wrong.version = PROTOCOL_VERSION + 1;
-    let mut frame = Vec::new();
-    wrong.encode_length_delimited(&mut frame).unwrap();
+    for version in [1, PROTOCOL_VERSION + 1] {
+        let mut wrong = sample_envelopes().remove(0);
+        wrong.version = version;
+        let mut frame = Vec::new();
+        wrong.encode_length_delimited(&mut frame).unwrap();
 
-    assert!(matches!(
-        decode_frame(&frame),
-        Err(ProtocolError::UnsupportedVersion(v)) if v == PROTOCOL_VERSION + 1
-    ));
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(ProtocolError::UnsupportedVersion(v)) if v == version
+        ));
+    }
 }
 
 #[test]
@@ -330,6 +1128,7 @@ fn decoder_rejects_missing_fields_and_invalid_sequences() {
     let empty_id = envelope(envelope::Body::Join(Join {
         session_id: Vec::new(),
         peer_id: b"peer-a".to_vec(),
+        endpoint_addr: Vec::new(),
     }));
     let mut empty_id_frame = Vec::new();
     empty_id
@@ -444,6 +1243,7 @@ fn encode_frame_rejects_invalid_envelopes() {
             envelope(envelope::Body::Join(Join {
                 session_id: vec![0; MAX_SESSION_ID_BYTES + 1],
                 peer_id: b"peer-a".to_vec(),
+                endpoint_addr: Vec::new(),
             })),
         ),
         (
@@ -451,6 +1251,7 @@ fn encode_frame_rejects_invalid_envelopes() {
             envelope(envelope::Body::Join(Join {
                 session_id: b"session-a".to_vec(),
                 peer_id: vec![0; MAX_PEER_ID_BYTES + 1],
+                endpoint_addr: Vec::new(),
             })),
         ),
         (

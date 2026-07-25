@@ -25,10 +25,13 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 - **Roles:** **coordinator** serializes shared structural state (layout, admission, lifecycle). **Pane host** = whose Mac runs that PTY (not exclusive control rights).
 - **Trust:** all members fully trusted; full shell control when they are controller.
 - **Visibility:** everyone sees every pane; no private panes.
-- **Split/close:** any member may split or close any **available** pane (with close confirmation).
+- **Spike 3 structural authority:** any admitted member may split a pane or create a tab; the new
+  fixed-grid PTY runs on that requester’s Mac. Only a pane’s host may delete that pane. A tab may
+  be deleted only by a member that hosts every pane in it. There is no close confirmation in this
+  spike; stale requests are rejected rather than replayed.
 - **Input:** one controller per pane; **idle → hop in and type, no approval**; if controller is **actively typing**, explicit **Take control** required.
-- **Disconnect grace:** **5 minutes** — departed host’s panes = unavailable placeholders; no input to those PTYs; reconnect within grace restores; after grace coordinator removes placeholders.
-- **Coordinator disconnect:** session **continues**; that host’s panes unavailable; see Coordinator failover.
+- **Later-spike disconnect behavior:** 5-minute unavailable placeholders and coordinator failover
+  are MVP goals, not implemented by Spike 3.
 - **Layout:** nested binary 50/50; **depth ≤ 4**; **≤ 8 panes/tab**; max **9 tabs**.
 - **Latency:** ≈ same-region SSH; relay normal
 - **Non-goals:** cloud VM execution, sandbox/ACL tiers, Win/Linux, drag-resize, mosh prediction, private panes, per-person ticket revocation in v1
@@ -37,10 +40,9 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 
 1. You `create` → reusable join ticket → first shell on your Mac. You start as coordinator.
 2. Others `join <ticket>` (up to 8). Everyone sees the same tabs/panes.
-3. Shells run on whoever **hosts** that pane’s Mac. Others watch; when idle they hop in and type; if someone’s mid-typing, use Take control.
-4. Anyone can split any available pane (new shell starts on the splitter’s Mac). Anyone can close a pane (confirm).
-5. If someone disconnects: their hosted panes go idle/unavailable for 5 minutes (session keeps going). If they return in time, panes come back.
-6. If the coordinator disconnects: same grace for their panes; structural edits pause briefly; if they don’t return, another member becomes coordinator (see below).
+3. Shells run on whoever **hosts** that pane’s Mac. Others watch; when idle they hop in and type; active typing is protected until the controller becomes idle.
+4. Any member can split an available pane or create a tab; the requester hosts the new PTY. Only the host can delete a pane. A member can delete a tab only when it owns every pane in that tab.
+5. Spike 3 is localhost layout/control work. Disconnect grace and coordinator failover remain later spikes.
 
 ## 4. Architecture
 
@@ -80,13 +82,19 @@ If coordinator disconnects:
 - Typing: explicit **Take control** (visible handoff).
 - Control serialized so two streams never hit one PTY.
 
-### Splits
+### Spike 3 layout and deletion
 
-Any member splits any available pane → **new PTY on the splitter’s machine**; 50/50; depth≤4; ≤8 panes/tab. All panes visible to all.
+Any member splits any available pane or creates a tab → **new PTY on the requester’s machine**;
+50/50 nested splits; depth≤4; ≤8 panes/tab; ≤9 tabs. All panes are visible to all. A pane host
+alone may delete its pane. Deleting a tab requires the requester to host every leaf in that tab.
+The last pane in a tab must be removed by deleting the tab; the final tab is retained.
 
-### Close
+### Spike 3 controls
 
-Any member may close any available leaf pane (confirm; kills that PTY; sibling expands). Placeholders during grace aren’t manually closable; restored or pruned after grace.
+`Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` plus arrows
+moves focus. `Ctrl+T` then `N` creates a tab; `Ctrl+T` then `X` requests tab deletion; `Ctrl+T`
+plus left/right switches tabs; `Esc` cancels. These mux chords are consumed locally. Ctrl+Q exits
+the local view; F9 and F10 reach the focused PTY. Pane grids never resize.
 
 ### Disconnect grace (any member)
 
@@ -120,7 +128,10 @@ See [SPIKE_PLAN.md](./SPIKE_PLAN.md).
 
 ## 10. MVP success criteria
 
-Two (then more) Macs join via reusable ticket; shared layout; both host panes; anyone can split available panes; idle hop-in typing; Take control when busy; presence; locality of processes; encrypted P2P/relay; ≈ SSH feel; disconnect grace works; coordinator leave does not kill whole session.
+Two (then more) Macs join via reusable ticket; shared layout; both host panes; anyone can split
+available panes; pane hosts delete their own panes; all-host tabs can be deleted; idle hop-in
+typing; Take control when busy; presence; locality of processes; encrypted P2P/relay; ≈ SSH feel;
+disconnect grace works; coordinator leave does not kill whole session.
 
 ## Caveat (honest)
 

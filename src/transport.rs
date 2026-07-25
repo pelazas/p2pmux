@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::protocol::{Envelope, MAX_FRAME_BYTES, ProtocolError, decode_frame, encode_frame};
 
-pub const ALPN: &[u8] = b"p2pmux/1";
+pub const ALPN: &[u8] = b"p2pmux/2";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -116,7 +116,14 @@ impl Transport {
     }
 
     pub async fn accept_incoming(&self) -> Result<Incoming, TransportError> {
-        timeout(HANDSHAKE_TIMEOUT, self.endpoint.accept())
+        self.accept_incoming_with_timeout(HANDSHAKE_TIMEOUT).await
+    }
+
+    pub async fn accept_incoming_with_timeout(
+        &self,
+        accept_timeout: Duration,
+    ) -> Result<Incoming, TransportError> {
+        timeout(accept_timeout, self.endpoint.accept())
             .await
             .map_err(|_| TransportError::TimedOut("incoming accept"))?
             .ok_or(TransportError::Closed)
@@ -170,6 +177,18 @@ impl Transport {
         connection: &Connection,
     ) -> Result<(FrameWriter, FrameReader), TransportError> {
         let (send, recv) = self.accept_bi(connection).await?;
+        Ok((FrameWriter { send }, FrameReader::new(recv)))
+    }
+
+    /// Accept a post-handshake control stream without imposing the handshake timeout while idle.
+    pub async fn accept_framed_bi_when_ready(
+        &self,
+        connection: &Connection,
+    ) -> Result<(FrameWriter, FrameReader), TransportError> {
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .map_err(TransportError::Stream)?;
         Ok((FrameWriter { send }, FrameReader::new(recv)))
     }
 
