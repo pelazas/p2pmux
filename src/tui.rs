@@ -60,7 +60,7 @@ const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT";
 
 type FooterSegment = (&'static str, bool);
 
@@ -71,7 +71,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     ("t", true),
     ("> TAB   <", false),
     ("q", true),
-    ("> QUIT    type to claim when free", false),
+    ("> QUIT", false),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     ("Pane  <", false),
@@ -4108,10 +4108,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
 
         for (mode, expected) in [
-            (
-                ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free",
-            ),
+            (ChordMode::None, "Ctrl+ <p> PANE   <t> TAB   <q> QUIT"),
             (
                 ChordMode::Pane,
                 "Pane  <←↓↑→> FOCUS   <n> NEW   <x> CLOSE   <Esc> BACK",
