@@ -1493,6 +1493,75 @@ mod tests {
     }
 
     #[test]
+    fn pane_delete_chord_targets_the_focused_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        assert_eq!(tui.focused_pane(), 2);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 2 }])
+        );
+    }
+
+    #[test]
+    fn tall_pane_create_chord_uses_a_top_bottom_split_and_usable_grid() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 20, 40);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::TopBottom,
+                grid_rows: 36,
+                grid_cols: 18,
+            }])
+        );
+    }
+
+    #[test]
+    fn invalid_second_chord_keys_are_consumed_instead_of_forwarded() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        for prefix in ['p', 't'] {
+            assert_eq!(
+                tui.handle_key(
+                    KeyEvent::new(KeyCode::Char(prefix), KeyModifiers::CONTROL),
+                    area
+                ),
+                KeyHandling::Consumed(vec![])
+            );
+            assert_eq!(
+                tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+                KeyHandling::Consumed(vec![])
+            );
+            assert_eq!(tui.chord_mode(), ChordMode::None);
+        }
+    }
+
+    #[test]
     fn pane_focus_uses_nearest_directional_leaf_then_a_stable_fallback() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
