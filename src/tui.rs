@@ -178,11 +178,17 @@ impl PaneTextSelection {
     }
 
     fn contains(self, cell: ScreenCell) -> bool {
-        let min_row = self.anchor.row.min(self.cursor.row);
-        let max_row = self.anchor.row.max(self.cursor.row);
-        let min_col = self.anchor.col.min(self.cursor.col);
-        let max_col = self.anchor.col.max(self.cursor.col);
-        (min_row..=max_row).contains(&cell.row) && (min_col..=max_col).contains(&cell.col)
+        let (start, end) = self.bounds();
+        match cell.row {
+            row if row == start.row && row == end.row => (start.col..=end.col).contains(&cell.col),
+            row if row == start.row => cell.col >= start.col,
+            row if row == end.row => cell.col <= end.col,
+            row => (start.row..end.row).contains(&row),
+        }
+    }
+
+    fn bounds(self) -> (ScreenCell, ScreenCell) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
     }
 }
 
@@ -843,26 +849,25 @@ fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Optio
         return None;
     }
     let (rows, cols) = screen.size();
-    let min_row = selection.anchor.row.min(selection.cursor.row).min(rows);
-    let max_row = selection
-        .anchor
-        .row
-        .max(selection.cursor.row)
-        .min(rows.saturating_sub(1));
-    let min_col = selection.anchor.col.min(selection.cursor.col).min(cols);
-    let max_col = selection
-        .anchor
-        .col
-        .max(selection.cursor.col)
-        .min(cols.saturating_sub(1));
-    if min_row > max_row || min_col > max_col {
+    if rows == 0 || cols == 0 {
         return None;
     }
+    let (start, end) = selection.bounds();
+    let start = ScreenCell {
+        row: start.row.min(rows.saturating_sub(1)),
+        col: start.col.min(cols.saturating_sub(1)),
+    };
+    let end = ScreenCell {
+        row: end.row.min(rows.saturating_sub(1)),
+        col: end.col.min(cols.saturating_sub(1)),
+    };
 
-    let lines = (min_row..=max_row)
+    let lines = (start.row..=end.row)
         .map(|row| {
+            let first_col = if row == start.row { start.col } else { 0 };
+            let last_col = if row == end.row { end.col } else { cols - 1 };
             let mut line = String::new();
-            for col in min_col..=max_col {
+            for col in first_col..=last_col {
                 let Some(cell) = screen.cell(row, col) else {
                     continue;
                 };
@@ -1762,13 +1767,6 @@ impl SharedLayoutRuntime {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if key.code == KeyCode::Esc
-                        && key.modifiers.is_empty()
-                        && self.tui.clear_selection()
-                    {
-                        dirty = true;
-                        continue;
-                    }
                     match self.tui.handle_key(key, Rect::new(0, 0, cols, rows)) {
                         KeyHandling::Quit => break,
                         KeyHandling::Consumed(intents) => {
@@ -2446,6 +2444,8 @@ fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
             bytes
         }
         KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
+        // xterm modifyOtherKeys encodes Shift+Return distinctly for nested TUIs.
+        KeyCode::Enter if modifiers == 2 => b"\x1b[27;2;13~".to_vec(),
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
         KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
@@ -3666,18 +3666,18 @@ mod tests {
     }
 
     #[test]
-    fn selection_text_extracts_the_selected_grid_cells() {
-        let mut parser = vt100::Parser::new(2, 4, 0);
-        parser.process(b"ab  \r\ncdef");
+    fn selection_text_uses_stream_semantics_in_document_order() {
+        let mut parser = vt100::Parser::new(3, 4, 0);
+        parser.process(b"abcd\r\nefgh\r\nijkl");
         let selection = PaneTextSelection {
             pane_id: 1,
-            anchor: ScreenCell { row: 0, col: 1 },
-            cursor: ScreenCell { row: 1, col: 2 },
+            anchor: ScreenCell { row: 2, col: 1 },
+            cursor: ScreenCell { row: 0, col: 2 },
         };
 
         assert_eq!(
             selection_text(parser.screen(), selection),
-            Some("b\nde".to_owned())
+            Some("cd\nefgh\nij".to_owned())
         );
     }
 
@@ -4518,6 +4518,10 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
             KeyHandling::Forward
         );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             area,
@@ -4609,15 +4613,15 @@ mod tests {
     }
 
     #[test]
-    fn renderer_highlights_selected_cells() {
-        let mut parser = vt100::Parser::new(1, 3, 0);
-        parser.process(b"abc");
+    fn renderer_highlights_stream_selected_cells() {
+        let mut parser = vt100::Parser::new(3, 4, 0);
+        parser.process(b"abcd\r\nefgh\r\nijkl");
         let selection = PaneTextSelection {
             pane_id: 1,
-            anchor: ScreenCell { row: 0, col: 0 },
-            cursor: ScreenCell { row: 0, col: 1 },
+            anchor: ScreenCell { row: 2, col: 1 },
+            cursor: ScreenCell { row: 0, col: 2 },
         };
-        let mut terminal = Terminal::new(TestBackend::new(3, 1)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(4, 3)).expect("test terminal");
 
         terminal
             .draw(|frame| {
@@ -4629,9 +4633,12 @@ mod tests {
             .expect("render should work");
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 0)].bg, Color::DarkGray);
-        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
-        assert_ne!(buffer[(2, 0)].bg, Color::DarkGray);
+        assert_ne!(buffer[(1, 0)].bg, Color::DarkGray);
+        assert_eq!(buffer[(2, 0)].bg, Color::DarkGray);
+        assert_eq!(buffer[(0, 1)].bg, Color::DarkGray);
+        assert_eq!(buffer[(1, 2)].bg, Color::DarkGray);
+        assert_ne!(buffer[(2, 2)].bg, Color::DarkGray);
+        assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -4812,5 +4819,22 @@ mod tests {
                 "{event:?}"
             );
         }
+    }
+
+    #[test]
+    fn shift_enter_is_distinct_from_plain_enter() {
+        let parser = vt100::Parser::new(1, 1, 0);
+        let plain = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            parser.screen(),
+        );
+        let shifted = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            parser.screen(),
+        );
+
+        assert_eq!(plain, Some(b"\r".to_vec()));
+        assert_eq!(shifted, Some(b"\x1b[27;2;13~".to_vec()));
+        assert_ne!(shifted, plain);
     }
 }
