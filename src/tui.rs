@@ -576,26 +576,30 @@ fn render_shared_multi_pane(
     join_code: Option<&str>,
 ) {
     let geometry = tui.geometry(frame.area());
-    let tabs = tui
-        .snapshot
-        .tabs
-        .iter()
-        .map(|tab| {
-            if tab.tab_id == tui.current_tab {
-                format!("[*{}]", tab.tab_id)
-            } else {
-                format!("[{}]", tab.tab_id)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     if geometry.tab_bar.width > 0 && geometry.tab_bar.height > 0 {
-        frame.buffer_mut().set_string(
-            geometry.tab_bar.x,
-            geometry.tab_bar.y,
-            tabs,
-            Style::default().fg(Color::Cyan),
-        );
+        let mut x = geometry.tab_bar.x;
+        for (index, tab) in tui.snapshot.tabs.iter().enumerate() {
+            if index > 0 {
+                frame
+                    .buffer_mut()
+                    .set_string(x, geometry.tab_bar.y, " ", Style::default());
+                x = x.saturating_add(1);
+            }
+            let active = tab.tab_id == tui.current_tab;
+            let style = if active {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(220, 50, 47))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let label = format!("Tab #{}", index + 1);
+            frame
+                .buffer_mut()
+                .set_string(x, geometry.tab_bar.y, &label, style);
+            x = x.saturating_add(label.len() as u16);
+        }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
         frame.buffer_mut().set_string(
@@ -3077,6 +3081,36 @@ mod tests {
                 "mode: {mode:?}, footer: {footer}"
             );
         }
+    }
+
+    #[test]
+    fn tab_bar_uses_ordinal_labels_and_highlights_the_active_tab() {
+        let tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 10,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 20,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(32, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..32).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(tab_bar.contains("Tab #1"));
+        assert!(tab_bar.contains("Tab #2"));
+        assert_eq!(buffer[(0, 0)].fg, Color::White);
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(220, 50, 47));
     }
 
     #[test]
