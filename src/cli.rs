@@ -80,7 +80,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 writeln!(stdout, "Join with: p2pmux join {join_code}")?;
                 writeln!(
                     stdout,
-                    "This code stays visible in the host status bar after you continue."
+                    "Copy this code before you continue; the shared footer then shows control help."
                 )?;
                 if !host.address_ready() {
                     writeln!(
