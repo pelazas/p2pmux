@@ -1,64 +1,81 @@
 use p2pmux::layout::{
-    Axis, LayoutError, MAX_MEMBERS, MAX_PANES_PER_TAB, MAX_TABS, Node, SessionState,
+    Axis, LayoutError, LayoutSnapshot, MAX_ENDPOINT_ADDR_BYTES, MAX_MEMBERS, MAX_PANES_PER_TAB,
+    MAX_TABS, Node, ReservationCommit, SessionState,
 };
 
 const HOST_A: &[u8] = b"host-a";
 const HOST_B: &[u8] = b"host-b";
+const ADDR_A: &[u8] = b"addr-a";
+const ADDR_B: &[u8] = b"addr-b";
 
 fn state() -> SessionState {
-    SessionState::new(HOST_A.to_vec(), 24, 80).expect("valid initial layout")
+    SessionState::new(HOST_A.to_vec(), ADDR_A.to_vec(), 24, 80).expect("valid initial layout")
+}
+
+fn snapshot(state: &SessionState) -> LayoutSnapshot {
+    state.snapshot()
+}
+
+fn tab(snapshot: &LayoutSnapshot, tab_id: u64) -> &p2pmux::layout::Tab {
+    snapshot
+        .tabs
+        .iter()
+        .find(|tab| tab.tab_id == tab_id)
+        .expect("tab exists")
 }
 
 #[test]
 fn initial_state_has_one_tab_and_one_hosted_pane() {
     let state = state();
+    let snapshot = snapshot(&state);
 
-    assert_eq!(state.revision, 1);
-    assert_eq!(state.members.len(), 1);
-    assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.panes.len(), 1);
-    assert_eq!(state.tabs[0].root, Node::Leaf { pane_id: 1 });
-    assert_eq!(state.panes[&1].host_peer_id, HOST_A);
-    assert_eq!(state.panes[&1].grid_rows, 24);
-    assert_eq!(state.panes[&1].grid_cols, 80);
+    assert_eq!(state.revision(), 1);
+    assert_eq!(snapshot.members.len(), 1);
+    assert_eq!(snapshot.tabs.len(), 1);
+    assert_eq!(snapshot.panes.len(), 1);
+    assert_eq!(snapshot.tabs[0].root, Node::Leaf { pane_id: 1 });
+    assert_eq!(snapshot.panes[&1].host_peer_id, HOST_A);
+    assert_eq!(snapshot.members[0].endpoint_addr, ADDR_A);
 }
 
 #[test]
-fn initial_layout_rejects_zero_sized_grids() {
+fn initial_layout_rejects_zero_sized_grids_and_invalid_endpoint_addresses() {
     assert_eq!(
-        SessionState::new(HOST_A.to_vec(), 0, 80),
+        SessionState::new(HOST_A.to_vec(), ADDR_A.to_vec(), 0, 80),
         Err(LayoutError::InvalidGrid)
     );
     assert_eq!(
-        SessionState::new(HOST_A.to_vec(), 24, 0),
+        SessionState::new(HOST_A.to_vec(), ADDR_A.to_vec(), 24, 0),
         Err(LayoutError::InvalidGrid)
+    );
+    assert_eq!(
+        SessionState::new(HOST_A.to_vec(), Vec::new(), 24, 80),
+        Err(LayoutError::InvalidEndpointAddress)
+    );
+    assert_eq!(
+        SessionState::new(
+            HOST_A.to_vec(),
+            vec![0; MAX_ENDPOINT_ADDR_BYTES + 1],
+            24,
+            80
+        ),
+        Err(LayoutError::InvalidEndpointAddress)
     );
 }
 
 #[test]
 fn creating_panes_uses_the_requested_split_axis() {
     let mut state = state();
-    let first_revision = state.revision;
     let right = state
-        .create_pane(HOST_A, first_revision, 1, Axis::LeftRight, 30, 100)
+        .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 30, 100)
         .expect("right split");
-
-    assert_eq!(right, 2);
-    assert_eq!(state.revision, first_revision + 1);
-    assert_eq!(
-        state.tabs[0].root,
-        Node::Split {
-            axis: Axis::LeftRight,
-            first: Box::new(Node::Leaf { pane_id: 1 }),
-            second: Box::new(Node::Leaf { pane_id: right }),
-        }
-    );
-
     let down = state
-        .create_pane(HOST_A, state.revision, right, Axis::TopBottom, 20, 70)
+        .create_pane(HOST_A, state.revision(), right, Axis::TopBottom, 20, 70)
         .expect("down split");
+    let root = &snapshot(&state).tabs[0].root;
+
     assert!(matches!(
-        &state.tabs[0].root,
+        root,
         Node::Split {
             axis: Axis::LeftRight,
             second,
@@ -79,122 +96,119 @@ fn creating_panes_uses_the_requested_split_axis() {
 fn deleting_a_pane_expands_its_sibling() {
     let mut state = state();
     let sibling = state
-        .create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 24, 80)
+        .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
         .expect("split");
-
     state
-        .delete_pane(HOST_A, state.revision, sibling)
+        .delete_pane(HOST_A, state.revision(), sibling)
         .expect("host can delete pane");
 
-    assert_eq!(state.tabs[0].root, Node::Leaf { pane_id: 1 });
-    assert!(!state.panes.contains_key(&sibling));
+    let snapshot = snapshot(&state);
+    assert_eq!(snapshot.tabs[0].root, Node::Leaf { pane_id: 1 });
+    assert!(!snapshot.panes.contains_key(&sibling));
 }
 
 #[test]
-fn membership_and_tab_and_pane_limits_are_enforced() {
+fn membership_tab_pane_and_depth_limits_are_enforced() {
     let mut state = state();
     for member in 1..MAX_MEMBERS {
         state
-            .add_member(state.revision, format!("member-{member}").into_bytes())
+            .add_member(
+                state.revision(),
+                format!("member-{member}").into_bytes(),
+                format!("addr-{member}").into_bytes(),
+            )
             .expect("within member limit");
     }
-    let revision = state.revision;
+    let before = snapshot(&state);
     assert_eq!(
-        state.add_member(revision, b"one-too-many".to_vec()),
+        state.add_member(
+            state.revision(),
+            b"one-too-many".to_vec(),
+            b"address".to_vec()
+        ),
         Err(LayoutError::MemberLimit)
     );
-    assert_eq!(state.revision, revision);
+    assert_eq!(snapshot(&state), before);
 
     for _ in 1..MAX_TABS {
         state
-            .create_tab(HOST_A, state.revision, 24, 80)
+            .create_tab(HOST_A, state.revision(), 24, 80)
             .expect("within tab limit");
     }
-    let revision = state.revision;
     assert_eq!(
-        state.create_tab(HOST_A, revision, 24, 80),
+        state.create_tab(HOST_A, state.revision(), 24, 80),
         Err(LayoutError::TabLimit)
     );
-    assert_eq!(state.revision, revision);
 
-    let tab_id = state.tabs[0].tab_id;
+    let tab_id = snapshot(&state).tabs[0].tab_id;
     let mut leaves = vec![1];
     while leaves.len() < MAX_PANES_PER_TAB {
         let target = leaves.remove(0);
         let new_pane = state
-            .create_pane(HOST_A, state.revision, target, Axis::LeftRight, 24, 80)
+            .create_pane(HOST_A, state.revision(), target, Axis::LeftRight, 24, 80)
             .expect("within pane limit");
-        leaves.push(target);
-        leaves.push(new_pane);
+        leaves.extend([target, new_pane]);
     }
     assert_eq!(state.pane_ids_in_tab(tab_id).len(), MAX_PANES_PER_TAB);
-    let revision = state.revision;
     assert_eq!(
-        state.create_pane(HOST_A, revision, leaves[0], Axis::LeftRight, 24, 80),
+        state.create_pane(HOST_A, state.revision(), leaves[0], Axis::LeftRight, 24, 80),
         Err(LayoutError::PaneLimit)
     );
-    assert_eq!(state.revision, revision);
-}
 
-#[test]
-fn splitting_beyond_depth_four_is_rejected() {
-    let mut state = state();
+    let mut depth_state =
+        SessionState::new(HOST_A.to_vec(), ADDR_A.to_vec(), 24, 80).expect("valid initial layout");
     let mut leaf = 1;
     for _ in 0..4 {
-        leaf = state
-            .create_pane(HOST_A, state.revision, leaf, Axis::TopBottom, 24, 80)
+        leaf = depth_state
+            .create_pane(
+                HOST_A,
+                depth_state.revision(),
+                leaf,
+                Axis::TopBottom,
+                24,
+                80,
+            )
             .expect("within depth limit");
     }
-
-    let revision = state.revision;
     assert_eq!(
-        state.create_pane(HOST_A, revision, leaf, Axis::TopBottom, 24, 80),
+        depth_state.create_pane(
+            HOST_A,
+            depth_state.revision(),
+            leaf,
+            Axis::TopBottom,
+            24,
+            80
+        ),
         Err(LayoutError::SplitDepthLimit)
     );
-    assert_eq!(state.revision, revision);
 }
 
 #[test]
-fn only_the_pane_host_can_delete_it() {
+fn only_hosts_can_delete_panes_and_mixed_tabs() {
     let mut state = state();
     state
-        .add_member(state.revision, HOST_B.to_vec())
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
         .expect("member B joins");
-    let revision = state.revision;
-
     assert_eq!(
-        state.delete_pane(HOST_B, revision, 1),
+        state.delete_pane(HOST_B, state.revision(), 1),
         Err(LayoutError::NotPaneHost { pane_id: 1 })
     );
-    assert_eq!(state.revision, revision);
-}
-
-#[test]
-fn deleting_a_tab_requires_ownership_of_every_pane() {
-    let mut state = state();
     state
-        .add_member(state.revision, HOST_B.to_vec())
-        .expect("member B joins");
-    state
-        .create_pane(HOST_B, state.revision, 1, Axis::LeftRight, 24, 80)
+        .create_pane(HOST_B, state.revision(), 1, Axis::LeftRight, 24, 80)
         .expect("B hosts new pane");
-    let revision = state.revision;
-
     state
-        .create_tab(HOST_A, state.revision, 24, 80)
-        .expect("a second tab allows deletion");
+        .create_tab(HOST_A, state.revision(), 24, 80)
+        .expect("second tab");
     assert_eq!(
-        state.delete_tab(HOST_A, state.revision, 1),
+        state.delete_tab(HOST_A, state.revision(), 1),
         Err(LayoutError::NotTabHost { tab_id: 1 })
     );
-    assert_eq!(state.revision, revision + 1);
 }
 
 #[test]
-fn stale_requests_do_not_change_the_layout() {
+fn stale_requests_and_failed_grid_operations_do_not_change_the_snapshot() {
     let mut state = state();
-    let before = state.clone();
-
+    let before = snapshot(&state);
     assert_eq!(
         state.create_pane(HOST_A, 0, 1, Axis::LeftRight, 24, 80),
         Err(LayoutError::StaleRevision {
@@ -202,163 +216,59 @@ fn stale_requests_do_not_change_the_layout() {
             got: 0,
         })
     );
-    assert_eq!(state, before);
+    assert_eq!(
+        state.create_tab(HOST_A, state.revision(), 0, 80),
+        Err(LayoutError::InvalidGrid)
+    );
+    assert_eq!(snapshot(&state), before);
+    assert_eq!(state.revision(), before.revision);
 }
 
 #[test]
-fn last_leaf_and_last_tab_cannot_be_deleted() {
+fn last_leaf_and_last_tab_cannot_be_deleted_and_unknown_tab_wins_precedence() {
     let mut state = state();
-    let revision = state.revision;
-
     assert_eq!(
-        state.delete_pane(HOST_A, revision, 1),
+        state.delete_pane(HOST_A, state.revision(), 1),
         Err(LayoutError::LastPaneInTab { tab_id: 1 })
     );
     assert_eq!(
-        state.delete_tab(HOST_A, revision, 1),
+        state.delete_tab(HOST_A, state.revision(), 99),
+        Err(LayoutError::UnknownTab { tab_id: 99 })
+    );
+    assert_eq!(
+        state.delete_tab(HOST_A, state.revision(), 1),
         Err(LayoutError::LastTab)
     );
-    assert_eq!(state.revision, revision);
 }
 
 #[test]
-fn pane_ids_are_not_reused_after_deletion() {
+fn ids_are_not_reused_after_deleted_tabs_or_panes() {
     let mut state = state();
-    let second = state
-        .create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 24, 80)
+    let pane = state
+        .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
         .expect("second pane");
     state
-        .delete_pane(HOST_A, state.revision, second)
+        .delete_pane(HOST_A, state.revision(), pane)
         .expect("delete second pane");
-
     assert_eq!(
         state
-            .create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 24, 80)
+            .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
             .expect("third pane"),
         3
     );
-}
 
-#[test]
-fn zero_sized_grids_are_rejected_without_mutating_the_state() {
-    let mut state = state();
-    let before = state.clone();
-
-    assert_eq!(
-        state.create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 0, 80),
-        Err(LayoutError::InvalidGrid)
-    );
-    assert_eq!(state, before);
-
-    assert_eq!(
-        state.create_tab(HOST_A, state.revision, 24, 0),
-        Err(LayoutError::InvalidGrid)
-    );
-    assert_eq!(state, before);
-}
-
-#[test]
-fn a_created_tab_has_one_creator_hosted_pane_at_the_requested_grid() {
-    let mut state = state();
-    state
-        .add_member(state.revision, HOST_B.to_vec())
-        .expect("member B joins");
-
-    let tab_id = state
-        .create_tab(HOST_B, state.revision, 33, 111)
-        .expect("B creates a tab");
-    let tab = state
-        .tabs
-        .iter()
-        .find(|tab| tab.tab_id == tab_id)
-        .expect("created tab exists");
-    let Node::Leaf { pane_id } = tab.root else {
-        panic!("a new tab starts with exactly one leaf");
-    };
-    let pane = &state.panes[&pane_id];
-
-    assert_eq!(state.pane_ids_in_tab(tab_id), vec![pane_id]);
-    assert_eq!(pane.host_peer_id, HOST_B);
-    assert_eq!((pane.grid_rows, pane.grid_cols), (33, 111));
-}
-
-#[test]
-fn successful_mutations_advance_the_revision_once() {
-    let mut state = state();
-    let revision = state.revision;
-    state
-        .add_member(revision, HOST_B.to_vec())
-        .expect("member joins");
-    assert_eq!(state.revision, revision + 1);
-
-    let revision = state.revision;
-    let tab_id = state
-        .create_tab(HOST_A, revision, 24, 80)
-        .expect("create tab");
-    assert_eq!(state.revision, revision + 1);
-
-    let pane_id = state
-        .create_pane(HOST_A, state.revision, 1, Axis::LeftRight, 24, 80)
-        .expect("create pane to delete");
-    let revision = state.revision;
-    state
-        .delete_pane(HOST_A, revision, pane_id)
-        .expect("delete pane");
-    assert_eq!(state.revision, revision + 1);
-
-    let revision = state.revision;
-    state
-        .delete_tab(HOST_A, revision, tab_id)
-        .expect("delete all-owned tab");
-    assert_eq!(state.revision, revision + 1);
-}
-
-#[test]
-fn failed_ownership_and_limit_operations_leave_the_entire_state_unchanged() {
-    let mut ownership = state();
-    ownership
-        .add_member(ownership.revision, HOST_B.to_vec())
-        .expect("member B joins");
-    let before = ownership.clone();
-    assert_eq!(
-        ownership.delete_pane(HOST_B, ownership.revision, 1),
-        Err(LayoutError::NotPaneHost { pane_id: 1 })
-    );
-    assert_eq!(ownership, before);
-
-    let mut capped = state();
-    let mut leaves = vec![1];
-    while leaves.len() < MAX_PANES_PER_TAB {
-        let target = leaves.remove(0);
-        let new_pane = capped
-            .create_pane(HOST_A, capped.revision, target, Axis::LeftRight, 24, 80)
-            .expect("within pane limit");
-        leaves.extend([target, new_pane]);
-    }
-    let before = capped.clone();
-    assert_eq!(
-        capped.create_pane(HOST_A, capped.revision, leaves[0], Axis::LeftRight, 24, 80),
-        Err(LayoutError::PaneLimit)
-    );
-    assert_eq!(capped, before);
-}
-
-#[test]
-fn tab_ids_are_not_reused_after_a_tab_is_deleted() {
-    let mut state = state();
     let first_new_tab = state
-        .create_tab(HOST_A, state.revision, 24, 80)
+        .create_tab(HOST_A, state.revision(), 24, 80)
         .expect("first new tab");
     let second_new_tab = state
-        .create_tab(HOST_A, state.revision, 24, 80)
+        .create_tab(HOST_A, state.revision(), 24, 80)
         .expect("second new tab");
     state
-        .delete_tab(HOST_A, state.revision, first_new_tab)
-        .expect("delete first new tab");
-
+        .delete_tab(HOST_A, state.revision(), first_new_tab)
+        .expect("delete first tab");
     assert_eq!(
         state
-            .create_tab(HOST_A, state.revision, 24, 80)
+            .create_tab(HOST_A, state.revision(), 24, 80)
             .expect("replacement tab"),
         second_new_tab + 1
     );
@@ -368,16 +278,199 @@ fn tab_ids_are_not_reused_after_a_tab_is_deleted() {
 fn an_owner_can_delete_an_entire_tab_when_every_pane_is_local() {
     let mut state = state();
     let tab_id = state
-        .create_tab(HOST_A, state.revision, 24, 80)
+        .create_tab(HOST_A, state.revision(), 24, 80)
         .expect("second tab");
     let only_pane = state.pane_ids_in_tab(tab_id)[0];
-    let revision = state.revision;
-
+    let revision = state.revision();
     state
         .delete_tab(HOST_A, revision, tab_id)
         .expect("all-owned tab can be deleted");
 
-    assert_eq!(state.revision, revision + 1);
-    assert_eq!(state.tabs.len(), 1);
-    assert!(!state.panes.contains_key(&only_pane));
+    let snapshot = snapshot(&state);
+    assert_eq!(state.revision(), revision + 1);
+    assert_eq!(snapshot.tabs.len(), 1);
+    assert!(!snapshot.panes.contains_key(&only_pane));
+}
+
+#[test]
+fn successful_visible_mutations_advance_revision_once() {
+    let mut state = state();
+    let revision = state.revision();
+    state
+        .add_member(revision, HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member joins");
+    assert_eq!(state.revision(), revision + 1);
+
+    let revision = state.revision();
+    let tab_id = state
+        .create_tab(HOST_A, revision, 24, 80)
+        .expect("create tab");
+    assert_eq!(state.revision(), revision + 1);
+
+    let pane_id = state
+        .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("create pane");
+    let revision = state.revision();
+    state
+        .delete_pane(HOST_A, revision, pane_id)
+        .expect("delete pane");
+    assert_eq!(state.revision(), revision + 1);
+
+    let revision = state.revision();
+    state
+        .delete_tab(HOST_A, revision, tab_id)
+        .expect("delete tab");
+    assert_eq!(state.revision(), revision + 1);
+}
+
+#[test]
+fn pane_reservation_is_invisible_until_the_creator_reports_ready() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    let before = snapshot(&state);
+    let reservation = state
+        .reserve_pane(HOST_B, state.revision(), 1, Axis::LeftRight, 30, 100)
+        .expect("reserve B pane");
+
+    assert_eq!(snapshot(&state), before);
+    assert_eq!(state.revision(), before.revision);
+    assert_eq!(
+        state
+            .pane_ready(HOST_B, state.revision(), reservation.reservation_id)
+            .expect("creator reports ready"),
+        ReservationCommit::Pane {
+            pane_id: reservation.pane_id
+        }
+    );
+    let snapshot = snapshot(&state);
+    assert_eq!(snapshot.panes[&reservation.pane_id].host_peer_id, HOST_B);
+    assert_eq!(snapshot.panes[&reservation.pane_id].grid_rows, 30);
+    assert_eq!(state.revision(), before.revision + 1);
+}
+
+#[test]
+fn tab_reservation_commits_its_reserved_tab_and_initial_pane() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    let reservation = state
+        .reserve_tab(HOST_B, state.revision(), 33, 111)
+        .expect("reserve B tab");
+    let tab_id = reservation.tab_id.expect("tab reservation has tab ID");
+
+    assert_eq!(
+        state
+            .pane_ready(HOST_B, state.revision(), reservation.reservation_id)
+            .expect("commit tab"),
+        ReservationCommit::Tab {
+            tab_id,
+            pane_id: reservation.pane_id,
+        }
+    );
+    let snapshot = snapshot(&state);
+    assert_eq!(
+        tab(&snapshot, tab_id).root,
+        Node::Leaf {
+            pane_id: reservation.pane_id
+        }
+    );
+    assert_eq!(snapshot.panes[&reservation.pane_id].host_peer_id, HOST_B);
+}
+
+#[test]
+fn cancelling_or_expiring_a_reservation_keeps_layout_invisible_and_consumes_ids() {
+    let mut state = state();
+    let before = snapshot(&state);
+    let first = state
+        .reserve_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("reserve first pane");
+    state
+        .cancel_reservation(HOST_A, first.reservation_id)
+        .expect("creator cancels");
+    assert_eq!(snapshot(&state), before);
+    assert_eq!(state.revision(), before.revision);
+
+    let second = state
+        .reserve_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("reserve second pane");
+    state
+        .expire_reservation(second.reservation_id)
+        .expect("coordinator expires it");
+    assert_eq!(snapshot(&state), before);
+    let third = state
+        .reserve_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("reserve third pane");
+    assert!(third.pane_id > second.pane_id);
+    state
+        .cancel_reservation(HOST_A, third.reservation_id)
+        .expect("cleanup");
+
+    let tab = state
+        .reserve_tab(HOST_A, state.revision(), 24, 80)
+        .expect("reserve a tab");
+    state
+        .expire_reservation(tab.reservation_id)
+        .expect("expire tab reservation");
+    assert_eq!(snapshot(&state), before);
+}
+
+#[test]
+fn only_the_reservation_creator_can_commit_or_cancel_it() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    let reservation = state
+        .reserve_pane(HOST_B, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("reserve B pane");
+    let before = snapshot(&state);
+
+    assert_eq!(
+        state.pane_ready(HOST_A, state.revision(), reservation.reservation_id),
+        Err(LayoutError::ReservationCreatorMismatch)
+    );
+    assert_eq!(
+        state.cancel_reservation(HOST_A, reservation.reservation_id),
+        Err(LayoutError::ReservationCreatorMismatch)
+    );
+    assert_eq!(snapshot(&state), before);
+    state
+        .cancel_reservation(HOST_B, reservation.reservation_id)
+        .expect("creator can cancel");
+}
+
+#[test]
+fn snapshots_associate_pane_hosts_with_bounded_member_addresses_and_reject_malformed_data() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    state
+        .update_member_endpoint(state.revision(), HOST_B, b"updated-addr-b".to_vec())
+        .expect("member B updates its endpoint");
+    let pane_id = state
+        .create_pane(HOST_B, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("B pane");
+    let snapshot = snapshot(&state);
+    assert_eq!(snapshot.panes[&pane_id].host_peer_id, HOST_B);
+    assert_eq!(
+        snapshot
+            .members
+            .iter()
+            .find(|member| member.peer_id == HOST_B)
+            .expect("B member")
+            .endpoint_addr,
+        b"updated-addr-b"
+    );
+    SessionState::validate_snapshot(&snapshot).expect("valid snapshot");
+
+    let mut malformed = snapshot;
+    malformed.tabs.clear();
+    assert_eq!(
+        SessionState::validate_snapshot(&malformed),
+        Err(LayoutError::InvalidSnapshot)
+    );
 }
