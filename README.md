@@ -1,6 +1,4 @@
-# Peer-to-peer multiplayer terminal multiplexer
-
-> Name: to decide
+# p2pmux
 
 A brew-installable **macOS** terminal multiplexer where **each pane’s process runs on its host’s machine**, and members in one encrypted peer-to-peer session share layout, presence, and can take control of panes.
 
