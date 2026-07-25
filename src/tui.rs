@@ -29,6 +29,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Paragraph, Widget},
 };
 
@@ -700,16 +701,22 @@ fn pane_title(
     host_peer_id: &[u8],
     controller_peer_id: Option<&[u8]>,
     members: &[crate::layout::Member],
-) -> String {
+) -> Line<'static> {
     let control = match controller_peer_id {
         Some([]) => "free".to_owned(),
         Some(peer_id) => member_label(peer_id, members),
         None => "…".to_owned(),
     };
-    format!(
-        "Pane #{index} host: {} control: {control}",
-        member_label(host_peer_id, members)
-    )
+    Line::from(vec![
+        Span::styled(
+            format!("Pane #{index}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " host: {} control: {control}",
+            member_label(host_peer_id, members)
+        )),
+    ])
 }
 
 fn pane_border_color(
@@ -1104,19 +1111,21 @@ fn render_shared_multi_pane(
         let pane = &tui.snapshot.panes[&pane_id];
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
-        let title = pane_title(
+        let mut title = pane_title(
             index + 1,
             &pane.host_peer_id,
             view.controller_peer_id.as_deref(),
             &tui.snapshot.members,
         );
+        title.spans.insert(0, Span::raw(" "));
+        title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
             view.controller_peer_id.as_deref(),
             view.controller_active,
             focused,
         );
         let block = Block::bordered()
-            .title(format!(" {title} "))
+            .title(title)
             .border_style(Style::default().fg(border_color));
         let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
@@ -3583,15 +3592,15 @@ mod tests {
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
-            pane_title(1, b"host", Some(b""), &members),
+            pane_title(1, b"host", Some(b""), &members).to_string(),
             "Pane #1 host: Host control: free"
         );
         assert_eq!(
-            pane_title(2, b"host", Some(b"guest"), &members),
+            pane_title(2, b"host", Some(b"guest"), &members).to_string(),
             "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
-            pane_title(2, b"host", None, &members),
+            pane_title(2, b"host", None, &members).to_string(),
             "Pane #2 host: Host control: …"
         );
     }
@@ -3857,6 +3866,8 @@ mod tests {
         assert_eq!(buffer[(0, 2)].symbol(), "┌");
         assert_eq!(buffer[(1, 2)].symbol(), " ");
         assert_eq!(buffer[(2, 2)].symbol(), "P");
+        assert!((2..9).all(|x| buffer[(x, 2)].modifier.contains(Modifier::BOLD)));
+        assert!(!buffer[(9, 2)].modifier.contains(Modifier::BOLD));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "h"));
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "t"));
     }
