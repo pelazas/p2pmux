@@ -3,7 +3,7 @@ use p2pmux::{
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, NewPanePosition, PaneFailed,
-        PaneGrid, PaneReady, SetSplitRatio, SplitAxis, UpdatePaneGrids,
+        PaneGrid, PaneReady, SetPaneLock, SetSplitRatio, SplitAxis, UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -46,6 +46,7 @@ fn request(request_id: u64, base_revision: u64) -> LayoutRequest {
         update_pane_grids: None,
         rename_pane: None,
         rename_tab: None,
+        set_pane_lock: None,
     }
 }
 
@@ -117,6 +118,38 @@ fn admitted_members_set_ratios_and_hosts_reconcile_their_grids() {
             .grid_rows,
         30
     );
+}
+
+#[test]
+fn pane_host_can_set_lock_and_guest_is_rejected() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member admitted");
+
+    let commit = commit(coordinator.handle_request(
+        &host_a(),
+        LayoutRequest {
+            set_pane_lock: Some(SetPaneLock {
+                pane_id: 1,
+                locked: true,
+            }),
+            ..request(1, 2)
+        },
+    ));
+    assert!(commit.state.expect("state").panes[0].locked);
+
+    let rejection = reject(coordinator.handle_request(
+        &host_b(),
+        LayoutRequest {
+            set_pane_lock: Some(SetPaneLock {
+                pane_id: 1,
+                locked: false,
+            }),
+            ..request(2, 3)
+        },
+    ));
+    assert_eq!(rejection.reason, LayoutRejectReason::NotHost as i32);
 }
 
 fn commit(response: CoordinatorResponse) -> LayoutCommit {

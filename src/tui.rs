@@ -4321,6 +4321,7 @@ impl SharedLayoutRuntime {
 
                 rename_pane: None,
                 rename_tab: None,
+                set_pane_lock: None,
             })?;
         }
         Ok(())
@@ -4376,6 +4377,7 @@ impl SharedLayoutRuntime {
 
                     rename_pane: None,
                     rename_tab: None,
+                    set_pane_lock: None,
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -4392,6 +4394,7 @@ impl SharedLayoutRuntime {
 
                     rename_pane: None,
                     rename_tab: None,
+                    set_pane_lock: None,
                 })?
             }
             UiIntent::SetSplitRatio {
@@ -4419,6 +4422,7 @@ impl SharedLayoutRuntime {
                     update_pane_grids: None,
                     rename_pane: None,
                     rename_tab: None,
+                    set_pane_lock: None,
                 })?;
             }
             UiIntent::RenamePane { pane_id, title } => {
@@ -4434,6 +4438,7 @@ impl SharedLayoutRuntime {
                     update_pane_grids: None,
                     rename_pane: Some(RenamePane { pane_id, title }),
                     rename_tab: None,
+                    set_pane_lock: None,
                 })?;
             }
             UiIntent::RenameTab { tab_id, title } => {
@@ -4449,6 +4454,7 @@ impl SharedLayoutRuntime {
                     update_pane_grids: None,
                     rename_pane: None,
                     rename_tab: Some(RenameTab { tab_id, title }),
+                    set_pane_lock: None,
                 })?;
             }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
@@ -4500,6 +4506,7 @@ impl SharedLayoutRuntime {
             update_pane_grids: None,
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         })
     }
 
@@ -4549,8 +4556,8 @@ impl SharedLayoutRuntime {
             host_peer_id,
             grid_rows: u32::from(pending.grid_rows),
             grid_cols: u32::from(pending.grid_cols),
-
             title: None,
+            locked: false,
         };
         if let Err(error) = self.panes.register_local_pane(descriptor, pane.channels()) {
             let _ = self.control.try_failed(PaneFailed {
@@ -6032,8 +6039,8 @@ mod tests {
                     host_peer_id: host_id,
                     grid_rows: 2,
                     grid_cols: 8,
-
                     title: None,
+                    locked: false,
                 },
                 initial.channels(),
             )
@@ -6134,8 +6141,8 @@ mod tests {
             host_peer_id: host_id.clone(),
             grid_rows: 1,
             grid_cols: 1,
-
             title: None,
+            locked: false,
         };
         host_panes
             .register_local_pane(
