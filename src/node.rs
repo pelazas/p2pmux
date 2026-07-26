@@ -534,7 +534,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_focus_reads_runtime_state_without_drain() {
         let host = SharedLayoutHost::new(HostSession::create().await.unwrap(), 2, 8).unwrap();
         let panes = host.pane_server();
@@ -586,7 +586,7 @@ mod tests {
         node.focus(1, 2).unwrap();
 
         assert_eq!(node.local_focus(), (1, 2));
-        node.shutdown();
+        tokio::task::block_in_place(|| node.shutdown());
     }
 
     #[test]
