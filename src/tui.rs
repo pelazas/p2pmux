@@ -212,6 +212,7 @@ struct ResizeDrag {
     horizontal: bool,
     vertical: bool,
     original_share_bps: u16,
+    preview_first_share_bps: Option<u16>,
     span: u16,
     content: Rect,
 }
@@ -220,6 +221,13 @@ struct ResizeDrag {
 struct SplitTarget {
     first_share_bps: u16,
     span: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResizePreview {
+    pane_id: PaneId,
+    axis: Axis,
+    first_share_bps: u16,
 }
 
 impl PaneTextSelection {
@@ -386,6 +394,7 @@ impl MultiPaneTui {
             horizontal,
             vertical,
             original_share_bps: 0,
+            preview_first_share_bps: None,
             span: 1,
             content: geometry.content,
         });
@@ -403,25 +412,31 @@ impl MultiPaneTui {
         let Some(drag) = self.resize_drag else {
             return false;
         };
-        if drag.axis.is_some() {
-            return true;
-        }
-        let horizontal = i32::from(column) - i32::from(drag.origin_column);
-        let vertical = i32::from(row) - i32::from(drag.origin_row);
-        if horizontal.unsigned_abs().max(vertical.unsigned_abs()) < 2 {
-            return true;
-        }
-        let axis = match (drag.horizontal, drag.vertical) {
-            (true, false) => Axis::LeftRight,
-            (false, true) => Axis::TopBottom,
-            (true, true) if horizontal.unsigned_abs() >= vertical.unsigned_abs() => Axis::LeftRight,
-            (true, true) => Axis::TopBottom,
-            (false, false) => {
-                self.resize_drag = None;
+        if drag.axis.is_none() {
+            let horizontal = i32::from(column) - i32::from(drag.origin_column);
+            let vertical = i32::from(row) - i32::from(drag.origin_row);
+            if horizontal.unsigned_abs().max(vertical.unsigned_abs()) < 2 {
                 return true;
             }
-        };
-        self.lock_resize_drag(axis);
+            let axis = match (drag.horizontal, drag.vertical) {
+                (true, false) => Axis::LeftRight,
+                (false, true) => Axis::TopBottom,
+                (true, true) if horizontal.unsigned_abs() >= vertical.unsigned_abs() => {
+                    Axis::LeftRight
+                }
+                (true, true) => Axis::TopBottom,
+                (false, false) => {
+                    self.resize_drag = None;
+                    return true;
+                }
+            };
+            self.lock_resize_drag(axis);
+        }
+        if let Some(drag) = self.resize_drag.as_mut()
+            && drag.axis.is_some()
+        {
+            drag.preview_first_share_bps = Some(resize_proposed_share(*drag, column, row));
+        }
         true
     }
 
@@ -447,13 +462,7 @@ impl MultiPaneTui {
     fn end_resize_drag(&mut self, column: u16, row: u16) -> Option<UiIntent> {
         let drag = self.resize_drag.take()?;
         let axis = drag.axis?;
-        let delta = match axis {
-            Axis::LeftRight => i32::from(column) - i32::from(drag.origin_column),
-            Axis::TopBottom => i32::from(row) - i32::from(drag.origin_row),
-        };
-        let proposed = (i32::from(drag.original_share_bps)
-            + delta * 10_000 / i32::from(drag.span.max(1)))
-        .clamp(1, 9_999) as u16;
+        let proposed = resize_proposed_share(drag, column, row);
         (proposed != drag.original_share_bps).then_some(UiIntent::SetSplitRatio {
             pane_id: drag.pane_id,
             axis,
@@ -558,6 +567,7 @@ impl MultiPaneTui {
             })
             .collect();
         self.snapshot = snapshot;
+        self.cancel_resize_drag();
         self.repair_selection();
         Ok(())
     }
@@ -625,7 +635,20 @@ impl MultiPaneTui {
         );
         let mut panes = BTreeMap::new();
         if let Some(tab) = self.current_tab_layout() {
-            allocate_node(&tab.root, content, &mut panes);
+            allocate_node_with_preview(
+                &tab.root,
+                content,
+                &mut panes,
+                self.resize_drag.and_then(|drag| {
+                    drag.axis
+                        .zip(drag.preview_first_share_bps)
+                        .map(|(axis, first_share_bps)| ResizePreview {
+                            pane_id: drag.pane_id,
+                            axis,
+                            first_share_bps,
+                        })
+                }),
+            );
         }
         PaneGeometry {
             tab_bar,
@@ -1060,6 +1083,15 @@ fn pane_border_color(
     }
 }
 
+fn resize_proposed_share(drag: ResizeDrag, column: u16, row: u16) -> u16 {
+    let delta = match drag.axis.expect("locked resize drag has an axis") {
+        Axis::LeftRight => i32::from(column) - i32::from(drag.origin_column),
+        Axis::TopBottom => i32::from(row) - i32::from(drag.origin_row),
+    };
+    (i32::from(drag.original_share_bps) + delta * 10_000 / i32::from(drag.span.max(1)))
+        .clamp(1, 9_999) as u16
+}
+
 fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
     match node {
         Node::Leaf { pane_id: candidate } => *candidate == pane_id,
@@ -1185,7 +1217,12 @@ fn split_areas(
     }
 }
 
-fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
+fn allocate_node_with_preview(
+    node: &Node,
+    area: Rect,
+    panes: &mut BTreeMap<PaneId, Rect>,
+    preview: Option<ResizePreview>,
+) {
     match node {
         Node::Leaf { pane_id } => {
             panes.insert(*pane_id, area);
@@ -1196,11 +1233,58 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
             first,
             second,
         } => {
-            let (first_area, second_area) =
-                split_areas(*axis, *first_share_bps, first, second, area);
-            allocate_node(first, first_area, panes);
-            allocate_node(second, second_area, panes);
+            let share = preview
+                .filter(|preview| {
+                    preview.axis == *axis
+                        && split_is_nearest_for_pane(node, preview.pane_id, preview.axis)
+                })
+                .map_or(*first_share_bps, |preview| preview.first_share_bps);
+            let (first_area, second_area) = split_areas(*axis, share, first, second, area);
+            allocate_node_with_preview(first, first_area, panes, preview);
+            allocate_node_with_preview(second, second_area, panes, preview);
         }
+    }
+}
+
+fn split_is_nearest_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> bool {
+    let Node::Split {
+        axis: split_axis,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return false;
+    };
+    if *split_axis != axis {
+        return false;
+    }
+    let child = if contains_leaf(first, pane_id) {
+        first
+    } else if contains_leaf(second, pane_id) {
+        second
+    } else {
+        return false;
+    };
+    !contains_split_for_pane(child, pane_id, axis)
+}
+
+fn contains_split_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> bool {
+    let Node::Split {
+        axis: split_axis,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return false;
+    };
+    if contains_leaf(first, pane_id) {
+        *split_axis == axis || contains_split_for_pane(first, pane_id, axis)
+    } else if contains_leaf(second, pane_id) {
+        *split_axis == axis || contains_split_for_pane(second, pane_id, axis)
+    } else {
+        false
     }
 }
 
@@ -3830,7 +3914,7 @@ mod tests {
         FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent, HostPaneChannels,
         HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection,
         PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, allocate_node, area_from_terminal_size,
+        SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
         contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
         initial_root_pane_grid, is_chord_command, lease_allows_held_input, member_label,
         mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
@@ -4491,13 +4575,13 @@ mod tests {
             }),
         };
         let mut panes = BTreeMap::new();
-        allocate_node(&node, Rect::new(0, 0, 12, 9), &mut panes);
+        allocate_node_with_preview(&node, Rect::new(0, 0, 12, 9), &mut panes, None);
         assert_eq!(panes[&1].width, 6, "nested sibling needs six columns");
         assert_eq!(panes[&2].width, 3);
         assert_eq!(panes[&3].width, 3);
 
         panes.clear();
-        allocate_node(&node, Rect::new(0, 0, 2, 2), &mut panes);
+        allocate_node_with_preview(&node, Rect::new(0, 0, 2, 2), &mut panes, None);
         assert_eq!(panes[&1].width + panes[&2].width + panes[&3].width, 2);
     }
 
@@ -4506,6 +4590,7 @@ mod tests {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
         assert!(!tui.begin_resize_drag(2, 3, area));
+        assert!(tui.resize_drag.is_none());
         assert!(tui.begin_selection_at(2, 3, area));
         assert!(tui.extend_selection_at(3, 3, area));
         assert!(tui.end_selection_drag());
@@ -4538,6 +4623,49 @@ mod tests {
                 base_revision: 1,
             })
         ));
+    }
+
+    #[test]
+    fn resize_drag_previews_geometry_without_mutating_the_snapshot() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let snapshot = tui.snapshot().clone();
+        let initial = tui.geometry(area);
+
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+
+        let preview = tui.geometry(area);
+        assert_eq!(initial.panes[&1], Rect::new(0, 1, 40, 22));
+        assert_eq!(preview.panes[&1], Rect::new(0, 1, 50, 22));
+        assert_eq!(tui.snapshot(), &snapshot);
+        assert!(matches!(
+            tui.end_resize_drag(49, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 1,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+        assert_eq!(tui.snapshot(), &snapshot);
+        assert_eq!(tui.geometry(area), initial);
+    }
+
+    #[test]
+    fn applying_a_new_snapshot_cancels_the_resize_preview() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let initial = tui.geometry(area);
+
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+        assert_ne!(tui.geometry(area), initial);
+
+        tui.apply_snapshot(tui.snapshot().clone())
+            .expect("valid snapshot");
+        assert!(tui.resize_drag.is_none());
+        assert_eq!(tui.geometry(area), initial);
     }
 
     #[test]
