@@ -105,6 +105,7 @@ async fn direct_subscription_streams_a_registered_non_default_pane_without_synth
         host_peer_id: host_id.clone(),
         grid_rows: 1,
         grid_cols: 3,
+        title: None,
     };
     let mut screen = HostScreen::new(1, 3).expect("screen");
     let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
