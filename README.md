@@ -70,6 +70,13 @@ Set a peer-visible display name once with `p2pmux config set name pelazas`; insp
 `~/.config/p2pmux/config.toml`). `create` and `join` accept `--name <name>` to override and save
 the value for that run and future sessions.
 
+Run `p2pmux config init` to create a fully commented configuration template; it refuses to
+overwrite an existing file. Local TUI chrome colors live under `[ui.theme]`. Every theme key is
+optional, and omitted keys retain today's built-in colors; the template documents every key and
+its default. Colors accept lowercase named values (`white`, `yellow`, `gray`, `dark_gray`) or
+case-insensitive `#RRGGBB` values. The theme is client-local and is never synchronized over P2P;
+detach and reattach after editing the file to reload it.
+
 Every `create` and `join` automatically receives a memorable world-city session name such as
 `tokyo` or `cape-town`; no session name is required. `create --session-name <name>` remains
 available when you want to choose a name explicitly. Automatically chosen names avoid live local

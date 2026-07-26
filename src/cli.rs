@@ -76,6 +76,7 @@ enum Command {
 enum ConfigCommand {
     Set { key: String, value: String },
     Get { key: String },
+    Init,
 }
 
 const TRUST_WARNING: &str = "TRUST WARNING: This is a fully trusted shared-shell session. Anyone with the join ticket can see every pane and may obtain interactive control of available terminals (run commands, see output, touch files reachable to that macOS user).
@@ -111,6 +112,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
+            ConfigCommand::Init => {
+                crate::config::init()?;
+                Ok(())
+            }
             ConfigCommand::Set { key, value } if key == "name" => {
                 crate::config::save(&value)?;
                 Ok(())
