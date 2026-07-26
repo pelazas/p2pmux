@@ -172,8 +172,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     host_peer_id,
                     grid_rows: u32::from(shell_rows),
                     grid_cols: u32::from(shell_cols),
-
                     title: None,
+                    locked: false,
                 },
                 initial.channels(),
             )?;

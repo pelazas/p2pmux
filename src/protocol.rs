@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -285,6 +285,8 @@ pub struct PaneDescriptor {
     pub grid_cols: u32,
     #[prost(string, optional, tag = "5")]
     pub title: Option<String>,
+    #[prost(bool, tag = "6")]
+    pub locked: bool,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -353,6 +355,16 @@ pub struct LayoutRequest {
     pub rename_pane: Option<RenamePane>,
     #[prost(message, optional, tag = "10")]
     pub rename_tab: Option<RenameTab>,
+    #[prost(message, optional, tag = "11")]
+    pub set_pane_lock: Option<SetPaneLock>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetPaneLock {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+    #[prost(bool, tag = "2")]
+    pub locked: bool,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -902,7 +914,8 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
         + usize::from(request.set_split_ratio.is_some())
         + usize::from(request.update_pane_grids.is_some())
         + usize::from(request.rename_pane.is_some())
-        + usize::from(request.rename_tab.is_some());
+        + usize::from(request.rename_tab.is_some())
+        + usize::from(request.set_pane_lock.is_some());
     if actions != 1 {
         return Err(ProtocolError::InvalidLayout("layout_request.action"));
     }
@@ -978,6 +991,9 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
             rename.title.len(),
             MAX_LAYOUT_TITLE_BYTES,
         )?;
+    }
+    if let Some(lock) = &request.set_pane_lock {
+        validate_nonzero("layout_request.set_pane_lock.pane_id", lock.pane_id)?;
     }
     Ok(())
 }

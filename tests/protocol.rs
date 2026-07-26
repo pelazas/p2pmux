@@ -6,7 +6,7 @@ use p2pmux::protocol::{
     MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
     MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION,
     PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, ProtocolError,
-    SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
+    SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
     UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
@@ -27,8 +27,8 @@ fn envelope(body: envelope::Body) -> Envelope {
 }
 
 #[test]
-fn protocol_version_is_v5() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+fn protocol_version_is_v7() {
+    assert_eq!(PROTOCOL_VERSION, 7);
 }
 
 #[test]
@@ -49,6 +49,7 @@ fn ratio_and_grid_actions_validate_strictly() {
 
         rename_pane: None,
         rename_tab: None,
+        set_pane_lock: None,
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid request");
@@ -75,6 +76,7 @@ fn ratio_and_grid_actions_validate_strictly() {
                 update_pane_grids: None,
                 rename_pane: None,
                 rename_tab: None,
+                set_pane_lock: None,
             }
         };
         assert!(encode_frame(&envelope(envelope::Body::LayoutRequest(invalid))).is_err());
@@ -98,12 +100,39 @@ fn ratio_and_grid_actions_validate_strictly() {
 
         rename_pane: None,
         rename_tab: None,
+        set_pane_lock: None,
     };
     assert!(
         decode_frame(
             &encode_frame(&envelope(envelope::Body::LayoutRequest(grids))).expect("encode")
         )
         .is_ok()
+    );
+}
+
+#[test]
+fn pane_lock_action_round_trips_and_is_the_only_action() {
+    let request = LayoutRequest {
+        request_id: 1,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: None,
+        rename_pane: None,
+        rename_tab: None,
+        set_pane_lock: Some(SetPaneLock {
+            pane_id: 1,
+            locked: true,
+        }),
+    };
+    let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
+        .expect("valid lock request");
+    assert_eq!(
+        decode_frame(&encoded).expect("round trip"),
+        envelope(envelope::Body::LayoutRequest(request))
     );
 }
 
@@ -427,8 +456,8 @@ fn layout_state(root: LayoutNode) -> LayoutState {
             host_peer_id: b"peer-a".to_vec(),
             grid_rows: 24,
             grid_cols: 80,
-
             title: None,
+            locked: true,
         }],
         tabs: vec![TabDescriptor {
             tab_id: 1,
@@ -463,6 +492,7 @@ fn v2_envelopes() -> Vec<Envelope> {
 
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         })),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
@@ -550,6 +580,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
 
         rename_pane: None,
         rename_tab: None,
+        set_pane_lock: None,
     };
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
@@ -609,6 +640,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                 grid_rows: 24,
                 grid_cols: 80,
                 title: None,
+                locked: false,
             })
             .collect(),
         ..state.clone()
@@ -629,8 +661,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             host_peer_id: b"peer-a".to_vec(),
             grid_rows: 0,
             grid_cols: 80,
-
             title: None,
+            locked: true,
         }],
         ..state.clone()
     };
@@ -771,6 +803,7 @@ fn create_pane_axis_and_position_are_validated() {
 
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         }))
     }
 
@@ -782,16 +815,16 @@ fn create_pane_axis_and_position_are_validated() {
                     host_peer_id: b"peer-a".to_vec(),
                     grid_rows: 24,
                     grid_cols: 80,
-
                     title: None,
+                    locked: false,
                 },
                 PaneDescriptor {
                     pane_id: 2,
                     host_peer_id: b"peer-a".to_vec(),
                     grid_rows: 24,
                     grid_cols: 80,
-
                     title: None,
+                    locked: false,
                 },
             ],
             tabs: vec![TabDescriptor {
@@ -879,6 +912,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
 
         rename_pane: None,
         rename_tab: None,
+        set_pane_lock: None,
     };
 
     for valid in [
@@ -1117,6 +1151,7 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
                 grid_rows: 24,
                 grid_cols: 80,
                 title: None,
+                locked: false,
             },
         ],
         ..state
@@ -1166,8 +1201,8 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
             host_peer_id: b"peer-a".to_vec(),
             grid_rows: 24,
             grid_cols: 80,
-
             title: None,
+            locked: true,
         }],
         tabs: vec![TabDescriptor {
             tab_id: 13,
@@ -1195,7 +1230,7 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
     );
     assert_eq!(
         field_shape(&parse_fields(&state_fields[2].value)),
-        vec![(1, 0), (2, 2), (3, 0), (4, 0)]
+        vec![(1, 0), (2, 2), (3, 0), (4, 0), (6, 0)]
     );
     let tab_fields = parse_fields(&state_fields[3].value);
     assert_eq!(field_shape(&tab_fields), vec![(1, 0), (2, 2)]);

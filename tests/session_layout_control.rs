@@ -89,6 +89,7 @@ fn create_request(request_id: u64, base_revision: u64) -> LayoutRequest {
         update_pane_grids: None,
         rename_pane: None,
         rename_tab: None,
+        set_pane_lock: None,
     }
 }
 
@@ -245,8 +246,8 @@ async fn late_joiner_subscribes_after_snapshot_without_preloaded_host_roster() {
         host_peer_id: host_id.clone(),
         grid_rows: 1,
         grid_cols: 1,
-
         title: None,
+        locked: false,
     };
     let screen = HostScreen::new(1, 1).expect("screen");
     let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
@@ -322,8 +323,8 @@ async fn departed_member_loses_direct_pane_access_while_healthy_member_receives_
         host_peer_id: host_id.clone(),
         grid_rows: 1,
         grid_cols: 1,
-
         title: None,
+        locked: false,
     };
     let screen = HostScreen::new(1, 1).expect("screen");
     let (_screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
@@ -485,6 +486,7 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
 
                 rename_pane: None,
                 rename_tab: None,
+                set_pane_lock: None,
             })),
         })
         .await
@@ -555,6 +557,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
 
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         })
         .expect("queue tab request");
     let reservation = match next_event(&mut second).await {
@@ -591,6 +594,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
 
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         })
         .expect("queue tab delete");
     for member in [&mut first, &mut second] {
@@ -673,6 +677,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
 
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         })
         .expect("queue deletion");
     assert!(
@@ -695,6 +700,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
 
             rename_pane: None,
             rename_tab: None,
+            set_pane_lock: None,
         })
         .expect("queue foreign deletion");
     assert!(matches!(
