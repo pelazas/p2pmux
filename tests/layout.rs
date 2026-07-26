@@ -57,7 +57,45 @@ fn initial_state_has_one_tab_and_one_hosted_pane() {
     assert_eq!(snapshot.panes.len(), 1);
     assert_eq!(snapshot.tabs[0].root, Node::Leaf { pane_id: 1 });
     assert_eq!(snapshot.panes[&1].host_peer_id, HOST_A);
+    assert!(!snapshot.panes[&1].locked);
     assert_eq!(snapshot.members[0].endpoint_addr, ADDR_A);
+}
+
+#[test]
+fn pane_host_can_lock_and_unlock_while_guests_cannot() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+
+    state
+        .set_pane_lock(HOST_A, state.revision(), 1, true)
+        .expect("host locks pane");
+    assert!(state.pane(1).expect("pane").locked);
+    assert_eq!(
+        state.set_pane_lock(HOST_B, state.revision(), 1, false),
+        Err(LayoutError::NotPaneHost { pane_id: 1 })
+    );
+
+    state
+        .set_pane_lock(HOST_A, state.revision(), 1, false)
+        .expect("host unlocks pane");
+    assert!(!state.pane(1).expect("pane").locked);
+}
+
+#[test]
+fn pane_lock_survives_snapshot_round_trip() {
+    let mut state = state();
+    state
+        .set_pane_lock(HOST_A, state.revision(), 1, true)
+        .expect("host locks pane");
+
+    let snapshot = state.snapshot();
+    let round_trip: LayoutSnapshot =
+        serde_json::from_slice(&serde_json::to_vec(&snapshot).expect("serialize snapshot"))
+            .expect("deserialize snapshot");
+    assert_eq!(round_trip, snapshot);
+    assert!(round_trip.panes[&1].locked);
 }
 
 #[test]

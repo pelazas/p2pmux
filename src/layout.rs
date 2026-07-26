@@ -83,6 +83,7 @@ pub struct Member {
 pub struct Pane {
     pub pane_id: PaneId,
     pub host_peer_id: Vec<u8>,
+    pub locked: bool,
     pub grid_rows: u16,
     pub grid_cols: u16,
     pub title: Option<String>,
@@ -222,6 +223,7 @@ impl SessionState {
         let initial_pane = Pane {
             pane_id: 1,
             host_peer_id: initial_host.clone(),
+            locked: false,
             grid_rows,
             grid_cols,
             title: None,
@@ -582,6 +584,7 @@ impl SessionState {
                     Pane {
                         pane_id,
                         host_peer_id: creator.to_vec(),
+                        locked: false,
                         grid_rows,
                         grid_cols,
                         title: None,
@@ -610,6 +613,7 @@ impl SessionState {
                     Pane {
                         pane_id,
                         host_peer_id: creator.to_vec(),
+                        locked: false,
                         grid_rows,
                         grid_cols,
                         title: None,
@@ -843,6 +847,28 @@ impl SessionState {
             pane.grid_rows = rows;
             pane.grid_cols = cols;
         }
+        self.advance_revision();
+        Ok(())
+    }
+
+    pub fn set_pane_lock(
+        &mut self,
+        requester: &[u8],
+        base_revision: u64,
+        pane_id: PaneId,
+        locked: bool,
+    ) -> Result<(), LayoutError> {
+        self.check_mutation(base_revision)?;
+        self.require_member(requester)?;
+        self.ensure_no_reservation()?;
+        let pane = self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or(LayoutError::UnknownPane { pane_id })?;
+        if pane.host_peer_id != requester {
+            return Err(LayoutError::NotPaneHost { pane_id });
+        }
+        pane.locked = locked;
         self.advance_revision();
         Ok(())
     }

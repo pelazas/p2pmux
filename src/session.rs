@@ -845,6 +845,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
                 Pane {
                     pane_id: pane.pane_id,
                     host_peer_id: pane.host_peer_id.clone(),
+                    locked: false,
                     grid_rows,
                     grid_cols,
                     title: pane.title.clone(),

@@ -566,6 +566,7 @@ mod tests {
             Pane {
                 pane_id: 2,
                 host_peer_id,
+                locked: false,
                 grid_rows: 2,
                 grid_cols: 8,
                 title: None,
