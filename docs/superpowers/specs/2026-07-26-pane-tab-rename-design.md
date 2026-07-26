@@ -98,13 +98,23 @@ membership.
   treatment and clickable tab hit-testing.
 - Pane border label: custom title when present, otherwise `Pane #N`, followed by the existing
   `host: … control: …` metadata.
+- Agents overlay location chrome follows the same title rule: show the tab's custom title when
+  present (otherwise `Tab #N`) and the pane's custom title when present (otherwise `Pane #N`).
+  The selected row is still keyed by `pane_id` and Enter still selects that pane, so using a title
+  does not make selection ambiguous; no extra ordinal is appended when a custom title exists.
 - Apply a display-width-aware, single-line ellipsis helper at each render boundary. Never emit
   controls/newlines (the model already rejects controls). Tab labels are clipped to their allocated
   tab-bar width; reserve the active-tab padding and show an ellipsis when it fits. Pane labels are
-  clipped to the block title's available width after reserving host/control text; if chrome is too
-  narrow, host/control may clip normally but title rendering must not overflow adjacent borders.
-- Titles in snapshots naturally survive a client detach/resume while the headless session lives.
-  They are intentionally not written to finder records and cannot restore a dead session.
+  title-first: protect a single-line, ellipsized custom/fallback title within the block-title
+  width, then append `host`/`control` metadata only from remaining width. Host/control may clip or
+  disappear at narrow widths, but title rendering must not overflow adjacent borders. The same
+  single-line clipping rule applies to agents-overlay location chrome.
+- A local detach does not serialize a separate layout store. The live
+  `SharedLayoutRuntime` owns the current `LayoutSnapshot`; `SharedLayoutNode::snapshot()` returns
+  it and `node::write_snapshot()` sends it to a later local attachment. `SessionStore` finder
+  records contain only connection/identity data for locating that live node. Therefore titles ride
+  in the existing in-memory node snapshot and are not added to finder records; they cannot restore
+  a dead session.
 
 ## Wire contract and compatibility
 
@@ -171,17 +181,22 @@ No new reject enum is needed. Coordinator outcomes are:
 | Sender not an admitted member | existing `NotHost` mapping for `LayoutError::NotMember` |
 | Invalid title or malformed/multiple action request | `Malformed` |
 | Request revision does not equal state revision | `Stale` |
+| Create reservation is pending | existing `ReservationFailure` mapping |
 | Valid rename | authoritative revision advances and `LayoutCommit` broadcasts title-bearing state |
 
-Unlike delete/grid operations, rename performs no pane-host/tab-host authorization check. A pending
-creation reservation should use the existing `ensure_no_reservation` structural-mutation gate so
-rename ordering/revision behavior stays consistent with other layout requests.
+Unlike delete/grid operations, rename performs no pane-host/tab-host authorization check. Rename
+*does* wait behind the existing `ensure_no_reservation` gate. A create reservation records its
+creator's base revision and its later `PaneReady` must commit at that same revision; a rename in
+between would advance the revision and turn a valid ready into `Stale`. Blocking rename until the
+reservation is committed, cancelled, failed, or expired preserves that create protocol without a
+second reservation/rebase mechanism. This is ordering protection, not title authorization.
 
 ## Testing
 
 - Layout: normalization; empty/whitespace clear; 32-scalar boundary; overlong/control rejection;
-  any admitted member can rename a remote-hosted pane/tab; unknown IDs and stale revisions reject;
-  snapshot validation rejects `Some("")` and invalid titles; commits preserve titles.
+  any admitted member can rename a remote-hosted pane/tab; unknown IDs, stale revisions, and a
+  pending reservation reject; snapshot validation rejects `Some("")` and invalid titles; commits
+  preserve titles.
 - Protocol: v6 assertion; descriptor encode/decode preserves optional titles; rename action tags 9
   and 10 round-trip; empty clear is valid; zero IDs, over-128-byte titles, and mixed actions fail.
 - Session: coordinator dispatches both actions, maps each rejection correctly, broadcasts commits,
@@ -189,7 +204,8 @@ rename ordering/revision behavior stays consistent with other layout requests.
 - TUI: `Ctrl+P e` / `Ctrl+T e` target the expected IDs and expose `e` in chord recognition/footer;
   prefill; character and Backspace editing; Enter request; blank clear; invalid stays open; Esc
   cancel; no chord timeout; modal key/mouse/PTY suppression; Ctrl+Q priority; overlay mutual
-  exclusion; title/fallback render and narrow-width ellipsis.
+  exclusion without changing existing overlay behavior; title/fallback render in tab, pane, and
+  agents-overlay chrome; title-first narrow-width ellipsis.
 
 Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and
 `cargo test` after the implementation tasks.
