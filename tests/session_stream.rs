@@ -85,9 +85,9 @@ async fn join_pane_delivers_snapshot_then_delta_in_order() {
         saw_snapshot && saw_lease,
         "host must publish the initial lease"
     );
-    screen_tx.send_replace(screen.process_pty(b"abc").expect("screen update"));
+    screen_tx.send_replace(screen.process_pty(b"\x1b[>1u").expect("screen update"));
     assert!(
-        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenDelta(delta)) if delta.base_sequence == 1 && delta.sequence == 2)
+        matches!(timeout(TEST_TIMEOUT, pane.events.recv()).await.expect("event timeout"), Some(GuestEvent::ScreenDelta(delta)) if delta.base_sequence == 1 && delta.sequence == 2 && delta.kitty_keyboard_active)
     );
     pane.shutdown().await;
     let _ = timeout(TEST_TIMEOUT, host_task).await;

@@ -28,10 +28,39 @@ fn initial_snapshot_describes_the_empty_fixed_grid() {
 #[test]
 fn host_screen_tracks_child_kitty_keyboard_mode() {
     let mut host = HostScreen::new(1, 1).expect("valid fixed grid");
+    let pushed = host.process_pty(b"\x1b[>1u").expect("kitty push");
+    assert!(host.kitty_keyboard_active());
+    assert!(pushed.kitty_keyboard_active);
+    let popped = host.process_pty(b"\x1b[<1u").expect("kitty pop");
+    assert!(!host.kitty_keyboard_active());
+    assert!(!popped.kitty_keyboard_active);
+
+    let mut guest = GuestScreen::new();
+    guest
+        .apply_snapshot(pushed.sequence, &pushed.snapshot)
+        .expect("pushed snapshot applies");
+    guest.set_kitty_keyboard_active(pushed.kitty_keyboard_active);
+    assert!(guest.kitty_keyboard_active());
+    assert_eq!(
+        guest.apply_delta(popped.base_sequence, popped.sequence, &popped.delta),
+        Ok(ApplyDelta::Applied)
+    );
+    guest.set_kitty_keyboard_active(popped.kitty_keyboard_active);
+    assert!(!guest.kitty_keyboard_active());
+}
+
+#[test]
+fn host_screen_replies_to_kitty_keyboard_queries() {
+    let mut host = HostScreen::new(1, 1).expect("valid fixed grid");
+    host.process_pty(b"\x1b[?u").expect("kitty query");
+    assert_eq!(
+        host.take_kitty_keyboard_query_reply(),
+        Some(b"\x1b[?0u".to_vec())
+    );
+    assert!(!host.kitty_keyboard_active());
+
     host.process_pty(b"\x1b[>1u").expect("kitty push");
     assert!(host.kitty_keyboard_active());
-    host.process_pty(b"\x1b[<1u").expect("kitty pop");
-    assert!(!host.kitty_keyboard_active());
 }
 
 #[test]

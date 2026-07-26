@@ -133,6 +133,7 @@ fn envelope_exposes_each_v1_body() {
             host_peer_id: b"peer-host".to_vec(),
             sequence: u32::MAX as u64 + 4,
             screen: b"full screen".to_vec(),
+            kitty_keyboard_active: false,
         })),
         envelope(envelope::Body::Delta(Delta {
             pane_id: b"pane-a".to_vec(),
@@ -140,6 +141,7 @@ fn envelope_exposes_each_v1_body() {
             base_sequence: u32::MAX as u64 + 4,
             sequence: u32::MAX as u64 + 5,
             changes: b"patch".to_vec(),
+            kitty_keyboard_active: false,
         })),
     ];
 
@@ -258,6 +260,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             host_peer_id: b"peer-host".to_vec(),
             sequence: 1,
             screen: b"full screen".to_vec(),
+            kitty_keyboard_active: false,
         })),
         envelope(envelope::Body::Delta(Delta {
             pane_id: b"pane-a".to_vec(),
@@ -265,6 +268,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             base_sequence: 1,
             sequence: 2,
             changes: b"patch".to_vec(),
+            kitty_keyboard_active: false,
         })),
     ]
 }
@@ -274,6 +278,32 @@ fn framed_envelopes_round_trip_all_v1_bodies() {
     for original in sample_envelopes() {
         let frame = encode_frame(&original).expect("valid envelope encodes");
         assert_eq!(decode_frame(&frame).expect("valid frame decodes"), original);
+    }
+}
+
+#[test]
+fn kitty_keyboard_flag_round_trips() {
+    let messages = [
+        envelope(envelope::Body::Snapshot(Snapshot {
+            pane_id: b"pane-a".to_vec(),
+            host_peer_id: b"peer-host".to_vec(),
+            sequence: 1,
+            screen: b"full screen".to_vec(),
+            kitty_keyboard_active: true,
+        })),
+        envelope(envelope::Body::Delta(Delta {
+            pane_id: b"pane-a".to_vec(),
+            host_peer_id: b"peer-host".to_vec(),
+            base_sequence: 1,
+            sequence: 2,
+            changes: b"patch".to_vec(),
+            kitty_keyboard_active: true,
+        })),
+    ];
+
+    for message in messages {
+        let frame = encode_frame(&message).expect("valid envelope encodes");
+        assert_eq!(decode_frame(&frame).expect("valid frame decodes"), message);
     }
 }
 
@@ -1243,6 +1273,7 @@ fn decoder_rejects_oversize_declared_and_decoded_payloads() {
         host_peer_id: b"peer-host".to_vec(),
         sequence: 1,
         screen: vec![0; MAX_SNAPSHOT_BYTES + 1],
+        kitty_keyboard_active: false,
     }));
     let mut snapshot_frame = Vec::new();
     oversized_snapshot
@@ -1262,6 +1293,7 @@ fn decoder_rejects_oversize_declared_and_decoded_payloads() {
         base_sequence: 1,
         sequence: 2,
         changes: vec![0; MAX_DELTA_BYTES + 1],
+        kitty_keyboard_active: false,
     }));
     let mut delta_frame = Vec::new();
     oversized_delta
@@ -1367,6 +1399,7 @@ fn decoder_rejects_missing_fields_and_invalid_sequences() {
         base_sequence: 1,
         sequence: 1,
         changes: Vec::new(),
+        kitty_keyboard_active: false,
     }));
     let mut invalid_delta_frame = Vec::new();
     invalid_delta
@@ -1390,6 +1423,7 @@ fn decoder_accepts_maximum_payloads() {
         host_peer_id: b"peer-host".to_vec(),
         sequence: 1,
         screen: vec![0; MAX_SNAPSHOT_BYTES],
+        kitty_keyboard_active: false,
     }));
     let maximum_delta = envelope(envelope::Body::Delta(Delta {
         pane_id: b"pane-a".to_vec(),
@@ -1397,6 +1431,7 @@ fn decoder_accepts_maximum_payloads() {
         base_sequence: 1,
         sequence: 2,
         changes: vec![0; MAX_DELTA_BYTES],
+        kitty_keyboard_active: false,
     }));
 
     for envelope in [maximum_input, maximum_snapshot, maximum_delta] {
@@ -1443,6 +1478,7 @@ fn encode_frame_rejects_invalid_envelopes() {
         host_peer_id: b"peer-host".to_vec(),
         sequence: 0,
         screen: Vec::new(),
+        kitty_keyboard_active: false,
     }));
 
     let cases = vec![
@@ -1500,6 +1536,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 host_peer_id: b"peer-host".to_vec(),
                 sequence: 1,
                 screen: vec![0; MAX_SNAPSHOT_BYTES + 1],
+                kitty_keyboard_active: false,
             })),
         ),
         (
@@ -1510,6 +1547,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 base_sequence: 1,
                 sequence: 2,
                 changes: vec![0; MAX_DELTA_BYTES + 1],
+                kitty_keyboard_active: false,
             })),
         ),
     ];

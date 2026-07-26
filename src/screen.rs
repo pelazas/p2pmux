@@ -17,6 +17,7 @@ pub struct ScreenFrame {
     pub base_sequence: u64,
     pub snapshot: Arc<[u8]>,
     pub delta: Arc<[u8]>,
+    pub kitty_keyboard_active: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -71,6 +72,7 @@ impl HostScreen {
                 base_sequence: 0,
                 snapshot,
                 delta: Arc::from([]),
+                kitty_keyboard_active: false,
             },
             kitty_keyboard: KittyKeyboardTracker::default(),
         })
@@ -94,6 +96,7 @@ impl HostScreen {
             base_sequence: self.current.sequence,
             snapshot,
             delta: Arc::from(delta),
+            kitty_keyboard_active: self.kitty_keyboard.active(),
         };
         self.previous = self.parser.screen().clone();
         self.current = frame.clone();
@@ -115,6 +118,7 @@ impl HostScreen {
             base_sequence: 0,
             snapshot: snapshot_payload(self.parser.screen())?,
             delta: Arc::from([]),
+            kitty_keyboard_active: self.current.kitty_keyboard_active,
         };
         self.current = frame.clone();
         Ok(frame)
@@ -131,6 +135,10 @@ impl HostScreen {
     pub fn kitty_keyboard_active(&self) -> bool {
         self.kitty_keyboard.active()
     }
+
+    pub fn take_kitty_keyboard_query_reply(&mut self) -> Option<Vec<u8>> {
+        self.kitty_keyboard.take_query_reply()
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -142,6 +150,7 @@ pub enum ApplyDelta {
 pub struct GuestScreen {
     parser: Option<vt100::Parser>,
     sequence: Option<u64>,
+    kitty_keyboard_active: bool,
 }
 
 impl Default for GuestScreen {
@@ -155,6 +164,7 @@ impl GuestScreen {
         Self {
             parser: None,
             sequence: None,
+            kitty_keyboard_active: false,
         }
     }
 
@@ -200,6 +210,14 @@ impl GuestScreen {
 
     pub fn sequence(&self) -> Option<u64> {
         self.sequence
+    }
+
+    pub fn set_kitty_keyboard_active(&mut self, active: bool) {
+        self.kitty_keyboard_active = active;
+    }
+
+    pub fn kitty_keyboard_active(&self) -> bool {
+        self.kitty_keyboard_active
     }
 }
 
