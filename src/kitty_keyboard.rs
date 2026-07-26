@@ -1,6 +1,8 @@
 //! Per-PTY kitty keyboard mode tracking.
 
 const MAX_CARRY_BYTES: usize = 64;
+const DISAMBIGUATE_ESCAPE_CODES: u8 = 1;
+const SUPPORTED_FLAGS: u8 = DISAMBIGUATE_ESCAPE_CODES;
 
 /// Observes kitty keyboard mode escape sequences emitted by one child PTY.
 #[derive(Debug, Default)]
@@ -8,6 +10,7 @@ pub struct KittyKeyboardTracker {
     base: u8,
     stack: Vec<u8>,
     carry: Vec<u8>,
+    query_reply: Option<Vec<u8>>,
 }
 
 impl KittyKeyboardTracker {
@@ -34,8 +37,21 @@ impl KittyKeyboardTracker {
             }
 
             let operation = data[index + 2];
-            if !matches!(operation, b'>' | b'<' | b'=') {
+            if !matches!(operation, b'>' | b'<' | b'=' | b'?') {
                 index += 1;
+                continue;
+            }
+
+            if operation == b'?' {
+                if index + 3 >= data.len() {
+                    break;
+                }
+                if data[index + 3] == b'u' {
+                    self.query_reply = Some(format!("\x1b[?{}u", self.flags()).into_bytes());
+                    index += 4;
+                } else {
+                    index += 1;
+                }
                 continue;
             }
 
@@ -46,6 +62,15 @@ impl KittyKeyboardTracker {
             }
             if end == data.len() {
                 break;
+            }
+            if operation == b'=' && data[end] == b';' {
+                end += 1;
+                while end < data.len() && data[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end == data.len() {
+                    break;
+                }
             }
             if data[end] != b'u' {
                 index += 1;
@@ -66,12 +91,20 @@ impl KittyKeyboardTracker {
     }
 
     pub fn active(&self) -> bool {
-        self.stack.last().copied().unwrap_or(self.base) != 0
+        self.flags() & DISAMBIGUATE_ESCAPE_CODES != 0
+    }
+
+    pub fn take_query_reply(&mut self) -> Option<Vec<u8>> {
+        self.query_reply.take()
+    }
+
+    fn flags(&self) -> u8 {
+        self.stack.last().copied().unwrap_or(self.base)
     }
 
     fn apply(&mut self, operation: u8, value: Option<u8>) {
         match operation {
-            b'>' => self.stack.push(value.unwrap_or(0)),
+            b'>' => self.stack.push(value.unwrap_or(0) & SUPPORTED_FLAGS),
             b'<' => {
                 for _ in 0..usize::from(value.unwrap_or(1)) {
                     if self.stack.pop().is_none() {
@@ -80,7 +113,7 @@ impl KittyKeyboardTracker {
                 }
             }
             b'=' => {
-                let flags = value.unwrap_or(0);
+                let flags = value.unwrap_or(0) & SUPPORTED_FLAGS;
                 if let Some(current) = self.stack.last_mut() {
                     *current = flags;
                 } else {
@@ -142,6 +175,40 @@ mod tests {
         assert!(!tracker.active());
         tracker.observe(b"u");
         assert!(tracker.active());
+    }
+
+    #[test]
+    fn initial_query_replies_with_no_flags() {
+        let mut tracker = KittyKeyboardTracker::default();
+        tracker.observe(b"\x1b[?u");
+        assert_eq!(tracker.take_query_reply(), Some(b"\x1b[?0u".to_vec()));
+    }
+
+    #[test]
+    fn query_replies_with_current_flags() {
+        let mut tracker = KittyKeyboardTracker::default();
+        tracker.observe(b"\x1b[>1u\x1b[?u");
+        assert_eq!(tracker.take_query_reply(), Some(b"\x1b[?1u".to_vec()));
+    }
+
+    #[test]
+    fn split_query_is_observed() {
+        let mut tracker = KittyKeyboardTracker::default();
+        tracker.observe(b"\x1b[?");
+        assert_eq!(tracker.take_query_reply(), None);
+        tracker.observe(b"u");
+        assert_eq!(tracker.take_query_reply(), Some(b"\x1b[?0u".to_vec()));
+    }
+
+    #[test]
+    fn unsupported_flags_are_inactive() {
+        let mut tracker = KittyKeyboardTracker::default();
+        tracker.observe(b"\x1b[>2u");
+        assert!(!tracker.active());
+        tracker.observe(b"\x1b[=3;1u");
+        assert!(tracker.active());
+        tracker.observe(b"\x1b[?u");
+        assert_eq!(tracker.take_query_reply(), Some(b"\x1b[?1u".to_vec()));
     }
 
     #[test]
