@@ -32,6 +32,16 @@ use crate::{
 };
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = crate::config::config_path()?;
+    let theme = crate::config::load_config_from(&config_path)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "could not load config {}: {error}",
+                config_path.display()
+            ))
+        })?
+        .ui
+        .theme;
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
@@ -82,6 +92,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     {
                         apply_snapshot(
                             &mut tui,
+                            theme,
                             &mut screens,
                             room_name,
                             *layout,
@@ -255,6 +266,7 @@ fn should_forward_paste(tui: &MultiPaneTui) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn apply_snapshot(
     tui: &mut Option<MultiPaneTui>,
+    theme: crate::config::UiTheme,
     screens: &mut BTreeMap<u64, GuestScreen>,
     room_name: String,
     layout: crate::layout::LayoutSnapshot,
@@ -271,7 +283,7 @@ fn apply_snapshot(
             view
         }
         None => tui
-            .insert(MultiPaneTui::new(layout).map_err(|error| {
+            .insert(MultiPaneTui::with_theme(layout, theme).map_err(|error| {
                 io::Error::other(format!("invalid layout snapshot: {error:?}"))
             })?),
     };

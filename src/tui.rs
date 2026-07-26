@@ -49,6 +49,7 @@ use crate::{
         PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree,
         sample_global_snapshot,
     },
+    config::UiTheme,
     kitty_keyboard::KittyKeyboardTracker,
     layout::{
         Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId, normalize_title,
@@ -77,10 +78,6 @@ pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bo
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
-const FOOTER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
-const FOOTER_MUTED: Color = Color::White;
-const FOOTER_ACCENT: Color = Color::Rgb(220, 50, 47);
-const FOOTER_ORANGE: Color = Color::Rgb(255, 120, 70);
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
@@ -98,10 +95,6 @@ const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
-const AGENT_OVERLAY_CHROME: Color = Color::Rgb(255, 69, 0);
-const AGENT_OVERLAY_SELECTED_BACKGROUND: Color = Color::DarkGray;
-const AGENT_OVERLAY_MUTED: Color = Color::Rgb(145, 157, 180);
-const AGENT_OVERLAY_WARM: Color = Color::Rgb(255, 184, 77);
 
 enum FooterSegment {
     Text(&'static str),
@@ -351,6 +344,7 @@ impl PaneTextSelection {
 #[derive(Clone, Debug)]
 pub struct MultiPaneTui {
     title: String,
+    theme: UiTheme,
     snapshot: LayoutSnapshot,
     current_tab: TabId,
     focused_pane: PaneId,
@@ -374,6 +368,10 @@ pub struct MultiPaneTui {
 
 impl MultiPaneTui {
     pub fn new(snapshot: LayoutSnapshot) -> Result<Self, LayoutError> {
+        Self::with_theme(snapshot, UiTheme::default())
+    }
+
+    pub fn with_theme(snapshot: LayoutSnapshot, theme: UiTheme) -> Result<Self, LayoutError> {
         crate::layout::SessionState::validate_snapshot(&snapshot)?;
         let current_tab = snapshot.tabs[0].tab_id;
         let focused_pane = first_leaf(&snapshot.tabs[0].root).expect("validated layout has a leaf");
@@ -384,6 +382,7 @@ impl MultiPaneTui {
             .collect();
         Ok(Self {
             title: TOP_BAR_BRAND.into(),
+            theme,
             snapshot,
             current_tab,
             focused_pane,
@@ -1627,17 +1626,18 @@ fn pane_title(
 }
 
 fn pane_border_color(
+    theme: &UiTheme,
     controller_peer_id: Option<&[u8]>,
     _controller_active: bool,
     focused: bool,
     hovered: bool,
 ) -> Color {
     match controller_peer_id {
-        Some([]) if focused => Color::White,
-        None if focused => Color::Yellow,
-        Some([]) | None if hovered => Color::Gray,
-        Some([]) | None => Color::DarkGray,
-        Some(_) => Color::Rgb(255, 69, 0),
+        Some([]) if focused => theme.pane_border_free_focused,
+        None if focused => theme.pane_border_unknown_focused,
+        Some([]) | None if hovered => theme.pane_border_hovered,
+        Some([]) | None => theme.pane_border_idle,
+        Some(_) => theme.pane_border_remote_control,
     }
 }
 
@@ -1992,6 +1992,7 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
 
 fn render_footer_segments(
     buffer: &mut Buffer,
+    theme: &UiTheme,
     mut x: u16,
     y: u16,
     end_x: u16,
@@ -2001,20 +2002,22 @@ fn render_footer_segments(
         let (text, style) = match segment {
             FooterSegment::Text(text) => (
                 *text,
-                Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+                Style::default()
+                    .fg(theme.footer_muted)
+                    .bg(theme.footer_background),
             ),
             FooterSegment::Key(text) => (
                 *text,
                 Style::default()
-                    .fg(FOOTER_ACCENT)
-                    .bg(FOOTER_BACKGROUND)
+                    .fg(theme.footer_accent)
+                    .bg(theme.footer_background)
                     .add_modifier(Modifier::BOLD),
             ),
             FooterSegment::OrangeKey(text) => (
                 *text,
                 Style::default()
-                    .fg(FOOTER_ORANGE)
-                    .bg(FOOTER_BACKGROUND)
+                    .fg(theme.footer_orange)
+                    .bg(theme.footer_background)
                     .add_modifier(Modifier::BOLD),
             ),
         };
@@ -2025,14 +2028,23 @@ fn render_footer_segments(
     x
 }
 
-fn render_copy_feedback(buffer: &mut Buffer, mut x: u16, y: u16, end_x: u16, lines: usize) {
+fn render_copy_feedback(
+    buffer: &mut Buffer,
+    theme: &UiTheme,
+    mut x: u16,
+    y: u16,
+    end_x: u16,
+    lines: usize,
+) {
     x = buffer
         .set_stringn(
             x,
             y,
             "  copied ",
             usize::from(end_x.saturating_sub(x)),
-            Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+            Style::default()
+                .fg(theme.footer_muted)
+                .bg(theme.footer_background),
         )
         .0;
     buffer.set_stringn(
@@ -2041,20 +2053,27 @@ fn render_copy_feedback(buffer: &mut Buffer, mut x: u16, y: u16, end_x: u16, lin
         format!("{lines} line{}", if lines == 1 { "" } else { "s" }),
         usize::from(end_x.saturating_sub(x)),
         Style::default()
-            .fg(Color::Rgb(255, 69, 0))
-            .bg(FOOTER_BACKGROUND),
+            .fg(theme.copy_feedback_accent)
+            .bg(theme.footer_background),
     );
 }
 
-fn render_footer_notice(buffer: &mut Buffer, x: u16, y: u16, end_x: u16, notice: &str) {
+fn render_footer_notice(
+    buffer: &mut Buffer,
+    theme: &UiTheme,
+    x: u16,
+    y: u16,
+    end_x: u16,
+    notice: &str,
+) {
     buffer.set_stringn(
         x,
         y,
         format!("  {notice}"),
         usize::from(end_x.saturating_sub(x)),
         Style::default()
-            .fg(FOOTER_ORANGE)
-            .bg(FOOTER_BACKGROUND)
+            .fg(theme.footer_orange)
+            .bg(theme.footer_background)
             .add_modifier(Modifier::BOLD),
     );
 }
@@ -2089,6 +2108,7 @@ fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&st
 
 fn render_contextual_footer(
     buffer: &mut Buffer,
+    theme: &UiTheme,
     area: Rect,
     status: &str,
     copied_lines: Option<usize>,
@@ -2101,7 +2121,7 @@ fn render_contextual_footer(
         area.y,
         " ".repeat(usize::from(area.width)),
         usize::from(area.width),
-        Style::default().bg(FOOTER_BACKGROUND),
+        Style::default().bg(theme.footer_background),
     );
 
     let end_x = area.right();
@@ -2113,7 +2133,9 @@ fn render_contextual_footer(
                 area.y,
                 format!("{status}  "),
                 usize::from(end_x.saturating_sub(x)),
-                Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+                Style::default()
+                    .fg(theme.footer_muted)
+                    .bg(theme.footer_background),
             )
             .0;
     }
@@ -2138,15 +2160,15 @@ fn render_contextual_footer(
     };
     let help_end = join_x.saturating_sub(flash_width);
     let (_, segments) = contextual_footer(chord_mode);
-    let x = render_footer_segments(buffer, x, area.y, help_end, segments);
+    let x = render_footer_segments(buffer, theme, x, area.y, help_end, segments);
     // Mid-bar flash messages sit after chord help and before the join code.
     if let Some(notice) = footer_notice {
-        render_footer_notice(buffer, x, area.y, join_x, notice);
+        render_footer_notice(buffer, theme, x, area.y, join_x, notice);
     } else if status.is_empty()
         && chord_mode == ChordMode::None
         && let Some(lines) = copied_lines
     {
-        render_copy_feedback(buffer, x, area.y, join_x, lines);
+        render_copy_feedback(buffer, theme, x, area.y, join_x, lines);
     }
     if let Some(text) = join_text {
         buffer.set_stringn(
@@ -2154,7 +2176,9 @@ fn render_contextual_footer(
             area.y,
             text,
             usize::from(end_x.saturating_sub(join_x)),
-            Style::default().fg(FOOTER_MUTED).bg(FOOTER_BACKGROUND),
+            Style::default()
+                .fg(theme.footer_muted)
+                .bg(theme.footer_background),
         );
     }
 }
@@ -2168,6 +2192,7 @@ fn render_shared_multi_pane(
     footer_notice: Option<&str>,
     join_code: Option<&str>,
 ) {
+    let theme = &tui.theme;
     let geometry = tui.geometry(frame.area());
     if geometry.tab_bar.width > 0 && geometry.tab_bar.height > 0 {
         let buffer = frame.buffer_mut();
@@ -2176,7 +2201,7 @@ fn render_shared_multi_pane(
             geometry.tab_bar.y,
             " ".repeat(usize::from(geometry.tab_bar.width)),
             usize::from(geometry.tab_bar.width),
-            Style::default().bg(FOOTER_BACKGROUND),
+            Style::default().bg(theme.footer_background),
         );
         let mut x = buffer
             .set_stringn(
@@ -2184,7 +2209,9 @@ fn render_shared_multi_pane(
                 geometry.tab_bar.y,
                 tui.title(),
                 usize::from(geometry.tab_bar.width),
-                Style::default().fg(Color::White).bg(FOOTER_BACKGROUND),
+                Style::default()
+                    .fg(theme.tab_foreground)
+                    .bg(theme.footer_background),
             )
             .0;
         x = buffer
@@ -2193,7 +2220,9 @@ fn render_shared_multi_pane(
                 geometry.tab_bar.y,
                 TOP_BAR_BRAND_SEPARATOR,
                 usize::from(geometry.tab_bar.right().saturating_sub(x)),
-                Style::default().fg(Color::DarkGray).bg(FOOTER_BACKGROUND),
+                Style::default()
+                    .fg(theme.tab_separator)
+                    .bg(theme.footer_background),
             )
             .0;
         for (index, tab) in tui.snapshot.tabs.iter().enumerate() {
@@ -2204,18 +2233,22 @@ fn render_shared_multi_pane(
                         geometry.tab_bar.y,
                         TAB_BAR_SEPARATOR,
                         usize::from(geometry.tab_bar.right().saturating_sub(x)),
-                        Style::default().fg(Color::DarkGray).bg(FOOTER_BACKGROUND),
+                        Style::default()
+                            .fg(theme.tab_separator)
+                            .bg(theme.footer_background),
                     )
                     .0;
             }
             let active = tab.tab_id == tui.current_tab;
             let style = if active {
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(220, 50, 47))
+                    .fg(theme.tab_foreground)
+                    .bg(theme.tab_active_background)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White).bg(FOOTER_BACKGROUND)
+                Style::default()
+                    .fg(theme.tab_foreground)
+                    .bg(theme.footer_background)
             };
             let label = truncate_trailing(
                 &tab_label(tab.title.as_deref(), index + 1, active),
@@ -2238,6 +2271,7 @@ fn render_shared_multi_pane(
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
         render_contextual_footer(
             frame.buffer_mut(),
+            theme,
             geometry.footer,
             status,
             copied_lines,
@@ -2269,6 +2303,7 @@ fn render_shared_multi_pane(
         title.spans.insert(0, Span::raw(" "));
         title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
+            theme,
             view.controller_peer_id.as_deref(),
             view.controller_active,
             focused,
@@ -2325,17 +2360,17 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
         .title(Line::styled(
             " Agents ",
             Style::default()
-                .fg(AGENT_OVERLAY_CHROME)
+                .fg(tui.theme.agent_overlay_chrome)
                 .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(AGENT_OVERLAY_CHROME));
+        .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
     let inner = agents_overlay_inner(area);
     frame.render_widget(block, panel);
     if tui.agent_rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "No agents running",
-                Style::default().fg(AGENT_OVERLAY_MUTED),
+                Style::default().fg(tui.theme.agent_overlay_muted),
             )),
             inner,
         );
@@ -2350,6 +2385,7 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
             inner.width,
             now_unix_ms,
             animation_phase,
+            &tui.theme,
         ));
         if index + 1 < tui.agent_rows.len() {
             lines.push(Line::raw(""));
@@ -2428,6 +2464,7 @@ fn format_agent_overlay_card(
     width: u16,
     now_unix_ms: u64,
     animation_phase: usize,
+    theme: &UiTheme,
 ) -> [Line<'static>; 2] {
     let marker = if selected { "›" } else { " " };
     let kind = overlay_kind_label(&row.kind);
@@ -2437,22 +2474,22 @@ fn format_agent_overlay_card(
         usize::from(width.saturating_sub(text_width(&first_prefix))),
     );
     let card_style = if selected {
-        Style::default().bg(AGENT_OVERLAY_SELECTED_BACKGROUND)
+        Style::default().bg(theme.agent_overlay_selected_background)
     } else {
         Style::default()
     };
     let first_line = agent_overlay_line(
         vec![
-            Span::styled(marker, Style::default().fg(AGENT_OVERLAY_CHROME)),
+            Span::styled(marker, Style::default().fg(theme.agent_overlay_chrome)),
             Span::raw(" "),
             Span::styled(
                 kind,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme.agent_overlay_foreground)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · ", Style::default().fg(AGENT_OVERLAY_MUTED)),
-            Span::styled(cwd, Style::default().fg(Color::Gray)),
+            Span::styled(" · ", Style::default().fg(theme.agent_overlay_muted)),
+            Span::styled(cwd, Style::default().fg(theme.agent_overlay_secondary)),
         ],
         card_style,
         selected,
@@ -2490,18 +2527,18 @@ fn format_agent_overlay_card(
         Span::styled(
             glyph,
             Style::default().fg(if row.state == AgentRosterState::Working {
-                AGENT_OVERLAY_CHROME
+                theme.agent_overlay_chrome
             } else {
-                AGENT_OVERLAY_MUTED
+                theme.agent_overlay_muted
             }),
         ),
         Span::raw(" "),
         Span::styled(
             state,
             Style::default().fg(if row.state == AgentRosterState::Working {
-                Color::White
+                theme.agent_overlay_foreground
             } else {
-                AGENT_OVERLAY_MUTED
+                theme.agent_overlay_muted
             }),
         ),
     ];
@@ -2509,19 +2546,22 @@ fn format_agent_overlay_card(
         second_spans.push(Span::raw(" "));
         second_spans.push(Span::styled(
             elapsed,
-            Style::default().fg(AGENT_OVERLAY_WARM),
+            Style::default().fg(theme.agent_overlay_warm),
         ));
     }
     second_spans.push(Span::styled(
         location,
-        Style::default().fg(AGENT_OVERLAY_MUTED),
+        Style::default().fg(theme.agent_overlay_muted),
     ));
     if let Some(controller) = controller {
         second_spans.push(Span::styled(
             controller_prefix,
-            Style::default().fg(AGENT_OVERLAY_MUTED),
+            Style::default().fg(theme.agent_overlay_muted),
         ));
-        second_spans.push(Span::styled(controller, Style::default().fg(Color::Gray)));
+        second_spans.push(Span::styled(
+            controller,
+            Style::default().fg(theme.agent_overlay_secondary),
+        ));
     }
     [
         first_line,
@@ -5206,6 +5246,7 @@ mod tests {
         style::{Color, Modifier},
     };
 
+    use crate::config::UiTheme;
     use crate::layout::{Axis, LayoutSnapshot, NewPanePosition, Node, Pane, Tab};
     use crate::lease::{IDLE_AFTER, LeaseManager, LeaseState};
     use crate::screen::{GuestScreen, HostScreen};
@@ -5217,15 +5258,14 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FOOTER_ACCENT,
-        FOOTER_BACKGROUND, FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent,
-        HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui,
-        PaneTextSelection, PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell,
-        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview,
-        area_from_terminal_size, contextual_footer, copied_line_count, encode_key, encode_paste,
-        grid_for_pane, initial_root_pane_grid, is_chord_command, lease_allows_held_input,
-        member_label, mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
-        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterSegment,
+        HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
+        MultiPaneTui, PaneTextSelection, PaneViewState, PendingEscape, RemoteSubscriptionState,
+        ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
+        allocate_node_with_preview, area_from_terminal_size, contextual_footer, copied_line_count,
+        encode_key, encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
+        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
+        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
@@ -5381,7 +5421,14 @@ mod tests {
     fn agents_overlay_cards_show_state_elapsed_and_location() {
         let row = agent_row(2, 2, 1);
 
-        let rendered = super::format_agent_overlay_card(&row, true, 120, 1_725_000_084_123, 0);
+        let rendered = super::format_agent_overlay_card(
+            &row,
+            true,
+            120,
+            1_725_000_084_123,
+            0,
+            &UiTheme::default(),
+        );
 
         assert!(rendered[0].to_string().starts_with("› Codex · "));
         assert!(
@@ -5399,16 +5446,37 @@ mod tests {
     fn agents_overlay_cards_distinguish_idle_done_and_future_work() {
         let mut row = agent_row(2, 2, 1);
         row.state = crate::protocol::AgentRosterState::Idle;
-        let idle = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0);
+        let idle = super::format_agent_overlay_card(
+            &row,
+            false,
+            120,
+            1_725_000_000_123,
+            0,
+            &UiTheme::default(),
+        );
         assert!(idle[1].to_string().starts_with("○ idle"));
 
         row.state = crate::protocol::AgentRosterState::Done;
-        let done = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0);
+        let done = super::format_agent_overlay_card(
+            &row,
+            false,
+            120,
+            1_725_000_000_123,
+            0,
+            &UiTheme::default(),
+        );
         assert!(done[1].to_string().starts_with("✓ done"));
 
         row.state = crate::protocol::AgentRosterState::Working;
         row.working_since_unix_ms = 1_725_000_001_123;
-        let future = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0);
+        let future = super::format_agent_overlay_card(
+            &row,
+            false,
+            120,
+            1_725_000_000_123,
+            0,
+            &UiTheme::default(),
+        );
         assert!(future[1].to_string().starts_with("◐ working 0s"));
     }
 
@@ -5460,9 +5528,16 @@ mod tests {
             vec![(8, 1, 1), (6, 1, 2), (3, 2, 1)]
         );
         assert!(
-            super::format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0, 0)[1]
-                .to_string()
-                .contains("Tab #2 · Pane #1")
+            super::format_agent_overlay_card(
+                &tui.agent_rows[2],
+                false,
+                120,
+                0,
+                0,
+                &UiTheme::default(),
+            )[1]
+            .to_string()
+            .contains("Tab #2 · Pane #1")
         );
     }
 
@@ -5894,7 +5969,7 @@ mod tests {
         assert!(notice < join, "notice sits before join code");
         assert_eq!(
             terminal.backend().buffer()[(notice as u16, 4)].fg,
-            FOOTER_ORANGE
+            UiTheme::default().footer_orange
         );
         assert!(
             !footer.trim_start().starts_with("layout request"),
@@ -6490,31 +6565,45 @@ mod tests {
 
     #[test]
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
+        let theme = UiTheme::default();
         assert_eq!(
-            pane_border_color(Some(b""), false, true, false),
+            pane_border_color(&theme, Some(b""), false, true, false),
             Color::White
         );
         assert_eq!(
-            pane_border_color(Some(b""), false, false, true),
+            pane_border_color(&theme, Some(b""), false, false, true),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(Some(b""), false, false, false),
-            Color::DarkGray
-        );
-        assert_eq!(pane_border_color(None, false, true, false), Color::Yellow);
-        assert_eq!(pane_border_color(None, false, false, true), Color::Gray);
-        assert_eq!(
-            pane_border_color(None, false, false, false),
+            pane_border_color(&theme, Some(b""), false, false, false),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(Some(b"guest"), true, true, true),
+            pane_border_color(&theme, None, false, true, false),
+            Color::Yellow
+        );
+        assert_eq!(
+            pane_border_color(&theme, None, false, false, true),
+            Color::Gray
+        );
+        assert_eq!(
+            pane_border_color(&theme, None, false, false, false),
+            Color::DarkGray
+        );
+        assert_eq!(
+            pane_border_color(&theme, Some(b"guest"), true, true, true),
             Color::Rgb(255, 69, 0)
         );
         assert_eq!(
-            pane_border_color(Some(b"guest"), false, false, true),
+            pane_border_color(&theme, Some(b"guest"), false, false, true),
             Color::Rgb(255, 69, 0)
+        );
+
+        let mut themed = UiTheme::default();
+        themed.pane_border_remote_control = Color::Rgb(1, 2, 3);
+        assert_eq!(
+            pane_border_color(&themed, Some(b"guest"), false, false, false),
+            Color::Rgb(1, 2, 3)
         );
     }
 
@@ -7247,6 +7336,7 @@ mod tests {
 
     #[test]
     fn shared_footer_accents_key_glyphs_on_a_dark_background() {
+        let theme = UiTheme::default();
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -7270,10 +7360,14 @@ mod tests {
             let mut x = 0;
             for segment in segments {
                 let (text, fg, bg, bold) = match segment {
-                    FooterSegment::Text(text) => (*text, FOOTER_MUTED, FOOTER_BACKGROUND, false),
-                    FooterSegment::Key(text) => (*text, FOOTER_ACCENT, FOOTER_BACKGROUND, true),
+                    FooterSegment::Text(text) => {
+                        (*text, theme.footer_muted, theme.footer_background, false)
+                    }
+                    FooterSegment::Key(text) => {
+                        (*text, theme.footer_accent, theme.footer_background, true)
+                    }
                     FooterSegment::OrangeKey(text) => {
-                        (*text, FOOTER_ORANGE, FOOTER_BACKGROUND, true)
+                        (*text, theme.footer_orange, theme.footer_background, true)
                     }
                 };
                 for key in text.chars() {
@@ -7288,6 +7382,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn themed_tui_overrides_footer_chrome() {
+        let mut theme = UiTheme::default();
+        theme.footer_background = Color::Rgb(1, 2, 3);
+        theme.footer_orange = Color::Rgb(4, 5, 6);
+        let tui = MultiPaneTui::with_theme(
+            layout(
+                vec![Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                }],
+                &[(1, 2, 2)],
+            ),
+            theme,
+        )
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let footer = terminal.backend().buffer();
+        assert_eq!(footer[(0, 3)].bg, theme.footer_background);
+        assert_eq!(footer[(0, 3)].fg, theme.footer_orange);
     }
 
     #[test]
