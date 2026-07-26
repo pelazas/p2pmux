@@ -2962,18 +2962,14 @@ impl Drop for TerminalGuard {
 }
 
 fn enable_keyboard_enhancement() -> io::Result<bool> {
-    if matches!(terminal::supports_keyboard_enhancement(), Ok(true)) {
-        execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            )
-        )?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )?;
+    Ok(true)
 }
 
 /// Run one local shell in a PTY whose dimensions never change after startup.
