@@ -2959,6 +2959,7 @@ async fn screen_writer_task(
                             base_sequence: frame.base_sequence,
                             sequence: frame.sequence,
                             changes: frame.delta.to_vec(),
+                            kitty_keyboard_active: frame.kitty_keyboard_active,
                         })),
                     }).await?;
                 }
@@ -2990,6 +2991,7 @@ async fn write_snapshot(
                 host_peer_id: host_peer_id.to_vec(),
                 sequence: frame.sequence,
                 screen: frame.snapshot.to_vec(),
+                kitty_keyboard_active: frame.kitty_keyboard_active,
             })),
         })
         .await

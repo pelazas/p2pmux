@@ -224,6 +224,8 @@ pub struct Snapshot {
     pub sequence: u64,
     #[prost(bytes = "vec", tag = "4")]
     pub screen: Vec<u8>,
+    #[prost(bool, tag = "5")]
+    pub kitty_keyboard_active: bool,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -238,6 +240,8 @@ pub struct Delta {
     pub sequence: u64,
     #[prost(bytes = "vec", tag = "5")]
     pub changes: Vec<u8>,
+    #[prost(bool, tag = "6")]
+    pub kitty_keyboard_active: bool,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
