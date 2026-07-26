@@ -6,6 +6,7 @@ pub mod config;
 pub mod kitty_keyboard;
 pub mod layout;
 pub mod lease;
+pub mod local_ipc;
 pub mod protocol;
 pub mod pty_host;
 pub mod rendezvous;
