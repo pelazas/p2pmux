@@ -88,15 +88,15 @@ Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
 to leave the mode and send that key to the focused PTY.
 
-`Ctrl+A` opens the Agents overlay, which lists only supported coding agents running below hosted
-pane shells: Claude Code (`claude`), Codex (`codex`), Cursor Agent (`cursor-agent`), and Pi
-(`pi`). It shows the agent's best-effort working directory, pane host, control holder, and
-idle/working/done state. Press `Esc` to close, use arrows or `j`/`k` to select, and press Enter
-to jump to that pane (including on another tab). To retain readline's beginning-of-line shortcut,
-press `Ctrl+A` twice within 400ms to forward one Ctrl+A to the focused PTY instead. The overlay is
-keyboard-only in v1. Working directories are shared with every member as part of the existing
-trusted shared-shell model, so do not use a session with people who should not see repository
-paths.
+`Ctrl+A` opens the Agents overlay, which lists supported coding agents running below hosted pane
+shells: Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv),
+Pi (including Node-based launches), and OpenCode (`opencode`). It shows the agent's best-effort
+working directory, pane number, host, and idle/working/done state. Press `Esc` to close, use
+arrows or `j`/`k` to select, and press Enter or left-click a row to jump to that pane (including
+on another tab). To retain readline's beginning-of-line shortcut, press `Ctrl+A` twice within
+400ms to forward one Ctrl+A to the focused PTY instead. Working directories are shared with every
+member as part of the existing trusted shared-shell model, so do not use a session with people who
+should not see repository paths.
 
 Clicking a pane focuses it locally without taking control or sending input. When p2pmux runs
 inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
