@@ -4,6 +4,8 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Write},
     str::FromStr,
+    process::{Command as ProcessCommand, Stdio},
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
@@ -49,6 +51,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(hide = true)]
+    Node { #[arg(long)] bootstrap: std::path::PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,6 +85,7 @@ pub async fn parse_and_run() -> Result<(), Box<dyn Error>> {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
+        Command::Node { bootstrap } => crate::node::run_background(crate::node::read_bootstrap(&bootstrap)?).await,
         Command::Local => crate::tui::run_local(),
         Command::Config { command } => match command {
             ConfigCommand::Set { key, value } if key == "name" => {
@@ -221,6 +226,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
     }
+}
+
+/// Launches an isolated session owner. It has no terminal file descriptors and its own process
+/// group, so closing the initiating terminal cannot take the PTYs down with it.
+pub(crate) fn launch_background_node(
+    kind: crate::node::NodeBootstrapKind,
+    name: String,
+    role: crate::session_store::SessionRole,
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    let store = crate::session_store::SessionStore::for_current_user()?;
+    let id = crate::session_store::generate_id()?;
+    let socket_path = store.socket_path(&id)?;
+    let descriptor = crate::session_store::SessionDescriptor::new(id.clone(), name, socket_path, 1, role);
+    let bootstrap = crate::node::NodeBootstrap { descriptor: descriptor.clone(), kind };
+    let bootstrap_path = descriptor.socket_path.with_extension("bootstrap");
+    crate::node::write_bootstrap(&bootstrap_path, &bootstrap)?;
+    let mut command = ProcessCommand::new(std::env::current_exe()?);
+    command.arg("__node").arg("--bootstrap").arg(&bootstrap_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    { use std::os::unix::process::CommandExt; command.process_group(0); }
+    command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(found) = store.read(&id)
+            && std::os::unix::net::UnixStream::connect(&found.socket_path).is_ok() { return Ok(found); }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut, "background node did not become ready").into())
 }
 
 fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn Error>> {
