@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    fs::OpenOptions,
     io,
     io::Write,
     process::{Command, Stdio},
@@ -2945,6 +2946,11 @@ impl Drop for TerminalGuard {
         let mut stdout = io::stdout();
         if self.keyboard_enhancement {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+            let _ = stdout.flush();
+            if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+                let _ = execute!(tty, PopKeyboardEnhancementFlags);
+                let _ = tty.flush();
+            }
         }
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
@@ -2964,10 +2970,7 @@ impl Drop for TerminalGuard {
 fn enable_keyboard_enhancement() -> io::Result<bool> {
     execute!(
         io::stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     Ok(true)
 }
@@ -3408,7 +3411,7 @@ mod tests {
     };
     use tokio::sync::{mpsc, watch};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
     use portable_pty::PtySize;
     use ratatui::{
         Terminal,
@@ -3438,6 +3441,14 @@ mod tests {
         pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
+
+    #[test]
+    fn disambiguate_escape_codes_uses_kitty_flag_one() {
+        assert_eq!(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
+            1
+        );
+    }
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
         LayoutSnapshot {
