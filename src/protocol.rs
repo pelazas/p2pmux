@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -13,6 +13,9 @@ pub const MAX_ENDPOINT_ADDR_BYTES: usize = 4096;
 pub const MAX_INPUT_BYTES: usize = 8 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
 pub const MAX_DELTA_BYTES: usize = 64 * 1024;
+pub const MAX_AGENT_ROSTER_ENTRIES: usize = 32;
+pub const MAX_AGENT_KIND_BYTES: usize = 32;
+pub const MAX_AGENT_CWD_BYTES: usize = 512;
 
 #[derive(Debug)]
 pub enum ProtocolError {
@@ -108,7 +111,7 @@ pub struct Envelope {
     pub sender_peer_id: Vec<u8>,
     #[prost(
         oneof = "envelope::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -148,6 +151,8 @@ pub mod envelope {
         PaneFailed(super::PaneFailed),
         #[prost(message, tag = "25")]
         ReleaseControl(super::ReleaseControl),
+        #[prost(message, tag = "26")]
+        AgentRoster(super::AgentRoster),
     }
 }
 
@@ -434,6 +439,37 @@ pub struct PaneSubscribe {
     pub pane_id: u64,
 }
 
+/// Full hosted-agent replacement published by one pane host.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentRoster {
+    #[prost(bytes = "vec", tag = "1")]
+    pub host_peer_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub entries: Vec<AgentRosterEntry>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentRosterEntry {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+    #[prost(string, tag = "2")]
+    pub agent_kind: String,
+    #[prost(string, tag = "3")]
+    pub cwd: String,
+    #[prost(enumeration = "AgentRosterState", tag = "4")]
+    pub state: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AgentRosterState {
+    Idle = 0,
+    Working = 1,
+    Done = 2,
+}
+
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
     validate_envelope(envelope)?;
 
@@ -707,8 +743,51 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             )?;
             validate_nonzero("pane_subscribe.pane_id", subscribe.pane_id)?;
         }
+        envelope::Body::AgentRoster(roster) => validate_agent_roster(roster)?,
     }
 
+    Ok(())
+}
+
+fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
+    validate_id(
+        "agent_roster.host_peer_id",
+        &roster.host_peer_id,
+        MAX_PEER_ID_BYTES,
+    )?;
+    if roster.entries.len() > MAX_AGENT_ROSTER_ENTRIES {
+        return Err(ProtocolError::FieldTooLarge {
+            field: "agent_roster.entries",
+            limit: MAX_AGENT_ROSTER_ENTRIES,
+            actual: roster.entries.len(),
+        });
+    }
+    let mut pane_ids = HashSet::new();
+    for entry in &roster.entries {
+        validate_nonzero("agent_roster.entry.pane_id", entry.pane_id)?;
+        if !pane_ids.insert(entry.pane_id) {
+            return Err(ProtocolError::InvalidLayout(
+                "agent_roster.entry.pane_id",
+            ));
+        }
+        validate_field_size(
+            "agent_roster.entry.agent_kind",
+            entry.agent_kind.len(),
+            MAX_AGENT_KIND_BYTES,
+        )?;
+        if !matches!(entry.agent_kind.as_str(), "claude" | "codex" | "cursor" | "pi") {
+            return Err(ProtocolError::InvalidLayout(
+                "agent_roster.entry.agent_kind",
+            ));
+        }
+        validate_field_size(
+            "agent_roster.entry.cwd",
+            entry.cwd.len(),
+            MAX_AGENT_CWD_BYTES,
+        )?;
+        AgentRosterState::try_from(entry.state)
+            .map_err(|_| ProtocolError::InvalidLayout("agent_roster.entry.state"))?;
+    }
     Ok(())
 }
 
