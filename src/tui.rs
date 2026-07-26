@@ -3672,8 +3672,7 @@ impl SharedLayoutRuntime {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-        let rows = self
-            .agent_rosters
+        self.agent_rosters
             .values()
             .flat_map(|roster| {
                 roster.entries.iter().filter_map(|entry| {
@@ -3705,8 +3704,7 @@ impl SharedLayoutRuntime {
                     })
                 })
             })
-            .collect();
-        rows
+            .collect()
     }
 
     fn handle_control_event(&mut self, event: LayoutControlEvent) -> Result<(), Box<dyn Error>> {
