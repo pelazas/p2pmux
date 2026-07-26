@@ -2406,6 +2406,7 @@ impl SharedLayoutRuntime {
             LayoutControlEvent::Snapshot(snapshot) => {
                 self.apply_layout_state(snapshot.state.as_ref().ok_or("missing layout state")?)?;
             }
+            LayoutControlEvent::AgentRoster(_) => {}
             LayoutControlEvent::Commit(commit) => {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }
