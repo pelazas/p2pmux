@@ -708,9 +708,10 @@ mod tests {
         let mut animation = Instant::now();
 
         assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
-        assert!(refresh_tui_timers(
+        assert!(tui.overlay_open());
+        assert!(!refresh_tui_timers(
             tui,
-            Instant::now() + Duration::from_millis(400),
+            Instant::now() + Duration::from_secs(1),
             &mut animation,
         ));
         assert!(tui.overlay_open());
