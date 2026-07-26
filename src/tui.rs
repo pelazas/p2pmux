@@ -62,7 +62,7 @@ use crate::{
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutRequest, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor,
-        PaneFailed, PaneReady, RenamePane, RenameTab, SplitAxis,
+        PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
@@ -272,6 +272,10 @@ pub enum UiIntent {
     RenameTab {
         tab_id: TabId,
         title: String,
+    },
+    SetPaneLock {
+        pane_id: PaneId,
+        locked: bool,
     },
 }
 
@@ -2865,6 +2869,7 @@ pub struct SharedLocalPane {
     screen: HostScreen,
     lease: LeaseManager,
     host_peer_id: Vec<u8>,
+    locked: bool,
     screen_tx: watch::Sender<ScreenFrame>,
     lease_tx: watch::Sender<LeaseState>,
     control_tx: mpsc::Sender<HostControlEvent>,
@@ -2896,6 +2901,7 @@ impl SharedLocalPane {
             screen,
             lease,
             host_peer_id,
+            locked: false,
             screen_tx,
             lease_tx,
             control_tx,
@@ -2932,6 +2938,9 @@ impl SharedLocalPane {
         while let Ok(event) = self.control_rx.try_recv() {
             match event {
                 HostControlEvent::Input { peer_id, input } => {
+                    if self.locked && peer_id != self.host_peer_id {
+                        continue;
+                    }
                     if let LeaseDecision::AcceptInput(bytes) =
                         self.lease
                             .input(&peer_id, input.lease_epoch, input.data, Instant::now())
@@ -2942,6 +2951,9 @@ impl SharedLocalPane {
                     }
                 }
                 HostControlEvent::TakeControl { peer_id, request } => {
+                    if self.locked && peer_id != self.host_peer_id {
+                        continue;
+                    }
                     let decision = self.lease.take_control(
                         peer_id,
                         request.known_lease_epoch,
@@ -3050,6 +3062,20 @@ impl SharedLocalPane {
             return Ok(false);
         };
         self.lease_tx.send_replace(state);
+        Ok(true)
+    }
+
+    fn set_locked(&mut self, locked: bool) -> Result<bool, Box<dyn Error>> {
+        if self.locked == locked {
+            return Ok(false);
+        }
+        self.locked = locked;
+        if locked
+            && self.lease.state().controller_peer_id != self.host_peer_id
+            && let Some(state) = self.lease.clear_controller(Instant::now())?
+        {
+            self.lease_tx.send_replace(state);
+        }
         Ok(true)
     }
 
@@ -3479,6 +3505,7 @@ pub struct SharedLayoutRuntime {
     subscription_rx: tokio::sync::mpsc::UnboundedReceiver<(PaneId, Result<GuestPane, String>)>,
     pending_create: Option<PendingCreate>,
     provisional: BTreeMap<u64, PaneId>,
+    pending_locks: BTreeMap<u64, (PaneId, bool)>,
     next_request_id: u64,
     status: String,
     copied_lines: Option<usize>,
@@ -3585,6 +3612,7 @@ impl SharedLayoutRuntime {
             subscription_rx,
             pending_create: None,
             provisional: BTreeMap::new(),
+            pending_locks: BTreeMap::new(),
             next_request_id: 1,
             status: String::new(),
             copied_lines: None,
@@ -4235,6 +4263,17 @@ impl SharedLayoutRuntime {
                 }
             }
         }
+        for (pane_id, pane) in &snapshot.panes {
+            if let Some(local) = self.local.get_mut(pane_id) {
+                local.set_locked(pane.locked)?;
+            }
+        }
+        self.pending_locks.retain(|_, (pane_id, locked)| {
+            snapshot
+                .panes
+                .get(pane_id)
+                .is_some_and(|pane| pane.locked != *locked)
+        });
         let remote_ids = self.remote.keys().copied().collect::<Vec<_>>();
         for pane_id in remote_ids {
             if !current_ids.contains(&pane_id)
@@ -4457,6 +4496,9 @@ impl SharedLayoutRuntime {
                     set_pane_lock: None,
                 })?;
             }
+            UiIntent::SetPaneLock { pane_id, locked } => {
+                self.set_pane_lock(pane_id, locked)?;
+            }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
         }
         Ok(())
@@ -4508,6 +4550,49 @@ impl SharedLayoutRuntime {
             rename_tab: None,
             set_pane_lock: None,
         })
+    }
+
+    fn set_pane_lock(&mut self, pane_id: PaneId, locked: bool) -> Result<(), Box<dyn Error>> {
+        let peer_id = self.control.peer_id();
+        if self
+            .tui
+            .snapshot()
+            .panes
+            .get(&pane_id)
+            .is_none_or(|pane| pane.host_peer_id != peer_id)
+        {
+            self.footer_notice = Some(String::from("only the pane host can lock it"));
+            return Ok(());
+        }
+        let Some(pane) = self.local.get_mut(&pane_id) else {
+            self.footer_notice = Some(String::from("pane host is unavailable"));
+            return Ok(());
+        };
+        let previous = pane.locked;
+        pane.set_locked(locked)?;
+        let request_id = self.next_id();
+        self.pending_locks.insert(request_id, (pane_id, previous));
+        let request = LayoutRequest {
+            request_id,
+            base_revision: self.tui.snapshot().revision,
+            create_pane: None,
+            delete_pane: None,
+            create_tab: None,
+            delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
+            rename_pane: None,
+            rename_tab: None,
+            set_pane_lock: Some(SetPaneLock { pane_id, locked }),
+        };
+        if let Err(error) = self.send_request(request) {
+            self.pending_locks.remove(&request_id);
+            if let Some(pane) = self.local.get_mut(&pane_id) {
+                pane.set_locked(previous)?;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn send_request(&mut self, request: LayoutRequest) -> Result<(), Box<dyn Error>> {
@@ -4600,6 +4685,11 @@ impl SharedLayoutRuntime {
             if let Some(mut pane) = self.local.remove(&pane_id) {
                 let _ = pane.shutdown();
             }
+        }
+        if let Some((pane_id, previous)) = self.pending_locks.remove(&request_id)
+            && let Some(pane) = self.local.get_mut(&pane_id)
+        {
+            let _ = pane.set_locked(previous);
         }
         self.footer_notice = Some(format!("layout request {request_id} rejected"));
     }
@@ -6441,6 +6531,73 @@ mod tests {
         let lease = lease_rx.borrow_and_update().clone();
         assert!(lease.controller_peer_id.is_empty());
         assert_eq!(lease.epoch, 2);
+    }
+
+    #[test]
+    fn locked_local_pane_rejects_guest_control_and_accepts_host_control() {
+        let host_id = b"host".to_vec();
+        let guest_id = b"guest".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        pane.set_locked(true).expect("lock pane");
+
+        pane.control_tx
+            .try_send(HostControlEvent::TakeControl {
+                peer_id: guest_id.clone(),
+                request: crate::protocol::TakeControl {
+                    pane_id: pane_wire_id(99),
+                    requester_peer_id: guest_id.clone(),
+                    known_lease_epoch: 1,
+                },
+            })
+            .expect("guest takeover event");
+        pane.drain().expect("drain guest takeover");
+        assert!(pane.lease.state().controller_peer_id.is_empty());
+
+        pane.control_tx
+            .try_send(HostControlEvent::Input {
+                peer_id: guest_id.clone(),
+                input: crate::protocol::Input {
+                    pane_id: pane_wire_id(99),
+                    lease_epoch: 1,
+                    data: b"blocked".to_vec(),
+                },
+            })
+            .expect("guest input event");
+        pane.drain().expect("drain guest input");
+        assert!(pane.lease.state().controller_peer_id.is_empty());
+
+        pane.control_tx
+            .try_send(HostControlEvent::TakeControl {
+                peer_id: host_id.clone(),
+                request: crate::protocol::TakeControl {
+                    pane_id: pane_wire_id(99),
+                    requester_peer_id: host_id.clone(),
+                    known_lease_epoch: 1,
+                },
+            })
+            .expect("host takeover event");
+        pane.drain().expect("drain host takeover");
+        assert_eq!(pane.lease.state().controller_peer_id, host_id);
+        pane.shutdown().expect("shutdown local pane");
+    }
+
+    #[test]
+    fn locking_local_pane_clears_guest_lease_but_keeps_host_lease() {
+        let host_id = b"host".to_vec();
+        let guest_id = b"guest".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        let mut lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::new(guest_id, Instant::now());
+
+        pane.set_locked(true).expect("lock pane");
+        assert!(lease_rx.has_changed().expect("lease watch"));
+        assert!(lease_rx.borrow_and_update().controller_peer_id.is_empty());
+
+        pane.lease = LeaseManager::new(host_id.clone(), Instant::now());
+        pane.set_locked(false).expect("unlock pane");
+        pane.set_locked(true).expect("relock pane");
+        assert_eq!(pane.lease.state().controller_peer_id, host_id);
+        pane.shutdown().expect("shutdown local pane");
     }
 
     #[test]
