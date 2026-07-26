@@ -2106,6 +2106,7 @@ fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&st
     0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_contextual_footer(
     buffer: &mut Buffer,
     theme: &UiTheme,
@@ -6599,8 +6600,10 @@ mod tests {
             Color::Rgb(255, 69, 0)
         );
 
-        let mut themed = UiTheme::default();
-        themed.pane_border_remote_control = Color::Rgb(1, 2, 3);
+        let themed = UiTheme {
+            pane_border_remote_control: Color::Rgb(1, 2, 3),
+            ..Default::default()
+        };
         assert_eq!(
             pane_border_color(&themed, Some(b"guest"), false, false, false),
             Color::Rgb(1, 2, 3)
@@ -7386,9 +7389,11 @@ mod tests {
 
     #[test]
     fn themed_tui_overrides_footer_chrome() {
-        let mut theme = UiTheme::default();
-        theme.footer_background = Color::Rgb(1, 2, 3);
-        theme.footer_orange = Color::Rgb(4, 5, 6);
+        let theme = UiTheme {
+            footer_background: Color::Rgb(1, 2, 3),
+            footer_orange: Color::Rgb(4, 5, 6),
+            ..Default::default()
+        };
         let tui = MultiPaneTui::with_theme(
             layout(
                 vec![Tab {

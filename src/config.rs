@@ -40,32 +40,15 @@ impl From<io::Error> for ConfigError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     pub display_name: Option<String>,
     pub ui: UiConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            display_name: None,
-            ui: UiConfig::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiConfig {
     pub theme: UiTheme,
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            theme: UiTheme::default(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -302,7 +285,7 @@ fn apply_color(
     key: &'static str,
 ) -> Result<(), ConfigError> {
     if let Some(value) = value {
-        *color = parse_color(&value).ok_or_else(|| ConfigError::InvalidColor { key, value })?;
+        *color = parse_color(&value).ok_or(ConfigError::InvalidColor { key, value })?;
     }
     Ok(())
 }
