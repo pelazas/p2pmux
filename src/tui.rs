@@ -2836,8 +2836,8 @@ fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
             bytes
         }
         KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
-        // terminal-setup / Alt+Enter encoding for nested agents (Claude Code, etc.).
-        KeyCode::Enter if modifiers == 2 => b"\x1b\r".to_vec(),
+        // LF / Ctrl+J — Claude/Cursor agents treat this as newline vs CR submit.
+        KeyCode::Enter if modifiers == 2 => b"\n".to_vec(),
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
         KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
@@ -5568,7 +5568,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_is_distinct_from_plain_enter() {
+    fn shift_enter_uses_lf_while_plain_enter_uses_cr() {
         let parser = vt100::Parser::new(1, 1, 0);
         let plain = encode_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -5580,24 +5580,7 @@ mod tests {
         );
 
         assert_eq!(plain, Some(b"\r".to_vec()));
-        assert_eq!(shifted, Some(b"\x1b\r".to_vec()));
-        assert_ne!(shifted, plain);
-    }
-
-    #[test]
-    fn shift_enter_uses_escape_carriage_return_for_nested_agents() {
-        let parser = vt100::Parser::new(1, 1, 0);
-        let plain = encode_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            parser.screen(),
-        );
-        let shifted = encode_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-            parser.screen(),
-        );
-
-        assert_eq!(plain, Some(b"\r".to_vec()));
-        assert_eq!(shifted, Some(b"\x1b\r".to_vec()));
+        assert_eq!(shifted, Some(b"\n".to_vec()));
         assert_ne!(shifted, plain);
     }
 }
