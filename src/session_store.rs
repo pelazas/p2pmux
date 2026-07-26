@@ -4,6 +4,7 @@
 //! state (PTYs, tickets, screens, and focus) belongs to the node process, never to disk.
 
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, BufRead, Write},
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
@@ -309,10 +310,37 @@ pub fn generate_id() -> io::Result<String> {
 }
 
 pub fn generate_name() -> io::Result<String> {
+    generate_name_from_store(&SessionStore::for_current_user()?)
+}
+
+fn generate_name_from_store(store: &SessionStore) -> io::Result<String> {
+    let live_names = store
+        .list_live()?
+        .into_iter()
+        .map(|session| session.name)
+        .collect();
     let mut bytes = [0u8; 8];
     fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
     let index = u64::from_le_bytes(bytes) as usize % CITY_NAMES.len();
-    Ok(CITY_NAMES[index].to_owned())
+    Ok(available_city_name(&live_names, index))
+}
+
+fn available_city_name(live_names: &HashSet<String>, start: usize) -> String {
+    for offset in 0..CITY_NAMES.len() {
+        let city = CITY_NAMES[(start + offset) % CITY_NAMES.len()];
+        if !live_names.contains(city) {
+            return city.to_owned();
+        }
+    }
+
+    let city = CITY_NAMES[start % CITY_NAMES.len()];
+    for suffix in 2.. {
+        let name = format!("{city}-{suffix}");
+        if !live_names.contains(&name) {
+            return name;
+        }
+    }
+    unreachable!("an unbounded suffix range always yields a name")
 }
 
 pub fn valid_name(name: &str) -> bool {
