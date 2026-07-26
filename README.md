@@ -70,6 +70,11 @@ Set a peer-visible display name once with `p2pmux config set name pelazas`; insp
 `~/.config/p2pmux/config.toml`). `create` and `join` accept `--name <name>` to override and save
 the value for that run and future sessions.
 
+Every `create` and `join` automatically receives a memorable world-city session name such as
+`tokyo` or `cape-town`; no session name is required. `create --session-name <name>` remains
+available when you want to choose a name explicitly. Automatically chosen names avoid live local
+session names, adding `-2`, `-3`, and so on if every city name is already in use.
+
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
 Ctrl+Q detaches that client without stopping shells, Iroh, rendezvous, or hosted panes. It prints
 the exact `--resume`, `attach`, and `kill` commands needed to return. Use `p2pmux --resume` for
