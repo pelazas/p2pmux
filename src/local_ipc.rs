@@ -45,7 +45,7 @@ pub enum NodeMessage {
         room_name: String,
         role: String,
         summary: SessionSummary,
-        layout: LayoutSnapshot,
+        layout: Box<LayoutSnapshot>,
         screens: Vec<PaneScreenSnapshot>,
         leases: Vec<PaneLeaseSnapshot>,
         rosters: serde_json::Value,

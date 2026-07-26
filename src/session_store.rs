@@ -174,7 +174,7 @@ impl SessionStore {
                 }
             }
         }
-        sessions.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        sessions.sort_by_key(|session| session.created_at);
         Ok(sessions)
     }
 

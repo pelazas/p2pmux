@@ -67,6 +67,9 @@ use crate::{
     transport::Transport,
 };
 
+pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, (u64, Vec<u8>, bool)>;
+pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
+
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
@@ -2216,9 +2219,11 @@ fn format_agent_overlay_card(
         &row.cwd,
         usize::from(width.saturating_sub(text_width(&first_prefix))),
     );
-    let card_style = selected
-        .then_some(Style::default().bg(AGENT_OVERLAY_SELECTED_BACKGROUND))
-        .unwrap_or_default();
+    let card_style = if selected {
+        Style::default().bg(AGENT_OVERLAY_SELECTED_BACKGROUND)
+    } else {
+        Style::default()
+    };
     let first_line = agent_overlay_line(
         vec![
             Span::styled(marker, Style::default().fg(AGENT_OVERLAY_CHROME)),
@@ -3175,13 +3180,7 @@ impl SharedLayoutRuntime {
 
     /// A complete node-owned view for a newly attached local renderer. Frames are deliberately
     /// snapshots: the client can always rebuild a `GuestScreen` without owning a PTY.
-    pub fn node_snapshot(
-        &self,
-    ) -> (
-        LayoutSnapshot,
-        BTreeMap<PaneId, (u64, Vec<u8>, bool)>,
-        BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>,
-    ) {
+    pub fn node_snapshot(&self) -> (LayoutSnapshot, NodeScreenSnapshots, NodeLeaseSnapshots) {
         let mut screens = BTreeMap::new();
         let mut chrome = BTreeMap::new();
         for (pane_id, pane) in &self.local {

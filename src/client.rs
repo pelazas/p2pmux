@@ -63,30 +63,30 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     'attached: loop {
         loop {
             match messages.try_recv() {
-                Ok(ReaderEvent::Message(NodeMessage::Snapshot {
-                    room_name,
-                    layout,
-                    screens: next_screens,
-                    leases,
-                    tab_id,
-                    pane_id,
-                    ..
-                })) => {
-                    apply_snapshot(
-                        &mut tui,
-                        &mut screens,
+                Ok(ReaderEvent::Message(message)) => {
+                    if let NodeMessage::Snapshot {
                         room_name,
                         layout,
-                        next_screens,
+                        screens: next_screens,
                         leases,
                         tab_id,
                         pane_id,
-                    )?;
-                    dirty = true;
+                        ..
+                    } = *message
+                    {
+                        apply_snapshot(
+                            &mut tui,
+                            &mut screens,
+                            room_name,
+                            *layout,
+                            next_screens,
+                            leases,
+                            tab_id,
+                            pane_id,
+                        )?;
+                        dirty = true;
+                    }
                 }
-                Ok(ReaderEvent::Message(NodeMessage::Update { .. }))
-                | Ok(ReaderEvent::Message(NodeMessage::Error { .. }))
-                | Ok(ReaderEvent::Message(_)) => {}
                 Ok(ReaderEvent::Ended) | Err(TryRecvError::Disconnected) => {
                     node_ended = true;
                     break 'attached;
@@ -309,7 +309,7 @@ pub fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Nod
 }
 
 enum ReaderEvent {
-    Message(NodeMessage),
+    Message(Box<NodeMessage>),
     DecodeError(String),
     ReadError(String),
     Ended,
@@ -323,7 +323,10 @@ fn spawn_message_reader(
         loop {
             match read_message(&mut reader) {
                 Ok(Some(message)) => {
-                    if sender.send(ReaderEvent::Message(message)).is_err() {
+                    if sender
+                        .send(ReaderEvent::Message(Box::new(message)))
+                        .is_err()
+                    {
                         return;
                     }
                 }

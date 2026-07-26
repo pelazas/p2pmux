@@ -185,42 +185,6 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     result.map_err(Into::into)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    #[test]
-    fn bootstrap_is_private_and_round_trips() {
-        let path = std::env::temp_dir().join(format!("p2pmux-bootstrap-{}", std::process::id()));
-        let _ = fs::remove_file(&path);
-        let descriptor = SessionDescriptor::new(
-            "0123456789abcdef0123456789abcdef".into(),
-            "amber-otter-01".into(),
-            "/tmp/p2pmux-test.sock".into(),
-            1,
-            SessionRole::Coordinator,
-        );
-        write_bootstrap(
-            &path,
-            &NodeBootstrap {
-                descriptor: descriptor.clone(),
-                kind: NodeBootstrapKind::Create {
-                    display_name: "A".into(),
-                    cols: 80,
-                    rows: 24,
-                },
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(read_bootstrap(&path).unwrap().descriptor, descriptor);
-        assert!(!path.exists());
-    }
-}
-
 fn run_socket_loop(
     node: &mut SharedLayoutNode,
     listener: UnixListener,
@@ -371,10 +335,11 @@ fn run_socket_loop(
                 Ok(None) => detached = true,
                 Err(_) => detached = true,
             }
-            if changed && !detached {
-                if write_snapshot(stream, descriptor, node, *generation).is_err() {
-                    detached = true;
-                }
+            if changed
+                && !detached
+                && write_snapshot(stream, descriptor, node, *generation).is_err()
+            {
+                detached = true;
             }
         }
         if (detached || shutdown)
@@ -442,7 +407,7 @@ fn write_snapshot(
                 hosts,
                 coordinator_name,
             },
-            layout,
+            layout: Box::new(layout),
             screens: screens
                 .into_iter()
                 .map(
@@ -503,8 +468,8 @@ impl SharedLayoutNode {
         &self,
     ) -> (
         crate::layout::LayoutSnapshot,
-        std::collections::BTreeMap<u64, (u64, Vec<u8>, bool)>,
-        std::collections::BTreeMap<u64, (bool, Option<Vec<u8>>, bool)>,
+        crate::tui::NodeScreenSnapshots,
+        crate::tui::NodeLeaseSnapshots,
     ) {
         self.runtime.node_snapshot()
     }
@@ -519,5 +484,42 @@ impl SharedLayoutNode {
     }
     pub fn shutdown(self) {
         self.runtime.shutdown_node();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn bootstrap_is_private_and_round_trips() {
+        let path = std::env::temp_dir().join(format!("p2pmux-bootstrap-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let descriptor = SessionDescriptor::new(
+            "0123456789abcdef0123456789abcdef".into(),
+            "amber-otter-01".into(),
+            "/tmp/p2pmux-test.sock".into(),
+            1,
+            SessionRole::Coordinator,
+        );
+        write_bootstrap(
+            &path,
+            &NodeBootstrap {
+                descriptor: descriptor.clone(),
+                kind: NodeBootstrapKind::Create {
+                    display_name: "A".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(read_bootstrap(&path).unwrap().descriptor, descriptor);
+        assert!(!path.exists());
     }
 }

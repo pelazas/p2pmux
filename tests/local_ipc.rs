@@ -9,12 +9,12 @@ fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
         room_name: "amber-otter-01".into(),
         role: "coordinator".into(),
         summary: SessionSummary::default(),
-        layout: LayoutSnapshot {
+        layout: Box::new(LayoutSnapshot {
             revision: 0,
             members: vec![],
             tabs: vec![],
             panes: Default::default(),
-        },
+        }),
         screens: Default::default(),
         leases: Default::default(),
         rosters: serde_json::json!({}),
