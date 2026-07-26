@@ -13,8 +13,9 @@ keeping two facts true at once:
 This replaces the current fixed-at-birth behavior for shared-layout panes.
 Today a split only gives the newly created pane a birth grid; the existing
 pane's PTY does not resize, and outer terminal resize only crops or letterboxes
-the fixed grids. This feature makes both drag-driven reflow and outer-window
-reflow resize hosted PTYs.
+the fixed grids. This feature makes reflow resize hosted PTYs whenever an
+authoritative layout change or outer-window resize changes their allocated
+chrome.
 
 ## Non-goals
 
@@ -150,10 +151,18 @@ resized screen through the existing snapshot/delta stream.
 
 ## PTY and screen reflow
 
-When a runtime applies an authoritative ratio commit, it compares old and new
-layout, calculates local chrome content rectangles for the changed tab, and
-reflows every locally hosted descendant leaf whose allocated rectangle changed
-(reflowing all locally hosted leaves in that tab is an acceptable equivalent).
+When a runtime applies any authoritative `LayoutCommit`, it compares old and
+new layout, calculates local chrome content rectangles for affected tabs, and
+reflows every locally hosted leaf whose allocated chrome rect changed
+(reflowing all locally hosted leaves in each affected tab is an acceptable
+equivalent). This is not limited to `SetSplitRatio`: it includes `CreatePane`
+(split), `DeletePane`, `DeleteTab`, member-removal rewrites, and every other
+authoritative layout mutation that changes a local pane's allocation. A new
+split must therefore reflow its surviving locally hosted pane as well as giving
+the new pane its grid.
+For every such locally hosted pane, the runtime must reflow its PTY and
+`HostScreen`; it may publish an `UpdatePaneGrids` batch for grids that actually
+changed.
 The calculation uses the host's local terminal area, even if that tab is not
 currently selected. It converts each pane content rect with the existing
 `grid_for_pane` rule, so grids remain at least 1 by 1 even under extreme
@@ -167,14 +176,16 @@ For each changed hosted grid the runtime, in order:
    based on the pre-resize dimensions); and
 4. batches the changed grids into `UpdatePaneGrids`.
 
-The drag overlay performs none of these operations. v1 commits only on mouse
-release, so PTYs resize after a ratio commit or a received authoritative ratio
-commit, not on every drag event.
+The drag overlay performs none of these operations. v1 commits the drag
+gesture only on mouse release, so it never resizes PTYs on mouse movement; its
+resulting `SetSplitRatio` commit (like any other qualifying authoritative
+commit) triggers reflow after release.
 
 Outer `Event::Resize` is intentionally included. The shared-layout runtime
 recomputes all locally hosted panes against its current chrome and follows the
-same PTY/screen/grid-update path. This makes dynamic grids consistent whether
-the allocation changed because of a drag or because the host window changed.
+same PTY/HostScreen/`UpdatePaneGrids` path whenever their allocated chrome
+rects change. This makes dynamic grids consistent whether the allocation
+changed because of a layout commit or because the host window changed.
 The single-pane `local` mode remains outside this feature unless its own resize
 loop is deliberately changed in later work.
 

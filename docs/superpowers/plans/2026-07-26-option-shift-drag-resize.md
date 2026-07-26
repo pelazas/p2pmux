@@ -2,7 +2,8 @@
 
 **Goal:** Add an Option/Alt+Shift drag resize gesture whose ratio is shared and
 revisioned, then reflow real hosted PTYs, VT screens, and published pane grids
-after a ratio or outer-window change.
+after any authoritative layout commit or outer-window change that changes a
+locally hosted pane's allocated chrome rect.
 
 **Architecture:** Persist `first_share_bps` on each split and make allocation
 ratio-aware with recursive local minima. A drag holds an overlay in
@@ -38,16 +39,10 @@ prost, existing revision/reservation coordinator.
 
 ## Tasks
 
-### Task 1: Commit the design and execution plan
+### Task 1: Commit the design and execution plan — DONE (skip)
 
-- [ ] Add the normative design and this checkbox plan at the exact paths below.
-- [ ] Confirm no application source, test, or README changes are staged.
-- [ ] Commit:
-
-```bash
-git add docs/superpowers/specs/2026-07-26-option-shift-drag-resize-design.md docs/superpowers/plans/2026-07-26-option-shift-drag-resize.md
-git commit -m "docs: plan Option+Shift+drag pane resize with PTY resize"
-```
+Completed by docs commit `3f19aba`, already on this branch. Do not recreate or
+amend that commit; execution begins with Task 2.
 
 ### Task 2: Add authoritative split ratios and host grid mutation to the pure layout model
 
@@ -241,20 +236,25 @@ git commit -m "feat: resize panes with Option Shift drag overlays"
 
 - [ ] First add tests around `SharedLocalPane`/runtime helpers using a
   testable resize abstraction or controlled local pane fixture: only local
-  panes are resized; remote panes are never resized; changed ratios reflow the
-  affected descendant leaves; unchanged grids emit no update; and a resize
-  causes a fresh screen frame for viewers.
+  panes are resized; remote panes are never resized; any authoritative
+  `LayoutCommit` that changes a locally hosted pane's allocated chrome rect
+  reflows it; unchanged grids emit no update; and a resize causes a fresh
+  screen frame for viewers. Cover `CreatePane` (including the surviving pane),
+  `DeletePane`, `DeleteTab`, member-removal rewrites, and `SetSplitRatio`.
 - [ ] Add runtime-helper tests for an outer `Event::Resize` calculating grids
   from current chrome for every locally hosted pane, including panes in an
   unselected tab, and for stale grid-update retry recomputing from the current
   revision without resending a stale ratio.
 - [ ] Extend `SharedLocalPane` with a resize operation that calls Task 5's PTY
   and screen methods, publishes the fresh frame, and reports the resulting
-  grid. On every authoritative state application, compare old/new ratio-aware
-  geometry before replacing the snapshot, reflow changed local leaves, then
-  send one host-only `UpdatePaneGrids` batch with the current revision. On
-  `Event::Resize`, use the same reflow path. Do this after commit/release, not
-  per mouse movement.
+  grid. On every authoritative `LayoutCommit`, compare old/new ratio-aware
+  geometry before replacing the snapshot, reflow every locally hosted leaf
+  whose allocated chrome rect changed, then send one host-only
+  `UpdatePaneGrids` batch with the current revision. This applies to
+  `CreatePane`, `DeletePane`, `DeleteTab`, member-removal rewrites,
+  `SetSplitRatio`, and any other allocation-changing commit. On `Event::Resize`,
+  use the same reflow path. Keep the drag gesture overlay-only until its
+  commit-on-release: never resize a PTY per mouse movement.
 - [ ] Extend `handle_intent`/`send_request` for `SetSplitRatio` with its
   captured base revision. Clear overlay on every newer authoritative layout
   state and on its rejection. Route grid update rejection to recomputation of
