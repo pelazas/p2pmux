@@ -197,7 +197,10 @@ fn run_socket_loop(
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                    // Prevent stalled clients from wedging the node on large Snapshot writes.
+                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                     let mut reader = BufReader::new(stream);
                     match read_message(&mut reader) {
                         // Probes and shutdowns are control requests. They must not consume or
