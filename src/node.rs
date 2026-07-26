@@ -129,14 +129,20 @@ fn run_socket_loop(node: &mut SharedLayoutNode, listener: UnixListener, descript
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+                    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                     if let Ok(generation) = gate.attach() {
-                        let hello = read_message(&mut stream)?;
-                        if matches!(hello, Some(ClientMessage::Hello { .. })) {
-                            write_message(&mut stream, &NodeMessage::AttachAccepted { generation })?;
-                            write_snapshot(&mut stream, descriptor, node, generation)?;
-                            client = Some((stream, generation));
-                        } else { let _ = gate.detach(generation); }
+                        match read_message(&mut stream) {
+                            Ok(Some(ClientMessage::Hello { .. })) => {
+                                write_message(&mut stream, &NodeMessage::AttachAccepted { generation })?;
+                                write_snapshot(&mut stream, descriptor, node, generation)?;
+                                stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+                                client = Some((stream, generation));
+                            }
+                            Ok(None) => { let _ = gate.detach(generation); }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut => { let _ = gate.detach(generation); }
+                            Err(error) => return Err(error),
+                            _ => { let _ = gate.detach(generation); }
+                        }
                     } else { let _ = write_message(&mut stream, &NodeMessage::AttachRejected { reason: "already attached".into() }); }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,

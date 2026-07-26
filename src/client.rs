@@ -48,6 +48,19 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+pub fn shutdown(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = UnixStream::connect(&descriptor.socket_path)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    write_message(&mut stream, &ClientMessage::Hello { cols: 0, rows: 0 })?;
+    let generation = match read_message(&mut reader)? {
+        Some(NodeMessage::AttachAccepted { generation }) => generation,
+        Some(NodeMessage::AttachRejected { reason }) => return Err(io::Error::other(reason).into()),
+        _ => return Err(io::Error::other("node did not accept attachment").into()),
+    };
+    write_message(&mut stream, &ClientMessage::Shutdown { generation })?;
+    Ok(())
+}
+
 fn draw(name: &str, screen: &str) -> io::Result<()> {
     let mut stdout = io::stdout(); execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
     writeln!(stdout, "p2pmux ({name})")?; write!(stdout, "{screen}")?; stdout.flush()
