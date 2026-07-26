@@ -577,9 +577,6 @@ impl MultiPaneTui {
             .is_some_and(|then| now.duration_since(then) >= AGENT_TOGGLE_WINDOW)
         {
             self.pending_agent_toggle = None;
-            self.modal = ModalState::Agents;
-            self.exit_chord_mode();
-            return true;
         }
         false
     }
@@ -980,26 +977,34 @@ impl MultiPaneTui {
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
         if is_quit(key) {
             self.modal = ModalState::None;
+            self.pending_agent_toggle = None;
             self.exit_chord_mode();
             return KeyHandling::Quit;
         }
         if matches!(self.modal, ModalState::Rename(_)) {
             return self.handle_rename_key(key);
         }
+        if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
+            if self.overlay_open() {
+                let forward = self
+                    .pending_agent_toggle
+                    .is_some_and(|then| then.elapsed() <= AGENT_TOGGLE_WINDOW);
+                self.modal = ModalState::None;
+                self.pending_agent_toggle = None;
+                return if forward {
+                    KeyHandling::Forward
+                } else {
+                    KeyHandling::Consumed(vec![])
+                };
+            }
+            self.modal = ModalState::Agents;
+            self.pending_agent_toggle = Some(Instant::now());
+            self.exit_chord_mode();
+            return KeyHandling::Consumed(vec![]);
+        }
         if self.overlay_open() {
             self.set_agent_overlay_viewport(area);
             return self.handle_agent_overlay_key(key);
-        }
-        if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
-            if self
-                .pending_agent_toggle
-                .is_some_and(|then| then.elapsed() <= AGENT_TOGGLE_WINDOW)
-            {
-                self.pending_agent_toggle = None;
-                return KeyHandling::Forward;
-            }
-            self.pending_agent_toggle = Some(Instant::now());
-            return KeyHandling::Consumed(vec![]);
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
@@ -1114,6 +1119,7 @@ impl MultiPaneTui {
         match key.code {
             KeyCode::Esc => {
                 self.modal = ModalState::None;
+                self.pending_agent_toggle = None;
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1234,6 +1240,7 @@ impl MultiPaneTui {
         self.current_tab = tab.tab_id;
         self.focused_pane = pane_id;
         self.modal = ModalState::None;
+        self.pending_agent_toggle = None;
         vec![UiIntent::FocusPane { pane_id }]
     }
 
@@ -5398,7 +5405,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_overlay_toggles_and_double_tap_forwards_ctrl_a() {
+    fn agents_overlay_opens_immediately_and_double_tap_forwards_ctrl_a() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -5413,6 +5420,7 @@ mod tests {
             tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
             KeyHandling::Consumed(vec![])
         );
+        assert!(tui.overlay_open());
         assert_eq!(
             tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
             KeyHandling::Forward
@@ -5422,13 +5430,13 @@ mod tests {
             tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
             KeyHandling::Consumed(vec![])
         );
-        assert!(tui.expire_agent_toggle(Instant::now() + AGENT_TOGGLE_WINDOW));
         assert!(tui.overlay_open());
+        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
+        assert!(!tui.expire_agent_toggle(Instant::now()));
+        assert!(tui.overlay_open());
+        assert_eq!(tui.pending_agent_toggle, None);
         assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                Rect::new(0, 0, 80, 24)
-            ),
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
             KeyHandling::Consumed(vec![])
         );
         assert!(!tui.overlay_open());
@@ -5453,8 +5461,8 @@ mod tests {
         );
         let mut tui = MultiPaneTui::new(snapshot).unwrap();
         tui.set_agent_rows(vec![agent_row(2, 2, 1)]);
-        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
-        tui.expire_agent_toggle(Instant::now());
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24));
         assert_eq!(
             tui.handle_key(
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
@@ -5471,6 +5479,24 @@ mod tests {
         );
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.overlay_open());
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                Rect::new(0, 0, 80, 24)
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
     }
 
     #[test]
@@ -5698,9 +5724,9 @@ mod tests {
         );
         let mut tui = MultiPaneTui::new(snapshot).unwrap();
         tui.set_agent_rows(vec![agent_row(1, 1, 1), agent_row(2, 2, 1)]);
-        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
-        tui.expire_agent_toggle(Instant::now());
         let area = Rect::new(0, 0, 80, 24);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        tui.handle_key(ctrl_a, area);
 
         assert_eq!(tui.handle_agent_overlay_click(0, 0, area), Vec::new());
         assert!(tui.overlay_open());
@@ -5736,6 +5762,8 @@ mod tests {
         assert!(!tui.overlay_open());
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
     }
 
     #[test]
