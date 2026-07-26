@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"dark_gray\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -86,7 +86,7 @@ impl Default for UiTheme {
             tab_separator: Color::DarkGray,
             copy_feedback_accent: Color::Rgb(255, 69, 0),
             agent_overlay_chrome: Color::Rgb(255, 69, 0),
-            agent_overlay_selected_background: Color::DarkGray,
+            agent_overlay_selected_background: Color::Rgb(42, 42, 42),
             agent_overlay_muted: Color::Rgb(145, 157, 180),
             agent_overlay_warm: Color::Rgb(255, 184, 77),
             agent_overlay_foreground: Color::White,
@@ -410,6 +410,17 @@ mod tests {
         );
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn default_agent_overlay_selection_background_is_soft_gray() {
+        assert_eq!(
+            UiTheme::default().agent_overlay_selected_background,
+            Color::Rgb(42, 42, 42)
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("agent_overlay_selected_background = \"#2a2a2a\"")
+        );
     }
 
     #[test]
