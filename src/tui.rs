@@ -87,6 +87,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> + <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
+    FooterSegment::Text("   Option+Shift+drag RESIZE"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Pane  <"),
@@ -157,6 +158,12 @@ pub enum UiIntent {
     SwitchTab {
         tab_id: TabId,
     },
+    SetSplitRatio {
+        pane_id: PaneId,
+        axis: Axis,
+        first_share_bps: u16,
+        base_revision: u64,
+    },
 }
 
 /// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
@@ -190,6 +197,17 @@ struct PaneTextSelection {
     pane_id: PaneId,
     anchor: ScreenCell,
     cursor: ScreenCell,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResizeDrag {
+    pane_id: PaneId,
+    base_revision: u64,
+    origin_column: u16,
+    origin_row: u16,
+    axis: Option<Axis>,
+    original_share_bps: u16,
+    first_child: bool,
 }
 
 impl PaneTextSelection {
@@ -226,6 +244,7 @@ pub struct MultiPaneTui {
     pending_created_pane: Option<PaneId>,
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
+    resize_drag: Option<ResizeDrag>,
 }
 
 impl MultiPaneTui {
@@ -250,6 +269,7 @@ impl MultiPaneTui {
             pending_created_pane: None,
             selection: None,
             selection_dragging: false,
+            resize_drag: None,
         })
     }
 
@@ -337,6 +357,68 @@ impl MultiPaneTui {
 
     fn end_selection_drag(&mut self) -> bool {
         std::mem::replace(&mut self.selection_dragging, false)
+    }
+
+    fn begin_resize_drag(&mut self, column: u16, row: u16, area: Rect, modifiers: KeyModifiers) -> bool {
+        if !modifiers.contains(KeyModifiers::ALT) || !modifiers.contains(KeyModifiers::SHIFT) {
+            return false;
+        }
+        let Some((pane_id, rect)) = self.geometry(area).panes.iter().find_map(|(pane_id, rect)| {
+            rect_contains(pane_content_rect(*rect), column, row).then_some((*pane_id, *rect))
+        }) else { return false; };
+        let _ = rect;
+        self.resize_drag = Some(ResizeDrag {
+            pane_id,
+            base_revision: self.snapshot.revision,
+            origin_column: column,
+            origin_row: row,
+            axis: None,
+            original_share_bps: 0,
+            first_child: false,
+        });
+        true
+    }
+
+    fn extend_resize_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(drag) = self.resize_drag else { return false; };
+        if drag.axis.is_some() { return true; }
+        let horizontal = i32::from(column) - i32::from(drag.origin_column);
+        let vertical = i32::from(row) - i32::from(drag.origin_row);
+        if horizontal.unsigned_abs().max(vertical.unsigned_abs()) < 2 { return true; }
+        let axis = if horizontal.unsigned_abs() >= vertical.unsigned_abs() { Axis::LeftRight } else { Axis::TopBottom };
+        let Some(tab) = self.current_tab_layout() else { self.resize_drag = None; return true; };
+        let Some((share, first_child)) = nearest_split_for_pane(&tab.root, drag.pane_id, axis) else {
+            self.resize_drag = None;
+            return true;
+        };
+        let drag = self.resize_drag.as_mut().expect("drag remains active");
+        drag.axis = Some(axis);
+        drag.original_share_bps = share;
+        drag.first_child = first_child;
+        true
+    }
+
+    fn end_resize_drag(&mut self, column: u16, row: u16, area: Rect) -> Option<UiIntent> {
+        let drag = self.resize_drag.take()?;
+        let axis = drag.axis?;
+        let delta = match axis {
+            Axis::LeftRight => i32::from(column) - i32::from(drag.origin_column),
+            Axis::TopBottom => i32::from(row) - i32::from(drag.origin_row),
+        };
+        let span = match axis { Axis::LeftRight => area.width, Axis::TopBottom => area.height }.max(1);
+        let signed = if drag.first_child { delta } else { -delta };
+        let proposed = (i32::from(drag.original_share_bps) + signed * 10_000 / i32::from(span))
+            .clamp(1, 9_999) as u16;
+        (proposed != drag.original_share_bps).then_some(UiIntent::SetSplitRatio {
+            pane_id: drag.pane_id,
+            axis,
+            first_share_bps: proposed,
+            base_revision: drag.base_revision,
+        })
+    }
+
+    fn cancel_resize_drag(&mut self) -> bool {
+        self.resize_drag.take().is_some()
     }
 
     fn selection(&self) -> Option<PaneTextSelection> {
@@ -897,6 +979,17 @@ fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
             contains_leaf(first, pane_id) || contains_leaf(second, pane_id)
         }
     }
+}
+
+fn nearest_split_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> Option<(u16, bool)> {
+    let Node::Split { axis: split_axis, first_share_bps, first, second } = node else { return None; };
+    if contains_leaf(first, pane_id) {
+        nearest_split_for_pane(first, pane_id, axis)
+            .or_else(|| (*split_axis == axis).then_some((*first_share_bps, true)))
+    } else if contains_leaf(second, pane_id) {
+        nearest_split_for_pane(second, pane_id, axis)
+            .or_else(|| (*split_axis == axis).then_some((*first_share_bps, false)))
+    } else { None }
 }
 
 fn node_minimum(node: &Node) -> (u16, u16) {
@@ -2199,7 +2292,9 @@ impl SharedLayoutRuntime {
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
                     dirty |= self.clear_selection();
-                    if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
+                    if self.tui.begin_resize_drag(mouse.column, mouse.row, area, mouse.modifiers) {
+                        dirty = true;
+                    } else if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
                         self.handle_intent(intent)?;
                         dirty = true;
                     } else {
@@ -2211,16 +2306,23 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
                 {
-                    dirty |= self.tui.extend_selection_at(
-                        mouse.column,
-                        mouse.row,
-                        Rect::new(0, 0, cols, rows),
-                    );
+                    if self.tui.extend_resize_drag(mouse.column, mouse.row) {
+                        dirty = true;
+                    } else {
+                        dirty |= self.tui.extend_selection_at(
+                            mouse.column,
+                            mouse.row,
+                            Rect::new(0, 0, cols, rows),
+                        );
+                    }
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
                 {
-                    if self.tui.end_selection_drag() {
+                    let area = Rect::new(0, 0, cols, rows);
+                    if let Some(intent) = self.tui.end_resize_drag(mouse.column, mouse.row, area) {
+                        self.handle_intent(intent)?;
+                    } else if self.tui.end_selection_drag() {
                         self.copy_selection_to_clipboard();
                     }
                     dirty = true;
@@ -2412,6 +2514,7 @@ impl SharedLayoutRuntime {
         self.tui
             .apply_snapshot(snapshot.clone())
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
+        self.tui.cancel_resize_drag();
         self.release_blurred_pane(previously_focused)?;
         let me = self.control.peer_id();
         self.remote_descriptors.clear();
@@ -2501,6 +2604,23 @@ impl SharedLayoutRuntime {
                     set_split_ratio: None,
                     update_pane_grids: None,
                 })?
+            }
+            UiIntent::SetSplitRatio { pane_id, axis, first_share_bps, base_revision } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: None,
+                    set_split_ratio: Some(crate::protocol::SetSplitRatio {
+                        pane_id,
+                        axis: Some(match axis { Axis::LeftRight => SplitAxis::LeftRight as i32, Axis::TopBottom => SplitAxis::TopBottom as i32 }),
+                        first_share_bps: u32::from(first_share_bps),
+                    }),
+                    update_pane_grids: None,
+                })?;
             }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
         }
@@ -4096,6 +4216,20 @@ mod tests {
         panes.clear();
         allocate_node(&node, Rect::new(0, 0, 2, 2), &mut panes);
         assert_eq!(panes[&1].width + panes[&2].width + panes[&3].width, 2);
+    }
+
+    #[test]
+    fn option_shift_drag_locks_once_and_emits_one_ratio_intent() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(10, 5, area, KeyModifiers::ALT | KeyModifiers::SHIFT));
+        assert!(tui.extend_resize_drag(11, 5), "under threshold remains pending");
+        assert!(tui.extend_resize_drag(20, 6), "horizontal lock");
+        assert!(matches!(
+            tui.end_resize_drag(20, 6, area),
+            Some(UiIntent::SetSplitRatio { pane_id: 1, axis: Axis::LeftRight, base_revision: 1, .. })
+        ));
+        assert!(tui.end_resize_drag(20, 6, area).is_none());
     }
 
     #[test]
