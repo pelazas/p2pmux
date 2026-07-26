@@ -811,7 +811,7 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
         )?;
         if !matches!(
             entry.agent_kind.as_str(),
-            "claude" | "codex" | "cursor" | "pi"
+            "claude" | "codex" | "cursor" | "pi" | "opencode"
         ) {
             return Err(ProtocolError::InvalidLayout(
                 "agent_roster.entry.agent_kind",

@@ -840,22 +840,43 @@ impl MultiPaneTui {
                 let Some(pane_id) = self.agent_selected_pane else {
                     return KeyHandling::Consumed(vec![]);
                 };
-                if let Some(tab) = self
-                    .snapshot
-                    .tabs
-                    .iter()
-                    .find(|tab| contains_leaf(&tab.root, pane_id))
-                {
-                    self.current_tab = tab.tab_id;
-                    self.focused_pane = pane_id;
-                    self.agent_overlay_open = false;
-                    KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id }])
-                } else {
-                    KeyHandling::Consumed(vec![])
-                }
+                KeyHandling::Consumed(self.jump_to_agent_pane(pane_id))
             }
             _ => KeyHandling::Consumed(vec![]),
         }
+    }
+
+    fn handle_agent_overlay_click(&mut self, column: u16, row: u16, area: Rect) -> Vec<UiIntent> {
+        let Some(pane_id) = self.agent_overlay_row_at(column, row, area) else {
+            return Vec::new();
+        };
+        self.agent_selected_pane = Some(pane_id);
+        self.jump_to_agent_pane(pane_id)
+    }
+
+    fn agent_overlay_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
+        let inner = agents_overlay_inner(area);
+        if !rect_contains(inner, column, row) {
+            return None;
+        }
+        self.agent_rows
+            .get(usize::from(row.saturating_sub(inner.y)))
+            .map(|agent| agent.pane_id)
+    }
+
+    fn jump_to_agent_pane(&mut self, pane_id: PaneId) -> Vec<UiIntent> {
+        let Some(tab) = self
+            .snapshot
+            .tabs
+            .iter()
+            .find(|tab| contains_leaf(&tab.root, pane_id))
+        else {
+            return Vec::new();
+        };
+        self.current_tab = tab.tab_id;
+        self.focused_pane = pane_id;
+        self.agent_overlay_open = false;
+        vec![UiIntent::FocusPane { pane_id }]
     }
 
     fn move_agent_selection(&mut self, forward: bool) {
@@ -1896,18 +1917,10 @@ fn render_shared_multi_pane(
 
 fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).clamp(24, 88);
-    let height = area.height.saturating_sub(4).clamp(5, 18);
-    let panel = Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y
-            .saturating_add(area.height.saturating_sub(height) / 2),
-        width.min(area.width),
-        height.min(area.height),
-    );
+    let panel = agents_overlay_panel(area);
     frame.render_widget(Clear, panel);
     let block = Block::bordered().title(" Agents ");
-    let inner = block.inner(panel);
+    let inner = agents_overlay_inner(area);
     frame.render_widget(block, panel);
     if tui.agent_rows.is_empty() {
         frame.render_widget(Paragraph::new("No agents running"), inner);
@@ -1917,32 +1930,48 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui) {
         .agent_rows
         .iter()
         .map(|row| {
-            let marker = if tui.agent_selected_pane == Some(row.pane_id) {
-                "›"
-            } else {
-                " "
-            };
-            let prefix = format!(
-                "{marker} {} {} ",
-                overlay_kind_label(&row.kind),
-                overlay_state_label(row.state)
-            );
-            let detail = format!(
-                "{} · {} · {}",
-                truncate_leading(
-                    &row.cwd,
-                    usize::from(inner.width.saturating_sub(text_width(&prefix)))
+            Line::styled(
+                format_agent_overlay_row(
+                    row,
+                    tui.agent_selected_pane == Some(row.pane_id),
+                    inner.width,
                 ),
-                row.host,
-                row.controller
-            );
-            Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Yellow)),
-                Span::raw(detail),
-            ])
+                Style::default().fg(Color::Yellow),
+            )
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn agents_overlay_panel(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).clamp(24, 88);
+    let height = area.height.saturating_sub(4).clamp(5, 18);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width.min(area.width),
+        height.min(area.height),
+    )
+}
+
+fn agents_overlay_inner(area: Rect) -> Rect {
+    Block::bordered().inner(agents_overlay_panel(area))
+}
+
+fn format_agent_overlay_row(row: &AgentOverlayRow, selected: bool, width: u16) -> String {
+    let marker = if selected { "›" } else { " " };
+    let prefix = format!(
+        "{marker} {}  {}  ",
+        overlay_kind_label(&row.kind),
+        overlay_state_label(row.state)
+    );
+    let suffix = format!("  Pane #{}  host: {}", row.pane_id, row.host);
+    let cwd_width = width.saturating_sub(text_width(&prefix).saturating_add(text_width(&suffix)));
+    format!(
+        "{prefix}{}{suffix}",
+        truncate_leading(&row.cwd, usize::from(cwd_width))
+    )
 }
 
 fn overlay_kind_label(kind: &str) -> &'static str {
@@ -1951,6 +1980,7 @@ fn overlay_kind_label(kind: &str) -> &'static str {
         "codex" => "Codex",
         "cursor" => "Cursor Agent",
         "pi" => "Pi",
+        "opencode" => "OpenCode",
         _ => "Unknown",
     }
 }
@@ -2872,6 +2902,15 @@ impl SharedLayoutRuntime {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
                     if self.tui.overlay_open() {
+                        let previously_focused = self.tui.focused_pane();
+                        for intent in self.tui.handle_agent_overlay_click(
+                            mouse.column,
+                            mouse.row,
+                            Rect::new(0, 0, cols, rows),
+                        ) {
+                            self.handle_intent(intent)?;
+                        }
+                        self.release_blurred_pane(previously_focused)?;
                         dirty = true;
                         continue;
                     }
@@ -4483,6 +4522,50 @@ mod tests {
             ),
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn agents_overlay_rows_include_location_pane_and_host() {
+        let row = agent_row(2);
+
+        let rendered = super::format_agent_overlay_row(&row, true, 120);
+
+        assert!(rendered.starts_with("› Codex  working  "));
+        assert!(rendered.contains("/very/long/repository/path"));
+        assert!(rendered.contains("Pane #2"));
+        assert!(rendered.ends_with("host: Host"));
+    }
+
+    #[test]
+    fn agents_overlay_click_jumps_to_the_clicked_row_and_ignores_outside_clicks() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).unwrap();
+        tui.set_agent_rows(vec![agent_row(2)]);
+        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
+        tui.expire_agent_toggle(Instant::now());
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(tui.handle_agent_overlay_click(0, 0, area), Vec::new());
+        assert!(tui.overlay_open());
+        assert_eq!(
+            tui.handle_agent_overlay_click(4, 4, area),
+            vec![UiIntent::FocusPane { pane_id: 2 }]
+        );
+        assert!(!tui.overlay_open());
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
     }

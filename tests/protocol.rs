@@ -343,6 +343,16 @@ fn agent_roster_uses_tag_26_and_round_trips() {
 }
 
 #[test]
+fn agent_roster_accepts_opencode_kind() {
+    let roster = agent_roster(vec![AgentRosterEntry {
+        agent_kind: String::from("opencode"),
+        ..agent_entry(9)
+    }]);
+
+    assert!(encode_frame(&envelope(envelope::Body::AgentRoster(roster))).is_ok());
+}
+
+#[test]
 fn agent_roster_validation_rejects_bad_entries() {
     let cases = [
         agent_roster(vec![agent_entry(0)]),
