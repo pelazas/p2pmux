@@ -347,9 +347,13 @@ mod tests {
         use std::os::unix::net::UnixListener;
         use std::thread;
 
-        let store = store();
+        let root = PathBuf::from(format!("/tmp/p2pmux-t-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = SessionStore::at(root.join("s"), root.join("k"));
         let id = generate_id().unwrap();
-        let socket = store.socket_path(&id).unwrap();
+        // Keep the path short enough for sockaddr_un on macOS.
+        let socket = root.join("k").join(format!("{}.s", &id[..8]));
+        fs::create_dir_all(root.join("k")).unwrap();
         let _ = fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -366,7 +370,7 @@ mod tests {
             .write(&SessionDescriptor::new(
                 id.clone(),
                 "amber-otter-01".into(),
-                socket,
+                socket.clone(),
                 42,
                 SessionRole::Coordinator,
             ))
@@ -375,5 +379,6 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, id);
         server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
