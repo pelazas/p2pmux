@@ -87,6 +87,8 @@ fn unix_ms_now() -> u64 {
 }
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
+const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
+const AGENT_OVERLAY_CARD_LINES: usize = 3;
 const AGENT_OVERLAY_CHROME: Color = Color::Rgb(56, 132, 255);
 const AGENT_OVERLAY_BACKGROUND: Color = Color::Rgb(10, 18, 35);
 const AGENT_OVERLAY_SELECTED_BACKGROUND: Color = Color::Rgb(31, 74, 142);
@@ -304,6 +306,9 @@ pub struct MultiPaneTui {
     agent_rows: Vec<AgentOverlayRow>,
     agent_overlay_open: bool,
     agent_selected_pane: Option<PaneId>,
+    /// Terminal-line offset into the cards (two card lines plus one spacer each).
+    agent_overlay_scroll_line: usize,
+    agent_overlay_viewport_lines: u16,
     pending_agent_toggle: Option<Instant>,
     resize_drag: Option<ResizeDrag>,
 }
@@ -333,6 +338,8 @@ impl MultiPaneTui {
             agent_rows: Vec::new(),
             agent_overlay_open: false,
             agent_selected_pane: None,
+            agent_overlay_scroll_line: 0,
+            agent_overlay_viewport_lines: 0,
             pending_agent_toggle: None,
             resize_drag: None,
         })
@@ -381,7 +388,86 @@ impl MultiPaneTui {
         if self.agent_selected_pane.is_none() {
             self.agent_selected_pane = self.agent_rows.first().map(|row| row.pane_id);
         }
+        self.clamp_agent_overlay_scroll();
+        self.ensure_agent_selection_visible();
         true
+    }
+
+    fn set_agent_overlay_viewport(&mut self, area: Rect) {
+        self.agent_overlay_viewport_lines = agents_overlay_inner(area).height;
+        self.clamp_agent_overlay_scroll();
+    }
+
+    fn agent_overlay_total_lines(&self) -> usize {
+        self.agent_rows
+            .len()
+            .saturating_mul(AGENT_OVERLAY_CARD_LINES)
+            .saturating_sub(1)
+    }
+
+    fn agent_overlay_max_scroll(&self) -> usize {
+        self.agent_overlay_total_lines()
+            .saturating_sub(usize::from(self.agent_overlay_viewport_lines.max(1)))
+    }
+
+    fn clamp_agent_overlay_scroll(&mut self) {
+        if self.agent_overlay_viewport_lines == 0 {
+            self.agent_overlay_scroll_line = 0;
+            return;
+        }
+        self.agent_overlay_scroll_line = self
+            .agent_overlay_scroll_line
+            .min(self.agent_overlay_max_scroll());
+    }
+
+    fn ensure_agent_selection_visible(&mut self) {
+        if self.agent_overlay_viewport_lines == 0 {
+            return;
+        }
+        let Some(index) = self
+            .agent_selected_pane
+            .and_then(|pane| self.agent_rows.iter().position(|row| row.pane_id == pane))
+        else {
+            return;
+        };
+        let viewport_lines = usize::from(self.agent_overlay_viewport_lines.max(1));
+        let card_start = index.saturating_mul(AGENT_OVERLAY_CARD_LINES);
+        let card_end = card_start.saturating_add(1);
+        if card_start < self.agent_overlay_scroll_line {
+            self.agent_overlay_scroll_line = card_start;
+        } else if card_end
+            >= self
+                .agent_overlay_scroll_line
+                .saturating_add(viewport_lines)
+        {
+            self.agent_overlay_scroll_line =
+                card_end.saturating_add(1).saturating_sub(viewport_lines);
+        }
+        self.clamp_agent_overlay_scroll();
+    }
+
+    fn scroll_agent_overlay(&mut self, area: Rect, up: bool) -> bool {
+        self.set_agent_overlay_viewport(area);
+        let previous = self.agent_overlay_scroll_line;
+        if up {
+            self.agent_overlay_scroll_line = self
+                .agent_overlay_scroll_line
+                .saturating_sub(AGENT_OVERLAY_CARD_LINES);
+        } else {
+            self.agent_overlay_scroll_line = self
+                .agent_overlay_scroll_line
+                .saturating_add(AGENT_OVERLAY_CARD_LINES);
+        }
+        self.clamp_agent_overlay_scroll();
+        self.agent_overlay_scroll_line != previous
+    }
+
+    fn agent_overlay_has_working_rows(&self) -> bool {
+        self.agent_overlay_open
+            && self
+                .agent_rows
+                .iter()
+                .any(|row| row.state == AgentRosterState::Working)
     }
 
     fn pane_location(&self, pane_id: PaneId) -> Option<(usize, usize)> {
@@ -785,6 +871,7 @@ impl MultiPaneTui {
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
         if self.agent_overlay_open {
+            self.set_agent_overlay_viewport(area);
             return self.handle_agent_overlay_key(key);
         }
         if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
@@ -885,12 +972,13 @@ impl MultiPaneTui {
         if !rect_contains(inner, column, row) {
             return None;
         }
-        let line = row.saturating_sub(inner.y);
-        if line % 3 == 2 {
+        let line =
+            usize::from(row.saturating_sub(inner.y)).saturating_add(self.agent_overlay_scroll_line);
+        if line % AGENT_OVERLAY_CARD_LINES == 2 {
             return None;
         }
         self.agent_rows
-            .get(usize::from(line) / 3)
+            .get(line / AGENT_OVERLAY_CARD_LINES)
             .map(|agent| agent.pane_id)
     }
 
@@ -925,6 +1013,7 @@ impl MultiPaneTui {
             (current + len - 1) % len
         };
         self.agent_selected_pane = Some(self.agent_rows[next].pane_id);
+        self.ensure_agent_selection_visible();
     }
 
     fn handle_pane_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
@@ -1969,18 +2058,28 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
         return;
     }
     let mut lines = Vec::with_capacity(tui.agent_rows.len().saturating_mul(3));
+    let animation_phase = agent_overlay_animation_phase(now_unix_ms);
     for (index, row) in tui.agent_rows.iter().enumerate() {
         lines.extend(format_agent_overlay_card(
             row,
             tui.agent_selected_pane == Some(row.pane_id),
             inner.width,
             now_unix_ms,
+            animation_phase,
         ));
         if index + 1 < tui.agent_rows.len() {
             lines.push(Line::raw(""));
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(tui.agent_overlay_scroll_line)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
+    );
 }
 
 fn agents_overlay_panel(area: Rect) -> Rect {
@@ -2004,6 +2103,7 @@ fn format_agent_overlay_card(
     selected: bool,
     width: u16,
     now_unix_ms: u64,
+    animation_phase: usize,
 ) -> [Line<'static>; 2] {
     let marker = if selected { "›" } else { " " };
     let kind = overlay_kind_label(&row.kind);
@@ -2035,7 +2135,7 @@ fn format_agent_overlay_card(
 
     let (glyph, state, elapsed) = match row.state {
         AgentRosterState::Working => (
-            "◐",
+            agent_overlay_working_glyph(animation_phase),
             "working",
             Some(format_agent_elapsed(row.working_since_unix_ms, now_unix_ms)),
         ),
@@ -2099,6 +2199,15 @@ fn format_agent_overlay_card(
         first_line,
         agent_overlay_line(second_spans, card_style, selected, width),
     ]
+}
+
+fn agent_overlay_animation_phase(now_unix_ms: u64) -> usize {
+    now_unix_ms.saturating_div(AGENT_OVERLAY_ANIMATION_INTERVAL.as_millis() as u64) as usize
+}
+
+fn agent_overlay_working_glyph(animation_phase: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    FRAMES[animation_phase % FRAMES.len()]
 }
 
 fn agent_overlay_line(
@@ -2811,6 +2920,7 @@ pub struct SharedLayoutRuntime {
     agent_roster_generation: u64,
     last_local_agent_entries: Vec<AgentRosterEntry>,
     next_agent_roster_heartbeat: Instant,
+    last_agent_overlay_animation: Instant,
 }
 
 impl SharedLayoutRuntime {
@@ -2916,6 +3026,7 @@ impl SharedLayoutRuntime {
             agent_roster_generation: 0,
             last_local_agent_entries: Vec::new(),
             next_agent_roster_heartbeat: Instant::now(),
+            last_agent_overlay_animation: Instant::now(),
         };
         value.refresh_local_views();
         Ok(value)
@@ -2966,7 +3077,7 @@ impl SharedLayoutRuntime {
     }
 
     pub fn run(mut self) -> Result<(), Box<dyn Error>> {
-        let (cols, rows) = terminal::size()?;
+        let (mut cols, mut rows) = terminal::size()?;
         let mut guard = TerminalGuard::new();
         enable_raw_mode()?;
         guard.raw_mode = true;
@@ -2985,6 +3096,8 @@ impl SharedLayoutRuntime {
                 viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
             },
         )?;
+        self.tui
+            .set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
         let mut dirty = true;
         let mut pending_escape = PendingEscape::default();
         loop {
@@ -2993,6 +3106,14 @@ impl SharedLayoutRuntime {
                 dirty = true;
             }
             if self.tui.expire_agent_toggle(Instant::now()) {
+                dirty = true;
+            }
+            let now = Instant::now();
+            if self.tui.agent_overlay_has_working_rows()
+                && now.duration_since(self.last_agent_overlay_animation)
+                    >= AGENT_OVERLAY_ANIMATION_INTERVAL
+            {
+                self.last_agent_overlay_animation = now;
                 dirty = true;
             }
             if pending_escape.take_if_expired(Instant::now()) {
@@ -3132,6 +3253,13 @@ impl SharedLayoutRuntime {
                     ) =>
                 {
                     let area = Rect::new(0, 0, cols, rows);
+                    if self.tui.overlay_open() {
+                        dirty |= self.tui.scroll_agent_overlay(
+                            area,
+                            matches!(mouse.kind, MouseEventKind::ScrollUp),
+                        );
+                        continue;
+                    }
                     let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
                     let scrollback_len = self
                         .local
@@ -3151,6 +3279,11 @@ impl SharedLayoutRuntime {
                     );
                 }
                 Event::Resize(width, height) => {
+                    cols = width;
+                    rows = height;
+                    self.tui
+                        .set_agent_overlay_viewport(Rect::new(0, 0, width, height));
+                    self.tui.ensure_agent_selection_visible();
                     self.reflow_local_panes(Rect::new(0, 0, width, height))?;
                     dirty = true;
                 }
@@ -4644,6 +4777,26 @@ mod tests {
         }
     }
 
+    fn agent_overlay_tui(count: u64) -> MultiPaneTui {
+        let tabs = (1..=count)
+            .map(|pane_id| Tab {
+                tab_id: pane_id,
+                root: Node::Leaf { pane_id },
+            })
+            .collect();
+        let panes = (1..=count)
+            .map(|pane_id| (pane_id, 2, 8))
+            .collect::<Vec<_>>();
+        let mut tui = MultiPaneTui::new(layout(tabs, &panes)).expect("valid layout");
+        tui.set_agent_rows(
+            (1..=count)
+                .map(|pane_id| agent_row(pane_id, pane_id as usize, 1))
+                .collect(),
+        );
+        tui.agent_overlay_open = true;
+        tui
+    }
+
     #[test]
     fn agents_overlay_toggles_and_double_tap_forwards_ctrl_a() {
         let mut tui = MultiPaneTui::new(layout(
@@ -4721,7 +4874,7 @@ mod tests {
     fn agents_overlay_cards_show_state_elapsed_and_location() {
         let row = agent_row(2, 2, 1);
 
-        let rendered = super::format_agent_overlay_card(&row, true, 120, 1_725_000_084_123);
+        let rendered = super::format_agent_overlay_card(&row, true, 120, 1_725_000_084_123, 0);
 
         assert!(rendered[0].to_string().starts_with("› Codex · "));
         assert!(
@@ -4739,16 +4892,16 @@ mod tests {
     fn agents_overlay_cards_distinguish_idle_done_and_future_work() {
         let mut row = agent_row(2, 2, 1);
         row.state = crate::protocol::AgentRosterState::Idle;
-        let idle = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123);
+        let idle = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0);
         assert!(idle[1].to_string().starts_with("○ idle"));
 
         row.state = crate::protocol::AgentRosterState::Done;
-        let done = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123);
+        let done = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0);
         assert!(done[1].to_string().starts_with("✓ done"));
 
         row.state = crate::protocol::AgentRosterState::Working;
         row.working_since_unix_ms = 1_725_000_001_123;
-        let future = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123);
+        let future = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0);
         assert!(future[1].to_string().starts_with("◐ working 0s"));
     }
 
@@ -4796,7 +4949,7 @@ mod tests {
             vec![(8, 1, 1), (6, 1, 2), (3, 2, 1)]
         );
         assert!(
-            super::format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0)[1]
+            super::format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0, 0)[1]
                 .to_string()
                 .contains("Tab #2 · Pane #1")
         );
@@ -4872,6 +5025,53 @@ mod tests {
         assert!(!tui.overlay_open());
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn agents_overlay_hit_test_accounts_for_terminal_line_scroll() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut tui = agent_overlay_tui(3);
+        let inner = super::agents_overlay_inner(area);
+
+        assert!(tui.scroll_agent_overlay(area, false));
+        assert_eq!(tui.agent_overlay_scroll_line, 3);
+        assert_eq!(tui.agent_overlay_row_at(inner.x, inner.y, area), Some(2));
+        assert_eq!(
+            tui.agent_overlay_row_at(inner.x, inner.y.saturating_add(2), area),
+            None
+        );
+    }
+
+    #[test]
+    fn agents_overlay_selection_auto_scrolls_to_keep_cards_visible() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut tui = agent_overlay_tui(4);
+
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
+        assert_eq!(tui.agent_selected_pane, Some(2));
+        assert_eq!(tui.agent_overlay_scroll_line, 2);
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
+        assert_eq!(tui.agent_selected_pane, Some(3));
+        assert_eq!(tui.agent_overlay_scroll_line, 5);
+    }
+
+    #[test]
+    fn agents_overlay_scroll_clamps_when_roster_shrinks() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut tui = agent_overlay_tui(4);
+
+        assert!(tui.scroll_agent_overlay(area, false));
+        assert!(tui.scroll_agent_overlay(area, false));
+        assert_eq!(tui.agent_overlay_scroll_line, 6);
+        tui.set_agent_rows(vec![agent_row(1, 1, 1)]);
+        assert_eq!(tui.agent_overlay_scroll_line, 0);
+    }
+
+    #[test]
+    fn agents_overlay_working_glyph_uses_animation_phase() {
+        assert_eq!(super::agent_overlay_working_glyph(0), "◐");
+        assert_eq!(super::agent_overlay_working_glyph(1), "◓");
+        assert_eq!(super::agent_overlay_working_glyph(4), "◐");
     }
 
     #[test]
