@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use sysinfo::{ProcessesToUpdate, System};
+
 const DONE_GRACE: Duration = Duration::from_secs(15);
 const WORKING_WINDOW: Duration = Duration::from_secs(2);
 
@@ -55,6 +57,51 @@ pub struct ProcessSnapshot {
     pub basename: String,
     pub start_time: Option<u64>,
     pub cwd: Option<String>,
+}
+
+/// Replaceable adapter for collecting one global process snapshot.
+pub trait ProcessSampler {
+    fn snapshot(&mut self) -> Vec<ProcessSnapshot>;
+}
+
+/// `sysinfo`-backed process sampler used by the macOS host runtime.
+pub struct SysinfoSampler {
+    system: System,
+}
+
+impl Default for SysinfoSampler {
+    fn default() -> Self {
+        Self {
+            system: System::new(),
+        }
+    }
+}
+
+impl ProcessSampler for SysinfoSampler {
+    fn snapshot(&mut self) -> Vec<ProcessSnapshot> {
+        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        self.system
+            .processes()
+            .values()
+            .map(|process| ProcessSnapshot {
+                pid: process.pid().as_u32(),
+                parent_pid: process.parent().map(|pid| pid.as_u32()),
+                basename: process
+                    .exe()
+                    .and_then(|path| path.file_name())
+                    .unwrap_or(process.name())
+                    .to_string_lossy()
+                    .into_owned(),
+                start_time: Some(process.start_time()),
+                cwd: process.cwd().map(|path| path.to_string_lossy().into_owned()),
+            })
+            .collect()
+    }
+}
+
+/// Collect one global snapshot through an injected sampler.
+pub fn sample_global_snapshot(sampler: &mut dyn ProcessSampler) -> Vec<ProcessSnapshot> {
+    sampler.snapshot()
 }
 
 /// The supported agent selected from a hosted pane's process tree.
@@ -339,5 +386,18 @@ mod tests {
                 AgentState::Idle,
             ))
         );
+    }
+
+    #[test]
+    fn global_snapshot_uses_the_injected_sampler() {
+        struct FakeSampler;
+
+        impl ProcessSampler for FakeSampler {
+            fn snapshot(&mut self) -> Vec<ProcessSnapshot> {
+                vec![process(1, None, "codex", None)]
+            }
+        }
+
+        assert_eq!(sample_global_snapshot(&mut FakeSampler).len(), 1);
     }
 }

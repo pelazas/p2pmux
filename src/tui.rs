@@ -6,6 +6,12 @@ use std::{
     io,
     io::Write,
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self as sync_mpsc, Receiver},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -35,6 +41,10 @@ use ratatui::{
 };
 
 use crate::{
+    agent_detect::{
+        PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree,
+        sample_global_snapshot,
+    },
     layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     protocol::{
@@ -66,6 +76,7 @@ const TAB_BAR_SEPARATOR: &str = " · ";
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 enum FooterSegment {
     Text(&'static str),
@@ -1414,6 +1425,7 @@ pub struct SharedLocalPane {
     lease_tx: watch::Sender<LeaseState>,
     control_tx: mpsc::Sender<HostControlEvent>,
     control_rx: mpsc::Receiver<HostControlEvent>,
+    agent_tracker: PaneAgentTracker,
 }
 
 impl SharedLocalPane {
@@ -1444,6 +1456,7 @@ impl SharedLocalPane {
             lease_tx,
             control_tx,
             control_rx,
+            agent_tracker: PaneAgentTracker::default(),
         })
     }
 
@@ -1525,11 +1538,22 @@ impl SharedLocalPane {
             let Some(bytes) = self.host.try_read_output()? else {
                 break;
             };
+            self.agent_tracker.record_output(Instant::now());
             let frame = self.screen.process_pty(&bytes)?;
             self.screen_tx.send_replace(frame);
             changed = true;
         }
         Ok(changed)
+    }
+
+    fn apply_agent_snapshot(&mut self, processes: &[ProcessSnapshot], now: Instant) -> bool {
+        let before = self.agent_tracker.listed_agent(now);
+        let detected = self
+            .host
+            .process_id()
+            .and_then(|pid| classify_pane_tree(pid, processes));
+        self.agent_tracker.update(detected, now);
+        self.agent_tracker.listed_agent(now) != before
     }
 
     fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
@@ -1563,6 +1587,49 @@ impl SharedLocalPane {
 
     fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         self.host.shutdown()
+    }
+}
+
+struct AgentSamplingWorker {
+    snapshots: Receiver<Vec<ProcessSnapshot>>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AgentSamplingWorker {
+    fn spawn() -> Self {
+        let (snapshot_tx, snapshots) = sync_mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let join = thread::spawn(move || {
+            let mut sampler = SysinfoSampler::default();
+            while !worker_stop.load(Ordering::Relaxed) {
+                if snapshot_tx.send(sample_global_snapshot(&mut sampler)).is_err() {
+                    break;
+                }
+                thread::sleep(AGENT_SAMPLE_INTERVAL);
+            }
+        });
+        Self {
+            snapshots,
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn latest_snapshot(&self) -> Option<Vec<ProcessSnapshot>> {
+        let mut latest = None;
+        while let Ok(snapshot) = self.snapshots.try_recv() {
+            latest = Some(snapshot);
+        }
+        latest
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -1910,6 +1977,7 @@ pub struct SharedLayoutRuntime {
     copied_lines: Option<usize>,
     footer_notice: Option<String>,
     join_code: Option<String>,
+    agent_sampler: AgentSamplingWorker,
 }
 
 impl SharedLayoutRuntime {
@@ -2010,6 +2078,7 @@ impl SharedLayoutRuntime {
             copied_lines: None,
             footer_notice: None,
             join_code,
+            agent_sampler: AgentSamplingWorker::spawn(),
         };
         value.refresh_local_views();
         Ok(value)
@@ -2283,6 +2352,12 @@ impl SharedLayoutRuntime {
         self.start_eligible_subscriptions();
         for pane in self.local.values_mut() {
             changed |= pane.drain()?;
+        }
+        if let Some(snapshot) = self.agent_sampler.latest_snapshot() {
+            let now = Instant::now();
+            for pane in self.local.values_mut() {
+                changed |= pane.apply_agent_snapshot(&snapshot, now);
+            }
         }
         let disconnected = self
             .remote
@@ -2644,6 +2719,7 @@ impl SharedLayoutRuntime {
     }
 
     fn shutdown(mut self) {
+        self.agent_sampler.shutdown();
         for (_, mut pane) in std::mem::take(&mut self.local) {
             let _ = self.panes.remove_local_pane(pane.pane_id);
             let _ = pane.shutdown();

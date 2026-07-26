@@ -85,6 +85,11 @@ impl PtyHost {
         self.output_closed
     }
 
+    /// Return the PTY session child PID while the child is still owned.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.process_id())
+    }
+
     /// Write terminal input to the child PTY immediately.
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let writer = self.writer.as_mut().ok_or("PTY writer is shut down")?;
