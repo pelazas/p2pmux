@@ -287,8 +287,9 @@ pub fn shutdown(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error
 }
 
 fn write_message(stream: &mut UnixStream, message: &ClientMessage) -> io::Result<()> {
-    serde_json::to_writer(&mut *stream, message).map_err(io::Error::other)?;
-    stream.write_all(b"\n")?;
+    let mut frame = serde_json::to_vec(message).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    stream.write_all(&frame)?;
     stream.flush()
 }
 

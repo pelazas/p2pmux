@@ -191,22 +191,23 @@ fn run_socket_loop(
     descriptor: &SessionDescriptor,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
-    let mut client: Option<(UnixStream, u64)> = None;
+    let mut client: Option<(BufReader<UnixStream>, u64)> = None;
     loop {
         let mut shutdown = false;
         loop {
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-                    match read_message(&mut stream) {
+                    let mut reader = BufReader::new(stream);
+                    match read_message(&mut reader) {
                         // Probes and shutdowns are control requests. They must not consume or
                         // contend with the single interactive attachment slot.
                         Ok(Some(ClientMessage::Probe)) => {
-                            let _ = write_message(&mut stream, &NodeMessage::ProbeAck);
+                            let _ = write_message(reader.get_mut(), &NodeMessage::ProbeAck);
                         }
                         Ok(Some(ClientMessage::Shutdown { generation })) => {
                             let _ = write_message(
-                                &mut stream,
+                                reader.get_mut(),
                                 &NodeMessage::ShutdownAck { generation },
                             );
                             shutdown = true;
@@ -217,22 +218,24 @@ fn run_socket_loop(
                                 node.resize(cols, rows)
                                     .map_err(|error| io::Error::other(error.to_string()))?;
                                 let attached = write_message(
-                                    &mut stream,
+                                    reader.get_mut(),
                                     &NodeMessage::AttachAccepted { generation },
                                 )
                                 .and_then(|()| {
-                                    write_snapshot(&mut stream, descriptor, node, generation)
+                                    write_snapshot(reader.get_mut(), descriptor, node, generation)
                                 })
                                 .is_ok();
                                 if attached {
-                                    stream.set_read_timeout(Some(Duration::from_millis(1)))?;
-                                    client = Some((stream, generation));
+                                    reader
+                                        .get_mut()
+                                        .set_read_timeout(Some(Duration::from_millis(1)))?;
+                                    client = Some((reader, generation));
                                 } else {
                                     let _ = gate.detach(generation);
                                 }
                             } else {
                                 let _ = write_message(
-                                    &mut stream,
+                                    reader.get_mut(),
                                     &NodeMessage::AttachRejected {
                                         reason: "already attached".into(),
                                     },
@@ -267,8 +270,8 @@ fn run_socket_loop(
             .drain()
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut detached = false;
-        if !shutdown && let Some((stream, generation)) = client.as_mut() {
-            match read_message(stream) {
+        if !shutdown && let Some((reader, generation)) = client.as_mut() {
+            match read_message(reader) {
                 Ok(Some(ClientMessage::Input { bytes })) => node
                     .input(bytes)
                     .map_err(|error| io::Error::other(error.to_string()))?,
@@ -293,7 +296,7 @@ fn run_socket_loop(
                     node.release_all_local_control()
                         .map_err(|error| io::Error::other(error.to_string()))?;
                     let _ = write_message(
-                        stream,
+                        reader.get_mut(),
                         &NodeMessage::DetachAck {
                             generation: *generation,
                         },
@@ -304,7 +307,7 @@ fn run_socket_loop(
                     generation: requested,
                 })) if requested == *generation => {
                     write_message(
-                        stream,
+                        reader.get_mut(),
                         &NodeMessage::ShutdownAck {
                             generation: *generation,
                         },
@@ -314,14 +317,14 @@ fn run_socket_loop(
                 Ok(Some(ClientMessage::Rename { name })) => {
                     if crate::session_store::valid_name(&name) {
                         write_message(
-                            stream,
+                            reader.get_mut(),
                             &NodeMessage::Update {
                                 state: serde_json::json!({"name": name}),
                             },
                         )?;
                     } else {
                         write_message(
-                            stream,
+                            reader.get_mut(),
                             &NodeMessage::Error {
                                 message: "invalid session name".into(),
                             },
@@ -337,15 +340,15 @@ fn run_socket_loop(
             }
             if changed
                 && !detached
-                && write_snapshot(stream, descriptor, node, *generation).is_err()
+                && write_snapshot(reader.get_mut(), descriptor, node, *generation).is_err()
             {
                 detached = true;
             }
         }
         if (detached || shutdown)
-            && let Some((stream, generation)) = client.take()
+            && let Some((mut reader, generation)) = client.take()
         {
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = reader.get_mut().shutdown(Shutdown::Both);
             let _ = gate.detach(generation);
             node.release_all_local_control()
                 .map_err(|error| io::Error::other(error.to_string()))?;
@@ -357,8 +360,7 @@ fn run_socket_loop(
     }
 }
 
-fn read_message(stream: &mut UnixStream) -> io::Result<Option<ClientMessage>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<ClientMessage>> {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) => Ok(None),
@@ -369,8 +371,9 @@ fn read_message(stream: &mut UnixStream) -> io::Result<Option<ClientMessage>> {
     }
 }
 fn write_message(stream: &mut UnixStream, message: &NodeMessage) -> io::Result<()> {
-    serde_json::to_writer(&mut *stream, message).map_err(io::Error::other)?;
-    stream.write_all(b"\n")?;
+    let mut frame = serde_json::to_vec(message).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    stream.write_all(&frame)?;
     stream.flush()
 }
 fn write_snapshot(
@@ -490,7 +493,35 @@ impl SharedLayoutNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        io::Write,
+        os::unix::{fs::PermissionsExt, net::UnixStream},
+    };
+
+    #[test]
+    fn reads_concatenated_client_frames_from_one_reader() {
+        let (mut writer, stream) = UnixStream::pair().unwrap();
+        let mut frames = serde_json::to_vec(&ClientMessage::Input {
+            bytes: b"first".to_vec(),
+        })
+        .unwrap();
+        frames.push(b'\n');
+        frames.extend_from_slice(
+            &serde_json::to_vec(&ClientMessage::Detach { generation: 7 }).unwrap(),
+        );
+        frames.push(b'\n');
+        writer.write_all(&frames).unwrap();
+
+        let mut reader = BufReader::new(stream);
+        assert!(matches!(
+            read_message(&mut reader).unwrap(),
+            Some(ClientMessage::Input { bytes }) if bytes == b"first"
+        ));
+        assert!(matches!(
+            read_message(&mut reader).unwrap(),
+            Some(ClientMessage::Detach { generation: 7 })
+        ));
+    }
 
     #[test]
     fn bootstrap_is_private_and_round_trips() {
