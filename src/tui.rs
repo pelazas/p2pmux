@@ -102,7 +102,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> + <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
-    FooterSegment::Text("   Option+Shift+drag RESIZE"),
+    FooterSegment::Text("   drag border RESIZE"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Pane  <"),
@@ -454,20 +454,10 @@ impl MultiPaneTui {
         std::mem::replace(&mut self.selection_dragging, false)
     }
 
-    fn begin_resize_drag(
-        &mut self,
-        column: u16,
-        row: u16,
-        modifiers: KeyModifiers,
-        area: Rect,
-    ) -> bool {
-        if !modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) {
-            return false;
-        }
+    fn begin_resize_drag(&mut self, column: u16, row: u16, area: Rect) -> bool {
         let geometry = self.geometry(area);
-        let Some(pane_id) = geometry.panes.iter().find_map(|(pane_id, rect)| {
-            rect_contains(pane_content_rect(*rect), column, row).then_some(*pane_id)
-        }) else {
+        let Some((pane_id, horizontal, vertical)) = resize_border_hit(&geometry.panes, column, row)
+        else {
             return false;
         };
         self.resize_drag = Some(ResizeDrag {
@@ -476,13 +466,20 @@ impl MultiPaneTui {
             origin_column: column,
             origin_row: row,
             axis: None,
-            horizontal: true,
-            vertical: true,
+            horizontal,
+            vertical,
             original_share_bps: 0,
             preview_first_share_bps: None,
             span: 1,
             content: geometry.content,
         });
+        if horizontal != vertical {
+            self.lock_resize_drag(if horizontal {
+                Axis::LeftRight
+            } else {
+                Axis::TopBottom
+            });
+        }
         true
     }
 
@@ -1130,6 +1127,49 @@ fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<Pane
     panes
         .iter()
         .find_map(|(pane_id, rect)| rect_contains(*rect, column, row).then_some(*pane_id))
+}
+
+fn resize_border_hit(
+    panes: &BTreeMap<PaneId, Rect>,
+    column: u16,
+    row: u16,
+) -> Option<(PaneId, bool, bool)> {
+    panes.iter().find_map(|(pane_id, rect)| {
+        if !rect_contains(*rect, column, row)
+            || rect_contains(pane_content_rect(*rect), column, row)
+        {
+            return None;
+        }
+        let vertical = (rect.width > 0
+            && column == rect.x
+            && panes.iter().any(|(other_id, other)| {
+                other_id != pane_id
+                    && other.right() == rect.x
+                    && rect_contains(*other, other.x, row)
+            }))
+            || (rect.width > 0
+                && column == rect.right().saturating_sub(1)
+                && panes.iter().any(|(other_id, other)| {
+                    other_id != pane_id
+                        && other.x == rect.right()
+                        && rect_contains(*other, other.x, row)
+                }));
+        let horizontal = (rect.height > 0
+            && row == rect.y
+            && panes.iter().any(|(other_id, other)| {
+                other_id != pane_id
+                    && other.bottom() == rect.y
+                    && rect_contains(*other, column, other.y)
+            }))
+            || (rect.height > 0
+                && row == rect.bottom().saturating_sub(1)
+                && panes.iter().any(|(other_id, other)| {
+                    other_id != pane_id
+                        && other.y == rect.bottom()
+                        && rect_contains(*other, column, other.y)
+                }));
+        (vertical || horizontal).then_some((*pane_id, vertical, horizontal))
+    })
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -2825,10 +2865,7 @@ impl SharedLayoutRuntime {
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
                     dirty |= self.clear_selection();
-                    if self
-                        .tui
-                        .begin_resize_drag(mouse.column, mouse.row, mouse.modifiers, area)
-                    {
+                    if self.tui.begin_resize_drag(mouse.column, mouse.row, area) {
                         dirty = true;
                     } else if let Some(intent) =
                         self.tui.switch_tab_at(mouse.column, mouse.row, area)
@@ -5062,7 +5099,7 @@ mod tests {
     fn content_drag_keeps_the_selection_path() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
-        assert!(!tui.begin_resize_drag(2, 3, KeyModifiers::NONE, area));
+        assert!(!tui.begin_resize_drag(2, 3, area));
         assert!(tui.resize_drag.is_none());
         assert!(tui.begin_selection_at(2, 3, area));
         assert!(tui.extend_selection_at(3, 3, area));
@@ -5074,10 +5111,10 @@ mod tests {
     fn dragging_a_shared_vertical_border_resizes_its_split() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
-        assert!(tui.begin_resize_drag(20, 5, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
-        assert!(tui.extend_resize_drag(30, 5));
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
         assert!(matches!(
-            tui.end_resize_drag(30, 5),
+            tui.end_resize_drag(49, 5),
             Some(UiIntent::SetSplitRatio {
                 pane_id: 1,
                 axis: Axis::LeftRight,
@@ -5085,12 +5122,12 @@ mod tests {
                 base_revision: 1,
             })
         ));
-        assert!(tui.end_resize_drag(30, 5).is_none());
+        assert!(tui.end_resize_drag(49, 5).is_none());
 
-        assert!(tui.begin_resize_drag(45, 5, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
-        assert!(tui.extend_resize_drag(55, 5));
+        assert!(tui.begin_resize_drag(40, 5, area));
+        assert!(tui.extend_resize_drag(50, 5));
         assert!(matches!(
-            tui.end_resize_drag(55, 5),
+            tui.end_resize_drag(50, 5),
             Some(UiIntent::SetSplitRatio {
                 pane_id: 2,
                 axis: Axis::LeftRight,
@@ -5107,19 +5144,19 @@ mod tests {
         let snapshot = tui.snapshot().clone();
         let initial = tui.geometry(area);
 
-        assert!(tui.begin_resize_drag(38, 5, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
+        assert!(tui.begin_resize_drag(39, 5, area));
         assert!(tui.extend_resize_drag(49, 5));
 
         let preview = tui.geometry(area);
         assert_eq!(initial.panes[&1], Rect::new(0, 1, 40, 22));
-        assert_eq!(preview.panes[&1], Rect::new(0, 1, 51, 22));
+        assert_eq!(preview.panes[&1], Rect::new(0, 1, 50, 22));
         assert_eq!(tui.snapshot(), &snapshot);
         assert!(matches!(
             tui.end_resize_drag(49, 5),
             Some(UiIntent::SetSplitRatio {
                 pane_id: 1,
                 axis: Axis::LeftRight,
-                first_share_bps: 6_375,
+                first_share_bps: 6_250,
                 base_revision: 1,
             })
         ));
@@ -5133,7 +5170,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let initial = tui.geometry(area);
 
-        assert!(tui.begin_resize_drag(38, 5, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
+        assert!(tui.begin_resize_drag(39, 5, area));
         assert!(tui.extend_resize_drag(49, 5));
         assert_ne!(tui.geometry(area), initial);
 
@@ -5147,10 +5184,14 @@ mod tests {
     fn dragging_a_shared_horizontal_border_resizes_its_split() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
-        assert!(tui.begin_resize_drag(60, 6, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
+        let initial = tui.geometry(area);
+        assert!(tui.begin_resize_drag(60, 11, area));
         assert!(tui.extend_resize_drag(60, 11));
+        assert_eq!(tui.geometry(area), initial);
+        assert!(tui.extend_resize_drag(60, 16));
+        assert_eq!(tui.geometry(area).panes[&2], Rect::new(40, 1, 40, 15));
         assert!(matches!(
-            tui.end_resize_drag(60, 11),
+            tui.end_resize_drag(60, 16),
             Some(UiIntent::SetSplitRatio {
                 pane_id: 2,
                 axis: Axis::TopBottom,
@@ -5923,10 +5964,7 @@ mod tests {
                 "mode: {mode:?}, footer: {footer}"
             );
             if mode == ChordMode::None {
-                assert!(
-                    footer.contains("Option+Shift+drag RESIZE"),
-                    "footer: {footer}"
-                );
+                assert!(footer.contains("drag border RESIZE"), "footer: {footer}");
             }
         }
     }
