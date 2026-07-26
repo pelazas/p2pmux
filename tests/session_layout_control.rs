@@ -145,7 +145,10 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
         .await
         .expect("first joins");
     accept_first.await.unwrap().unwrap();
-    assert!(matches!(next_event(&mut first).await, LayoutControlEvent::Snapshot(_)));
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
 
     first
         .try_request(create_request(1, 2))
@@ -178,7 +181,10 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
         next_event(&mut first).await,
         LayoutControlEvent::Commit(commit) if commit.revision == 4
     ));
-    assert!(matches!(next_event(&mut second).await, LayoutControlEvent::Snapshot(_)));
+    assert!(matches!(
+        next_event(&mut second).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
 
     first
         .try_agent_roster(AgentRoster {

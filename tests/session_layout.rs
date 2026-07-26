@@ -3,8 +3,7 @@ use p2pmux::{
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, NewPanePosition, PaneFailed,
-        PaneGrid, PaneReady, SetSplitRatio, SplitAxis,
-        UpdatePaneGrids,
+        PaneGrid, PaneReady, SetSplitRatio, SplitAxis, UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -173,7 +172,9 @@ fn admission_advances_revision_and_publishes_the_member_endpoint() {
 #[test]
 fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
     let mut coordinator = coordinator();
-    coordinator.admit(host_b(), addr_b()).expect("guest admitted");
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("guest admitted");
 
     let forged = AgentRoster {
         host_peer_id: host_a(),

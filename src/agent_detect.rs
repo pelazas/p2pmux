@@ -93,7 +93,9 @@ impl ProcessSampler for SysinfoSampler {
                     .to_string_lossy()
                     .into_owned(),
                 start_time: Some(process.start_time()),
-                cwd: process.cwd().map(|path| path.to_string_lossy().into_owned()),
+                cwd: process
+                    .cwd()
+                    .map(|path| path.to_string_lossy().into_owned()),
             })
             .collect()
     }
@@ -147,10 +149,12 @@ pub fn classify_pane_tree(
         .max_by(|left, right| {
             left.depth
                 .cmp(&right.depth)
-                .then_with(|| match (left.process.start_time, right.process.start_time) {
-                    (Some(left), Some(right)) => left.cmp(&right),
-                    _ => std::cmp::Ordering::Equal,
-                })
+                .then_with(
+                    || match (left.process.start_time, right.process.start_time) {
+                        (Some(left), Some(right)) => left.cmp(&right),
+                        _ => std::cmp::Ordering::Equal,
+                    },
+                )
                 .then_with(|| left.process.pid.cmp(&right.process.pid))
         })
         .map(|candidate| DetectedAgent {
@@ -164,7 +168,9 @@ fn descendant_depth(root_pid: u32, pid: u32, processes: &[ProcessSnapshot]) -> O
     let mut depth = 0;
 
     while current_pid != root_pid {
-        let process = processes.iter().find(|process| process.pid == current_pid)?;
+        let process = processes
+            .iter()
+            .find(|process| process.pid == current_pid)?;
         current_pid = process.parent_pid?;
         depth += 1;
         if depth > processes.len() {
@@ -335,7 +341,10 @@ mod tests {
         };
         let mut tracker = PaneAgentTracker::default();
         tracker.update(Some(agent.clone()), now);
-        assert_eq!(tracker.listed_agent(now), Some((agent.clone(), AgentState::Idle)));
+        assert_eq!(
+            tracker.listed_agent(now),
+            Some((agent.clone(), AgentState::Idle))
+        );
 
         tracker.record_output(now);
         assert_eq!(

@@ -29,10 +29,9 @@ use crate::{
     },
     lease::LeaseState,
     protocol::{
-        AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta,
-        Envelope, Input, Join, LayoutCommit, LayoutNode,
-        LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState,
-        MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
+        AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
+        Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
+        LayoutSplit, LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
         ReleaseControl, SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
         TakeControl, UpdatePaneGrids, Welcome, envelope,
@@ -3528,8 +3527,13 @@ mod control_queue_tests {
             b"slow".to_vec(),
             ControlPeer::new(slow_mailbox, slow_reader.abort_handle(), None),
         );
-        let (healthy_mailbox, healthy_initial_rx, healthy_state_rx, healthy_roster_rx, healthy_targeted_rx) =
-            ControlMailbox::new();
+        let (
+            healthy_mailbox,
+            healthy_initial_rx,
+            healthy_state_rx,
+            healthy_roster_rx,
+            healthy_targeted_rx,
+        ) = ControlMailbox::new();
         let healthy_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"healthy".to_vec(),
@@ -3795,7 +3799,10 @@ mod control_queue_tests {
         assert!(matches!(
             recorded_rx.recv().await,
             Some(Envelope {
-                body: Some(envelope::Body::LayoutCommit(LayoutCommit { revision: 1, .. })),
+                body: Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 1,
+                    ..
+                })),
                 ..
             })
         ));
@@ -3805,9 +3812,15 @@ mod control_queue_tests {
             (first.body, second.body),
             (
                 Some(envelope::Body::AgentRoster(_)),
-                Some(envelope::Body::LayoutCommit(LayoutCommit { revision: 3, .. }))
+                Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 3,
+                    ..
+                }))
             ) | (
-                Some(envelope::Body::LayoutCommit(LayoutCommit { revision: 3, .. })),
+                Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 3,
+                    ..
+                })),
                 Some(envelope::Body::AgentRoster(_))
             )
         ));

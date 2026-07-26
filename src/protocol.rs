@@ -798,16 +798,17 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
     for entry in &roster.entries {
         validate_nonzero("agent_roster.entry.pane_id", entry.pane_id)?;
         if !pane_ids.insert(entry.pane_id) {
-            return Err(ProtocolError::InvalidLayout(
-                "agent_roster.entry.pane_id",
-            ));
+            return Err(ProtocolError::InvalidLayout("agent_roster.entry.pane_id"));
         }
         validate_field_size(
             "agent_roster.entry.agent_kind",
             entry.agent_kind.len(),
             MAX_AGENT_KIND_BYTES,
         )?;
-        if !matches!(entry.agent_kind.as_str(), "claude" | "codex" | "cursor" | "pi") {
+        if !matches!(
+            entry.agent_kind.as_str(),
+            "claude" | "codex" | "cursor" | "pi"
+        ) {
             return Err(ProtocolError::InvalidLayout(
                 "agent_roster.entry.agent_kind",
             ));
