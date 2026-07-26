@@ -140,8 +140,15 @@ fn resize_forces_a_replacement_snapshot_for_guests() {
     assert!(resized.delta.is_empty());
 
     let mut guest = GuestScreen::new();
-    guest.apply_snapshot(before.sequence, &before.snapshot).expect("old snapshot");
-    assert_eq!(guest.apply_delta(resized.base_sequence, resized.sequence, &resized.delta), Err(p2pmux::screen::ScreenError::InvalidSequence));
-    guest.apply_snapshot(resized.sequence, &resized.snapshot).expect("replacement snapshot");
+    guest
+        .apply_snapshot(before.sequence, &before.snapshot)
+        .expect("old snapshot");
+    assert_eq!(
+        guest.apply_delta(resized.base_sequence, resized.sequence, &resized.delta),
+        Err(p2pmux::screen::ScreenError::InvalidSequence)
+    );
+    guest
+        .apply_snapshot(resized.sequence, &resized.snapshot)
+        .expect("replacement snapshot");
     assert_eq!(guest.screen().expect("screen").size(), (4, 5));
 }

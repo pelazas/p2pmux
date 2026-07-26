@@ -1011,8 +1011,14 @@ impl Node {
                 {
                     return true;
                 }
-                if *split_axis == axis && (first.contains_leaf(wanted) || second.contains_leaf(wanted)) {
-                    if let Self::Split { first_share_bps: share, .. } = self {
+                if *split_axis == axis
+                    && (first.contains_leaf(wanted) || second.contains_leaf(wanted))
+                {
+                    if let Self::Split {
+                        first_share_bps: share,
+                        ..
+                    } = self
+                    {
                         *share = first_share_bps;
                     }
                     return true;

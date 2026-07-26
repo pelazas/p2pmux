@@ -829,7 +829,9 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
     }
     if let Some(update) = &request.update_pane_grids {
         if update.panes.is_empty() {
-            return Err(ProtocolError::InvalidLayout("layout_request.update_pane_grids.panes"));
+            return Err(ProtocolError::InvalidLayout(
+                "layout_request.update_pane_grids.panes",
+            ));
         }
         let mut pane_ids = HashSet::with_capacity(update.panes.len());
         for pane in &update.panes {
@@ -840,7 +842,9 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
                 pane.grid_cols,
             )?;
             if !pane_ids.insert(pane.pane_id) {
-                return Err(ProtocolError::InvalidLayout("layout_request.update_pane_grids.pane_id"));
+                return Err(ProtocolError::InvalidLayout(
+                    "layout_request.update_pane_grids.pane_id",
+                ));
             }
         }
     }

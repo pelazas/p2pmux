@@ -33,9 +33,8 @@ use crate::{
         LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
         LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-        ReleaseControl, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
-        SetSplitRatio, UpdatePaneGrids,
-        envelope,
+        ReleaseControl, SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
+        TakeControl, UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -532,8 +531,8 @@ impl LayoutCoordinator {
         ratio: SetSplitRatio,
     ) -> Result<CoordinatorResponse, LayoutError> {
         let axis = protocol_axis(ratio.axis)?;
-        let first_share_bps = u16::try_from(ratio.first_share_bps)
-            .map_err(|_| LayoutError::InvalidSplitRatio)?;
+        let first_share_bps =
+            u16::try_from(ratio.first_share_bps).map_err(|_| LayoutError::InvalidSplitRatio)?;
         self.state.set_split_ratio(
             authenticated_peer_id,
             base_revision,
@@ -831,9 +830,9 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         | LayoutError::PaneLimit
         | LayoutError::SplitDepthLimit
         | LayoutError::IdExhausted => LayoutRejectReason::Limit,
-        LayoutError::UnknownPane { .. } | LayoutError::NoMatchingSplit { .. } | LayoutError::UnknownTab { .. } => {
-            LayoutRejectReason::UnknownId
-        }
+        LayoutError::UnknownPane { .. }
+        | LayoutError::NoMatchingSplit { .. }
+        | LayoutError::UnknownTab { .. } => LayoutRejectReason::UnknownId,
         LayoutError::LastPaneInTab { .. } | LayoutError::LastTab => {
             LayoutRejectReason::LastPaneOrTab
         }

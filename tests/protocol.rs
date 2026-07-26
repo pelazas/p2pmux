@@ -4,9 +4,9 @@ use p2pmux::protocol::{
     LayoutState, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES,
     MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_SESSION_ID_BYTES,
     MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor,
-    PaneFailed, PaneReady, PaneReservation, PaneSubscribe, ProtocolError, SessionSnapshot,
-    Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome, decode_frame, encode_frame, envelope,
-    PaneGrid, SetSplitRatio, UpdatePaneGrids,
+    PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, ProtocolError,
+    SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
+    UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -48,7 +48,10 @@ fn ratio_and_grid_actions_validate_strictly() {
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid request");
-    assert_eq!(decode_frame(&encoded).expect("round trip"), envelope(envelope::Body::LayoutRequest(request)));
+    assert_eq!(
+        decode_frame(&encoded).expect("round trip"),
+        envelope(envelope::Body::LayoutRequest(request))
+    );
 
     for first_share_bps in [0, 10_000] {
         let invalid = LayoutRequest {
@@ -79,9 +82,20 @@ fn ratio_and_grid_actions_validate_strictly() {
         create_tab: None,
         delete_tab: None,
         set_split_ratio: None,
-        update_pane_grids: Some(UpdatePaneGrids { panes: vec![PaneGrid { pane_id: 1, grid_rows: 24, grid_cols: 80 }] }),
+        update_pane_grids: Some(UpdatePaneGrids {
+            panes: vec![PaneGrid {
+                pane_id: 1,
+                grid_rows: 24,
+                grid_cols: 80,
+            }],
+        }),
     };
-    assert!(decode_frame(&encode_frame(&envelope(envelope::Body::LayoutRequest(grids))).expect("encode")).is_ok());
+    assert!(
+        decode_frame(
+            &encode_frame(&envelope(envelope::Body::LayoutRequest(grids))).expect("encode")
+        )
+        .is_ok()
+    );
 }
 
 #[test]

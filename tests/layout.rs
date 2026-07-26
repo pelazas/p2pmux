@@ -1,7 +1,7 @@
 use p2pmux::layout::{
-    Axis, LayoutError, LayoutSnapshot, MAX_ENDPOINT_ADDR_BYTES, MAX_MEMBERS, MAX_PANES_PER_TAB,
-    MAX_PEER_ID_BYTES, MAX_TABS, NewPanePosition, Node, ReservationCommit, SessionState,
-    DEFAULT_FIRST_SHARE_BPS,
+    Axis, DEFAULT_FIRST_SHARE_BPS, LayoutError, LayoutSnapshot, MAX_ENDPOINT_ADDR_BYTES,
+    MAX_MEMBERS, MAX_PANES_PER_TAB, MAX_PEER_ID_BYTES, MAX_TABS, NewPanePosition, Node,
+    ReservationCommit, SessionState,
 };
 
 const HOST_A: &[u8] = b"host-a";
@@ -68,7 +68,10 @@ fn splits_default_to_a_valid_shared_ratio_and_ratio_updates_are_revisioned() {
         .expect("split");
     assert!(matches!(
         snapshot(&state).tabs[0].root,
-        Node::Split { first_share_bps: DEFAULT_FIRST_SHARE_BPS, .. }
+        Node::Split {
+            first_share_bps: DEFAULT_FIRST_SHARE_BPS,
+            ..
+        }
     ));
 
     state
@@ -76,7 +79,10 @@ fn splits_default_to_a_valid_shared_ratio_and_ratio_updates_are_revisioned() {
         .expect("ratio update");
     assert!(matches!(
         snapshot(&state).tabs[0].root,
-        Node::Split { first_share_bps: 7_500, .. }
+        Node::Split {
+            first_share_bps: 7_500,
+            ..
+        }
     ));
 }
 
@@ -92,7 +98,10 @@ fn ratios_and_host_grid_batches_are_strict_and_atomic() {
     let before = snapshot(&state);
     assert_eq!(
         state.set_split_ratio(HOST_B, state.revision(), second, Axis::TopBottom, 5_000),
-        Err(LayoutError::NoMatchingSplit { pane_id: second, axis: Axis::TopBottom })
+        Err(LayoutError::NoMatchingSplit {
+            pane_id: second,
+            axis: Axis::TopBottom
+        })
     );
     assert_eq!(
         state.set_split_ratio(HOST_B, state.revision(), 99, Axis::LeftRight, 5_000),
