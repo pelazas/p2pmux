@@ -14,17 +14,40 @@ pub enum AgentKind {
     Codex,
     Cursor,
     Pi,
+    OpenCode,
 }
 
 impl AgentKind {
-    /// Match an exact, case-sensitive executable basename.
-    pub fn from_basename(basename: &str) -> Option<Self> {
-        match basename {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "cursor-agent" => Some(Self::Cursor),
-            "pi" => Some(Self::Pi),
-            _ => None,
+    /// Match supported agent launchers from process metadata.
+    pub fn from_process(exe_basename: &str, name: &str, cmdline: &[String]) -> Option<Self> {
+        if matches_launcher(exe_basename, name, cmdline, "claude") {
+            Some(Self::Claude)
+        } else if matches_launcher(exe_basename, name, cmdline, "codex") {
+            Some(Self::Codex)
+        } else if matches_launcher(exe_basename, name, cmdline, "cursor-agent")
+            || cmdline
+                .iter()
+                .any(|argument| argument.contains("cursor-agent"))
+        {
+            Some(Self::Cursor)
+        } else if matches_launcher(exe_basename, name, cmdline, "pi")
+            || cmdline
+                .iter()
+                .any(|argument| argument.contains("pi-coding-agent"))
+            || (exe_basename == "node"
+                && cmdline.iter().any(|argument| {
+                    argument.ends_with("/bin/pi") || argument.contains("@earendil-works/pi")
+                }))
+        {
+            Some(Self::Pi)
+        } else if matches_launcher(exe_basename, name, cmdline, "opencode")
+            || cmdline
+                .iter()
+                .any(|argument| argument.contains("/opencode") || argument.ends_with("opencode"))
+        {
+            Some(Self::OpenCode)
+        } else {
+            None
         }
     }
 
@@ -35,6 +58,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Pi => "pi",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -45,8 +69,15 @@ impl AgentKind {
             Self::Codex => "Codex",
             Self::Cursor => "Cursor Agent",
             Self::Pi => "Pi",
+            Self::OpenCode => "OpenCode",
         }
     }
+}
+
+fn matches_launcher(exe_basename: &str, name: &str, cmdline: &[String], launcher: &str) -> bool {
+    exe_basename == launcher
+        || name == launcher
+        || cmdline.first().is_some_and(|argv0| argv0 == launcher)
 }
 
 /// One process from a sampler snapshot.
@@ -54,7 +85,9 @@ impl AgentKind {
 pub struct ProcessSnapshot {
     pub pid: u32,
     pub parent_pid: Option<u32>,
-    pub basename: String,
+    pub exe_basename: String,
+    pub name: String,
+    pub cmdline: Vec<String>,
     pub start_time: Option<u64>,
     pub cwd: Option<String>,
 }
@@ -86,12 +119,18 @@ impl ProcessSampler for SysinfoSampler {
             .map(|process| ProcessSnapshot {
                 pid: process.pid().as_u32(),
                 parent_pid: process.parent().map(|pid| pid.as_u32()),
-                basename: process
+                exe_basename: process
                     .exe()
                     .and_then(|path| path.file_name())
                     .unwrap_or(process.name())
                     .to_string_lossy()
                     .into_owned(),
+                name: process.name().to_string_lossy().into_owned(),
+                cmdline: process
+                    .cmd()
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect(),
                 start_time: Some(process.start_time()),
                 cwd: process
                     .cwd()
@@ -131,7 +170,9 @@ pub fn classify_pane_tree(
     let mut candidates = Vec::new();
 
     for process in processes {
-        let Some(kind) = AgentKind::from_basename(&process.basename) else {
+        let Some(kind) =
+            AgentKind::from_process(&process.exe_basename, &process.name, &process.cmdline)
+        else {
             continue;
         };
         let Some(depth) = descendant_depth(session_child_pid, process.pid, processes) else {
@@ -273,31 +314,86 @@ mod tests {
     fn process(
         pid: u32,
         parent_pid: Option<u32>,
-        basename: &str,
+        exe_basename: &str,
         start_time: Option<u64>,
     ) -> ProcessSnapshot {
         ProcessSnapshot {
             pid,
             parent_pid,
-            basename: basename.into(),
+            exe_basename: exe_basename.into(),
+            name: exe_basename.into(),
+            cmdline: Vec::new(),
             start_time,
             cwd: None,
         }
     }
 
     #[test]
-    fn allowlist_matches_only_exact_basenames() {
-        assert_eq!(AgentKind::from_basename("claude"), Some(AgentKind::Claude));
-        assert_eq!(AgentKind::from_basename("codex"), Some(AgentKind::Codex));
+    fn process_matchers_cover_direct_and_wrapped_agent_launches() {
         assert_eq!(
-            AgentKind::from_basename("cursor-agent"),
+            AgentKind::from_process("claude", "claude", &[]),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            AgentKind::from_process("sh", "codex", &[]),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            AgentKind::from_process("cursor-agent", "node", &[]),
             Some(AgentKind::Cursor)
         );
-        assert_eq!(AgentKind::from_basename("pi"), Some(AgentKind::Pi));
-        assert_eq!(AgentKind::from_basename("cursor"), None);
-        assert_eq!(AgentKind::from_basename("Codex"), None);
+        assert_eq!(
+            AgentKind::from_process("pi", "pi", &[]),
+            Some(AgentKind::Pi)
+        );
+        assert_eq!(
+            AgentKind::from_process("opencode", "opencode", &[]),
+            Some(AgentKind::OpenCode)
+        );
+
+        let cursor_argv = vec![
+            String::from("/Applications/Cursor.app/Contents/Resources/app/bin/agent"),
+            String::from("--use-system-ca"),
+            String::from(
+                "/Applications/Cursor.app/Contents/Resources/app/extensions/cursor-agent/dist/index.js",
+            ),
+        ];
+        assert_eq!(
+            AgentKind::from_process("node", "node", &cursor_argv),
+            Some(AgentKind::Cursor)
+        );
+
+        let pi_argv = vec![
+            String::from("node"),
+            String::from("/tmp/pi-coding-agent/dist/cli.js"),
+        ];
+        assert_eq!(
+            AgentKind::from_process("node", "node", &pi_argv),
+            Some(AgentKind::Pi)
+        );
+        let pi_bin_argv = vec![
+            String::from("node"),
+            String::from("/Users/me/.local/bin/pi"),
+        ];
+        assert_eq!(
+            AgentKind::from_process("node", "node", &pi_bin_argv),
+            Some(AgentKind::Pi)
+        );
+        let opencode_argv = vec![
+            String::from("node"),
+            String::from("/usr/local/lib/node_modules/opencode/bin/opencode"),
+        ];
+        assert_eq!(
+            AgentKind::from_process("node", "node", &opencode_argv),
+            Some(AgentKind::OpenCode)
+        );
+
+        assert_eq!(AgentKind::from_process("cursor", "cursor", &[]), None);
+        assert_eq!(AgentKind::from_process("node", "node", &[]), None);
+        assert_eq!(AgentKind::from_process("Codex", "Codex", &[]), None);
         assert_eq!(AgentKind::Claude.display_label(), "Claude Code");
         assert_eq!(AgentKind::Cursor.wire_value(), "cursor");
+        assert_eq!(AgentKind::OpenCode.wire_value(), "opencode");
     }
 
     #[test]
