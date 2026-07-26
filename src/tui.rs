@@ -1786,7 +1786,10 @@ fn pane_title(
         available_width,
     );
     let control = if locked { "host-only" } else { &control };
-    let metadata = format!(" host: {} control: {control}", member_label(host_peer_id, members));
+    let metadata = format!(
+        " host: {} control: {control}",
+        member_label(host_peer_id, members)
+    );
     let metadata_width = available_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
     Line::from(vec![
         Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
@@ -2463,9 +2466,12 @@ fn render_shared_multi_pane(
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
         let title_width = usize::from(rect.width.saturating_sub(2));
-        let lock_badge = pane
-            .locked
-            .then(|| format!("(locked by {})", member_label(&pane.host_peer_id, &tui.snapshot.members)));
+        let lock_badge = pane.locked.then(|| {
+            format!(
+                "(locked by {})",
+                member_label(&pane.host_peer_id, &tui.snapshot.members)
+            )
+        });
         let badge_width = lock_badge
             .as_deref()
             .map_or(0, |badge| UnicodeWidthStr::width(badge).min(title_width));
@@ -6985,7 +6991,16 @@ mod tests {
             display_name: String::from("Host"),
         }];
         assert_eq!(
-            pane_title(Some("build logs"), 1, b"host", Some(b""), false, &members, 12).to_string(),
+            pane_title(
+                Some("build logs"),
+                1,
+                b"host",
+                Some(b""),
+                false,
+                &members,
+                12
+            )
+            .to_string(),
             "build logs …"
         );
     }
@@ -7872,7 +7887,7 @@ mod tests {
             ),
             (
                 ChordMode::Pane,
-                "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
+                "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
