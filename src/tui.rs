@@ -2171,6 +2171,7 @@ impl SharedLocalPane {
                 crate::agent_detect::AgentState::Working => AgentRosterState::Working as i32,
                 crate::agent_detect::AgentState::Done => AgentRosterState::Done as i32,
             },
+            working_since_unix_ms: 0,
         })
     }
 

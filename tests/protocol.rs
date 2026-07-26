@@ -27,8 +27,8 @@ fn envelope(body: envelope::Body) -> Envelope {
 }
 
 #[test]
-fn protocol_version_is_v4() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+fn protocol_version_is_v5() {
+    assert_eq!(PROTOCOL_VERSION, 5);
 }
 
 #[test]
@@ -321,6 +321,7 @@ fn agent_entry(pane_id: u64) -> AgentRosterEntry {
         agent_kind: String::from("codex"),
         cwd: String::from("/repo"),
         state: AgentRosterState::Working as i32,
+        working_since_unix_ms: 1_725_000_000_123,
     }
 }
 
@@ -346,6 +347,16 @@ fn agent_roster_uses_tag_26_and_round_trips() {
 fn agent_roster_accepts_opencode_kind() {
     let roster = agent_roster(vec![AgentRosterEntry {
         agent_kind: String::from("opencode"),
+        ..agent_entry(9)
+    }]);
+
+    assert!(encode_frame(&envelope(envelope::Body::AgentRoster(roster))).is_ok());
+}
+
+#[test]
+fn agent_roster_allows_zero_working_since_while_working() {
+    let roster = agent_roster(vec![AgentRosterEntry {
+        working_since_unix_ms: 0,
         ..agent_entry(9)
     }]);
 

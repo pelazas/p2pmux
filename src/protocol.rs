@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -496,6 +496,10 @@ pub struct AgentRosterEntry {
     pub cwd: String,
     #[prost(enumeration = "AgentRosterState", tag = "4")]
     pub state: i32,
+    /// `0` is the sentinel for non-working states (idle or done). A positive value is the Unix
+    /// timestamp in milliseconds when the current working interval started.
+    #[prost(uint64, tag = "5")]
+    pub working_since_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
