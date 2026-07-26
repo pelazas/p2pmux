@@ -1759,6 +1759,13 @@ struct ControlMailbox {
     next_sequence: Arc<AtomicU64>,
 }
 
+struct ControlMailboxReceivers {
+    initial_rx: mpsc::Receiver<Envelope>,
+    state_rx: watch::Receiver<Option<SequencedEnvelope>>,
+    roster_rx: watch::Receiver<Option<SequencedEnvelope>>,
+    targeted_rx: mpsc::Receiver<SequencedEnvelope>,
+}
+
 #[derive(Clone)]
 struct SequencedEnvelope {
     sequence: u64,
@@ -1766,13 +1773,7 @@ struct SequencedEnvelope {
 }
 
 impl ControlMailbox {
-    fn new() -> (
-        Self,
-        mpsc::Receiver<Envelope>,
-        watch::Receiver<Option<SequencedEnvelope>>,
-        watch::Receiver<Option<SequencedEnvelope>>,
-        mpsc::Receiver<SequencedEnvelope>,
-    ) {
+    fn new() -> (Self, ControlMailboxReceivers) {
         let (initial_tx, initial_rx) = mpsc::channel(33);
         let (state_tx, state_rx) = watch::channel(None);
         let (roster_tx, roster_rx) = watch::channel(None);
@@ -1785,10 +1786,12 @@ impl ControlMailbox {
                 targeted_tx,
                 next_sequence: Arc::new(AtomicU64::new(1)),
             },
-            initial_rx,
-            state_rx,
-            roster_rx,
-            targeted_rx,
+            ControlMailboxReceivers {
+                initial_rx,
+                state_rx,
+                roster_rx,
+                targeted_rx,
+            },
         )
     }
 
@@ -2182,7 +2185,7 @@ impl SharedLayoutHost {
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
             let peer_id = receipt.admitted_peer_id.clone();
-            let (mailbox, initial_rx, state_rx, roster_rx, targeted_rx) = ControlMailbox::new();
+            let (mailbox, receivers) = ControlMailbox::new();
             let peer = ControlPeer::pending_reader(mailbox.clone(), connection.clone());
             let reader_abort = peer.reader_abort.clone();
             self.peers
@@ -2230,10 +2233,7 @@ impl SharedLayoutHost {
             }
             tokio::spawn(layout_peer_writer_task(
                 writer,
-                initial_rx,
-                state_rx,
-                roster_rx,
-                targeted_rx,
+                receivers,
                 receipt.admitted_peer_id.clone(),
                 self.peers.clone(),
                 Some((
@@ -2568,10 +2568,12 @@ pub async fn join_layout_with_display_name(
 
 async fn layout_peer_writer_task<W>(
     mut writer: W,
-    mut initial_rx: mpsc::Receiver<Envelope>,
-    mut state_rx: watch::Receiver<Option<SequencedEnvelope>>,
-    mut roster_rx: watch::Receiver<Option<SequencedEnvelope>>,
-    mut targeted_rx: mpsc::Receiver<SequencedEnvelope>,
+    ControlMailboxReceivers {
+        mut initial_rx,
+        mut state_rx,
+        mut roster_rx,
+        mut targeted_rx,
+    }: ControlMailboxReceivers,
     peer_id: Vec<u8>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     coordinator: Option<CoordinatorDeparture>,
@@ -3477,7 +3479,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn failed_writer_removes_the_peer_and_aborts_its_reader() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, roster_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
@@ -3494,10 +3496,7 @@ mod control_queue_tests {
 
         layout_peer_writer_task(
             FailingWriter,
-            initial_rx,
-            state_rx,
-            roster_rx,
-            targeted_rx,
+            receivers,
             b"slow".to_vec(),
             peers.clone(),
             None,
@@ -3519,21 +3518,14 @@ mod control_queue_tests {
     #[tokio::test]
     async fn stalled_peer_coalesces_commits_while_a_healthy_peer_receives_the_latest() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (slow_mailbox, slow_initial_rx, slow_state_rx, slow_roster_rx, slow_targeted_rx) =
-            ControlMailbox::new();
-        let observed_slow_state = slow_state_rx.clone();
+        let (slow_mailbox, slow_receivers) = ControlMailbox::new();
+        let observed_slow_state = slow_receivers.state_rx.clone();
         let slow_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
             ControlPeer::new(slow_mailbox, slow_reader.abort_handle(), None),
         );
-        let (
-            healthy_mailbox,
-            healthy_initial_rx,
-            healthy_state_rx,
-            healthy_roster_rx,
-            healthy_targeted_rx,
-        ) = ControlMailbox::new();
+        let (healthy_mailbox, healthy_receivers) = ControlMailbox::new();
         let healthy_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"healthy".to_vec(),
@@ -3566,10 +3558,7 @@ mod control_queue_tests {
                 started: Some(started_tx),
                 release: Some(release_rx),
             },
-            slow_initial_rx,
-            slow_state_rx,
-            slow_roster_rx,
-            slow_targeted_rx,
+            slow_receivers,
             b"slow".to_vec(),
             peers.clone(),
             None,
@@ -3577,10 +3566,7 @@ mod control_queue_tests {
         let (healthy_tx, mut healthy_rx) = mpsc::unbounded_channel();
         let healthy_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(healthy_tx),
-            healthy_initial_rx,
-            healthy_state_rx,
-            healthy_roster_rx,
-            healthy_targeted_rx,
+            healthy_receivers,
             b"healthy".to_vec(),
             peers.clone(),
             None,
@@ -3628,7 +3614,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn targeted_queue_overflow_closes_the_peer_before_it_can_keep_reading() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, _initial_rx, _state_rx, _roster_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
@@ -3663,7 +3649,7 @@ mod control_queue_tests {
         assert!(!peers.lock().unwrap().contains_key(b"slow".as_slice()));
         tokio::task::yield_now().await;
         assert!(reader.is_finished());
-        drop(targeted_rx);
+        drop(receivers.targeted_rx);
         assert!(!mailbox.enqueue_targeted(coordinator_envelope(
             b"coordinator",
             envelope::Body::LayoutReject(LayoutReject {
@@ -3676,7 +3662,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn initial_snapshot_is_first_when_a_commit_arrives_before_the_writer_starts() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, roster_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"member".to_vec(),
@@ -3694,10 +3680,7 @@ mod control_queue_tests {
         let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
         let writer_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(recorded_tx),
-            initial_rx,
-            state_rx,
-            roster_rx,
-            targeted_rx,
+            receivers,
             b"member".to_vec(),
             peers.clone(),
             None,
@@ -3721,7 +3704,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn targeted_frame_precedes_later_coalesced_state_updates() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, roster_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"member".to_vec(),
@@ -3745,10 +3728,7 @@ mod control_queue_tests {
         let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
         let writer_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(recorded_tx),
-            initial_rx,
-            state_rx,
-            roster_rx,
-            targeted_rx,
+            receivers,
             b"member".to_vec(),
             peers.clone(),
             None,
@@ -3773,7 +3753,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn roster_watch_does_not_replace_a_pending_layout_commit() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, roster_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"member".to_vec(),
@@ -3787,10 +3767,7 @@ mod control_queue_tests {
         let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
         let writer_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(recorded_tx),
-            initial_rx,
-            state_rx,
-            roster_rx,
-            targeted_rx,
+            receivers,
             b"member".to_vec(),
             peers.clone(),
             None,

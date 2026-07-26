@@ -1772,8 +1772,8 @@ fn render_shared_multi_pane(
 
 fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).min(88).max(24);
-    let height = area.height.saturating_sub(4).min(18).max(5);
+    let width = area.width.saturating_sub(4).clamp(24, 88);
+    let height = area.height.saturating_sub(4).clamp(5, 18);
     let panel = Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
         area.y
