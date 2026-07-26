@@ -36,6 +36,7 @@ use ratatui::{
 };
 
 use crate::{
+    kitty_keyboard::KittyKeyboardTracker,
     layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     protocol::{
@@ -2612,14 +2613,18 @@ impl SharedLayoutRuntime {
         let pane_id = self.tui.focused_pane();
         let mut sent = false;
         if let Some(pane) = self.local.get_mut(&pane_id)
-            && let Some(bytes) = encode_key(key, pane.screen.screen())
+            && let Some(bytes) = encode_key(
+                key,
+                pane.screen.screen(),
+                pane.screen.kitty_keyboard_active(),
+            )
         {
             pane.input(bytes)?;
             sent = true;
         }
         if let Some(pane) = self.remote.get_mut(&pane_id)
             && let Some(screen) = pane.screen.screen()
-            && let Some(bytes) = encode_key(key, screen)
+            && let Some(bytes) = encode_key(key, screen, false)
         {
             pane.input(bytes);
             sent = true;
@@ -2809,7 +2814,11 @@ fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL
 }
 
-fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
+fn encode_key(
+    key: KeyEvent,
+    screen: &vt100::Screen,
+    kitty_keyboard_active: bool,
+) -> Option<Vec<u8>> {
     if is_quit(key) {
         return None;
     }
@@ -2837,8 +2846,14 @@ fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
             bytes
         }
         KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
-        // LF / Ctrl+J — Claude/Cursor agents treat this as newline vs CR submit.
-        KeyCode::Enter if modifiers == 2 => b"\n".to_vec(),
+        // Use kitty CSI-u when the child opted in; otherwise LF is the newline fallback.
+        KeyCode::Enter if modifiers == 2 => {
+            if kitty_keyboard_active {
+                b"\x1b[13;2u".to_vec()
+            } else {
+                b"\n".to_vec()
+            }
+        }
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
         KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
@@ -2986,6 +3001,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     };
     let mut host = PtyHost::spawn_default_shell(size)?;
     let mut parser = vt100::Parser::new(rows, cols, 0);
+    let mut kitty_keyboard = KittyKeyboardTracker::default();
 
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
@@ -3016,6 +3032,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             let Some(bytes) = host.try_read_output()? else {
                 break;
             };
+            kitty_keyboard.observe(&bytes);
             parser.process(&bytes);
             dirty = true;
         }
@@ -3044,7 +3061,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
                 if is_quit(key) {
                     break;
                 }
-                if let Some(bytes) = encode_key(key, parser.screen()) {
+                if let Some(bytes) = encode_key(key, parser.screen(), kitty_keyboard.active()) {
                     host.write_input(&bytes)?;
                 }
             }
@@ -3164,7 +3181,11 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if is_quit(key) {
                     break;
                 }
-                if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
+                if let Some(bytes) = encode_key(
+                    key,
+                    runtime.screen.screen(),
+                    runtime.screen.kitty_keyboard_active(),
+                ) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
                     let decision = runtime
@@ -3323,7 +3344,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
-                    && let Some(bytes) = encode_key(key, screen)
+                    && let Some(bytes) = encode_key(key, screen, false)
                 {
                     if state.controller_peer_id == pane.controls.peer_id() {
                         if held_input.is_empty() {
@@ -5459,7 +5480,8 @@ mod tests {
         assert_eq!(
             encode_key(
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                normal.screen()
+                normal.screen(),
+                false,
             ),
             Some(b"\x1b[A".to_vec())
         );
@@ -5469,7 +5491,8 @@ mod tests {
         assert_eq!(
             encode_key(
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                application.screen()
+                application.screen(),
+                false,
             ),
             Some(b"\x1bOA".to_vec())
         );
@@ -5567,7 +5590,7 @@ mod tests {
 
         for (event, expected) in cases {
             assert_eq!(
-                encode_key(event, screen).as_deref(),
+                encode_key(event, screen, false).as_deref(),
                 expected.map(str::as_bytes),
                 "{event:?}"
             );
@@ -5575,19 +5598,34 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_uses_lf_while_plain_enter_uses_cr() {
+    fn shift_enter_uses_kitty_csi_u_when_active_and_lf_when_inactive() {
         let parser = vt100::Parser::new(1, 1, 0);
         let plain = encode_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             parser.screen(),
+            false,
         );
-        let shifted = encode_key(
+        let plain_active = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            parser.screen(),
+            true,
+        );
+        let shifted_inactive = encode_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             parser.screen(),
+            false,
+        );
+        let shifted_active = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            parser.screen(),
+            true,
         );
 
         assert_eq!(plain, Some(b"\r".to_vec()));
-        assert_eq!(shifted, Some(b"\n".to_vec()));
-        assert_ne!(shifted, plain);
+        assert_eq!(plain_active, Some(b"\r".to_vec()));
+        assert_eq!(shifted_inactive, Some(b"\n".to_vec()));
+        assert_eq!(shifted_active, Some(b"\x1b[13;2u".to_vec()));
+        assert_ne!(shifted_inactive, plain);
+        assert_ne!(shifted_active, plain);
     }
 }

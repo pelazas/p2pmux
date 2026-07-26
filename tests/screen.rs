@@ -26,6 +26,15 @@ fn initial_snapshot_describes_the_empty_fixed_grid() {
 }
 
 #[test]
+fn host_screen_tracks_child_kitty_keyboard_mode() {
+    let mut host = HostScreen::new(1, 1).expect("valid fixed grid");
+    host.process_pty(b"\x1b[>1u").expect("kitty push");
+    assert!(host.kitty_keyboard_active());
+    host.process_pty(b"\x1b[<1u").expect("kitty pop");
+    assert!(!host.kitty_keyboard_active());
+}
+
+#[test]
 fn host_snapshots_the_live_edge_after_scrollback_accumulates() {
     let mut host = HostScreen::new(1, 3).expect("valid fixed grid");
     let frame = host.process_pty(b"a\r\nb\r\nc").expect("scrollback update");
