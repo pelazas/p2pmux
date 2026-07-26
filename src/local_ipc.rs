@@ -49,6 +49,7 @@ pub enum NodeMessage {
         screens: Vec<PaneScreenSnapshot>,
         leases: Vec<PaneLeaseSnapshot>,
         rosters: Vec<AgentOverlaySnapshotRow>,
+        local_peer_id: Vec<u8>,
         tab_id: u64,
         pane_id: u64,
     },

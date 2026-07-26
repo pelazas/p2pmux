@@ -391,6 +391,7 @@ fn write_snapshot(
     _generation: u64,
 ) -> io::Result<()> {
     let (tab_id, pane_id) = node.local_focus();
+    let local_peer_id = node.local_peer_id();
     let (layout, screens, leases, rosters) = node.snapshot();
     let hosts = layout
         .panes
@@ -442,6 +443,7 @@ fn write_snapshot(
                 )
                 .collect(),
             rosters,
+            local_peer_id,
             tab_id,
             pane_id,
         },
@@ -461,6 +463,9 @@ impl SharedLayoutNode {
 
     pub fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
         self.runtime.node_input(bytes)
+    }
+    pub fn local_peer_id(&self) -> Vec<u8> {
+        self.runtime.local_peer_id()
     }
     pub fn release_all_local_control(&mut self) -> Result<(), Box<dyn Error>> {
         self.runtime.release_all_local_control()
@@ -643,6 +648,7 @@ mod tests {
                 }],
                 leases: vec![],
                 rosters: vec![],
+                local_peer_id: vec![],
                 tab_id: 1,
                 pane_id: 1,
             },

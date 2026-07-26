@@ -3641,6 +3641,9 @@ impl SharedLayoutRuntime {
 
     pub fn node_input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
+        if !self.input_allowed(pane_id) {
+            return Ok(());
+        }
         if let Some(pane) = self.local.get_mut(&pane_id) {
             pane.input(bytes.clone())?;
         }
@@ -3664,6 +3667,19 @@ impl SharedLayoutRuntime {
 
     pub fn local_focus(&self) -> (u64, u64) {
         (self.tui.current_tab(), self.tui.focused_pane())
+    }
+
+    pub fn local_peer_id(&self) -> Vec<u8> {
+        self.control.peer_id()
+    }
+
+    fn input_allowed(&self, pane_id: PaneId) -> bool {
+        let peer_id = self.control.peer_id();
+        self.tui
+            .snapshot()
+            .panes
+            .get(&pane_id)
+            .is_none_or(|pane| !pane.locked || pane.host_peer_id == peer_id)
     }
 
     /// A complete node-owned view for a newly attached local renderer. Frames are deliberately
@@ -4702,6 +4718,9 @@ impl SharedLayoutRuntime {
 
     fn forward_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
+        if !self.input_allowed(pane_id) {
+            return Ok(());
+        }
         let mut sent = false;
         if let Some(pane) = self.local.get_mut(&pane_id)
             && let Some(bytes) = encode_key(
@@ -4728,6 +4747,9 @@ impl SharedLayoutRuntime {
 
     fn forward_paste(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
+        if !self.input_allowed(pane_id) {
+            return Ok(());
+        }
         if let Some(pane) = self.local.get_mut(&pane_id) {
             pane.input(encode_paste(text, pane.screen.screen().bracketed_paste()))?;
         }
