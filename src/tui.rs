@@ -2304,16 +2304,26 @@ impl SharedRemotePane {
         loop {
             match self.pane.events.try_recv() {
                 Ok(GuestEvent::ScreenSnapshot(snapshot)) => {
-                    changed |= self
+                    if self
                         .screen
                         .apply_snapshot(snapshot.sequence, &snapshot.screen)
-                        .is_ok();
+                        .is_ok()
+                    {
+                        self.screen
+                            .set_kitty_keyboard_active(snapshot.kitty_keyboard_active);
+                        changed = true;
+                    }
                 }
                 Ok(GuestEvent::ScreenDelta(delta)) => {
-                    changed |= self
+                    if self
                         .screen
                         .apply_delta(delta.base_sequence, delta.sequence, &delta.changes)
-                        .is_ok();
+                        .is_ok()
+                    {
+                        self.screen
+                            .set_kitty_keyboard_active(delta.kitty_keyboard_active);
+                        changed = true;
+                    }
                 }
                 Ok(GuestEvent::Lease(lease)) => {
                     received_lease = true;
@@ -3504,7 +3514,7 @@ impl SharedLayoutRuntime {
         }
         if let Some(pane) = self.remote.get_mut(&pane_id)
             && let Some(screen) = pane.screen.screen()
-            && let Some(bytes) = encode_key(key, screen, false)
+            && let Some(bytes) = encode_key(key, screen, pane.screen.kitty_keyboard_active())
         {
             pane.input(bytes);
             sent = true;
@@ -4156,6 +4166,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         .apply_snapshot(snapshot.sequence, &snapshot.screen)
                         .is_ok()
                     {
+                        remote.set_kitty_keyboard_active(snapshot.kitty_keyboard_active);
                         dirty = true;
                     }
                 }
@@ -4164,6 +4175,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         .apply_delta(delta.base_sequence, delta.sequence, &delta.changes)
                         .is_ok()
                     {
+                        remote.set_kitty_keyboard_active(delta.kitty_keyboard_active);
                         dirty = true;
                     }
                 }
@@ -4236,7 +4248,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
-                    && let Some(bytes) = encode_key(key, screen, false)
+                    && let Some(bytes) = encode_key(key, screen, remote.kitty_keyboard_active())
                 {
                     if state.controller_peer_id == pane.controls.peer_id() {
                         if held_input.is_empty() {
