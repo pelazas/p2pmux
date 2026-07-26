@@ -13,7 +13,7 @@ use std::{
         mpsc::{self as sync_mpsc, Receiver},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, watch};
 
@@ -78,6 +78,13 @@ const TAB_BAR_SEPARATOR: &str = " · ";
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
 
@@ -2139,7 +2146,8 @@ impl SharedLocalPane {
             let Some(bytes) = self.host.try_read_output()? else {
                 break;
             };
-            self.agent_tracker.record_output(Instant::now());
+            self.agent_tracker
+                .record_output(Instant::now(), unix_ms_now());
             let frame = self.screen.process_pty(&bytes)?;
             if let Some(reply) = self.screen.take_kitty_keyboard_query_reply() {
                 self.host.write_input(&reply)?;
@@ -2151,17 +2159,18 @@ impl SharedLocalPane {
     }
 
     fn apply_agent_snapshot(&mut self, processes: &[ProcessSnapshot], now: Instant) -> bool {
-        let before = self.agent_tracker.listed_agent(now);
+        let unix_ms_now = unix_ms_now();
+        let before = self.agent_tracker.listed_agent(now, unix_ms_now);
         let detected = self
             .host
             .process_id()
             .and_then(|pid| classify_pane_tree(pid, processes));
-        self.agent_tracker.update(detected, now);
-        self.agent_tracker.listed_agent(now) != before
+        self.agent_tracker.update(detected, now, unix_ms_now);
+        self.agent_tracker.listed_agent(now, unix_ms_now) != before
     }
 
-    fn agent_roster_entry(&self, now: Instant) -> Option<AgentRosterEntry> {
-        let (agent, state) = self.agent_tracker.listed_agent(now)?;
+    fn agent_roster_entry(&mut self, now: Instant) -> Option<AgentRosterEntry> {
+        let (agent, state) = self.agent_tracker.listed_agent(now, unix_ms_now())?;
         Some(AgentRosterEntry {
             pane_id: self.pane_id,
             agent_kind: agent.kind.wire_value().into(),
@@ -2171,7 +2180,11 @@ impl SharedLocalPane {
                 crate::agent_detect::AgentState::Working => AgentRosterState::Working as i32,
                 crate::agent_detect::AgentState::Done => AgentRosterState::Done as i32,
             },
-            working_since_unix_ms: 0,
+            working_since_unix_ms: if state == crate::agent_detect::AgentState::Working {
+                self.agent_tracker.working_since_unix_ms
+            } else {
+                0
+            },
         })
     }
 
@@ -3105,7 +3118,7 @@ impl SharedLayoutRuntime {
         let now = Instant::now();
         let entries = self
             .local
-            .values()
+            .values_mut()
             .filter_map(|pane| pane.agent_roster_entry(now))
             .collect::<Vec<_>>();
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
