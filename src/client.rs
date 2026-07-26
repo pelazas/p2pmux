@@ -302,6 +302,8 @@ fn apply_snapshot(
                     pane_id: row.pane_id,
                     tab_ordinal: 0,
                     pane_ordinal: 0,
+                    tab_label: String::new(),
+                    pane_label: String::new(),
                     kind: row.kind,
                     cwd: row.cwd,
                     state: AgentRosterState::try_from(row.state).ok()?,
@@ -529,7 +531,11 @@ mod tests {
                 endpoint_addr: b"endpoint".to_vec(),
                 display_name: String::from("Host"),
             }],
-            tabs: vec![Tab { tab_id: 1, root }],
+            tabs: vec![Tab {
+                tab_id: 1,
+                root,
+                title: None,
+            }],
             panes: pane_ids
                 .iter()
                 .map(|pane_id| {
@@ -540,6 +546,7 @@ mod tests {
                             host_peer_id: b"host".to_vec(),
                             grid_rows: 2,
                             grid_cols: 8,
+                            title: None,
                         },
                     )
                 })
