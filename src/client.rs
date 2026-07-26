@@ -26,8 +26,8 @@ use crate::{
     screen::GuestScreen,
     session_store::SessionDescriptor,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, AGENT_TOGGLE_WINDOW, AgentOverlayRow, KeyHandling,
-        MultiPaneTui, PaneViewState, render_multi_pane,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
+        PaneViewState, render_multi_pane,
     },
 };
 
@@ -543,7 +543,7 @@ mod tests {
     use crate::{
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
         local_ipc::AgentOverlaySnapshotRow,
-        tui::UiIntent,
+        tui::{AGENT_TOGGLE_WINDOW, UiIntent},
     };
 
     use super::*;
