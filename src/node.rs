@@ -172,7 +172,9 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     listener.set_nonblocking(true)?;
     store.write(&descriptor)?;
     let result = run_socket_loop(&mut node, listener, &descriptor);
-    node.shutdown();
+    // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
+    // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
+    tokio::task::block_in_place(|| node.shutdown());
     dispatcher_task.abort();
     let _ = dispatcher_task.await;
     if let Some(rendezvous) = rendezvous {
@@ -227,55 +229,62 @@ fn run_socket_loop(
     let gate = AttachmentGate::default();
     let mut client: Option<(UnixStream, u64)> = None;
     loop {
+        let mut shutdown = false;
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-                    if let Ok(generation) = gate.attach() {
-                        match read_message(&mut stream) {
-                            Ok(Some(ClientMessage::Probe)) => {
-                                write_message(&mut stream, &NodeMessage::ProbeAck)?;
-                                let _ = gate.detach(generation);
-                            }
-                            Ok(Some(ClientMessage::Hello { cols, rows })) => {
+                    match read_message(&mut stream) {
+                        // Probes and shutdowns are control requests. They must not consume or
+                        // contend with the single interactive attachment slot.
+                        Ok(Some(ClientMessage::Probe)) => {
+                            let _ = write_message(&mut stream, &NodeMessage::ProbeAck);
+                        }
+                        Ok(Some(ClientMessage::Shutdown { generation })) => {
+                            let _ = write_message(
+                                &mut stream,
+                                &NodeMessage::ShutdownAck { generation },
+                            );
+                            shutdown = true;
+                            break;
+                        }
+                        Ok(Some(ClientMessage::Hello { cols, rows })) => {
+                            if let Ok(generation) = gate.attach() {
                                 node.resize(cols, rows)
                                     .map_err(|error| io::Error::other(error.to_string()))?;
-                                write_message(
+                                let attached = write_message(
                                     &mut stream,
                                     &NodeMessage::AttachAccepted { generation },
-                                )?;
-                                write_snapshot(&mut stream, descriptor, node, generation)?;
-                                stream.set_read_timeout(Some(Duration::from_millis(1)))?;
-                                client = Some((stream, generation));
-                            }
-                            Ok(None) => {
-                                let _ = gate.detach(generation);
-                            }
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    io::ErrorKind::WouldBlock
-                                        | io::ErrorKind::TimedOut
-                                        | io::ErrorKind::ConnectionReset
-                                        | io::ErrorKind::BrokenPipe
-                                ) =>
-                            {
-                                let _ = gate.detach(generation);
-                            }
-                            Err(_) => {
-                                let _ = gate.detach(generation);
-                            }
-                            _ => {
-                                let _ = gate.detach(generation);
+                                )
+                                .and_then(|()| {
+                                    write_snapshot(&mut stream, descriptor, node, generation)
+                                })
+                                .is_ok();
+                                if attached {
+                                    stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+                                    client = Some((stream, generation));
+                                } else {
+                                    let _ = gate.detach(generation);
+                                }
+                            } else {
+                                let _ = write_message(
+                                    &mut stream,
+                                    &NodeMessage::AttachRejected {
+                                        reason: "already attached".into(),
+                                    },
+                                );
                             }
                         }
-                    } else {
-                        let _ = write_message(
-                            &mut stream,
-                            &NodeMessage::AttachRejected {
-                                reason: "already attached".into(),
-                            },
-                        );
+                        Ok(None) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::BrokenPipe
+                            ) => {}
+                        Err(_) | Ok(Some(_)) => {}
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -294,8 +303,7 @@ fn run_socket_loop(
             .drain()
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut detached = false;
-        let mut shutdown = false;
-        if let Some((stream, generation)) = client.as_mut() {
+        if !shutdown && let Some((stream, generation)) = client.as_mut() {
             match read_message(stream) {
                 Ok(Some(ClientMessage::Input { bytes })) => node
                     .input(bytes)
@@ -320,12 +328,12 @@ fn run_socket_loop(
                 })) if requested == *generation => {
                     node.release_all_local_control()
                         .map_err(|error| io::Error::other(error.to_string()))?;
-                    write_message(
+                    let _ = write_message(
                         stream,
                         &NodeMessage::DetachAck {
                             generation: *generation,
                         },
-                    )?;
+                    );
                     detached = true;
                 }
                 Ok(Some(ClientMessage::Shutdown {
@@ -364,7 +372,9 @@ fn run_socket_loop(
                 Err(_) => detached = true,
             }
             if changed && !detached {
-                write_snapshot(stream, descriptor, node, *generation)?;
+                if write_snapshot(stream, descriptor, node, *generation).is_err() {
+                    detached = true;
+                }
             }
         }
         if (detached || shutdown)

@@ -3,7 +3,10 @@
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, BufReader, Write},
+    net::Shutdown,
     os::unix::net::UnixStream,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::Duration,
 };
 
@@ -41,7 +44,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         Some(NodeMessage::AttachRejected { reason }) => return Err(io::Error::other(reason).into()),
         _ => return Err(io::Error::other("node did not accept attachment").into()),
     };
-    stream.set_nonblocking(true)?;
+    let (messages, reader_thread) = spawn_message_reader(reader);
     let mut guard = ClientTerminalGuard::enter(&descriptor.name)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
@@ -54,11 +57,13 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut screens = BTreeMap::new();
     let mut dirty = false;
     let mut node_ended = false;
+    let mut attach_error = None;
+    let mut detach_sent = false;
 
     'attached: loop {
         loop {
-            match read_message(&mut reader) {
-                Ok(Some(NodeMessage::Snapshot {
+            match messages.try_recv() {
+                Ok(ReaderEvent::Message(NodeMessage::Snapshot {
                     room_name,
                     layout,
                     screens: next_screens,
@@ -79,22 +84,23 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     )?;
                     dirty = true;
                 }
-                Ok(Some(NodeMessage::Update { .. })) | Ok(Some(NodeMessage::Error { .. })) => {}
-                Ok(Some(_)) => {}
-                Ok(None) => {
+                Ok(ReaderEvent::Message(NodeMessage::Update { .. }))
+                | Ok(ReaderEvent::Message(NodeMessage::Error { .. }))
+                | Ok(ReaderEvent::Message(_)) => {}
+                Ok(ReaderEvent::Ended) | Err(TryRecvError::Disconnected) => {
                     node_ended = true;
                     break 'attached;
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break;
+                Ok(ReaderEvent::DecodeError(error)) => {
+                    attach_error = Some(error);
+                    break 'attached;
                 }
-                Err(_) => {
+                Ok(ReaderEvent::ReadError(error)) => {
+                    attach_error = Some(error);
                     node_ended = true;
                     break 'attached;
                 }
+                Err(TryRecvError::Empty) => break,
             }
         }
         if dirty {
@@ -122,6 +128,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                 match tui.handle_key(key, terminal.size()?.into()) {
                     KeyHandling::Quit => {
                         write_message(&mut stream, &ClientMessage::Detach { generation })?;
+                        detach_sent = true;
                         break;
                     }
                     KeyHandling::Consumed(intents) => {
@@ -174,7 +181,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             _ => {}
         }
     }
+    if !node_ended && !detach_sent {
+        let _ = write_message(&mut stream, &ClientMessage::Detach { generation });
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = reader_thread.join();
     guard.leave()?;
+    if let Some(error) = attach_error {
+        eprintln!("p2pmux attach error: {error}");
+    }
     if node_ended {
         println!("p2pmux node ended");
     } else {
@@ -255,17 +270,13 @@ fn send_intents(
 pub fn shutdown(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    write_message(&mut stream, &ClientMessage::Hello { cols: 0, rows: 0 })?;
-    let generation = match read_message(&mut reader)? {
-        Some(NodeMessage::AttachAccepted { generation }) => generation,
-        Some(NodeMessage::AttachRejected { reason }) => return Err(io::Error::other(reason).into()),
-        _ => return Err(io::Error::other("node did not accept attachment").into()),
-    };
-    write_message(&mut stream, &ClientMessage::Shutdown { generation })?;
+    // Shutdown is a control request, not an interactive attachment.  It must still work while a
+    // stale or live client holds the single-attachment gate.
+    write_message(&mut stream, &ClientMessage::Shutdown { generation: 0 })?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     loop {
         match read_message(&mut reader)? {
-            Some(NodeMessage::ShutdownAck { generation: ack }) if ack == generation => break,
+            Some(NodeMessage::ShutdownAck { generation: 0 }) => break,
             Some(_) => continue,
             None => {
                 return Err(io::Error::other("node closed before shutdown acknowledgement").into());
@@ -281,15 +292,61 @@ fn write_message(stream: &mut UnixStream, message: &ClientMessage) -> io::Result
     stream.flush()
 }
 
-fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<NodeMessage>> {
+/// Reads one complete newline-delimited local IPC frame.  This deliberately stays blocking: a
+/// Snapshot can be much larger than a single Unix-socket read.
+pub fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<NodeMessage>> {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) => Ok(None),
-        Ok(_) => serde_json::from_str(&line)
-            .map(Some)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid node message")),
+        Ok(_) => serde_json::from_str(&line).map(Some).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid node message: {error}"),
+            )
+        }),
         Err(error) => Err(error),
     }
+}
+
+enum ReaderEvent {
+    Message(NodeMessage),
+    DecodeError(String),
+    ReadError(String),
+    Ended,
+}
+
+fn spawn_message_reader(
+    mut reader: BufReader<UnixStream>,
+) -> (Receiver<ReaderEvent>, thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        loop {
+            match read_message(&mut reader) {
+                Ok(Some(message)) => {
+                    if sender.send(ReaderEvent::Message(message)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = sender.send(ReaderEvent::Ended);
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    if sender
+                        .send(ReaderEvent::DecodeError(error.to_string()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(ReaderEvent::ReadError(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+    (receiver, thread)
 }
 
 fn client_key_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {

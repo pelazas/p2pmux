@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufReader, Write},
     os::unix::net::UnixStream,
     process::{Child, Command, Stdio},
     thread,
@@ -7,6 +7,7 @@ use std::{
 };
 
 use p2pmux::{
+    client,
     local_ipc::{ClientMessage, NodeMessage},
     node::{NodeBootstrap, NodeBootstrapKind, write_bootstrap},
     session_store::{SessionDescriptor, SessionRole, SessionStore, generate_id},
@@ -42,8 +43,8 @@ fn detached_node_serves_real_snapshots_and_accepts_a_new_attachment() {
             descriptor: descriptor.clone(),
             kind: NodeBootstrapKind::Create {
                 display_name: "Test User".into(),
-                cols: 80,
-                rows: 24,
+                cols: 320,
+                rows: 100,
             },
         },
     )
@@ -130,26 +131,27 @@ fn detached_node_serves_real_snapshots_and_accepts_a_new_attachment() {
     drop(reader);
     drop(stream);
 
-    let (mut stream, mut reader, generation) = attach(&socket_path);
+    let (_stream, mut reader, _generation) = attach(&socket_path);
     assert!(
         matches!(receive_until_snapshot(&mut reader), NodeMessage::Snapshot { layout, screens, .. }
         if layout.panes.contains_key(&1) && screens.iter().any(|frame| frame.pane_id == 1))
     );
-    send(&mut stream, &ClientMessage::Shutdown { generation });
-    loop {
-        if matches!(receive(&mut reader), NodeMessage::ShutdownAck { generation: ack } if ack == generation)
-        {
-            break;
-        }
-    }
+    // A shutdown control request must work even while this interactive attachment is live.
+    client::shutdown(&descriptor).unwrap();
+    drop(reader);
+    drop(_stream);
     let deadline = Instant::now() + Duration::from_secs(5);
     while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        child.0.try_wait().unwrap().is_some(),
-        "node did not shut down"
-    );
+    let status = child.0.try_wait().unwrap();
+    assert!(status.is_some(), "node did not shut down");
+    assert!(status.unwrap().success(), "node exited unsuccessfully");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while socket_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!socket_path.exists(), "node did not remove its socket");
 }
 
 fn attach(socket_path: &std::path::Path) -> (UnixStream, BufReader<UnixStream>, u64) {
@@ -182,7 +184,5 @@ fn send(stream: &mut UnixStream, message: &ClientMessage) {
 }
 
 fn receive(reader: &mut BufReader<UnixStream>) -> NodeMessage {
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    client::read_message(reader).unwrap().unwrap()
 }
