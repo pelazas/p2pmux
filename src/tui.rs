@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    fs::OpenOptions,
     io,
     io::Write,
     process::{Command, Stdio},
@@ -45,6 +46,7 @@ use crate::{
         PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree,
         sample_global_snapshot,
     },
+    kitty_keyboard::KittyKeyboardTracker,
     layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     protocol::{
@@ -101,6 +103,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> + <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
+    FooterSegment::Text("   Option+Shift+drag RESIZE"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Pane  <"),
@@ -171,6 +174,12 @@ pub enum UiIntent {
     SwitchTab {
         tab_id: TabId,
     },
+    SetSplitRatio {
+        pane_id: PaneId,
+        axis: Axis,
+        first_share_bps: u16,
+        base_revision: u64,
+    },
 }
 
 /// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
@@ -216,6 +225,26 @@ struct PaneTextSelection {
     cursor: ScreenCell,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ResizeDrag {
+    pane_id: PaneId,
+    base_revision: u64,
+    origin_column: u16,
+    origin_row: u16,
+    axis: Option<Axis>,
+    horizontal: bool,
+    vertical: bool,
+    original_share_bps: u16,
+    span: u16,
+    content: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitTarget {
+    first_share_bps: u16,
+    span: u16,
+}
+
 impl PaneTextSelection {
     fn is_empty(self) -> bool {
         self.anchor == self.cursor
@@ -254,6 +283,7 @@ pub struct MultiPaneTui {
     agent_overlay_open: bool,
     agent_selected_pane: Option<PaneId>,
     pending_agent_toggle: Option<Instant>,
+    resize_drag: Option<ResizeDrag>,
 }
 
 impl MultiPaneTui {
@@ -282,6 +312,7 @@ impl MultiPaneTui {
             agent_overlay_open: false,
             agent_selected_pane: None,
             pending_agent_toggle: None,
+            resize_drag: None,
         })
     }
 
@@ -397,6 +428,104 @@ impl MultiPaneTui {
 
     fn end_selection_drag(&mut self) -> bool {
         std::mem::replace(&mut self.selection_dragging, false)
+    }
+
+    fn begin_resize_drag(
+        &mut self,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+        area: Rect,
+    ) -> bool {
+        if !modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+            return false;
+        }
+        let geometry = self.geometry(area);
+        let Some(pane_id) = geometry.panes.iter().find_map(|(pane_id, rect)| {
+            rect_contains(pane_content_rect(*rect), column, row).then_some(*pane_id)
+        }) else {
+            return false;
+        };
+        self.resize_drag = Some(ResizeDrag {
+            pane_id,
+            base_revision: self.snapshot.revision,
+            origin_column: column,
+            origin_row: row,
+            axis: None,
+            horizontal: true,
+            vertical: true,
+            original_share_bps: 0,
+            span: 1,
+            content: geometry.content,
+        });
+        true
+    }
+
+    fn extend_resize_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(drag) = self.resize_drag else {
+            return false;
+        };
+        if drag.axis.is_some() {
+            return true;
+        }
+        let horizontal = i32::from(column) - i32::from(drag.origin_column);
+        let vertical = i32::from(row) - i32::from(drag.origin_row);
+        if horizontal.unsigned_abs().max(vertical.unsigned_abs()) < 2 {
+            return true;
+        }
+        let axis = match (drag.horizontal, drag.vertical) {
+            (true, false) => Axis::LeftRight,
+            (false, true) => Axis::TopBottom,
+            (true, true) if horizontal.unsigned_abs() >= vertical.unsigned_abs() => Axis::LeftRight,
+            (true, true) => Axis::TopBottom,
+            (false, false) => {
+                self.resize_drag = None;
+                return true;
+            }
+        };
+        self.lock_resize_drag(axis);
+        true
+    }
+
+    fn lock_resize_drag(&mut self, axis: Axis) {
+        let Some(drag) = self.resize_drag else {
+            return;
+        };
+        let Some(tab) = self.current_tab_layout() else {
+            self.resize_drag = None;
+            return;
+        };
+        let Some(target) = nearest_split_for_pane(&tab.root, drag.pane_id, axis, drag.content)
+        else {
+            self.resize_drag = None;
+            return;
+        };
+        let drag = self.resize_drag.as_mut().expect("drag remains active");
+        drag.axis = Some(axis);
+        drag.original_share_bps = target.first_share_bps;
+        drag.span = target.span;
+    }
+
+    fn end_resize_drag(&mut self, column: u16, row: u16) -> Option<UiIntent> {
+        let drag = self.resize_drag.take()?;
+        let axis = drag.axis?;
+        let delta = match axis {
+            Axis::LeftRight => i32::from(column) - i32::from(drag.origin_column),
+            Axis::TopBottom => i32::from(row) - i32::from(drag.origin_row),
+        };
+        let proposed = (i32::from(drag.original_share_bps)
+            + delta * 10_000 / i32::from(drag.span.max(1)))
+        .clamp(1, 9_999) as u16;
+        (proposed != drag.original_share_bps).then_some(UiIntent::SetSplitRatio {
+            pane_id: drag.pane_id,
+            axis,
+            first_share_bps: proposed,
+            base_revision: drag.base_revision,
+        })
+    }
+
+    fn cancel_resize_drag(&mut self) -> bool {
+        self.resize_drag.take().is_some()
     }
 
     fn selection(&self) -> Option<PaneTextSelection> {
@@ -996,6 +1125,122 @@ fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
     }
 }
 
+fn nearest_split_for_pane(
+    node: &Node,
+    pane_id: PaneId,
+    axis: Axis,
+    area: Rect,
+) -> Option<SplitTarget> {
+    let Node::Split {
+        axis: split_axis,
+        first_share_bps,
+        first,
+        second,
+    } = node
+    else {
+        return None;
+    };
+    let (first_area, second_area) = split_areas(*split_axis, *first_share_bps, first, second, area);
+    if contains_leaf(first, pane_id) {
+        nearest_split_for_pane(first, pane_id, axis, first_area).or_else(|| {
+            (*split_axis == axis).then_some(SplitTarget {
+                first_share_bps: *first_share_bps,
+                span: match axis {
+                    Axis::LeftRight => area.width,
+                    Axis::TopBottom => area.height,
+                },
+            })
+        })
+    } else if contains_leaf(second, pane_id) {
+        nearest_split_for_pane(second, pane_id, axis, second_area).or_else(|| {
+            (*split_axis == axis).then_some(SplitTarget {
+                first_share_bps: *first_share_bps,
+                span: match axis {
+                    Axis::LeftRight => area.width,
+                    Axis::TopBottom => area.height,
+                },
+            })
+        })
+    } else {
+        None
+    }
+}
+
+fn node_minimum(node: &Node) -> (u16, u16) {
+    match node {
+        Node::Leaf { .. } => (3, 3),
+        Node::Split {
+            axis,
+            first,
+            second,
+            ..
+        } => {
+            let (first_width, first_height) = node_minimum(first);
+            let (second_width, second_height) = node_minimum(second);
+            match axis {
+                Axis::LeftRight => (
+                    first_width.saturating_add(second_width),
+                    first_height.max(second_height),
+                ),
+                Axis::TopBottom => (
+                    first_width.max(second_width),
+                    first_height.saturating_add(second_height),
+                ),
+            }
+        }
+    }
+}
+
+fn allocated_first_span(span: u16, share_bps: u16, first_min: u16, second_min: u16) -> u16 {
+    let unconstrained = ((u32::from(span) * u32::from(share_bps)) / 10_000) as u16;
+    if span >= first_min.saturating_add(second_min) {
+        unconstrained.clamp(first_min, span.saturating_sub(second_min))
+    } else {
+        unconstrained.min(span)
+    }
+}
+
+fn split_areas(
+    axis: Axis,
+    first_share_bps: u16,
+    first: &Node,
+    second: &Node,
+    area: Rect,
+) -> (Rect, Rect) {
+    match axis {
+        Axis::LeftRight => {
+            let (first_min, _) = node_minimum(first);
+            let (second_min, _) = node_minimum(second);
+            let first_width =
+                allocated_first_span(area.width, first_share_bps, first_min, second_min);
+            (
+                Rect::new(area.x, area.y, first_width, area.height),
+                Rect::new(
+                    area.x.saturating_add(first_width),
+                    area.y,
+                    area.width - first_width,
+                    area.height,
+                ),
+            )
+        }
+        Axis::TopBottom => {
+            let (_, first_min) = node_minimum(first);
+            let (_, second_min) = node_minimum(second);
+            let first_height =
+                allocated_first_span(area.height, first_share_bps, first_min, second_min);
+            (
+                Rect::new(area.x, area.y, area.width, first_height),
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(first_height),
+                    area.width,
+                    area.height - first_height,
+                ),
+            )
+        }
+    }
+}
+
 fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
     match node {
         Node::Leaf { pane_id } => {
@@ -1003,35 +1248,12 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
         }
         Node::Split {
             axis,
+            first_share_bps,
             first,
             second,
         } => {
-            let (first_area, second_area) = match axis {
-                Axis::LeftRight => {
-                    let first_width = area.width / 2;
-                    (
-                        Rect::new(area.x, area.y, first_width, area.height),
-                        Rect::new(
-                            area.x.saturating_add(first_width),
-                            area.y,
-                            area.width - first_width,
-                            area.height,
-                        ),
-                    )
-                }
-                Axis::TopBottom => {
-                    let first_height = area.height / 2;
-                    (
-                        Rect::new(area.x, area.y, area.width, first_height),
-                        Rect::new(
-                            area.x,
-                            area.y.saturating_add(first_height),
-                            area.width,
-                            area.height - first_height,
-                        ),
-                    )
-                }
-            };
+            let (first_area, second_area) =
+                split_areas(*axis, *first_share_bps, first, second, area);
             allocate_node(first, first_area, panes);
             allocate_node(second, second_area, panes);
         }
@@ -1733,6 +1955,21 @@ impl SharedLocalPane {
         Ok(true)
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Box<dyn Error>> {
+        if self.screen.screen().size() == (rows, cols) {
+            return Ok(());
+        }
+        self.host.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let frame = self.screen.resize(rows, cols)?;
+        self.screen_tx.send_replace(frame);
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         self.host.shutdown()
     }
@@ -2401,7 +2638,16 @@ impl SharedLayoutRuntime {
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
                     dirty |= self.clear_selection();
-                    if let Some(intent) = self.tui.switch_tab_at(mouse.column, mouse.row, area) {
+                    if self.tui.begin_resize_drag(
+                        mouse.column,
+                        mouse.row,
+                        mouse.modifiers,
+                        area,
+                    ) {
+                        dirty = true;
+                    } else if let Some(intent) =
+                        self.tui.switch_tab_at(mouse.column, mouse.row, area)
+                    {
                         self.handle_intent(intent)?;
                         dirty = true;
                     } else {
@@ -2413,16 +2659,22 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
                 {
-                    dirty |= self.tui.extend_selection_at(
-                        mouse.column,
-                        mouse.row,
-                        Rect::new(0, 0, cols, rows),
-                    );
+                    if self.tui.extend_resize_drag(mouse.column, mouse.row) {
+                        dirty = true;
+                    } else {
+                        dirty |= self.tui.extend_selection_at(
+                            mouse.column,
+                            mouse.row,
+                            Rect::new(0, 0, cols, rows),
+                        );
+                    }
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
                 {
-                    if self.tui.end_selection_drag() {
+                    if let Some(intent) = self.tui.end_resize_drag(mouse.column, mouse.row) {
+                        self.handle_intent(intent)?;
+                    } else if self.tui.end_selection_drag() {
                         self.copy_selection_to_clipboard();
                     }
                     dirty = true;
@@ -2452,7 +2704,10 @@ impl SharedLayoutRuntime {
                         matches!(mouse.kind, MouseEventKind::ScrollUp),
                     );
                 }
-                Event::Resize(_, _) => dirty = true,
+                Event::Resize(width, height) => {
+                    self.reflow_local_panes(Rect::new(0, 0, width, height))?;
+                    dirty = true;
+                }
                 _ => {}
             }
         }
@@ -2653,6 +2908,7 @@ impl SharedLayoutRuntime {
         self.tui
             .apply_snapshot(snapshot.clone())
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
+        self.tui.cancel_resize_drag();
         self.release_blurred_pane(previously_focused)?;
         let me = self.control.peer_id();
         self.remote_descriptors.clear();
@@ -2678,6 +2934,53 @@ impl SharedLayoutRuntime {
         self.subscriptions.nudge();
         self.start_eligible_subscriptions();
         self.refresh_local_views();
+        if let Some(area) = area_from_terminal_size(terminal::size()) {
+            self.reflow_local_panes(area)?;
+        }
+        Ok(())
+    }
+
+    fn reflow_local_panes(&mut self, area: Rect) -> Result<(), Box<dyn Error>> {
+        let geometry = self.tui.geometry(area);
+        let mut updates = Vec::new();
+        for (pane_id, rect) in geometry.panes {
+            let Some(pane) = self.local.get_mut(&pane_id) else {
+                continue;
+            };
+            let (rows, cols) = grid_for_pane(rect);
+            if pane.screen.screen().size() == (rows, cols) {
+                continue;
+            }
+            pane.resize(rows, cols)?;
+            if self
+                .tui
+                .snapshot()
+                .panes
+                .get(&pane_id)
+                .is_some_and(|descriptor| {
+                    (descriptor.grid_rows, descriptor.grid_cols) != (rows, cols)
+                })
+            {
+                updates.push(crate::protocol::PaneGrid {
+                    pane_id,
+                    grid_rows: u32::from(rows),
+                    grid_cols: u32::from(cols),
+                });
+            }
+        }
+        if !updates.is_empty() {
+            let request_id = self.next_id();
+            self.send_request(LayoutRequest {
+                request_id,
+                base_revision: self.tui.snapshot().revision,
+                create_pane: None,
+                delete_pane: None,
+                create_tab: None,
+                delete_tab: None,
+                set_split_ratio: None,
+                update_pane_grids: Some(crate::protocol::UpdatePaneGrids { panes: updates }),
+            })?;
+        }
         Ok(())
     }
 
@@ -2726,6 +3029,8 @@ impl SharedLayoutRuntime {
                     delete_pane: Some(DeletePane { pane_id }),
                     create_tab: None,
                     delete_tab: None,
+                    set_split_ratio: None,
+                    update_pane_grids: None,
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -2737,7 +3042,34 @@ impl SharedLayoutRuntime {
                     delete_pane: None,
                     create_tab: None,
                     delete_tab: Some(DeleteTab { tab_id }),
+                    set_split_ratio: None,
+                    update_pane_grids: None,
                 })?
+            }
+            UiIntent::SetSplitRatio {
+                pane_id,
+                axis,
+                first_share_bps,
+                base_revision,
+            } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: None,
+                    set_split_ratio: Some(crate::protocol::SetSplitRatio {
+                        pane_id,
+                        axis: Some(match axis {
+                            Axis::LeftRight => SplitAxis::LeftRight as i32,
+                            Axis::TopBottom => SplitAxis::TopBottom as i32,
+                        }),
+                        first_share_bps: u32::from(first_share_bps),
+                    }),
+                    update_pane_grids: None,
+                })?;
             }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
         }
@@ -2784,6 +3116,8 @@ impl SharedLayoutRuntime {
                 grid_cols: u32::from(grid_cols),
             }),
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         })
     }
 
@@ -2866,6 +3200,7 @@ impl SharedLayoutRuntime {
     }
 
     fn reject_request(&mut self, request_id: u64) {
+        self.tui.cancel_resize_drag();
         self.pending_create = self
             .pending_create
             .filter(|pending| pending.request_id != request_id);
@@ -2888,14 +3223,18 @@ impl SharedLayoutRuntime {
         let pane_id = self.tui.focused_pane();
         let mut sent = false;
         if let Some(pane) = self.local.get_mut(&pane_id)
-            && let Some(bytes) = encode_key(key, pane.screen.screen())
+            && let Some(bytes) = encode_key(
+                key,
+                pane.screen.screen(),
+                pane.screen.kitty_keyboard_active(),
+            )
         {
             pane.input(bytes)?;
             sent = true;
         }
         if let Some(pane) = self.remote.get_mut(&pane_id)
             && let Some(screen) = pane.screen.screen()
-            && let Some(bytes) = encode_key(key, screen)
+            && let Some(bytes) = encode_key(key, screen, false)
         {
             pane.input(bytes);
             sent = true;
@@ -2931,6 +3270,11 @@ impl SharedLayoutRuntime {
         }
         self.runtime.block_on(self.control.shutdown());
     }
+}
+
+fn area_from_terminal_size(size: io::Result<(u16, u16)>) -> Option<Rect> {
+    size.ok()
+        .map(|(width, height)| Rect::new(0, 0, width, height))
 }
 
 pub struct HostPaneRuntime {
@@ -3086,7 +3430,11 @@ fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL
 }
 
-fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
+fn encode_key(
+    key: KeyEvent,
+    screen: &vt100::Screen,
+    kitty_keyboard_active: bool,
+) -> Option<Vec<u8>> {
     if is_quit(key) {
         return None;
     }
@@ -3114,8 +3462,14 @@ fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
             bytes
         }
         KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
-        // LF / Ctrl+J — Claude/Cursor agents treat this as newline vs CR submit.
-        KeyCode::Enter if modifiers == 2 => b"\n".to_vec(),
+        // Use kitty CSI-u when the child opted in; otherwise LF is the newline fallback.
+        KeyCode::Enter if modifiers == 2 => {
+            if kitty_keyboard_active {
+                b"\x1b[13;2u".to_vec()
+            } else {
+                b"\n".to_vec()
+            }
+        }
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
         KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
@@ -3223,6 +3577,11 @@ impl Drop for TerminalGuard {
         let mut stdout = io::stdout();
         if self.keyboard_enhancement {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+            let _ = stdout.flush();
+            if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+                let _ = execute!(tty, PopKeyboardEnhancementFlags);
+                let _ = tty.flush();
+            }
         }
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
@@ -3242,10 +3601,7 @@ impl Drop for TerminalGuard {
 fn enable_keyboard_enhancement() -> io::Result<bool> {
     execute!(
         io::stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     Ok(true)
 }
@@ -3261,6 +3617,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     };
     let mut host = PtyHost::spawn_default_shell(size)?;
     let mut parser = vt100::Parser::new(rows, cols, 0);
+    let mut kitty_keyboard = KittyKeyboardTracker::default();
 
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
@@ -3291,6 +3648,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             let Some(bytes) = host.try_read_output()? else {
                 break;
             };
+            kitty_keyboard.observe(&bytes);
             parser.process(&bytes);
             dirty = true;
         }
@@ -3319,7 +3677,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
                 if is_quit(key) {
                     break;
                 }
-                if let Some(bytes) = encode_key(key, parser.screen()) {
+                if let Some(bytes) = encode_key(key, parser.screen(), kitty_keyboard.active()) {
                     host.write_input(&bytes)?;
                 }
             }
@@ -3439,7 +3797,11 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 if is_quit(key) {
                     break;
                 }
-                if let Some(bytes) = encode_key(key, runtime.screen.screen()) {
+                if let Some(bytes) = encode_key(
+                    key,
+                    runtime.screen.screen(),
+                    runtime.screen.kitty_keyboard_active(),
+                ) {
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
                     let decision = runtime
@@ -3598,7 +3960,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
-                    && let Some(bytes) = encode_key(key, screen)
+                    && let Some(bytes) = encode_key(key, screen, false)
                 {
                     if state.controller_peer_id == pane.controls.peer_id() {
                         if held_input.is_empty() {
@@ -3680,13 +4042,14 @@ fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
+        io,
         net::Ipv4Addr,
         thread,
         time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, watch};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
     use portable_pty::PtySize;
     use ratatui::{
         Terminal,
@@ -3710,12 +4073,21 @@ mod tests {
         FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent, HostPaneChannels,
         HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection,
         PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, contextual_footer, copied_line_count, encode_key,
-        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
-        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        SharedLocalPane, UiIntent, VtScreen, allocate_node, area_from_terminal_size,
+        contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
+        initial_root_pane_grid, is_chord_command, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
+
+    #[test]
+    fn disambiguate_escape_codes_uses_kitty_flag_one() {
+        assert_eq!(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
+            1
+        );
+    }
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
         LayoutSnapshot {
@@ -3785,6 +4157,14 @@ mod tests {
         assert_eq!(tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Rect::new(0, 0, 80, 24)), KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }]));
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn terminal_area_is_absent_when_terminal_size_is_unavailable() {
+        assert_eq!(
+            area_from_terminal_size(Err(io::Error::from(io::ErrorKind::WouldBlock))),
+            None
+        );
     }
 
     #[test]
@@ -4303,6 +4683,17 @@ mod tests {
     }
 
     #[test]
+    fn local_pane_resize_publishes_a_replacement_screen_frame() {
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, b"host".to_vec()).expect("pane");
+        let before = pane.screen.current_frame().sequence;
+        pane.resize(3, 4).expect("resize");
+        assert_eq!(pane.screen.screen().size(), (3, 4));
+        assert!(pane.screen.current_frame().sequence > before);
+        assert_eq!(pane.screen.current_frame().base_sequence, 0);
+        pane.shutdown().expect("shutdown");
+    }
+
+    #[test]
     fn new_host_runtime_starts_free_while_the_host_retains_pty_ownership() {
         let host_id = b"host".to_vec();
         let screen = HostScreen::new(1, 1).expect("screen");
@@ -4359,9 +4750,11 @@ mod tests {
                 tab_id: 1,
                 root: Node::Split {
                     axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
                     first: Box::new(Node::Leaf { pane_id: 1 }),
                     second: Box::new(Node::Split {
                         axis: Axis::TopBottom,
+                        first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
                         first: Box::new(Node::Leaf { pane_id: 2 }),
                         second: Box::new(Node::Leaf { pane_id: 3 }),
                     }),
@@ -4372,12 +4765,95 @@ mod tests {
     }
 
     #[test]
+    fn ratio_allocation_respects_recursive_minima_and_small_areas() {
+        let node = Node::Split {
+            axis: Axis::LeftRight,
+            first_share_bps: 7_500,
+            first: Box::new(Node::Leaf { pane_id: 1 }),
+            second: Box::new(Node::Split {
+                axis: Axis::LeftRight,
+                first_share_bps: 5_000,
+                first: Box::new(Node::Leaf { pane_id: 2 }),
+                second: Box::new(Node::Leaf { pane_id: 3 }),
+            }),
+        };
+        let mut panes = BTreeMap::new();
+        allocate_node(&node, Rect::new(0, 0, 12, 9), &mut panes);
+        assert_eq!(panes[&1].width, 6, "nested sibling needs six columns");
+        assert_eq!(panes[&2].width, 3);
+        assert_eq!(panes[&3].width, 3);
+
+        panes.clear();
+        allocate_node(&node, Rect::new(0, 0, 2, 2), &mut panes);
+        assert_eq!(panes[&1].width + panes[&2].width + panes[&3].width, 2);
+    }
+
+    #[test]
+    fn content_drag_keeps_the_selection_path() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(!tui.begin_resize_drag(2, 3, KeyModifiers::NONE, area));
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        assert!(tui.end_selection_drag());
+        assert!(tui.selection().is_some());
+    }
+
+    #[test]
+    fn dragging_a_shared_vertical_border_resizes_its_split() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(20, 5, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
+        assert!(tui.extend_resize_drag(30, 5));
+        assert!(matches!(
+            tui.end_resize_drag(30, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 1,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+        assert!(tui.end_resize_drag(30, 5).is_none());
+
+        assert!(tui.begin_resize_drag(45, 5, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
+        assert!(tui.extend_resize_drag(55, 5));
+        assert!(matches!(
+            tui.end_resize_drag(55, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 2,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn dragging_a_shared_horizontal_border_resizes_its_split() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(60, 6, KeyModifiers::ALT | KeyModifiers::SHIFT, area));
+        assert!(tui.extend_resize_drag(60, 11));
+        assert!(matches!(
+            tui.end_resize_drag(60, 11),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 2,
+                axis: Axis::TopBottom,
+                first_share_bps: 7_272,
+                base_revision: 1,
+            })
+        ));
+    }
+
+    #[test]
     fn pane_title_uses_stable_leaf_order_and_control_state() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
                 root: Node::Split {
                     axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
                     first: Box::new(Node::Leaf { pane_id: 8 }),
                     second: Box::new(Node::Leaf { pane_id: 3 }),
                 },
@@ -5132,6 +5608,9 @@ mod tests {
                 footer.starts_with(expected),
                 "mode: {mode:?}, footer: {footer}"
             );
+            if mode == ChordMode::None {
+                assert!(footer.contains("Option+Shift+drag RESIZE"), "footer: {footer}");
+            }
         }
     }
 
@@ -5770,7 +6249,8 @@ mod tests {
         assert_eq!(
             encode_key(
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                normal.screen()
+                normal.screen(),
+                false,
             ),
             Some(b"\x1b[A".to_vec())
         );
@@ -5780,7 +6260,8 @@ mod tests {
         assert_eq!(
             encode_key(
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                application.screen()
+                application.screen(),
+                false,
             ),
             Some(b"\x1bOA".to_vec())
         );
@@ -5878,7 +6359,7 @@ mod tests {
 
         for (event, expected) in cases {
             assert_eq!(
-                encode_key(event, screen).as_deref(),
+                encode_key(event, screen, false).as_deref(),
                 expected.map(str::as_bytes),
                 "{event:?}"
             );
@@ -5886,19 +6367,34 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_uses_lf_while_plain_enter_uses_cr() {
+    fn shift_enter_uses_kitty_csi_u_when_active_and_lf_when_inactive() {
         let parser = vt100::Parser::new(1, 1, 0);
         let plain = encode_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             parser.screen(),
+            false,
         );
-        let shifted = encode_key(
+        let plain_active = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            parser.screen(),
+            true,
+        );
+        let shifted_inactive = encode_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             parser.screen(),
+            false,
+        );
+        let shifted_active = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            parser.screen(),
+            true,
         );
 
         assert_eq!(plain, Some(b"\r".to_vec()));
-        assert_eq!(shifted, Some(b"\n".to_vec()));
-        assert_ne!(shifted, plain);
+        assert_eq!(plain_active, Some(b"\r".to_vec()));
+        assert_eq!(shifted_inactive, Some(b"\n".to_vec()));
+        assert_eq!(shifted_active, Some(b"\x1b[13;2u".to_vec()));
+        assert_ne!(shifted_inactive, plain);
+        assert_ne!(shifted_active, plain);
     }
 }

@@ -3,6 +3,7 @@
 pub mod agent_detect;
 pub mod cli;
 pub mod config;
+pub mod kitty_keyboard;
 pub mod layout;
 pub mod lease;
 pub mod protocol;

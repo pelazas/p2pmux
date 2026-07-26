@@ -41,13 +41,13 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 ## Status
 
 Spike 3 provides a localhost shared layout for up to eight members. The coordinator owns a
-revisioned tab/split tree; every pane is a fixed-grid PTY owned by the member that created it.
+revisioned tab/split tree, including authoritative split ratios. Every pane is a PTY owned by
+the member that created it, and its host publishes the absolute grid for that host's window.
 Each process serves its own locally hosted panes directly to the other admitted members.
 
 This is still a dogfooding spike: relay/internet validation, disconnect grace, coordinator
-failover, presence, and dynamic resize remain later work. The protocol deliberately has no
-resize message: each pane grid is fixed when that pane is created and is letterboxed or clipped
-by smaller local rectangles.
+failover and presence remain later work. Shared ratios are portable while absolute pane grids are
+host-owned: guests consume the host's resized screen stream and never resize a remote PTY.
 
 ## Local Spike 1
 
@@ -103,12 +103,14 @@ inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disab
 passthrough configuration.
 
 Drag inside a pane's terminal content to select text; releasing the mouse copies it to the macOS
-clipboard.
+clipboard. Drag a shared pane border to resize its split. Corner drags lock to one axis after a
+short motion threshold, preview locally, and commit one shared ratio on release. The affected pane
+hosts then resize their own PTY and VT screen and publish their local grids.
 
 - `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
   tab. Some terminals need Shift with Option for horizontal arrows.
-- `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new
-  fixed-grid PTY runs on the requester’s Mac.
+- `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new PTY
+  runs on the requester’s Mac.
 - `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
   focused pane.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
@@ -118,7 +120,7 @@ clipboard.
 - `Ctrl+T`, then left/right — switch tabs.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
-Nested 50/50 splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
+Nested ratio-controlled splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Click tab labels to switch tabs without
 claiming control or sending input. Mouse wheel scrolls pane history locally. The dark contextual footer uses red key accents: normal mode is
@@ -127,7 +129,8 @@ claiming control or sending input. Mouse wheel scrolls pane history locally. The
 `Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
-outer terminal crops or letterboxes the immutable host grid; it never resizes the host PTY.
+outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any
+changed host-owned grids. Guests only receive the resulting commit and screen snapshot.
 
 Full product/architecture docs live in [`docs/`](./docs/).
 

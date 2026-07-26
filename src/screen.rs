@@ -2,7 +2,10 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::protocol::{MAX_DELTA_BYTES, MAX_SNAPSHOT_BYTES};
+use crate::{
+    kitty_keyboard::KittyKeyboardTracker,
+    protocol::{MAX_DELTA_BYTES, MAX_SNAPSHOT_BYTES},
+};
 
 pub const SCREEN_CODEC_VERSION: u8 = 1;
 pub(crate) const SCROLLBACK_LINES: usize = 10_000;
@@ -51,6 +54,7 @@ pub struct HostScreen {
     parser: vt100::Parser,
     previous: vt100::Screen,
     current: ScreenFrame,
+    kitty_keyboard: KittyKeyboardTracker,
 }
 
 impl HostScreen {
@@ -68,10 +72,12 @@ impl HostScreen {
                 snapshot,
                 delta: Arc::from([]),
             },
+            kitty_keyboard: KittyKeyboardTracker::default(),
         })
     }
 
     pub fn process_pty(&mut self, bytes: &[u8]) -> Result<ScreenFrame, ScreenError> {
+        self.kitty_keyboard.observe(bytes);
         self.parser.process(bytes);
         let sequence = self
             .current
@@ -94,12 +100,36 @@ impl HostScreen {
         Ok(frame)
     }
 
+    /// Resize the parser and force consumers to replace rather than delta-apply their screen.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<ScreenFrame, ScreenError> {
+        validate_dimensions(rows, cols)?;
+        let sequence = self
+            .current
+            .sequence
+            .checked_add(1)
+            .ok_or(ScreenError::SequenceExhausted)?;
+        self.parser.screen_mut().set_size(rows, cols);
+        self.previous = self.parser.screen().clone();
+        let frame = ScreenFrame {
+            sequence,
+            base_sequence: 0,
+            snapshot: snapshot_payload(self.parser.screen())?,
+            delta: Arc::from([]),
+        };
+        self.current = frame.clone();
+        Ok(frame)
+    }
+
     pub fn current_frame(&self) -> &ScreenFrame {
         &self.current
     }
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    pub fn kitty_keyboard_active(&self) -> bool {
+        self.kitty_keyboard.active()
     }
 }
 

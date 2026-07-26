@@ -304,6 +304,8 @@ pub struct LayoutSplit {
     pub first: Option<LayoutNode>,
     #[prost(message, optional, tag = "3")]
     pub second: Option<LayoutNode>,
+    #[prost(uint32, optional, tag = "4")]
+    pub first_share_bps: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
@@ -334,6 +336,10 @@ pub struct LayoutRequest {
     pub create_tab: Option<CreateTab>,
     #[prost(message, optional, tag = "6")]
     pub delete_tab: Option<DeleteTab>,
+    #[prost(message, optional, tag = "7")]
+    pub set_split_ratio: Option<SetSplitRatio>,
+    #[prost(message, optional, tag = "8")]
+    pub update_pane_grids: Option<UpdatePaneGrids>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -368,6 +374,32 @@ pub struct CreateTab {
 pub struct DeleteTab {
     #[prost(uint64, tag = "1")]
     pub tab_id: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetSplitRatio {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+    #[prost(enumeration = "SplitAxis", optional, tag = "2")]
+    pub axis: Option<i32>,
+    #[prost(uint32, tag = "3")]
+    pub first_share_bps: u32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneGrid {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+    #[prost(uint32, tag = "2")]
+    pub grid_rows: u32,
+    #[prost(uint32, tag = "3")]
+    pub grid_cols: u32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdatePaneGrids {
+    #[prost(message, repeated, tag = "1")]
+    pub panes: Vec<PaneGrid>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -832,7 +864,9 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
     let actions = usize::from(request.create_pane.is_some())
         + usize::from(request.delete_pane.is_some())
         + usize::from(request.create_tab.is_some())
-        + usize::from(request.delete_tab.is_some());
+        + usize::from(request.delete_tab.is_some())
+        + usize::from(request.set_split_ratio.is_some())
+        + usize::from(request.update_pane_grids.is_some());
     if actions != 1 {
         return Err(ProtocolError::InvalidLayout("layout_request.action"));
     }
@@ -862,6 +896,36 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
     }
     if let Some(delete_tab) = &request.delete_tab {
         validate_nonzero("layout_request.delete_tab.tab_id", delete_tab.tab_id)?;
+    }
+    if let Some(ratio) = &request.set_split_ratio {
+        validate_nonzero("layout_request.set_split_ratio.pane_id", ratio.pane_id)?;
+        validate_axis("layout_request.set_split_ratio.axis", ratio.axis)?;
+        if !(1..=9_999).contains(&ratio.first_share_bps) {
+            return Err(ProtocolError::InvalidLayout(
+                "layout_request.set_split_ratio.first_share_bps",
+            ));
+        }
+    }
+    if let Some(update) = &request.update_pane_grids {
+        if update.panes.is_empty() {
+            return Err(ProtocolError::InvalidLayout(
+                "layout_request.update_pane_grids.panes",
+            ));
+        }
+        let mut pane_ids = HashSet::with_capacity(update.panes.len());
+        for pane in &update.panes {
+            validate_nonzero("layout_request.update_pane_grids.pane_id", pane.pane_id)?;
+            validate_grid(
+                "layout_request.update_pane_grids.grid",
+                pane.grid_rows,
+                pane.grid_cols,
+            )?;
+            if !pane_ids.insert(pane.pane_id) {
+                return Err(ProtocolError::InvalidLayout(
+                    "layout_request.update_pane_grids.pane_id",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -958,6 +1022,13 @@ fn validate_layout_node(
         }
         (None, Some(split)) => {
             validate_axis("layout_state.node.split.axis", split.axis)?;
+            if let Some(first_share_bps) = split.first_share_bps
+                && !(1..=9_999).contains(&first_share_bps)
+            {
+                return Err(ProtocolError::InvalidLayout(
+                    "layout_state.node.split.first_share_bps",
+                ));
+            }
             let first = split.first.as_ref().ok_or(ProtocolError::InvalidLayout(
                 "layout_state.node.split.first",
             ))?;

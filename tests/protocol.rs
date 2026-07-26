@@ -4,10 +4,11 @@ use p2pmux::protocol::{
     LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, MAX_AGENT_CWD_BYTES,
     MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
     MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition,
+    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PaneGrid,
     PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-    ProtocolError, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
-    decode_frame, encode_frame, envelope,
+    ProtocolError,
+    SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
+    UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -29,6 +30,74 @@ fn envelope(body: envelope::Body) -> Envelope {
 #[test]
 fn protocol_version_is_v4() {
     assert_eq!(PROTOCOL_VERSION, 4);
+}
+
+#[test]
+fn ratio_and_grid_actions_validate_strictly() {
+    let request = LayoutRequest {
+        request_id: 1,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+        set_split_ratio: Some(SetSplitRatio {
+            pane_id: 1,
+            axis: Some(SplitAxis::LeftRight as i32),
+            first_share_bps: 7_500,
+        }),
+        update_pane_grids: None,
+    };
+    let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
+        .expect("valid request");
+    assert_eq!(
+        decode_frame(&encoded).expect("round trip"),
+        envelope(envelope::Body::LayoutRequest(request))
+    );
+
+    for first_share_bps in [0, 10_000] {
+        let invalid = LayoutRequest {
+            set_split_ratio: Some(SetSplitRatio {
+                pane_id: 1,
+                axis: Some(SplitAxis::LeftRight as i32),
+                first_share_bps,
+            }),
+            ..LayoutRequest {
+                request_id: 1,
+                base_revision: 1,
+                create_pane: None,
+                delete_pane: None,
+                create_tab: None,
+                delete_tab: None,
+                set_split_ratio: None,
+                update_pane_grids: None,
+            }
+        };
+        assert!(encode_frame(&envelope(envelope::Body::LayoutRequest(invalid))).is_err());
+    }
+
+    let grids = LayoutRequest {
+        request_id: 2,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: Some(UpdatePaneGrids {
+            panes: vec![PaneGrid {
+                pane_id: 1,
+                grid_rows: 24,
+                grid_cols: 80,
+            }],
+        }),
+    };
+    assert!(
+        decode_frame(
+            &encode_frame(&envelope(envelope::Body::LayoutRequest(grids))).expect("encode")
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -317,6 +386,8 @@ fn v2_envelopes() -> Vec<Envelope> {
             delete_pane: None,
             create_tab: None,
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         })),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
@@ -399,6 +470,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         delete_pane: None,
         create_tab: None,
         delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: None,
     };
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
@@ -430,6 +503,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                     axis: Some(SplitAxis::LeftRight as i32),
                     first: Some(leaf(1)),
                     second: Some(leaf(1)),
+                    first_share_bps: None,
                 })),
             }),
         }],
@@ -606,6 +680,8 @@ fn create_pane_axis_and_position_are_validated() {
             delete_pane: None,
             create_tab: None,
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         }))
     }
 
@@ -633,6 +709,7 @@ fn create_pane_axis_and_position_are_validated() {
                         axis,
                         first: Some(leaf(1)),
                         second: Some(leaf(2)),
+                        first_share_bps: None,
                     })),
                 }),
             }],
@@ -702,6 +779,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         delete_pane: None,
         create_tab: None,
         delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: None,
     };
 
     for valid in [
@@ -905,6 +984,7 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
                     axis: Some(SplitAxis::LeftRight as i32),
                     first: Some(leaf(1)),
                     second: Some(leaf(1)),
+                    first_share_bps: None,
                 })),
             }),
         }],
@@ -990,6 +1070,7 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
                     axis: Some(SplitAxis::TopBottom as i32),
                     first: Some(leaf(11)),
                     second: Some(leaf(11)),
+                    first_share_bps: None,
                 })),
             }),
         }],
@@ -1052,6 +1133,7 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
                 axis: Some(SplitAxis::TopBottom as i32),
                 first: Some(full_tree(depth - 1, next_pane_id)),
                 second: Some(full_tree(depth - 1, next_pane_id)),
+                first_share_bps: None,
             })),
         }
     }

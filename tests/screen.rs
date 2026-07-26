@@ -26,6 +26,15 @@ fn initial_snapshot_describes_the_empty_fixed_grid() {
 }
 
 #[test]
+fn host_screen_tracks_child_kitty_keyboard_mode() {
+    let mut host = HostScreen::new(1, 1).expect("valid fixed grid");
+    host.process_pty(b"\x1b[>1u").expect("kitty push");
+    assert!(host.kitty_keyboard_active());
+    host.process_pty(b"\x1b[<1u").expect("kitty pop");
+    assert!(!host.kitty_keyboard_active());
+}
+
+#[test]
 fn host_snapshots_the_live_edge_after_scrollback_accumulates() {
     let mut host = HostScreen::new(1, 3).expect("valid fixed grid");
     let frame = host.process_pty(b"a\r\nb\r\nc").expect("scrollback update");
@@ -127,4 +136,28 @@ fn malformed_and_oversize_payloads_are_rejected() {
             .apply_delta(1, 2, &vec![1; MAX_DELTA_BYTES + 1])
             .is_err()
     );
+}
+
+#[test]
+fn resize_forces_a_replacement_snapshot_for_guests() {
+    let mut host = HostScreen::new(2, 3).expect("grid");
+    let before = host.process_pty(b"abc").expect("frame");
+    let resized = host.resize(4, 5).expect("resize");
+    assert_eq!(host.screen().size(), (4, 5));
+    assert!(resized.sequence > before.sequence);
+    assert_eq!(resized.base_sequence, 0);
+    assert!(resized.delta.is_empty());
+
+    let mut guest = GuestScreen::new();
+    guest
+        .apply_snapshot(before.sequence, &before.snapshot)
+        .expect("old snapshot");
+    assert_eq!(
+        guest.apply_delta(resized.base_sequence, resized.sequence, &resized.delta),
+        Err(p2pmux::screen::ScreenError::InvalidSequence)
+    );
+    guest
+        .apply_snapshot(resized.sequence, &resized.snapshot)
+        .expect("replacement snapshot");
+    assert_eq!(guest.screen().expect("screen").size(), (4, 5));
 }
