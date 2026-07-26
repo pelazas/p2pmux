@@ -74,6 +74,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut attach_error = None;
     let mut detach_sent = false;
     let mut last_agent_overlay_animation = Instant::now();
+    let mut pending_focus = None;
 
     'attached: loop {
         loop {
@@ -101,6 +102,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             rosters,
                             tab_id,
                             pane_id,
+                            &mut pending_focus,
                         )?;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
@@ -156,7 +158,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         break;
                     }
                     KeyHandling::Consumed(intents) => {
-                        send_intents(&mut stream, tui, intents)?;
+                        send_intents(&mut stream, tui, intents, &mut pending_focus)?;
                         dirty = true;
                     }
                     KeyHandling::Forward => {
@@ -190,7 +192,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         );
                     } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                         let intents = tui.handle_mouse(mouse, area);
-                        send_intents(&mut stream, tui, intents)?;
+                        send_intents(&mut stream, tui, intents, &mut pending_focus)?;
                     }
                 } else if matches!(
                     mouse.kind,
@@ -211,7 +213,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     );
                 } else {
                     let intents = tui.handle_mouse(mouse, area);
-                    send_intents(&mut stream, tui, intents)?;
+                    send_intents(&mut stream, tui, intents, &mut pending_focus)?;
                 }
                 dirty = true;
             }
@@ -275,6 +277,7 @@ fn apply_snapshot(
     rosters: Vec<crate::local_ipc::AgentOverlaySnapshotRow>,
     tab_id: u64,
     pane_id: u64,
+    pending_focus: &mut Option<(u64, u64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let view = match tui {
         Some(view) => {
@@ -288,8 +291,6 @@ fn apply_snapshot(
             })?),
     };
     view.set_title(format!("p2pmux ({room_name})"));
-    view.set_focus(tab_id, pane_id)
-        .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))?;
     screens.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
     for frame in next_screens {
         let screen = screens.entry(frame.pane_id).or_default();
@@ -326,24 +327,47 @@ fn apply_snapshot(
             })
             .collect(),
     );
+    reconcile_snapshot_focus(view, pending_focus, tab_id, pane_id)?;
     Ok(())
+}
+
+fn reconcile_snapshot_focus(
+    view: &mut MultiPaneTui,
+    pending_focus: &mut Option<(u64, u64)>,
+    tab_id: u64,
+    pane_id: u64,
+) -> Result<(), io::Error> {
+    if let Some((pending_tab_id, pending_pane_id)) = *pending_focus {
+        if (tab_id, pane_id) == (pending_tab_id, pending_pane_id) {
+            *pending_focus = None;
+        } else if view.set_focus(pending_tab_id, pending_pane_id).is_ok() {
+            return Ok(());
+        } else {
+            *pending_focus = None;
+        }
+    }
+    view.set_focus(tab_id, pane_id)
+        .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))
 }
 
 fn send_intents(
     stream: &mut UnixStream,
     tui: &MultiPaneTui,
     intents: Vec<crate::tui::UiIntent>,
+    pending_focus: &mut Option<(u64, u64)>,
 ) -> io::Result<()> {
     for intent in intents {
         match intent {
             crate::tui::UiIntent::FocusPane { .. } | crate::tui::UiIntent::SwitchTab { .. } => {
+                let focus = (tui.current_tab(), tui.focused_pane());
                 write_message(
                     stream,
                     &ClientMessage::Focus {
-                        tab_id: tui.current_tab(),
-                        pane_id: tui.focused_pane(),
+                        tab_id: focus.0,
+                        pane_id: focus.1,
                     },
                 )?;
+                *pending_focus = Some(focus);
             }
             intent => write_message(stream, &ClientMessage::StructuralIntent { intent })?,
         }
@@ -583,6 +607,7 @@ mod tests {
         pane_ids: &[u64],
         rows: Vec<AgentOverlaySnapshotRow>,
     ) {
+        let mut pending_focus = None;
         apply_snapshot(
             tui,
             crate::config::UiTheme::default(),
@@ -594,6 +619,30 @@ mod tests {
             rows,
             1,
             pane_ids[0],
+            &mut pending_focus,
+        )
+        .unwrap();
+    }
+
+    fn apply_focus_snapshot(
+        tui: &mut Option<MultiPaneTui>,
+        layout: LayoutSnapshot,
+        tab_id: u64,
+        pane_id: u64,
+        pending_focus: &mut Option<(u64, u64)>,
+    ) {
+        apply_snapshot(
+            tui,
+            crate::config::UiTheme::default(),
+            &mut BTreeMap::new(),
+            String::from("room"),
+            layout,
+            vec![],
+            vec![],
+            vec![],
+            tab_id,
+            pane_id,
+            pending_focus,
         )
         .unwrap();
     }
@@ -607,6 +656,47 @@ mod tests {
             client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL),
             Some(vec![17])
         );
+    }
+
+    #[test]
+    fn stale_snapshot_preserves_pending_focus_after_applying_layout() {
+        let mut tui = None;
+        let mut pending_focus = None;
+        apply_focus_snapshot(&mut tui, layout(&[1, 2]), 1, 1, &mut pending_focus);
+        pending_focus = Some((1, 2));
+        let mut updated_layout = layout(&[1, 2]);
+        updated_layout.revision = 2;
+
+        apply_focus_snapshot(&mut tui, updated_layout, 1, 1, &mut pending_focus);
+
+        let tui = tui.unwrap();
+        assert_eq!(tui.snapshot().revision, 2);
+        assert_eq!((tui.current_tab(), tui.focused_pane()), (1, 2));
+        assert_eq!(pending_focus, Some((1, 2)));
+    }
+
+    #[test]
+    fn matching_snapshot_clears_pending_focus() {
+        let mut tui = None;
+        let mut pending_focus = Some((1, 2));
+
+        apply_focus_snapshot(&mut tui, layout(&[1, 2]), 1, 2, &mut pending_focus);
+
+        let tui = tui.unwrap();
+        assert_eq!((tui.current_tab(), tui.focused_pane()), (1, 2));
+        assert_eq!(pending_focus, None);
+    }
+
+    #[test]
+    fn snapshot_focus_replaces_pending_focus_when_layout_removes_it() {
+        let mut tui = None;
+        let mut pending_focus = Some((1, 2));
+
+        apply_focus_snapshot(&mut tui, layout(&[1]), 1, 1, &mut pending_focus);
+
+        let tui = tui.unwrap();
+        assert_eq!((tui.current_tab(), tui.focused_pane()), (1, 1));
+        assert_eq!(pending_focus, None);
     }
 
     #[test]
