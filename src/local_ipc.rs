@@ -12,6 +12,8 @@ use tokio::{
     sync::mpsc,
 };
 
+use crate::{layout::LayoutSnapshot, tui::UiIntent};
+
 const MAX_FRAME: usize = 1024 * 1024;
 pub const OUTBOUND_QUEUE: usize = 64;
 
@@ -21,7 +23,7 @@ pub enum ClientMessage {
     Probe,
     Hello { cols: u16, rows: u16 },
     Input { bytes: Vec<u8> },
-    StructuralIntent { intent: serde_json::Value },
+    StructuralIntent { intent: UiIntent },
     Resize { cols: u16, rows: u16 },
     Focus { tab_id: u64, pane_id: u64 },
     Detach { generation: u64 },
@@ -43,9 +45,9 @@ pub enum NodeMessage {
         room_name: String,
         role: String,
         summary: SessionSummary,
-        layout: serde_json::Value,
-        screens: serde_json::Value,
-        leases: serde_json::Value,
+        layout: LayoutSnapshot,
+        screens: Vec<PaneScreenSnapshot>,
+        leases: Vec<PaneLeaseSnapshot>,
         rosters: serde_json::Value,
         tab_id: u64,
         pane_id: u64,
@@ -62,6 +64,25 @@ pub enum NodeMessage {
     Error {
         message: String,
     },
+}
+
+/// Complete screen state for one pane. Attachments replace their local `GuestScreen` from this
+/// payload, so reconnects do not depend on a delta history.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PaneScreenSnapshot {
+    pub pane_id: u64,
+    pub sequence: u64,
+    pub snapshot: Vec<u8>,
+    pub kitty_keyboard_active: bool,
+}
+
+/// The subset of a pane lease needed by render chrome; lease authority stays in the node.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct PaneLeaseSnapshot {
+    pub pane_id: u64,
+    pub ready: bool,
+    pub controller_peer_id: Option<Vec<u8>>,
+    pub controller_active: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

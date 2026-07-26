@@ -1,32 +1,39 @@
 //! Terminal-facing half of a local session attachment.
 
 use std::{
+    collections::BTreeMap,
     io::{self, BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     time::Duration,
 };
 
 use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    },
     execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 
 use crate::{
     local_ipc::{ClientMessage, NodeMessage},
+    screen::GuestScreen,
     session_store::SessionDescriptor,
+    tui::{KeyHandling, MultiPaneTui, PaneViewState, render_multi_pane},
 };
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
+    let (initial_cols, initial_rows) = terminal::size()?;
     write_message(
         &mut stream,
         &ClientMessage::Hello {
-            cols: terminal::size()?.0,
-            rows: terminal::size()?.1,
+            cols: initial_cols,
+            rows: initial_rows,
         },
     )?;
     let generation = match read_message(&mut reader)? {
@@ -36,37 +43,96 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     };
     stream.set_nonblocking(true)?;
     let mut guard = ClientTerminalGuard::enter(&descriptor.name)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, initial_cols, initial_rows)),
+        },
+    )?;
+    let mut tui = None;
+    let mut screens = BTreeMap::new();
+    let mut dirty = false;
     let mut node_ended = false;
-    loop {
-        match read_message(&mut reader) {
-            Ok(Some(NodeMessage::Snapshot { screens, .. })) => {
-                draw(&descriptor.name, screens.as_str().unwrap_or_default())?
+
+    'attached: loop {
+        loop {
+            match read_message(&mut reader) {
+                Ok(Some(NodeMessage::Snapshot {
+                    room_name,
+                    layout,
+                    screens: next_screens,
+                    leases,
+                    tab_id,
+                    pane_id,
+                    ..
+                })) => {
+                    apply_snapshot(
+                        &mut tui,
+                        &mut screens,
+                        room_name,
+                        layout,
+                        next_screens,
+                        leases,
+                        tab_id,
+                        pane_id,
+                    )?;
+                    dirty = true;
+                }
+                Ok(Some(NodeMessage::Update { .. })) | Ok(Some(NodeMessage::Error { .. })) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    node_ended = true;
+                    break 'attached;
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    node_ended = true;
+                    break 'attached;
+                }
             }
-            Ok(Some(NodeMessage::Update { .. })) | Ok(Some(NodeMessage::Error { .. })) => {}
-            Ok(None) => {
-                node_ended = true;
-                break;
+        }
+        if dirty {
+            if let Some(tui) = tui.as_ref() {
+                terminal.draw(|frame| {
+                    let visible = screens
+                        .iter()
+                        .filter_map(|(pane_id, screen)| {
+                            screen.screen().map(|screen| (*pane_id, screen))
+                        })
+                        .collect();
+                    render_multi_pane(frame, tui, &visible);
+                })?;
             }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut => {}
-            Err(_) => {
-                node_ended = true;
-                break;
-            }
-            _ => {}
+            dirty = false;
         }
         if !event::poll(Duration::from_millis(16))? {
             continue;
         }
+        let Some(tui) = tui.as_mut() else {
+            continue;
+        };
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL {
-                    write_message(&mut stream, &ClientMessage::Detach { generation })?;
-                    break;
-                }
-                if let Some(bytes) = client_key_bytes(key.code, key.modifiers) {
-                    write_message(&mut stream, &ClientMessage::Input { bytes })?;
+                match tui.handle_key(key, terminal.size()?.into()) {
+                    KeyHandling::Quit => {
+                        write_message(&mut stream, &ClientMessage::Detach { generation })?;
+                        break;
+                    }
+                    KeyHandling::Consumed(intents) => {
+                        send_intents(&mut stream, tui, intents)?;
+                        dirty = true;
+                    }
+                    KeyHandling::Forward => {
+                        if let Some(bytes) = client_key_bytes(key.code, key.modifiers) {
+                            write_message(&mut stream, &ClientMessage::Input { bytes })?;
+                        }
+                    }
                 }
             }
             Event::Paste(text) => write_message(
@@ -75,8 +141,35 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     bytes: text.into_bytes(),
                 },
             )?,
+            Event::Mouse(mouse) => {
+                let area = terminal.size()?.into();
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) {
+                    let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
+                    let scrollback_len = screens
+                        .get(&pane_id)
+                        .and_then(GuestScreen::screen)
+                        .map(available_scrollback)
+                        .unwrap_or_default();
+                    tui.scroll_mouse_pane(
+                        mouse.column,
+                        mouse.row,
+                        area,
+                        scrollback_len,
+                        matches!(mouse.kind, MouseEventKind::ScrollUp),
+                    );
+                } else {
+                    let intents = tui.handle_mouse(mouse, area);
+                    send_intents(&mut stream, tui, intents)?;
+                }
+                dirty = true;
+            }
             Event::Resize(cols, rows) => {
-                write_message(&mut stream, &ClientMessage::Resize { cols, rows })?
+                terminal.resize(Rect::new(0, 0, cols, rows))?;
+                write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
+                dirty = true;
             }
             _ => {}
         }
@@ -89,6 +182,72 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             "Detached. Resume: p2pmux --resume  |  Attach: p2pmux attach {}  |  Kill: p2pmux kill {}",
             descriptor.name, descriptor.name
         );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_snapshot(
+    tui: &mut Option<MultiPaneTui>,
+    screens: &mut BTreeMap<u64, GuestScreen>,
+    room_name: String,
+    layout: crate::layout::LayoutSnapshot,
+    next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
+    leases: Vec<crate::local_ipc::PaneLeaseSnapshot>,
+    tab_id: u64,
+    pane_id: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let view = match tui {
+        Some(view) => {
+            view.apply_snapshot(layout)
+                .map_err(|error| io::Error::other(format!("invalid layout snapshot: {error:?}")))?;
+            view
+        }
+        None => tui
+            .insert(MultiPaneTui::new(layout).map_err(|error| {
+                io::Error::other(format!("invalid layout snapshot: {error:?}"))
+            })?),
+    };
+    view.set_title(format!("p2pmux ({room_name})"));
+    view.set_focus(tab_id, pane_id)
+        .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))?;
+    screens.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
+    for frame in next_screens {
+        let screen = screens.entry(frame.pane_id).or_default();
+        screen.apply_snapshot(frame.sequence, &frame.snapshot)?;
+        screen.set_kitty_keyboard_active(frame.kitty_keyboard_active);
+    }
+    for lease in leases {
+        view.set_pane_view(
+            lease.pane_id,
+            PaneViewState::from_chrome(
+                lease.ready,
+                lease.controller_peer_id,
+                lease.controller_active,
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn send_intents(
+    stream: &mut UnixStream,
+    tui: &MultiPaneTui,
+    intents: Vec<crate::tui::UiIntent>,
+) -> io::Result<()> {
+    for intent in intents {
+        match intent {
+            crate::tui::UiIntent::FocusPane { .. } | crate::tui::UiIntent::SwitchTab { .. } => {
+                write_message(
+                    stream,
+                    &ClientMessage::Focus {
+                        tab_id: tui.current_tab(),
+                        pane_id: tui.focused_pane(),
+                    },
+                )?;
+            }
+            intent => write_message(stream, &ClientMessage::StructuralIntent { intent })?,
+        }
     }
     Ok(())
 }
@@ -116,18 +275,12 @@ pub fn shutdown(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn draw(name: &str, screen: &str) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    writeln!(stdout, "p2pmux ({name})")?;
-    write!(stdout, "{screen}")?;
-    stdout.flush()
-}
 fn write_message(stream: &mut UnixStream, message: &ClientMessage) -> io::Result<()> {
     serde_json::to_writer(&mut *stream, message).map_err(io::Error::other)?;
     stream.write_all(b"\n")?;
     stream.flush()
 }
+
 fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<NodeMessage>> {
     let mut line = String::new();
     match reader.read_line(&mut line) {
@@ -159,9 +312,17 @@ fn client_key_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
     }
 }
 
+fn available_scrollback(screen: &vt100::Screen) -> usize {
+    let mut screen = screen.clone();
+    screen.set_scrollback(crate::screen::SCROLLBACK_LINES);
+    screen.scrollback()
+}
+
 struct ClientTerminalGuard {
     raw: bool,
     alternate: bool,
+    paste: bool,
+    mouse: bool,
 }
 impl ClientTerminalGuard {
     fn enter(name: &str) -> io::Result<Self> {
@@ -169,14 +330,26 @@ impl ClientTerminalGuard {
         execute!(
             io::stdout(),
             SetTitle(format!("p2pmux ({name})")),
-            EnterAlternateScreen
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
         )?;
         Ok(Self {
             raw: true,
             alternate: true,
+            paste: true,
+            mouse: true,
         })
     }
     fn leave(&mut self) -> io::Result<()> {
+        if self.mouse {
+            execute!(io::stdout(), DisableMouseCapture)?;
+            self.mouse = false;
+        }
+        if self.paste {
+            execute!(io::stdout(), DisableBracketedPaste)?;
+            self.paste = false;
+        }
         if self.alternate {
             execute!(io::stdout(), LeaveAlternateScreen)?;
             self.alternate = false;

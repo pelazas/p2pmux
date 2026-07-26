@@ -1,4 +1,7 @@
-use p2pmux::local_ipc::{AttachmentGate, ClientMessage, NodeMessage, SessionSummary};
+use p2pmux::{
+    layout::LayoutSnapshot,
+    local_ipc::{AttachmentGate, ClientMessage, NodeMessage, SessionSummary},
+};
 
 #[test]
 fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
@@ -6,9 +9,14 @@ fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
         room_name: "amber-otter-01".into(),
         role: "coordinator".into(),
         summary: SessionSummary::default(),
-        layout: serde_json::json!({}),
-        screens: serde_json::json!({}),
-        leases: serde_json::json!({}),
+        layout: LayoutSnapshot {
+            revision: 0,
+            members: vec![],
+            tabs: vec![],
+            panes: Default::default(),
+        },
+        screens: Default::default(),
+        leases: Default::default(),
         rosters: serde_json::json!({}),
         tab_id: 2,
         pane_id: 3,

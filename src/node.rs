@@ -13,13 +13,16 @@ use std::{
         fs::OpenOptionsExt,
         net::{UnixListener, UnixStream},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    local_ipc::{AttachmentGate, ClientMessage, NodeMessage, SessionSummary},
+    local_ipc::{
+        AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot, PaneScreenSnapshot,
+        SessionSummary,
+    },
     rendezvous::LocalRendezvous,
     session::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
@@ -234,7 +237,9 @@ fn run_socket_loop(
                                 write_message(&mut stream, &NodeMessage::ProbeAck)?;
                                 let _ = gate.detach(generation);
                             }
-                            Ok(Some(ClientMessage::Hello { .. })) => {
+                            Ok(Some(ClientMessage::Hello { cols, rows })) => {
+                                node.resize(cols, rows)
+                                    .map_err(|error| io::Error::other(error.to_string()))?;
                                 write_message(
                                     &mut stream,
                                     &NodeMessage::AttachAccepted { generation },
@@ -285,7 +290,7 @@ fn run_socket_loop(
                 Err(error) => return Err(error),
             }
         }
-        let changed = node
+        let mut changed = node
             .drain()
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut detached = false;
@@ -295,6 +300,21 @@ fn run_socket_loop(
                 Ok(Some(ClientMessage::Input { bytes })) => node
                     .input(bytes)
                     .map_err(|error| io::Error::other(error.to_string()))?,
+                Ok(Some(ClientMessage::StructuralIntent { intent })) => {
+                    node.intent(intent)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    changed = true;
+                }
+                Ok(Some(ClientMessage::Resize { cols, rows })) => {
+                    node.resize(cols, rows)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    changed = true;
+                }
+                Ok(Some(ClientMessage::Focus { tab_id, pane_id })) => {
+                    node.focus(tab_id, pane_id)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    changed = true;
+                }
                 Ok(Some(ClientMessage::Detach {
                     generation: requested,
                 })) if requested == *generation => {
@@ -385,6 +405,18 @@ fn write_snapshot(
     _generation: u64,
 ) -> io::Result<()> {
     let (tab_id, pane_id) = node.local_focus();
+    let (layout, screens, leases) = node.snapshot();
+    let hosts = layout
+        .panes
+        .values()
+        .map(|pane| pane.host_peer_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u32;
+    let coordinator_name = layout
+        .members
+        .first()
+        .map(|member| member.display_name.clone())
+        .unwrap_or_default();
     write_message(
         stream,
         &NodeMessage::Snapshot {
@@ -395,14 +427,34 @@ fn write_snapshot(
             }
             .into(),
             summary: SessionSummary {
-                tabs: 1,
-                panes: 1,
-                hosts: 1,
-                coordinator_name: String::new(),
+                tabs: layout.tabs.len() as u32,
+                panes: layout.panes.len() as u32,
+                hosts,
+                coordinator_name,
             },
-            layout: serde_json::json!({}),
-            screens: serde_json::json!(node.screen_text()),
-            leases: serde_json::json!({}),
+            layout,
+            screens: screens
+                .into_iter()
+                .map(
+                    |(pane_id, (sequence, snapshot, kitty_keyboard_active))| PaneScreenSnapshot {
+                        pane_id,
+                        sequence,
+                        snapshot,
+                        kitty_keyboard_active,
+                    },
+                )
+                .collect(),
+            leases: leases
+                .into_iter()
+                .map(
+                    |(pane_id, (ready, controller_peer_id, controller_active))| PaneLeaseSnapshot {
+                        pane_id,
+                        ready,
+                        controller_peer_id,
+                        controller_active,
+                    },
+                )
+                .collect(),
             rosters: serde_json::json!({}),
             tab_id,
             pane_id,
@@ -437,11 +489,23 @@ impl SharedLayoutNode {
     pub fn local_focus(&self) -> (u64, u64) {
         (self.last_tab_id, self.last_pane_id)
     }
-    pub fn screen_text(&self) -> String {
-        self.runtime.node_screen_text()
+    pub fn snapshot(
+        &self,
+    ) -> (
+        crate::layout::LayoutSnapshot,
+        std::collections::BTreeMap<u64, (u64, Vec<u8>, bool)>,
+        std::collections::BTreeMap<u64, (bool, Option<Vec<u8>>, bool)>,
+    ) {
+        self.runtime.node_snapshot()
     }
-    pub fn tick_due(&self) -> Instant {
-        Instant::now()
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
+        self.runtime.node_resize(cols, rows)
+    }
+    pub fn focus(&mut self, tab_id: u64, pane_id: u64) -> Result<(), Box<dyn Error>> {
+        self.runtime.node_focus(tab_id, pane_id)
+    }
+    pub fn intent(&mut self, intent: crate::tui::UiIntent) -> Result<(), Box<dyn Error>> {
+        self.runtime.node_intent(intent)
     }
     pub fn shutdown(self) {
         self.runtime.shutdown_node();

@@ -1,5 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
+mod pane_map {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{Pane, PaneId};
+
+    pub fn serialize<S>(panes: &BTreeMap<PaneId, Pane>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        panes.values().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<PaneId, Pane>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<Pane>::deserialize(deserializer)?
+            .into_iter()
+            .map(|pane| (pane.pane_id, pane))
+            .collect())
+    }
+}
+
 pub const MAX_MEMBERS: usize = 8;
 pub const MAX_TABS: usize = 9;
 pub const MAX_PANES_PER_TAB: usize = 8;
@@ -16,20 +43,23 @@ pub type PaneId = u64;
 pub type TabId = u64;
 pub type ReservationId = u64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Axis {
     LeftRight,
     TopBottom,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NewPanePosition {
     First,
     #[default]
     Second,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Node {
     Leaf {
         pane_id: PaneId,
@@ -42,14 +72,14 @@ pub enum Node {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Member {
     pub peer_id: Vec<u8>,
     pub endpoint_addr: Vec<u8>,
     pub display_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Pane {
     pub pane_id: PaneId,
     pub host_peer_id: Vec<u8>,
@@ -57,17 +87,18 @@ pub struct Pane {
     pub grid_cols: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Tab {
     pub tab_id: TabId,
     pub root: Node,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LayoutSnapshot {
     pub revision: u64,
     pub members: Vec<Member>,
     pub tabs: Vec<Tab>,
+    #[serde(with = "pane_map")]
     pub panes: BTreeMap<PaneId, Pane>,
 }
 
