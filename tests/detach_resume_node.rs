@@ -188,9 +188,18 @@ fn run_detach_resume_round_trip(
     );
 
     send(&mut stream, &ClientMessage::Detach { generation });
+    let detach_deadline = Instant::now() + RECEIVE_TIMEOUT;
     loop {
-        if matches!(receive(&mut reader, "detach acknowledgement"), NodeMessage::DetachAck { generation: ack } if ack == generation)
-        {
+        assert!(
+            Instant::now() < detach_deadline,
+            "timed out waiting for detach acknowledgement"
+        );
+        if matches!(
+            receive_until_deadline(&mut reader, detach_deadline, "detach acknowledgement"),
+            NodeMessage::DetachAck {
+                generation: ack
+            } if ack == generation
+        ) {
             break;
         }
     }
