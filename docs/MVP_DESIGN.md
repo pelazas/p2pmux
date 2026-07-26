@@ -8,7 +8,7 @@ This document is the **source of truth** for the MVP. Older Notion section pages
 
 ## 0. Trust warning (product + README + invite UI)
 
-This is a **fully trusted shared-shell** session. Anyone with the join ticket can see every pane and may obtain interactive control of available terminals (run commands, see output, touch files reachable to that macOS user). Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege Mac account and avoid production credentials in shared panes.
+This is a **fully trusted shared-shell** session. Anyone with the join ticket can see every pane and may obtain interactive control of unlocked terminals (run commands, see output, touch files reachable to that macOS user). A pane host can temporarily make its own pane host-only, but locking is not an ACL. Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege Mac account and avoid production credentials in shared panes.
 
 **Clarification:** Processes and credential *files* stay on the pane host’s Mac (not uploaded to peers). That does **not** stop a controller from using or displaying them via the shared shell.
 
@@ -32,6 +32,9 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 - **Input:** a pane has a controller only while that peer is actively typing. After about eight
   seconds idle, the host clears the controller and the pane is free; the next ordinary key claims
   it and is delivered as the first input. Active typing is protected; there is no forced takeover.
+- **Pane lock:** a pane host may toggle its own pane to host-only. All members still see its
+  screen, but only its host may input or claim control. Locking clears a guest controller and does
+  not claim control for the host.
 - **Later-spike disconnect behavior:** 5-minute unavailable placeholders and coordinator failover
   are MVP goals, not implemented by Spike 3.
 - **Layout:** nested binary 50/50; **depth ≤ 4**; **≤ 8 panes/tab**; max **9 tabs**.
@@ -111,7 +114,8 @@ The last pane in a tab must be removed by deleting the tab; the final tab is ret
 
 ### Spike 3 controls
 
-`Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` then `e`
+`Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` then `k`
+toggles host-only lock for a host-owned focused pane; `Ctrl+P` then `e`
 renames the focused pane for all admitted members. `Ctrl+P` plus arrows moves focus. `Ctrl+T` then
 `N` creates a tab; `Ctrl+T` then `X` requests tab deletion; `Ctrl+T` then `e` renames the current
 tab for all admitted members; `Ctrl+T` plus left/right switches tabs. Rename uses Enter to save and
@@ -125,7 +129,8 @@ the local view while the session node remains live; F9 and F10 reach the focused
 ## 5. UI / presence
 
 Tabs + nested splits as above. Tab labels are clickable for local tab switching. Each pane title is
-`Pane #N  host: <name>  control: free|<name>|…`; a focused free pane has a white border, an
+`Pane #N  host: <name>  control: free|<name>|…|host-only`; a locked pane also reserves a
+right-aligned `(locked by <host>)` badge. A focused free pane has a white border, an
 actively controlled pane a red-orange border, and an unbootstrapped lease a yellow focused border.
 The dark contextual footer uses red key accents: normal mode shows
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free`; pane and tab modes show their
@@ -156,7 +161,7 @@ See [SPIKE_PLAN.md](./SPIKE_PLAN.md).
 ## 10. MVP success criteria
 
 Two (then more) Macs join via reusable ticket; shared layout; both host panes; anyone can split
-available panes; pane hosts delete their own panes; all-host tabs can be deleted; free-pane first-
+available panes; pane hosts delete and lock their own panes; all-host tabs can be deleted; free-pane first-
 key claims and protected active typing; presence; locality of processes; encrypted P2P/relay; ≈ SSH feel;
 disconnect grace works; coordinator leave does not kill whole session.
 
