@@ -5188,10 +5188,7 @@ mod tests {
             buffer[(panel.x.saturating_add(1), panel.y)].modifier,
             Modifier::BOLD
         );
-        assert_eq!(
-            buffer[(inner.x, inner.y)].bg,
-            Color::DarkGray
-        );
+        assert_eq!(buffer[(inner.x, inner.y)].bg, Color::DarkGray);
         assert_eq!(
             buffer[(inner.x, inner.y.saturating_add(1))].bg,
             Color::DarkGray
