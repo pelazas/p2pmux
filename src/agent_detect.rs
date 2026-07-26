@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const DONE_GRACE: Duration = Duration::from_secs(15);
 const WORKING_WINDOW: Duration = Duration::from_secs(2);
@@ -22,14 +22,14 @@ impl AgentKind {
     pub fn from_process(exe_basename: &str, name: &str, cmdline: &[String]) -> Option<Self> {
         if matches_launcher(exe_basename, name, cmdline, "claude") {
             Some(Self::Claude)
-        } else if matches_launcher(exe_basename, name, cmdline, "codex") {
-            Some(Self::Codex)
         } else if matches_launcher(exe_basename, name, cmdline, "cursor-agent")
             || cmdline
                 .iter()
                 .any(|argument| argument.contains("cursor-agent"))
         {
             Some(Self::Cursor)
+        } else if matches_launcher(exe_basename, name, cmdline, "codex") {
+            Some(Self::Codex)
         } else if matches_launcher(exe_basename, name, cmdline, "pi")
             || cmdline
                 .iter()
@@ -112,7 +112,14 @@ impl Default for SysinfoSampler {
 
 impl ProcessSampler for SysinfoSampler {
     fn snapshot(&mut self) -> Vec<ProcessSnapshot> {
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::Always)
+                .with_cmd(UpdateKind::Always)
+                .with_cwd(UpdateKind::Always),
+        );
         self.system
             .processes()
             .values()
@@ -360,6 +367,10 @@ mod tests {
         ];
         assert_eq!(
             AgentKind::from_process("node", "node", &cursor_argv),
+            Some(AgentKind::Cursor)
+        );
+        assert_eq!(
+            AgentKind::from_process("codex", "agent", &cursor_argv),
             Some(AgentKind::Cursor)
         );
 
