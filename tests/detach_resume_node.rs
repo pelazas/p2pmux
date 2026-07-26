@@ -87,7 +87,7 @@ fn detached_node_serves_real_snapshots_and_accepts_a_new_attachment() {
     let socket_path = store.socket_path(&id).unwrap();
     let descriptor = SessionDescriptor::new(
         id,
-        "amber-otter-01".into(),
+        "lisbon".into(),
         socket_path.clone(),
         1,
         SessionRole::Coordinator,

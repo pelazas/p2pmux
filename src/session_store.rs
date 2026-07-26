@@ -4,6 +4,7 @@
 //! state (PTYs, tickets, screens, and focus) belongs to the node process, never to disk.
 
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, BufRead, Write},
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
@@ -15,6 +16,107 @@ use getrandom::fill;
 use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
+
+const CITY_NAMES: &[&str] = &[
+    "abu-dhabi",
+    "accra",
+    "amsterdam",
+    "ankara",
+    "athens",
+    "auckland",
+    "bangkok",
+    "barcelona",
+    "beijing",
+    "beirut",
+    "belgrade",
+    "berlin",
+    "bogota",
+    "boston",
+    "brasilia",
+    "brussels",
+    "buenos-aires",
+    "cairo",
+    "calgary",
+    "cape-town",
+    "caracas",
+    "chicago",
+    "copenhagen",
+    "dakar",
+    "dallas",
+    "delhi",
+    "denver",
+    "dhaka",
+    "doha",
+    "dublin",
+    "edinburgh",
+    "firenze",
+    "frankfurt",
+    "geneva",
+    "guangzhou",
+    "guatemala-city",
+    "hanoi",
+    "helsinki",
+    "hong-kong",
+    "honolulu",
+    "houston",
+    "istanbul",
+    "jakarta",
+    "jerusalem",
+    "johannesburg",
+    "kathmandu",
+    "kuala-lumpur",
+    "kyiv",
+    "lagos",
+    "lima",
+    "lisbon",
+    "london",
+    "los-angeles",
+    "madrid",
+    "manila",
+    "melbourne",
+    "mexico-city",
+    "miami",
+    "milan",
+    "montreal",
+    "mumbai",
+    "munich",
+    "nairobi",
+    "new-york",
+    "osaka",
+    "oslo",
+    "ottawa",
+    "paris",
+    "perth",
+    "philadelphia",
+    "prague",
+    "reykjavik",
+    "rio-de-janeiro",
+    "riyadh",
+    "rome",
+    "san-diego",
+    "san-francisco",
+    "san-jose",
+    "santiago",
+    "sao-paulo",
+    "seattle",
+    "seoul",
+    "shanghai",
+    "singapore",
+    "stockholm",
+    "sydney",
+    "taipei",
+    "tallinn",
+    "tehran",
+    "tel-aviv",
+    "tokyo",
+    "toronto",
+    "vancouver",
+    "vienna",
+    "warsaw",
+    "washington",
+    "wellington",
+    "zurich",
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,20 +310,37 @@ pub fn generate_id() -> io::Result<String> {
 }
 
 pub fn generate_name() -> io::Result<String> {
-    const ADJECTIVES: &[&str] = &[
-        "amber", "brisk", "cobalt", "daring", "ember", "fuzzy", "golden", "lunar",
-    ];
-    const NOUNS: &[&str] = &[
-        "badger", "comet", "falcon", "harbor", "meadow", "otter", "pine", "river",
-    ];
-    let mut bytes = [0u8; 3];
+    generate_name_from_store(&SessionStore::for_current_user()?)
+}
+
+fn generate_name_from_store(store: &SessionStore) -> io::Result<String> {
+    let live_names = store
+        .list_live()?
+        .into_iter()
+        .map(|session| session.name)
+        .collect();
+    let mut bytes = [0u8; 8];
     fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(format!(
-        "{}-{}-{:02x}",
-        ADJECTIVES[usize::from(bytes[0]) % ADJECTIVES.len()],
-        NOUNS[usize::from(bytes[1]) % NOUNS.len()],
-        bytes[2]
-    ))
+    let index = u64::from_le_bytes(bytes) as usize % CITY_NAMES.len();
+    Ok(available_city_name(&live_names, index))
+}
+
+fn available_city_name(live_names: &HashSet<String>, start: usize) -> String {
+    for offset in 0..CITY_NAMES.len() {
+        let city = CITY_NAMES[(start + offset) % CITY_NAMES.len()];
+        if !live_names.contains(city) {
+            return city.to_owned();
+        }
+    }
+
+    let city = CITY_NAMES[start % CITY_NAMES.len()];
+    for suffix in 2.. {
+        let name = format!("{city}-{suffix}");
+        if !live_names.contains(&name) {
+            return name;
+        }
+    }
+    unreachable!("an unbounded suffix range always yields a name")
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -306,7 +425,7 @@ mod tests {
         let socket = store.socket_path(&id).unwrap();
         let descriptor = SessionDescriptor::new(
             id.clone(),
-            "amber-otter-01".into(),
+            "lisbon".into(),
             socket,
             42,
             SessionRole::Coordinator,
@@ -332,7 +451,7 @@ mod tests {
         store
             .write(&SessionDescriptor::new(
                 id.clone(),
-                "amber-otter-01".into(),
+                "lisbon".into(),
                 socket,
                 42,
                 SessionRole::Coordinator,
@@ -369,7 +488,7 @@ mod tests {
         store
             .write(&SessionDescriptor::new(
                 id.clone(),
-                "amber-otter-01".into(),
+                "lisbon".into(),
                 socket.clone(),
                 42,
                 SessionRole::Coordinator,
@@ -380,5 +499,36 @@ mod tests {
         assert_eq!(live[0].id, id);
         server.join().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_names_are_valid_world_cities() {
+        let name = generate_name_from_store(&store()).unwrap();
+
+        assert!((80..=150).contains(&CITY_NAMES.len()));
+        assert!(CITY_NAMES.iter().all(|city| valid_name(city)));
+        assert!(CITY_NAMES.contains(&name.as_str()));
+    }
+
+    #[test]
+    fn city_name_skips_live_names() {
+        let live_names = HashSet::from([CITY_NAMES[0].to_owned()]);
+
+        assert_eq!(available_city_name(&live_names, 0), CITY_NAMES[1]);
+    }
+
+    #[test]
+    fn city_name_adds_suffix_after_all_cities_are_live() {
+        let mut live_names: HashSet<_> = CITY_NAMES.iter().map(|city| (*city).to_owned()).collect();
+
+        assert_eq!(
+            available_city_name(&live_names, 0),
+            format!("{}-2", CITY_NAMES[0])
+        );
+        live_names.insert(format!("{}-2", CITY_NAMES[0]));
+        assert_eq!(
+            available_city_name(&live_names, 0),
+            format!("{}-3", CITY_NAMES[0])
+        );
     }
 }
