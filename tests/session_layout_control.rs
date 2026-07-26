@@ -84,6 +84,8 @@ fn create_request(request_id: u64, base_revision: u64) -> LayoutRequest {
         delete_pane: None,
         create_tab: None,
         delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: None,
     }
 }
 
@@ -373,6 +375,8 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
                     grid_cols: 80,
                 }),
                 delete_tab: None,
+                set_split_ratio: None,
+                update_pane_grids: None,
             })),
         })
         .await
@@ -438,6 +442,8 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
                 grid_cols: 80,
             }),
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         })
         .expect("queue tab request");
     let reservation = match next_event(&mut second).await {
@@ -469,6 +475,8 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             delete_tab: Some(DeleteTab {
                 tab_id: reservation.tab_id.expect("tab reservation"),
             }),
+            set_split_ratio: None,
+            update_pane_grids: None,
         })
         .expect("queue tab delete");
     for member in [&mut first, &mut second] {
@@ -546,6 +554,8 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             }),
             create_tab: None,
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         })
         .expect("queue deletion");
     assert!(
@@ -563,6 +573,8 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             delete_pane: Some(DeletePane { pane_id: 1 }),
             create_tab: None,
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         })
         .expect("queue foreign deletion");
     assert!(matches!(

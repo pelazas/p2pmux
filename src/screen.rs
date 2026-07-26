@@ -100,6 +100,26 @@ impl HostScreen {
         Ok(frame)
     }
 
+    /// Resize the parser and force consumers to replace rather than delta-apply their screen.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<ScreenFrame, ScreenError> {
+        validate_dimensions(rows, cols)?;
+        let sequence = self
+            .current
+            .sequence
+            .checked_add(1)
+            .ok_or(ScreenError::SequenceExhausted)?;
+        self.parser.screen_mut().set_size(rows, cols);
+        self.previous = self.parser.screen().clone();
+        let frame = ScreenFrame {
+            sequence,
+            base_sequence: 0,
+            snapshot: snapshot_payload(self.parser.screen())?,
+            delta: Arc::from([]),
+        };
+        self.current = frame.clone();
+        Ok(frame)
+    }
+
     pub fn current_frame(&self) -> &ScreenFrame {
         &self.current
     }

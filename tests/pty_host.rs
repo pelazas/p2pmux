@@ -49,3 +49,34 @@ fn pty_host_reads_output_and_writes_input() {
     host.shutdown().expect("PTY should shut down cleanly");
     assert!(host.output_closed());
 }
+
+#[test]
+fn pty_host_resizes_without_disrupting_io() {
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf ready; IFS= read -r line; printf ':reply:%s' \"$line\"",
+    ]);
+    let mut host = PtyHost::spawn(
+        command,
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )
+    .expect("PTY should spawn");
+    host.resize(PtySize {
+        rows: 30,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .expect("resize succeeds");
+    assert!(read_until(&mut host, "ready").contains("ready"));
+    host.write_input(b"still alive\n")
+        .expect("writer stays alive");
+    assert!(read_until(&mut host, ":reply:still alive").contains("still alive"));
+    host.shutdown().expect("clean shutdown");
+}

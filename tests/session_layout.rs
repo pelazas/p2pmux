@@ -2,7 +2,8 @@ use iroh::{EndpointAddr, SecretKey};
 use p2pmux::{
     protocol::{
         CreatePane, CreateTab, DeletePane, DeleteTab, LayoutCommit, LayoutRejectReason,
-        LayoutRequest, NewPanePosition, PaneFailed, PaneReady, SplitAxis,
+        LayoutRequest, NewPanePosition, PaneFailed, PaneGrid, PaneReady, SetSplitRatio, SplitAxis,
+        UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -41,7 +42,79 @@ fn request(request_id: u64, base_revision: u64) -> LayoutRequest {
         delete_pane: None,
         create_tab: None,
         delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: None,
     }
+}
+
+#[test]
+fn admitted_members_set_ratios_and_hosts_reconcile_their_grids() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member admitted");
+    // Create through the established reservation flow so pane 2 is hosted by B.
+    let reservation = coordinator.handle_request(
+        &host_b(),
+        LayoutRequest {
+            create_pane: Some(p2pmux::protocol::CreatePane {
+                target_pane_id: 1,
+                axis: Some(SplitAxis::LeftRight as i32),
+                grid_rows: 24,
+                grid_cols: 80,
+                position: None,
+            }),
+            ..request(1, 2)
+        },
+    );
+    let reservation = match reservation {
+        CoordinatorResponse::Reservation(value) => value,
+        other => panic!("reservation: {other:?}"),
+    };
+    let _ = commit(coordinator.handle_pane_ready(
+        &host_b(),
+        PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 2,
+            request_id: 1,
+        },
+    ));
+    let ratio = commit(coordinator.handle_request(
+        &host_a(),
+        LayoutRequest {
+            set_split_ratio: Some(SetSplitRatio {
+                pane_id: 2,
+                axis: Some(SplitAxis::LeftRight as i32),
+                first_share_bps: 7_500,
+            }),
+            ..request(2, 3)
+        },
+    ));
+    assert_eq!(ratio.revision, 4);
+    let grids = commit(coordinator.handle_request(
+        &host_b(),
+        LayoutRequest {
+            update_pane_grids: Some(UpdatePaneGrids {
+                panes: vec![PaneGrid {
+                    pane_id: 2,
+                    grid_rows: 30,
+                    grid_cols: 100,
+                }],
+            }),
+            ..request(3, 4)
+        },
+    ));
+    assert_eq!(
+        grids
+            .state
+            .expect("state")
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == 2)
+            .expect("pane")
+            .grid_rows,
+        30
+    );
 }
 
 fn commit(response: CoordinatorResponse) -> LayoutCommit {

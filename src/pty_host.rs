@@ -93,6 +93,15 @@ impl PtyHost {
         Ok(())
     }
 
+    /// Resize the local PTY while retaining its existing reader and writer handles.
+    pub fn resize(&mut self, size: PtySize) -> Result<(), Box<dyn Error>> {
+        self.master
+            .as_mut()
+            .ok_or("PTY master is shut down")?
+            .resize(size)?;
+        Ok(())
+    }
+
     /// Stop the child, release its PTY handles, and join the reader once.
     pub fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(mut child) = self.child.take()

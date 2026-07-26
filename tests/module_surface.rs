@@ -17,5 +17,5 @@ fn exposes_the_scaffold_module_boundaries() {
     let _: Option<JoinTicket> = None;
     let _: Option<HostSession> = None;
     let _: Option<Envelope> = None;
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
 }

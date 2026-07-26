@@ -137,3 +137,27 @@ fn malformed_and_oversize_payloads_are_rejected() {
             .is_err()
     );
 }
+
+#[test]
+fn resize_forces_a_replacement_snapshot_for_guests() {
+    let mut host = HostScreen::new(2, 3).expect("grid");
+    let before = host.process_pty(b"abc").expect("frame");
+    let resized = host.resize(4, 5).expect("resize");
+    assert_eq!(host.screen().size(), (4, 5));
+    assert!(resized.sequence > before.sequence);
+    assert_eq!(resized.base_sequence, 0);
+    assert!(resized.delta.is_empty());
+
+    let mut guest = GuestScreen::new();
+    guest
+        .apply_snapshot(before.sequence, &before.snapshot)
+        .expect("old snapshot");
+    assert_eq!(
+        guest.apply_delta(resized.base_sequence, resized.sequence, &resized.delta),
+        Err(p2pmux::screen::ScreenError::InvalidSequence)
+    );
+    guest
+        .apply_snapshot(resized.sequence, &resized.snapshot)
+        .expect("replacement snapshot");
+    assert_eq!(guest.screen().expect("screen").size(), (4, 5));
+}
