@@ -48,7 +48,8 @@ use crate::{
     layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     protocol::{
-        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRequest,
+        AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
+        DeleteTab, LayoutRequest,
         NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
         SplitAxis,
     },
@@ -77,6 +78,7 @@ const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
 
 enum FooterSegment {
     Text(&'static str),
@@ -179,6 +181,16 @@ pub enum KeyHandling {
     Quit,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentOverlayRow {
+    pub pane_id: PaneId,
+    pub kind: String,
+    pub cwd: String,
+    pub state: AgentRosterState,
+    pub host: String,
+    pub controller: String,
+}
+
 /// Rectangles for one rendered terminal frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneGeometry {
@@ -238,6 +250,10 @@ pub struct MultiPaneTui {
     pending_created_pane: Option<PaneId>,
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
+    agent_rows: Vec<AgentOverlayRow>,
+    agent_overlay_open: bool,
+    agent_selected_pane: Option<PaneId>,
+    pending_agent_toggle: Option<Instant>,
 }
 
 impl MultiPaneTui {
@@ -262,6 +278,10 @@ impl MultiPaneTui {
             pending_created_pane: None,
             selection: None,
             selection_dragging: false,
+            agent_rows: Vec::new(),
+            agent_overlay_open: false,
+            agent_selected_pane: None,
+            pending_agent_toggle: None,
         })
     }
 
@@ -279,6 +299,34 @@ impl MultiPaneTui {
 
     pub fn chord_mode(&self) -> ChordMode {
         self.chord_mode
+    }
+
+    pub fn overlay_open(&self) -> bool { self.agent_overlay_open }
+
+    pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
+        rows.retain(|row| self.snapshot.panes.contains_key(&row.pane_id));
+        rows.sort_by_key(|row| (self.pane_order(row.pane_id), row.pane_id));
+        if self.agent_rows == rows { return false; }
+        self.agent_rows = rows;
+        if self.agent_selected_pane.is_some_and(|pane_id| !self.agent_rows.iter().any(|row| row.pane_id == pane_id)) {
+            self.agent_selected_pane = self.agent_rows.first().map(|row| row.pane_id);
+        }
+        if self.agent_selected_pane.is_none() { self.agent_selected_pane = self.agent_rows.first().map(|row| row.pane_id); }
+        true
+    }
+
+    fn pane_order(&self, pane_id: PaneId) -> usize {
+        self.snapshot.tabs.iter().flat_map(|tab| visible_leaf_panes(&tab.root)).position(|id| id == pane_id).unwrap_or(usize::MAX)
+    }
+
+    fn expire_agent_toggle(&mut self, now: Instant) -> bool {
+        if self.pending_agent_toggle.is_some_and(|then| now.duration_since(then) >= AGENT_TOGGLE_WINDOW) {
+            self.pending_agent_toggle = None;
+            self.agent_overlay_open = true;
+            self.exit_chord_mode();
+            return true;
+        }
+        false
     }
 
     fn exit_chord_mode(&mut self) {
@@ -545,6 +593,17 @@ impl MultiPaneTui {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
+        if self.agent_overlay_open {
+            return self.handle_agent_overlay_key(key);
+        }
+        if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
+            if self.pending_agent_toggle.is_some_and(|then| then.elapsed() <= AGENT_TOGGLE_WINDOW) {
+                self.pending_agent_toggle = None;
+                return KeyHandling::Forward;
+            }
+            self.pending_agent_toggle = Some(Instant::now());
+            return KeyHandling::Consumed(vec![]);
+        }
         if is_quit(key) {
             self.exit_chord_mode();
             return KeyHandling::Quit;
@@ -593,6 +652,32 @@ impl MultiPaneTui {
             self.exit_chord_mode();
             KeyHandling::Forward
         }
+    }
+
+    fn handle_agent_overlay_key(&mut self, key: KeyEvent) -> KeyHandling {
+        match key.code {
+            KeyCode::Esc => { self.agent_overlay_open = false; KeyHandling::Consumed(vec![]) }
+            KeyCode::Up | KeyCode::Char('k') => { self.move_agent_selection(false); KeyHandling::Consumed(vec![]) }
+            KeyCode::Down | KeyCode::Char('j') => { self.move_agent_selection(true); KeyHandling::Consumed(vec![]) }
+            KeyCode::Enter => {
+                let Some(pane_id) = self.agent_selected_pane else { return KeyHandling::Consumed(vec![]); };
+                if let Some(tab) = self.snapshot.tabs.iter().find(|tab| contains_leaf(&tab.root, pane_id)) {
+                    self.current_tab = tab.tab_id;
+                    self.focused_pane = pane_id;
+                    self.agent_overlay_open = false;
+                    KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id }])
+                } else { KeyHandling::Consumed(vec![]) }
+            }
+            _ => KeyHandling::Consumed(vec![]),
+        }
+    }
+
+    fn move_agent_selection(&mut self, forward: bool) {
+        if self.agent_rows.is_empty() { self.agent_selected_pane = None; return; }
+        let current = self.agent_selected_pane.and_then(|pane| self.agent_rows.iter().position(|row| row.pane_id == pane)).unwrap_or(0);
+        let len = self.agent_rows.len();
+        let next = if forward { (current + 1) % len } else { (current + len - 1) % len };
+        self.agent_selected_pane = Some(self.agent_rows[next].pane_id);
     }
 
     fn handle_pane_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
@@ -1411,6 +1496,55 @@ fn render_shared_multi_pane(
             frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), content);
         }
     }
+    if tui.agent_overlay_open {
+        render_agents_overlay(frame, tui);
+    }
+}
+
+fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(88).max(24);
+    let height = area.height.saturating_sub(4).min(18).max(5);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y.saturating_add(area.height.saturating_sub(height) / 2),
+        width.min(area.width),
+        height.min(area.height),
+    );
+    frame.render_widget(Clear, panel);
+    let block = Block::bordered().title(" Agents ");
+    let inner = block.inner(panel);
+    frame.render_widget(block, panel);
+    if tui.agent_rows.is_empty() {
+        frame.render_widget(Paragraph::new("No agents running"), inner);
+        return;
+    }
+    let lines = tui.agent_rows.iter().map(|row| {
+        let marker = if tui.agent_selected_pane == Some(row.pane_id) { "›" } else { " " };
+        let prefix = format!("{marker} {} {} ", overlay_kind_label(&row.kind), overlay_state_label(row.state));
+        let detail = format!("{} · {} · {}", truncate_leading(&row.cwd, usize::from(inner.width.saturating_sub(text_width(&prefix)))), row.host, row.controller);
+        Line::from(vec![Span::styled(prefix, Style::default().fg(Color::Yellow)), Span::raw(detail)])
+    }).collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn overlay_kind_label(kind: &str) -> &'static str {
+    match kind { "claude" => "Claude Code", "codex" => "Codex", "cursor" => "Cursor Agent", "pi" => "Pi", _ => "Unknown" }
+}
+
+fn overlay_state_label(state: AgentRosterState) -> &'static str {
+    match state { AgentRosterState::Idle => "idle", AgentRosterState::Working => "working", AgentRosterState::Done => "done" }
+}
+
+fn truncate_leading(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width { return value.into(); }
+    if width <= 1 { return "…".into(); }
+    format!("…{}", value.chars().skip(count - width + 1).collect::<String>())
+}
+
+fn sanitize_single_line(value: &str) -> String {
+    value.chars().filter(|character| !character.is_control()).collect()
 }
 
 /// One fixed-grid PTY owned by this process. Its watch channels are registered with the pane
@@ -1554,6 +1688,20 @@ impl SharedLocalPane {
             .and_then(|pid| classify_pane_tree(pid, processes));
         self.agent_tracker.update(detected, now);
         self.agent_tracker.listed_agent(now) != before
+    }
+
+    fn agent_roster_entry(&self, now: Instant) -> Option<AgentRosterEntry> {
+        let (agent, state) = self.agent_tracker.listed_agent(now)?;
+        Some(AgentRosterEntry {
+            pane_id: self.pane_id,
+            agent_kind: agent.kind.wire_value().into(),
+            cwd: agent.cwd,
+            state: match state {
+                crate::agent_detect::AgentState::Idle => AgentRosterState::Idle as i32,
+                crate::agent_detect::AgentState::Working => AgentRosterState::Working as i32,
+                crate::agent_detect::AgentState::Done => AgentRosterState::Done as i32,
+            },
+        })
     }
 
     fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
@@ -1848,6 +1996,13 @@ impl SharedControl {
         }
     }
 
+    fn try_agent_roster(&self, roster: AgentRoster) -> Result<(), String> {
+        match self {
+            Self::Host(host) => host.publish_local_agent_roster(roster).map_err(|error| error.to_string()),
+            Self::Member(member) => member.try_agent_roster(roster).map_err(layout_queue_message),
+        }
+    }
+
     fn try_event(&mut self, current_revision: u64) -> Option<LayoutControlEvent> {
         match self {
             // The coordinator is the authority, so it does not receive its own broadcasts. Poll
@@ -1978,6 +2133,10 @@ pub struct SharedLayoutRuntime {
     footer_notice: Option<String>,
     join_code: Option<String>,
     agent_sampler: AgentSamplingWorker,
+    agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
+    agent_roster_generation: u64,
+    last_local_agent_entries: Vec<AgentRosterEntry>,
+    next_agent_roster_heartbeat: Instant,
 }
 
 impl SharedLayoutRuntime {
@@ -2079,6 +2238,10 @@ impl SharedLayoutRuntime {
             footer_notice: None,
             join_code,
             agent_sampler: AgentSamplingWorker::spawn(),
+            agent_rosters: BTreeMap::new(),
+            agent_roster_generation: 0,
+            last_local_agent_entries: Vec::new(),
+            next_agent_roster_heartbeat: Instant::now(),
         };
         value.refresh_local_views();
         Ok(value)
@@ -2155,6 +2318,9 @@ impl SharedLayoutRuntime {
             if self.tui.expire_chord_mode(Instant::now()) {
                 dirty = true;
             }
+            if self.tui.expire_agent_toggle(Instant::now()) {
+                dirty = true;
+            }
             if pending_escape.take_if_expired(Instant::now()) {
                 if self.handle_key(
                     KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -2215,20 +2381,23 @@ impl SharedLayoutRuntime {
                     dirty = true;
                 }
                 Event::Paste(text) => {
-                    self.tui.exit_chord_mode();
-                    self.forward_paste(&text)?;
+                    if !self.tui.overlay_open() {
+                        self.tui.exit_chord_mode();
+                        self.forward_paste(&text)?;
+                    }
                     dirty = true;
                 }
                 Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
-                    dirty |= self.tui.hover_pane_at(
+                    if !self.tui.overlay_open() { dirty |= self.tui.hover_pane_at(
                         mouse.column,
                         mouse.row,
                         Rect::new(0, 0, cols, rows),
-                    );
+                    ); }
                 }
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
+                    if self.tui.overlay_open() { dirty = true; continue; }
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
                     dirty |= self.clear_selection();
@@ -2359,6 +2528,7 @@ impl SharedLayoutRuntime {
                 changed |= pane.apply_agent_snapshot(&snapshot, now);
             }
         }
+        changed |= self.publish_local_agent_roster();
         let disconnected = self
             .remote
             .iter_mut()
@@ -2382,6 +2552,7 @@ impl SharedLayoutRuntime {
             changed = true;
         }
         changed |= self.refresh_local_views();
+        changed |= self.refresh_agent_rows();
         Ok(changed)
     }
 
@@ -2400,13 +2571,39 @@ impl SharedLayoutRuntime {
         changed
     }
 
+    fn publish_local_agent_roster(&mut self) -> bool {
+        let now = Instant::now();
+        let entries = self.local.values().filter_map(|pane| pane.agent_roster_entry(now)).collect::<Vec<_>>();
+        if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat { return false; }
+        self.agent_roster_generation = self.agent_roster_generation.saturating_add(1);
+        let roster = AgentRoster { host_peer_id: self.control.peer_id(), generation: self.agent_roster_generation, entries: entries.clone() };
+        if self.control.try_agent_roster(roster.clone()).is_err() { return false; }
+        self.last_local_agent_entries = entries;
+        self.next_agent_roster_heartbeat = now + Duration::from_secs(5);
+        self.agent_rosters.insert(roster.host_peer_id.clone(), roster);
+        true
+    }
+
+    fn refresh_agent_rows(&mut self) -> bool {
+        let rows = self.agent_rosters.values().flat_map(|roster| roster.entries.iter().filter_map(|entry| {
+            let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
+            let view = self.tui.pane_view(entry.pane_id)?;
+            let host = sanitize_single_line(&member_label(&pane.host_peer_id, &self.tui.snapshot().members));
+            let controller = view.controller_peer_id.as_deref().filter(|id| !id.is_empty()).map(|id| sanitize_single_line(&member_label(id, &self.tui.snapshot().members))).unwrap_or_else(|| String::from("free"));
+            Some(AgentOverlayRow { pane_id: entry.pane_id, kind: sanitize_single_line(&entry.agent_kind), cwd: sanitize_single_line(&entry.cwd), state: AgentRosterState::try_from(entry.state).ok()?, host, controller })
+        })).collect();
+        self.tui.set_agent_rows(rows)
+    }
+
     fn handle_control_event(&mut self, event: LayoutControlEvent) -> Result<(), Box<dyn Error>> {
         self.reconciler.apply(&event)?;
         match event {
             LayoutControlEvent::Snapshot(snapshot) => {
                 self.apply_layout_state(snapshot.state.as_ref().ok_or("missing layout state")?)?;
             }
-            LayoutControlEvent::AgentRoster(_) => {}
+            LayoutControlEvent::AgentRoster(roster) => {
+                self.agent_rosters.insert(roster.host_peer_id.clone(), roster);
+            }
             LayoutControlEvent::Commit(commit) => {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }
@@ -2426,6 +2623,10 @@ impl SharedLayoutRuntime {
         let snapshot = layout_snapshot_from_state(state)
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
         let current_ids = snapshot.panes.keys().copied().collect::<BTreeSet<_>>();
+        self.agent_rosters.retain(|host, roster| {
+            roster.entries.retain(|entry| snapshot.panes.get(&entry.pane_id).is_some_and(|pane| pane.host_peer_id == *host));
+            snapshot.members.iter().any(|member| member.peer_id == *host)
+        });
         // A successful authoritative commit is the only point at which a provisional local PTY
         // becomes a real pane. Forget the request bookkeeping then; rejection handles the other
         // path and tears the provisional PTY down.
@@ -3505,7 +3706,7 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FOOTER_ACCENT, FOOTER_BACKGROUND,
+        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FOOTER_ACCENT, FOOTER_BACKGROUND,
         FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent, HostPaneChannels,
         HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection,
         PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
@@ -3540,6 +3741,50 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>(),
         }
+    }
+
+    fn agent_row(pane_id: u64) -> super::AgentOverlayRow {
+        super::AgentOverlayRow {
+            pane_id,
+            kind: String::from("codex"),
+            cwd: String::from("/very/long/repository/path"),
+            state: crate::protocol::AgentRosterState::Working,
+            host: String::from("Host"),
+            controller: String::from("free"),
+        }
+    }
+
+    #[test]
+    fn agents_overlay_toggles_and_double_tap_forwards_ctrl_a() {
+        let mut tui = MultiPaneTui::new(layout(vec![Tab { tab_id: 1, root: Node::Leaf { pane_id: 1 } }], &[(1, 2, 8)])).unwrap();
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)), KeyHandling::Consumed(vec![]));
+        assert_eq!(tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)), KeyHandling::Forward);
+        assert!(!tui.overlay_open());
+        assert_eq!(tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)), KeyHandling::Consumed(vec![]));
+        assert!(tui.expire_agent_toggle(Instant::now() + AGENT_TOGGLE_WINDOW));
+        assert!(tui.overlay_open());
+        assert_eq!(tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), Rect::new(0, 0, 80, 24)), KeyHandling::Consumed(vec![]));
+        assert!(!tui.overlay_open());
+    }
+
+    #[test]
+    fn agents_overlay_is_modal_and_enter_jumps_to_another_tab() {
+        let snapshot = layout(
+            vec![
+                Tab { tab_id: 1, root: Node::Leaf { pane_id: 1 } },
+                Tab { tab_id: 2, root: Node::Leaf { pane_id: 2 } },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).unwrap();
+        tui.set_agent_rows(vec![agent_row(2)]);
+        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
+        tui.expire_agent_toggle(Instant::now());
+        assert_eq!(tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), Rect::new(0, 0, 80, 24)), KeyHandling::Consumed(vec![]));
+        assert_eq!(tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Rect::new(0, 0, 80, 24)), KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }]));
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
     }
 
     #[test]

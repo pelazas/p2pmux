@@ -1973,6 +1973,23 @@ impl SharedLayoutHost {
             .map_err(|_| SessionError::InvalidPostWelcome)
     }
 
+    /// Publish the coordinator host's own full agent roster through the same relay path.
+    pub fn publish_local_agent_roster(&self, roster: AgentRoster) -> Result<(), SessionError> {
+        let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
+        let accepted = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .accept_agent_roster(&peer_id, roster);
+        if let Some(roster) = accepted {
+            broadcast_roster(
+                &self.peers,
+                coordinator_envelope(&peer_id, envelope::Body::AgentRoster(roster)),
+            );
+        }
+        Ok(())
+    }
+
     /// Applies a request made by the coordinator process itself. Remote peers receive the same
     /// commit as they would for a member-originated request; the caller applies the returned
     /// response to its own renderer.
