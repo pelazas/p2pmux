@@ -1691,6 +1691,21 @@ impl SharedLocalPane {
         Ok(true)
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Box<dyn Error>> {
+        if self.screen.screen().size() == (rows, cols) {
+            return Ok(());
+        }
+        self.host.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let frame = self.screen.resize(rows, cols)?;
+        self.screen_tx.send_replace(frame);
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         self.host.shutdown()
     }
@@ -2352,7 +2367,10 @@ impl SharedLayoutRuntime {
                         matches!(mouse.kind, MouseEventKind::ScrollUp),
                     );
                 }
-                Event::Resize(_, _) => dirty = true,
+                Event::Resize(width, height) => {
+                    self.reflow_local_panes(Rect::new(0, 0, width, height))?;
+                    dirty = true;
+                }
                 _ => {}
             }
         }
@@ -2540,6 +2558,38 @@ impl SharedLayoutRuntime {
         self.subscriptions.nudge();
         self.start_eligible_subscriptions();
         self.refresh_local_views();
+        let (width, height) = terminal::size()?;
+        self.reflow_local_panes(Rect::new(0, 0, width, height))?;
+        Ok(())
+    }
+
+    fn reflow_local_panes(&mut self, area: Rect) -> Result<(), Box<dyn Error>> {
+        let geometry = self.tui.geometry(area);
+        let mut updates = Vec::new();
+        for (pane_id, rect) in geometry.panes {
+            let Some(pane) = self.local.get_mut(&pane_id) else { continue; };
+            let (rows, cols) = grid_for_pane(rect);
+            if pane.screen.screen().size() == (rows, cols) {
+                continue;
+            }
+            pane.resize(rows, cols)?;
+            if self.tui.snapshot().panes.get(&pane_id).is_some_and(|descriptor| (descriptor.grid_rows, descriptor.grid_cols) != (rows, cols)) {
+                updates.push(crate::protocol::PaneGrid { pane_id, grid_rows: u32::from(rows), grid_cols: u32::from(cols) });
+            }
+        }
+        if !updates.is_empty() {
+            let request_id = self.next_id();
+            self.send_request(LayoutRequest {
+                request_id,
+                base_revision: self.tui.snapshot().revision,
+                create_pane: None,
+                delete_pane: None,
+                create_tab: None,
+                delete_tab: None,
+                set_split_ratio: None,
+                update_pane_grids: Some(crate::protocol::UpdatePaneGrids { panes: updates }),
+            })?;
+        }
         Ok(())
     }
 
@@ -2751,6 +2801,7 @@ impl SharedLayoutRuntime {
     }
 
     fn reject_request(&mut self, request_id: u64) {
+        self.tui.cancel_resize_drag();
         self.pending_create = self
             .pending_create
             .filter(|pending| pending.request_id != request_id);
@@ -4121,6 +4172,17 @@ mod tests {
         assert_eq!(pane.host_peer_id, host_id);
 
         pane.shutdown().expect("shutdown local pane");
+    }
+
+    #[test]
+    fn local_pane_resize_publishes_a_replacement_screen_frame() {
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, b"host".to_vec()).expect("pane");
+        let before = pane.screen.current_frame().sequence;
+        pane.resize(3, 4).expect("resize");
+        assert_eq!(pane.screen.screen().size(), (3, 4));
+        assert!(pane.screen.current_frame().sequence > before);
+        assert_eq!(pane.screen.current_frame().base_sequence, 0);
+        pane.shutdown().expect("shutdown");
     }
 
     #[test]
