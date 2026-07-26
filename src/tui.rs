@@ -49,13 +49,15 @@ use crate::{
         sample_global_snapshot,
     },
     kitty_keyboard::KittyKeyboardTracker,
-    layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
+    layout::{
+        Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId, normalize_title,
+    },
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     local_ipc::AgentOverlaySnapshotRow,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutRequest, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor,
-        PaneFailed, PaneReady, SplitAxis,
+        PaneFailed, PaneReady, RenamePane, RenameTab, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
@@ -127,6 +129,8 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Pane  <"),
     FooterSegment::Key("←↓↑→"),
     FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("e"),
+    FooterSegment::Text("> RENAME   <"),
     FooterSegment::Key("n"),
     FooterSegment::Text("> NEW   <"),
     FooterSegment::Key("r/l/d/u"),
@@ -140,6 +144,8 @@ const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Tab  <"),
     FooterSegment::Key("←→"),
     FooterSegment::Text("> SWITCH   <"),
+    FooterSegment::Key("e"),
+    FooterSegment::Text("> RENAME   <"),
     FooterSegment::Key("n"),
     FooterSegment::Text("> NEW   <"),
     FooterSegment::Key("x"),
@@ -213,6 +219,14 @@ pub enum UiIntent {
         first_share_bps: u16,
         base_revision: u64,
     },
+    RenamePane {
+        pane_id: PaneId,
+        title: String,
+    },
+    RenameTab {
+        tab_id: TabId,
+        title: String,
+    },
 }
 
 /// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
@@ -234,6 +248,27 @@ pub struct AgentOverlayRow {
     pub working_since_unix_ms: u64,
     pub host: String,
     pub controller: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RenameTarget {
+    Pane(PaneId),
+    Tab(TabId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenamePrompt {
+    target: RenameTarget,
+    value: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum ModalState {
+    #[default]
+    None,
+    Agents,
+    Rename(RenamePrompt),
 }
 
 /// Rectangles for one rendered terminal frame.
@@ -325,7 +360,7 @@ pub struct MultiPaneTui {
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
-    agent_overlay_open: bool,
+    modal: ModalState,
     agent_selected_pane: Option<PaneId>,
     /// Terminal-line offset into the cards (two card lines plus one spacer each).
     agent_overlay_scroll_line: usize,
@@ -358,7 +393,7 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
-            agent_overlay_open: false,
+            modal: ModalState::None,
             agent_selected_pane: None,
             agent_overlay_scroll_line: 0,
             agent_overlay_viewport_lines: 0,
@@ -393,7 +428,7 @@ impl MultiPaneTui {
     }
 
     pub fn overlay_open(&self) -> bool {
-        self.agent_overlay_open
+        matches!(self.modal, ModalState::Agents)
     }
 
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
@@ -494,7 +529,7 @@ impl MultiPaneTui {
     }
 
     pub(crate) fn agent_overlay_has_working_rows(&self) -> bool {
-        self.agent_overlay_open
+        self.overlay_open()
             && self
                 .agent_rows
                 .iter()
@@ -520,7 +555,7 @@ impl MultiPaneTui {
             .is_some_and(|then| now.duration_since(then) >= AGENT_TOGGLE_WINDOW)
         {
             self.pending_agent_toggle = None;
-            self.agent_overlay_open = true;
+            self.modal = ModalState::Agents;
             self.exit_chord_mode();
             return true;
         }
@@ -917,7 +952,15 @@ impl MultiPaneTui {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
-        if self.agent_overlay_open {
+        if is_quit(key) {
+            self.modal = ModalState::None;
+            self.exit_chord_mode();
+            return KeyHandling::Quit;
+        }
+        if matches!(self.modal, ModalState::Rename(_)) {
+            return self.handle_rename_key(key);
+        }
+        if self.overlay_open() {
             self.set_agent_overlay_viewport(area);
             return self.handle_agent_overlay_key(key);
         }
@@ -931,10 +974,6 @@ impl MultiPaneTui {
             }
             self.pending_agent_toggle = Some(Instant::now());
             return KeyHandling::Consumed(vec![]);
-        }
-        if is_quit(key) {
-            self.exit_chord_mode();
-            return KeyHandling::Quit;
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
@@ -988,6 +1027,9 @@ impl MultiPaneTui {
         mouse: crossterm::event::MouseEvent,
         area: Rect,
     ) -> Vec<UiIntent> {
+        if matches!(self.modal, ModalState::Rename(_)) {
+            return Vec::new();
+        }
         match mouse.kind {
             MouseEventKind::Moved if !self.overlay_open() => {
                 self.hover_pane_at(mouse.column, mouse.row, area);
@@ -1045,7 +1087,7 @@ impl MultiPaneTui {
     fn handle_agent_overlay_key(&mut self, key: KeyEvent) -> KeyHandling {
         match key.code {
             KeyCode::Esc => {
-                self.agent_overlay_open = false;
+                self.modal = ModalState::None;
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1061,6 +1103,71 @@ impl MultiPaneTui {
                     return KeyHandling::Consumed(vec![]);
                 };
                 KeyHandling::Consumed(self.jump_to_agent_pane(pane_id))
+            }
+            _ => KeyHandling::Consumed(vec![]),
+        }
+    }
+
+    fn open_rename(&mut self, target: RenameTarget) {
+        let value = match target {
+            RenameTarget::Pane(pane_id) => self
+                .snapshot
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.title.clone()),
+            RenameTarget::Tab(tab_id) => self
+                .snapshot
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == tab_id)
+                .and_then(|tab| tab.title.clone()),
+        }
+        .unwrap_or_default();
+        self.modal = ModalState::Rename(RenamePrompt {
+            target,
+            value,
+            error: None,
+        });
+        self.exit_chord_mode();
+        self.clear_selection();
+        self.cancel_resize_drag();
+    }
+
+    fn handle_rename_key(&mut self, key: KeyEvent) -> KeyHandling {
+        let ModalState::Rename(prompt) = &mut self.modal else {
+            unreachable!("rename handler requires an active rename prompt");
+        };
+        match key.code {
+            KeyCode::Esc if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Backspace if key.modifiers.is_empty() => {
+                prompt.value.pop();
+                prompt.error = None;
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => match normalize_title(&prompt.value) {
+                Ok(normalized) => {
+                    let title = normalized.unwrap_or_default();
+                    let intent = match prompt.target {
+                        RenameTarget::Pane(pane_id) => UiIntent::RenamePane { pane_id, title },
+                        RenameTarget::Tab(tab_id) => UiIntent::RenameTab { tab_id, title },
+                    };
+                    self.modal = ModalState::None;
+                    KeyHandling::Consumed(vec![intent])
+                }
+                Err(_) => {
+                    prompt.error = Some(String::from("Max 32 characters; no controls"));
+                    KeyHandling::Consumed(vec![])
+                }
+            },
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                prompt.value.push(character);
+                prompt.error = None;
+                KeyHandling::Consumed(vec![])
             }
             _ => KeyHandling::Consumed(vec![]),
         }
@@ -1100,7 +1207,7 @@ impl MultiPaneTui {
         };
         self.current_tab = tab.tab_id;
         self.focused_pane = pane_id;
-        self.agent_overlay_open = false;
+        self.modal = ModalState::None;
         vec![UiIntent::FocusPane { pane_id }]
     }
 
@@ -1125,6 +1232,10 @@ impl MultiPaneTui {
 
     fn handle_pane_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
         match key.code {
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                self.open_rename(RenameTarget::Pane(self.focused_pane));
+                None
+            }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
                 let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
                 self.create_pane(
@@ -1175,6 +1286,10 @@ impl MultiPaneTui {
 
     fn handle_tab_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
         match key.code {
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                self.open_rename(RenameTarget::Tab(self.current_tab));
+                None
+            }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
                 let (grid_rows, grid_cols) = grid_for_pane(self.geometry(area).content);
                 Some(UiIntent::CreateTab {
@@ -1333,7 +1448,8 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
     match mode {
         ChordMode::Pane => matches!(
             key.code,
-            KeyCode::Char('n')
+            KeyCode::Char('e')
+                | KeyCode::Char('n')
                 | KeyCode::Char('r')
                 | KeyCode::Char('l')
                 | KeyCode::Char('d')
@@ -1346,7 +1462,11 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
         ),
         ChordMode::Tab => matches!(
             key.code,
-            KeyCode::Char('n') | KeyCode::Char('x') | KeyCode::Left | KeyCode::Right
+            KeyCode::Char('e')
+                | KeyCode::Char('n')
+                | KeyCode::Char('x')
+                | KeyCode::Left
+                | KeyCode::Right
         ),
         ChordMode::None => false,
     }
@@ -1812,11 +1932,11 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
+            "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
-            "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
+            "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             TAB_FOOTER,
         ),
     }
@@ -2136,8 +2256,11 @@ fn render_shared_multi_pane(
             frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), content);
         }
     }
-    if tui.agent_overlay_open {
+    if tui.overlay_open() {
         render_agents_overlay(frame, tui, unix_ms_now());
+    }
+    if let ModalState::Rename(prompt) = &tui.modal {
+        render_rename_prompt(frame, prompt);
     }
 }
 
@@ -2204,6 +2327,46 @@ fn agents_overlay_panel(area: Rect) -> Rect {
 
 fn agents_overlay_inner(area: Rect) -> Rect {
     Block::bordered().inner(agents_overlay_panel(area))
+}
+
+fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(8).clamp(28, 64).min(area.width);
+    let height = 7_u16.min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    let title = match prompt.target {
+        RenameTarget::Pane(_) => " Rename pane ",
+        RenameTarget::Tab(_) => " Rename tab ",
+    };
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::bordered()
+            .title(Line::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(FOOTER_ACCENT)),
+        panel,
+    );
+    let inner = Block::bordered().inner(panel);
+    let field = truncate_trailing(&prompt.value, usize::from(inner.width));
+    let mut lines = vec![Line::raw(field)];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+    } else {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(
+        "Enter save · Esc cancel",
+        Style::default().fg(FOOTER_MUTED),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn format_agent_overlay_card(
@@ -3948,6 +4111,36 @@ impl SharedLayoutRuntime {
                     rename_tab: None,
                 })?;
             }
+            UiIntent::RenamePane { pane_id, title } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision: self.tui.snapshot().revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: None,
+                    set_split_ratio: None,
+                    update_pane_grids: None,
+                    rename_pane: Some(RenamePane { pane_id, title }),
+                    rename_tab: None,
+                })?;
+            }
+            UiIntent::RenameTab { tab_id, title } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision: self.tui.snapshot().revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: None,
+                    set_split_ratio: None,
+                    update_pane_grids: None,
+                    rename_pane: None,
+                    rename_tab: Some(RenameTab { tab_id, title }),
+                })?;
+            }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
         }
         Ok(())
@@ -5036,7 +5229,7 @@ mod tests {
                 .map(|pane_id| agent_row(pane_id, pane_id as usize, 1))
                 .collect(),
         );
-        tui.agent_overlay_open = true;
+        tui.modal = super::ModalState::Agents;
         tui
     }
 
@@ -6124,6 +6317,91 @@ mod tests {
     }
 
     #[test]
+    fn rename_prompt_captures_chord_target_edits_and_consumes_modal_input() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        tui.snapshot.panes.get_mut(&1).unwrap().title = Some(String::from("old"));
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(matches!(
+            &tui.modal,
+            super::ModalState::Rename(prompt) if prompt.value == "old"
+        ));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('🙂'), KeyModifiers::SHIFT),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::RenamePane {
+                pane_id: 1,
+                title: String::from("old"),
+            }])
+        );
+        assert!(!tui.overlay_open());
+    }
+
+    #[test]
+    fn rename_prompt_rejects_invalid_input_and_ctrl_q_wins() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        tui.open_rename(super::RenameTarget::Tab(1));
+        for character in "x".repeat(33).chars() {
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                area,
+            );
+        }
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(matches!(tui.modal, super::ModalState::Rename(_)));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Quit
+        );
+        assert!(matches!(tui.modal, super::ModalState::None));
+    }
+
+    #[test]
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         assert_eq!(
             pane_border_color(Some(b""), false, true, false),
@@ -6856,11 +7134,11 @@ mod tests {
             ),
             (
                 ChordMode::Pane,
-                "Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
+                "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
-                "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
+                "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
         ] {
             tui.chord_mode = mode;
