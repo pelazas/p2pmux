@@ -41,7 +41,7 @@ use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Widget},
@@ -176,6 +176,8 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> SPLIT   <"),
     FooterSegment::Key("x"),
     FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("k"),
+    FooterSegment::Text("> LOCK   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
@@ -1398,6 +1400,14 @@ impl MultiPaneTui {
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeletePane {
                 pane_id: self.focused_pane,
             }),
+            KeyCode::Char('k') if key.modifiers.is_empty() => self
+                .snapshot
+                .panes
+                .get(&self.focused_pane)
+                .map(|pane| UiIntent::SetPaneLock {
+                    pane_id: self.focused_pane,
+                    locked: !pane.locked,
+                }),
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                 if key.modifiers.is_empty() =>
             {
@@ -1633,6 +1643,7 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
                 | KeyCode::Char('d')
                 | KeyCode::Char('u')
                 | KeyCode::Char('x')
+                | KeyCode::Char('k')
                 | KeyCode::Left
                 | KeyCode::Right
                 | KeyCode::Up
@@ -1761,6 +1772,7 @@ fn pane_title(
     index: usize,
     host_peer_id: &[u8],
     controller_peer_id: Option<&[u8]>,
+    locked: bool,
     members: &[crate::layout::Member],
     available_width: usize,
 ) -> Line<'static> {
@@ -1773,10 +1785,8 @@ fn pane_title(
         &custom_title.map_or_else(|| format!("Pane #{index}"), str::to_owned),
         available_width,
     );
-    let metadata = format!(
-        " host: {} control: {control}",
-        member_label(host_peer_id, members)
-    );
+    let control = if locked { "host-only" } else { &control };
+    let metadata = format!(" host: {} control: {control}", member_label(host_peer_id, members));
     let metadata_width = available_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
     Line::from(vec![
         Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
@@ -2139,7 +2149,7 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
+            "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
@@ -2452,13 +2462,21 @@ fn render_shared_multi_pane(
         let pane = &tui.snapshot.panes[&pane_id];
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
+        let title_width = usize::from(rect.width.saturating_sub(2));
+        let lock_badge = pane
+            .locked
+            .then(|| format!("(locked by {})", member_label(&pane.host_peer_id, &tui.snapshot.members)));
+        let badge_width = lock_badge
+            .as_deref()
+            .map_or(0, |badge| UnicodeWidthStr::width(badge).min(title_width));
         let mut title = pane_title(
             pane.title.as_deref(),
             index + 1,
             &pane.host_peer_id,
             view.controller_peer_id.as_deref(),
+            pane.locked,
             &tui.snapshot.members,
-            usize::from(rect.width.saturating_sub(2).saturating_sub(2)),
+            title_width.saturating_sub(badge_width).saturating_sub(2),
         );
         title.spans.insert(0, Span::raw(" "));
         title.spans.push(Span::raw(" "));
@@ -2469,9 +2487,14 @@ fn render_shared_multi_pane(
             focused,
             tui.hovered_pane == Some(pane_id),
         );
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .title(title)
             .border_style(Style::default().fg(border_color));
+        if let Some(badge) = lock_badge {
+            block = block.title(
+                Line::from(truncate_trailing(&badge, badge_width)).alignment(Alignment::Right),
+            );
+        }
         let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
         // The fixed VT grid may be smaller than this pane after layout reflow. Clear the full
@@ -6931,16 +6954,20 @@ mod tests {
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
-            pane_title(None, 1, b"host", Some(b""), &members, 80).to_string(),
+            pane_title(None, 1, b"host", Some(b""), false, &members, 80).to_string(),
             "Pane #1 host: Host control: free"
         );
         assert_eq!(
-            pane_title(None, 2, b"host", Some(b"guest"), &members, 80).to_string(),
+            pane_title(None, 2, b"host", Some(b"guest"), false, &members, 80).to_string(),
             "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
-            pane_title(None, 2, b"host", None, &members, 80).to_string(),
+            pane_title(None, 2, b"host", None, false, &members, 80).to_string(),
             "Pane #2 host: Host control: …"
+        );
+        assert_eq!(
+            pane_title(None, 2, b"host", Some(b"guest"), true, &members, 80).to_string(),
+            "Pane #2 host: Host control: host-only"
         );
     }
 
@@ -6958,9 +6985,34 @@ mod tests {
             display_name: String::from("Host"),
         }];
         assert_eq!(
-            pane_title(Some("build logs"), 1, b"host", Some(b""), &members, 12).to_string(),
+            pane_title(Some("build logs"), 1, b"host", Some(b""), false, &members, 12).to_string(),
             "build logs …"
         );
+    }
+
+    #[test]
+    fn locked_badge_keeps_right_title_space_on_narrow_chrome() {
+        let mut snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        );
+        snapshot.panes.get_mut(&1).expect("pane").locked = true;
+        snapshot.members[0].display_name = String::from("Host");
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(18, 4)).expect("terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("draw");
+        let chrome = (0..18)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(chrome.contains("locked by Host"), "{chrome}");
+        assert!(!chrome.contains("Pane #1"));
     }
 
     #[test]
@@ -7678,6 +7730,29 @@ mod tests {
                 KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
             ));
         }
+    }
+
+    #[test]
+    fn pane_lock_chord_toggles_lock_and_stays_sticky() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SetPaneLock {
+                pane_id: 1,
+                locked: true,
+            }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert!(is_chord_command(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
