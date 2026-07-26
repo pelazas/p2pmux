@@ -114,16 +114,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
         }
         if let Some(tui) = tui.as_mut() {
-            let now = Instant::now();
-            dirty |= tui.expire_chord_mode(now);
-            dirty |= tui.expire_agent_toggle(now);
-            if tui.agent_overlay_has_working_rows()
-                && now.duration_since(last_agent_overlay_animation)
-                    >= AGENT_OVERLAY_ANIMATION_INTERVAL
-            {
-                last_agent_overlay_animation = now;
-                dirty = true;
-            }
+            dirty |= refresh_tui_timers(tui, Instant::now(), &mut last_agent_overlay_animation);
         }
         if dirty {
             if let Some(tui) = tui.as_ref() {
@@ -165,7 +156,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                 }
             }
             Event::Paste(text) => {
-                if !tui.overlay_open() {
+                if should_forward_paste(tui) {
                     write_message(
                         &mut stream,
                         &ClientMessage::Input {
@@ -240,6 +231,25 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         );
     }
     Ok(())
+}
+
+fn refresh_tui_timers(
+    tui: &mut MultiPaneTui,
+    now: Instant,
+    last_agent_overlay_animation: &mut Instant,
+) -> bool {
+    let mut dirty = tui.expire_chord_mode(now) || tui.expire_agent_toggle(now);
+    if tui.agent_overlay_has_working_rows()
+        && now.duration_since(*last_agent_overlay_animation) >= AGENT_OVERLAY_ANIMATION_INTERVAL
+    {
+        *last_agent_overlay_animation = now;
+        dirty = true;
+    }
+    dirty
+}
+
+fn should_forward_paste(tui: &MultiPaneTui) -> bool {
+    !tui.overlay_open()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -490,7 +500,83 @@ impl Drop for ClientTerminalGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::{
+        layout::{LayoutSnapshot, Member, Node, Pane, Tab},
+        local_ipc::AgentOverlaySnapshotRow,
+        tui::UiIntent,
+    };
+
     use super::*;
+
+    fn layout(pane_ids: &[u64]) -> LayoutSnapshot {
+        let root = pane_ids
+            .iter()
+            .copied()
+            .map(|pane_id| Node::Leaf { pane_id })
+            .reduce(|first, second| Node::Split {
+                axis: crate::layout::Axis::LeftRight,
+                first_share_bps: 5_000,
+                first: Box::new(first),
+                second: Box::new(second),
+            })
+            .expect("at least one pane");
+        LayoutSnapshot {
+            revision: 1,
+            members: vec![Member {
+                peer_id: b"host".to_vec(),
+                endpoint_addr: b"endpoint".to_vec(),
+                display_name: String::from("Host"),
+            }],
+            tabs: vec![Tab { tab_id: 1, root }],
+            panes: pane_ids
+                .iter()
+                .map(|pane_id| {
+                    (
+                        *pane_id,
+                        Pane {
+                            pane_id: *pane_id,
+                            host_peer_id: b"host".to_vec(),
+                            grid_rows: 2,
+                            grid_cols: 8,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    fn roster_row(pane_id: u64, state: i32) -> AgentOverlaySnapshotRow {
+        AgentOverlaySnapshotRow {
+            pane_id,
+            kind: String::from("codex"),
+            cwd: String::from("/repo"),
+            state,
+            working_since_unix_ms: 1,
+            host: String::from("Host"),
+            controller: String::from("free"),
+        }
+    }
+
+    fn apply_rows(
+        tui: &mut Option<MultiPaneTui>,
+        pane_ids: &[u64],
+        rows: Vec<AgentOverlaySnapshotRow>,
+    ) {
+        apply_snapshot(
+            tui,
+            &mut BTreeMap::new(),
+            String::from("room"),
+            layout(pane_ids),
+            vec![],
+            vec![],
+            rows,
+            1,
+            pane_ids[0],
+        )
+        .unwrap();
+    }
     #[test]
     fn ctrl_q_is_reserved_for_detach() {
         assert_eq!(
@@ -501,5 +587,115 @@ mod tests {
             client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL),
             Some(vec![17])
         );
+    }
+
+    #[test]
+    fn attach_client_timer_opens_overlay_and_double_tap_forwards_ctrl_a() {
+        let mut tui = Some(MultiPaneTui::new(layout(&[1])).unwrap());
+        let tui = tui.as_mut().unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        let ctrl_a = crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let mut animation = Instant::now();
+
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
+        assert!(refresh_tui_timers(
+            tui,
+            Instant::now() + Duration::from_millis(400),
+            &mut animation,
+        ));
+        assert!(tui.overlay_open());
+        assert_eq!(
+            tui.handle_key(
+                crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Forward);
+    }
+
+    #[test]
+    fn snapshot_rosters_populate_rows_and_ignore_invalid_or_unknown_panes() {
+        let mut tui = None;
+        apply_rows(
+            &mut tui,
+            &[1],
+            vec![
+                roster_row(1, AgentRosterState::Working as i32),
+                roster_row(2, AgentRosterState::Working as i32),
+                roster_row(1, 99),
+            ],
+        );
+        let area = Rect::new(0, 0, 80, 24);
+        {
+            let tui = tui.as_mut().unwrap();
+            tui.handle_key(
+                crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                area,
+            );
+            let mut animation = Instant::now();
+            refresh_tui_timers(
+                tui,
+                Instant::now() + Duration::from_millis(400),
+                &mut animation,
+            );
+            assert_eq!(
+                tui.handle_key(
+                    crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    area
+                ),
+                KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 1 }]),
+            );
+        }
+        apply_rows(&mut tui, &[1], vec![]);
+        let tui = tui.as_mut().unwrap();
+        tui.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            area,
+        );
+        let mut animation = Instant::now();
+        refresh_tui_timers(
+            tui,
+            Instant::now() + Duration::from_millis(400),
+            &mut animation,
+        );
+        assert_eq!(
+            tui.handle_key(
+                crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                area
+            ),
+            KeyHandling::Consumed(vec![]),
+        );
+    }
+
+    #[test]
+    fn modal_overlay_blocks_paste_and_resize_before_open_sets_scroll_bounds() {
+        let mut tui = None;
+        apply_rows(
+            &mut tui,
+            &[1, 2, 3],
+            vec![
+                roster_row(1, AgentRosterState::Working as i32),
+                roster_row(2, AgentRosterState::Working as i32),
+                roster_row(3, AgentRosterState::Working as i32),
+            ],
+        );
+        let tui = tui.as_mut().unwrap();
+        let area = Rect::new(0, 0, 24, 8);
+        tui.set_agent_overlay_viewport(area);
+        tui.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            area,
+        );
+        let mut animation = Instant::now();
+        refresh_tui_timers(
+            tui,
+            Instant::now() + Duration::from_millis(400),
+            &mut animation,
+        );
+
+        assert!(!should_forward_paste(tui));
+        assert!(tui.scroll_agent_overlay(area, false));
     }
 }
