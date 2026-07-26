@@ -38,8 +38,6 @@ use crate::tui::SharedLayoutRuntime;
 
 pub struct SharedLayoutNode {
     runtime: SharedLayoutRuntime,
-    last_tab_id: u64,
-    last_pane_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -452,20 +450,13 @@ fn write_snapshot(
 
 impl SharedLayoutNode {
     pub fn new(runtime: SharedLayoutRuntime) -> Self {
-        let (last_tab_id, last_pane_id) = runtime.local_focus();
-        Self {
-            runtime,
-            last_tab_id,
-            last_pane_id,
-        }
+        Self { runtime }
     }
 
     /// Advances Iroh, pane servers, PTYs, leases, subscriptions and agent sampling without ever
     /// touching terminal state.
     pub fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
-        let changed = self.runtime.drain_node()?;
-        (self.last_tab_id, self.last_pane_id) = self.runtime.local_focus();
-        Ok(changed)
+        self.runtime.drain_node()
     }
 
     pub fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
@@ -475,7 +466,7 @@ impl SharedLayoutNode {
         self.runtime.release_all_local_control()
     }
     pub fn local_focus(&self) -> (u64, u64) {
-        (self.last_tab_id, self.last_pane_id)
+        self.runtime.local_focus()
     }
     pub fn snapshot(
         &self,
@@ -504,6 +495,11 @@ impl SharedLayoutNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        layout::{Axis, Node, Pane},
+        session::{HostSession, SharedLayoutHost, layout_snapshot_from_state},
+        tui::SharedLocalPane,
+    };
     use std::{
         io::Write,
         os::unix::{
@@ -536,6 +532,61 @@ mod tests {
             read_message(&mut reader).unwrap(),
             Some(ClientMessage::Detach { generation: 7 })
         ));
+    }
+
+    #[tokio::test]
+    async fn local_focus_reads_runtime_state_without_drain() {
+        let host = SharedLayoutHost::new(HostSession::create().await.unwrap(), 2, 8).unwrap();
+        let panes = host.pane_server();
+        let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_peer_id.clone()).unwrap();
+        panes
+            .register_local_pane(
+                crate::protocol::PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_peer_id.clone(),
+                    grid_rows: 2,
+                    grid_cols: 8,
+                    title: None,
+                },
+                initial.channels(),
+            )
+            .unwrap();
+        let state = host.session_snapshot().unwrap().state.unwrap();
+        let mut snapshot = layout_snapshot_from_state(&state).unwrap();
+        let first = snapshot.tabs[0].root.clone();
+        snapshot.tabs[0].root = Node::Split {
+            axis: Axis::LeftRight,
+            first_share_bps: 5_000,
+            first: Box::new(first),
+            second: Box::new(Node::Leaf { pane_id: 2 }),
+        };
+        snapshot.panes.insert(
+            2,
+            Pane {
+                pane_id: 2,
+                host_peer_id,
+                grid_rows: 2,
+                grid_cols: 8,
+                title: None,
+            },
+        );
+        let mut node = SharedLayoutNode::new(
+            SharedLayoutRuntime::host(
+                host,
+                panes,
+                snapshot,
+                initial,
+                String::from("TESTCODE"),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+
+        node.focus(1, 2).unwrap();
+
+        assert_eq!(node.local_focus(), (1, 2));
+        node.shutdown();
     }
 
     #[test]
