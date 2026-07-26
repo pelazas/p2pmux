@@ -199,9 +199,12 @@ pub enum KeyHandling {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentOverlayRow {
     pub pane_id: PaneId,
+    pub tab_ordinal: usize,
+    pub pane_ordinal: usize,
     pub kind: String,
     pub cwd: String,
     pub state: AgentRosterState,
+    pub working_since_unix_ms: u64,
     pub host: String,
     pub controller: String,
 }
@@ -351,8 +354,15 @@ impl MultiPaneTui {
     }
 
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
-        rows.retain(|row| self.snapshot.panes.contains_key(&row.pane_id));
-        rows.sort_by_key(|row| (self.pane_order(row.pane_id), row.pane_id));
+        rows.retain_mut(|row| {
+            let Some((tab_ordinal, pane_ordinal)) = self.pane_location(row.pane_id) else {
+                return false;
+            };
+            row.tab_ordinal = tab_ordinal;
+            row.pane_ordinal = pane_ordinal;
+            true
+        });
+        rows.sort_by_key(|row| (row.tab_ordinal, row.pane_ordinal, row.pane_id));
         if self.agent_rows == rows {
             return false;
         }
@@ -369,13 +379,17 @@ impl MultiPaneTui {
         true
     }
 
-    fn pane_order(&self, pane_id: PaneId) -> usize {
+    fn pane_location(&self, pane_id: PaneId) -> Option<(usize, usize)> {
         self.snapshot
             .tabs
             .iter()
-            .flat_map(|tab| visible_leaf_panes(&tab.root))
-            .position(|id| id == pane_id)
-            .unwrap_or(usize::MAX)
+            .enumerate()
+            .find_map(|(tab_index, tab)| {
+                visible_leaf_panes(&tab.root)
+                    .iter()
+                    .position(|id| *id == pane_id)
+                    .map(|pane_index| (tab_index + 1, pane_index + 1))
+            })
     }
 
     fn expire_agent_toggle(&mut self, now: Instant) -> bool {
@@ -1973,7 +1987,10 @@ fn format_agent_overlay_row(row: &AgentOverlayRow, selected: bool, width: u16) -
         overlay_kind_label(&row.kind),
         overlay_state_label(row.state)
     );
-    let suffix = format!("  Pane #{}  host: {}", row.pane_id, row.host);
+    let suffix = format!(
+        "  Tab #{} · Pane #{}  host: {}",
+        row.tab_ordinal, row.pane_ordinal, row.host
+    );
     let cwd_width = width.saturating_sub(text_width(&prefix).saturating_add(text_width(&suffix)));
     format!(
         "{prefix}{}{suffix}",
@@ -3141,6 +3158,18 @@ impl SharedLayoutRuntime {
     }
 
     fn refresh_agent_rows(&mut self) -> bool {
+        let pane_locations =
+            self.tui
+                .snapshot()
+                .tabs
+                .iter()
+                .enumerate()
+                .flat_map(|(tab_index, tab)| {
+                    visible_leaf_panes(&tab.root).into_iter().enumerate().map(
+                        move |(pane_index, pane_id)| (pane_id, (tab_index + 1, pane_index + 1)),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
         let rows = self
             .agent_rosters
             .values()
@@ -3148,6 +3177,7 @@ impl SharedLayoutRuntime {
                 roster.entries.iter().filter_map(|entry| {
                     let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
                     let view = self.tui.pane_view(entry.pane_id)?;
+                    let &(tab_ordinal, pane_ordinal) = pane_locations.get(&entry.pane_id)?;
                     let host = sanitize_single_line(&member_label(
                         &pane.host_peer_id,
                         &self.tui.snapshot().members,
@@ -3162,9 +3192,12 @@ impl SharedLayoutRuntime {
                         .unwrap_or_else(|| String::from("free"));
                     Some(AgentOverlayRow {
                         pane_id: entry.pane_id,
+                        tab_ordinal,
+                        pane_ordinal,
                         kind: sanitize_single_line(&entry.agent_kind),
                         cwd: sanitize_single_line(&entry.cwd),
                         state: AgentRosterState::try_from(entry.state).ok()?,
+                        working_since_unix_ms: entry.working_since_unix_ms,
                         host,
                         controller,
                     })
@@ -4456,12 +4489,15 @@ mod tests {
         }
     }
 
-    fn agent_row(pane_id: u64) -> super::AgentOverlayRow {
+    fn agent_row(pane_id: u64, tab_ordinal: usize, pane_ordinal: usize) -> super::AgentOverlayRow {
         super::AgentOverlayRow {
             pane_id,
+            tab_ordinal,
+            pane_ordinal,
             kind: String::from("codex"),
             cwd: String::from("/very/long/repository/path"),
             state: crate::protocol::AgentRosterState::Working,
+            working_since_unix_ms: 1_725_000_000_123,
             host: String::from("Host"),
             controller: String::from("free"),
         }
@@ -4519,7 +4555,7 @@ mod tests {
             &[(1, 2, 8), (2, 2, 8)],
         );
         let mut tui = MultiPaneTui::new(snapshot).unwrap();
-        tui.set_agent_rows(vec![agent_row(2)]);
+        tui.set_agent_rows(vec![agent_row(2, 2, 1)]);
         tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
         tui.expire_agent_toggle(Instant::now());
         assert_eq!(
@@ -4542,14 +4578,55 @@ mod tests {
 
     #[test]
     fn agents_overlay_rows_include_location_pane_and_host() {
-        let row = agent_row(2);
+        let row = agent_row(2, 2, 1);
 
         let rendered = super::format_agent_overlay_row(&row, true, 120);
 
         assert!(rendered.starts_with("› Codex  working  "));
         assert!(rendered.contains("/very/long/repository/path"));
-        assert!(rendered.contains("Pane #2"));
+        assert!(rendered.contains("Tab #2 · Pane #1"));
         assert!(rendered.ends_with("host: Host"));
+    }
+
+    #[test]
+    fn agents_overlay_rows_use_chrome_locations_and_sort_by_them() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 10,
+                    root: Node::Split {
+                        axis: Axis::LeftRight,
+                        first_share_bps: 5_000,
+                        first: Box::new(Node::Leaf { pane_id: 8 }),
+                        second: Box::new(Node::Leaf { pane_id: 6 }),
+                    },
+                },
+                Tab {
+                    tab_id: 20,
+                    root: Node::Leaf { pane_id: 3 },
+                },
+            ],
+            &[(8, 2, 8), (6, 2, 8), (3, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).unwrap();
+
+        tui.set_agent_rows(vec![
+            agent_row(3, 99, 99),
+            agent_row(6, 99, 99),
+            agent_row(8, 99, 99),
+        ]);
+
+        assert_eq!(
+            tui.agent_rows
+                .iter()
+                .map(|row| (row.pane_id, row.tab_ordinal, row.pane_ordinal))
+                .collect::<Vec<_>>(),
+            vec![(8, 1, 1), (6, 1, 2), (3, 2, 1)]
+        );
+        assert!(
+            super::format_agent_overlay_row(&tui.agent_rows[2], false, 120)
+                .contains("Tab #2 · Pane #1")
+        );
     }
 
     #[test]
@@ -4568,7 +4645,7 @@ mod tests {
             &[(1, 2, 8), (2, 2, 8)],
         );
         let mut tui = MultiPaneTui::new(snapshot).unwrap();
-        tui.set_agent_rows(vec![agent_row(2)]);
+        tui.set_agent_rows(vec![agent_row(2, 2, 1)]);
         tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
         tui.expire_agent_toggle(Instant::now());
         let area = Rect::new(0, 0, 80, 24);
