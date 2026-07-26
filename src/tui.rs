@@ -51,6 +51,7 @@ use crate::{
     kitty_keyboard::KittyKeyboardTracker,
     layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
+    local_ipc::AgentOverlaySnapshotRow,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutRequest, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor,
@@ -3180,7 +3181,14 @@ impl SharedLayoutRuntime {
 
     /// A complete node-owned view for a newly attached local renderer. Frames are deliberately
     /// snapshots: the client can always rebuild a `GuestScreen` without owning a PTY.
-    pub fn node_snapshot(&self) -> (LayoutSnapshot, NodeScreenSnapshots, NodeLeaseSnapshots) {
+    pub fn node_snapshot(
+        &self,
+    ) -> (
+        LayoutSnapshot,
+        NodeScreenSnapshots,
+        NodeLeaseSnapshots,
+        Vec<AgentOverlaySnapshotRow>,
+    ) {
         let mut screens = BTreeMap::new();
         let mut chrome = BTreeMap::new();
         for (pane_id, pane) in &self.local {
@@ -3218,7 +3226,15 @@ impl SharedLayoutRuntime {
                 (view.ready, view.controller_peer_id, view.controller_active),
             );
         }
-        (self.tui.snapshot().clone(), screens, chrome)
+        (
+            self.tui.snapshot().clone(),
+            screens,
+            chrome,
+            self.agent_overlay_rows()
+                .iter()
+                .map(AgentOverlaySnapshotRow::from)
+                .collect(),
+        )
     }
 
     pub fn node_resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
@@ -3640,6 +3656,10 @@ impl SharedLayoutRuntime {
     }
 
     fn refresh_agent_rows(&mut self) -> bool {
+        self.tui.set_agent_rows(self.agent_overlay_rows())
+    }
+
+    pub fn agent_overlay_rows(&self) -> Vec<AgentOverlayRow> {
         let pane_locations =
             self.tui
                 .snapshot()
@@ -3686,7 +3706,7 @@ impl SharedLayoutRuntime {
                 })
             })
             .collect();
-        self.tui.set_agent_rows(rows)
+        rows
     }
 
     fn handle_control_event(&mut self, event: LayoutControlEvent) -> Result<(), Box<dyn Error>> {

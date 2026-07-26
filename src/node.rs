@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     local_ipc::{
-        AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot, PaneScreenSnapshot,
-        SessionSummary,
+        AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
+        PaneScreenSnapshot, SessionSummary,
     },
     rendezvous::LocalRendezvous,
     session::{
@@ -383,7 +383,7 @@ fn write_snapshot(
     _generation: u64,
 ) -> io::Result<()> {
     let (tab_id, pane_id) = node.local_focus();
-    let (layout, screens, leases) = node.snapshot();
+    let (layout, screens, leases, rosters) = node.snapshot();
     let hosts = layout
         .panes
         .values()
@@ -433,7 +433,7 @@ fn write_snapshot(
                     },
                 )
                 .collect(),
-            rosters: serde_json::json!({}),
+            rosters,
             tab_id,
             pane_id,
         },
@@ -473,6 +473,7 @@ impl SharedLayoutNode {
         crate::layout::LayoutSnapshot,
         crate::tui::NodeScreenSnapshots,
         crate::tui::NodeLeaseSnapshots,
+        Vec<AgentOverlaySnapshotRow>,
     ) {
         self.runtime.node_snapshot()
     }

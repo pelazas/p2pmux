@@ -22,9 +22,10 @@ use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, la
 
 use crate::{
     local_ipc::{ClientMessage, NodeMessage},
+    protocol::AgentRosterState,
     screen::GuestScreen,
     session_store::SessionDescriptor,
-    tui::{KeyHandling, MultiPaneTui, PaneViewState, render_multi_pane},
+    tui::{AgentOverlayRow, KeyHandling, MultiPaneTui, PaneViewState, render_multi_pane},
 };
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +70,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         layout,
                         screens: next_screens,
                         leases,
+                        rosters,
                         tab_id,
                         pane_id,
                         ..
@@ -81,6 +83,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             *layout,
                             next_screens,
                             leases,
+                            rosters,
                             tab_id,
                             pane_id,
                         )?;
@@ -209,6 +212,7 @@ fn apply_snapshot(
     layout: crate::layout::LayoutSnapshot,
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
     leases: Vec<crate::local_ipc::PaneLeaseSnapshot>,
+    rosters: Vec<crate::local_ipc::AgentOverlaySnapshotRow>,
     tab_id: u64,
     pane_id: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -242,6 +246,24 @@ fn apply_snapshot(
             ),
         );
     }
+    view.set_agent_rows(
+        rosters
+            .into_iter()
+            .filter_map(|row| {
+                Some(AgentOverlayRow {
+                    pane_id: row.pane_id,
+                    tab_ordinal: 0,
+                    pane_ordinal: 0,
+                    kind: row.kind,
+                    cwd: row.cwd,
+                    state: AgentRosterState::try_from(row.state).ok()?,
+                    working_since_unix_ms: row.working_since_unix_ms,
+                    host: row.host,
+                    controller: row.controller,
+                })
+            })
+            .collect(),
+    );
     Ok(())
 }
 
