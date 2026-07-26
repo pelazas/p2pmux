@@ -899,6 +899,29 @@ fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
     }
 }
 
+fn node_minimum(node: &Node) -> (u16, u16) {
+    match node {
+        Node::Leaf { .. } => (3, 3),
+        Node::Split { axis, first, second, .. } => {
+            let (first_width, first_height) = node_minimum(first);
+            let (second_width, second_height) = node_minimum(second);
+            match axis {
+                Axis::LeftRight => (first_width.saturating_add(second_width), first_height.max(second_height)),
+                Axis::TopBottom => (first_width.max(second_width), first_height.saturating_add(second_height)),
+            }
+        }
+    }
+}
+
+fn allocated_first_span(span: u16, share_bps: u16, first_min: u16, second_min: u16) -> u16 {
+    let unconstrained = ((u32::from(span) * u32::from(share_bps)) / 10_000) as u16;
+    if span >= first_min.saturating_add(second_min) {
+        unconstrained.clamp(first_min, span.saturating_sub(second_min))
+    } else {
+        unconstrained.min(span)
+    }
+}
+
 fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
     match node {
         Node::Leaf { pane_id } => {
@@ -906,12 +929,20 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
         }
         Node::Split {
             axis,
+            first_share_bps,
             first,
             second,
         } => {
             let (first_area, second_area) = match axis {
                 Axis::LeftRight => {
-                    let first_width = area.width / 2;
+                    let (first_min, _) = node_minimum(first);
+                    let (second_min, _) = node_minimum(second);
+                    let first_width = allocated_first_span(
+                        area.width,
+                        *first_share_bps,
+                        first_min,
+                        second_min,
+                    );
                     (
                         Rect::new(area.x, area.y, first_width, area.height),
                         Rect::new(
@@ -923,7 +954,14 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
                     )
                 }
                 Axis::TopBottom => {
-                    let first_height = area.height / 2;
+                    let (_, first_min) = node_minimum(first);
+                    let (_, second_min) = node_minimum(second);
+                    let first_height = allocated_first_span(
+                        area.height,
+                        *first_share_bps,
+                        first_min,
+                        second_min,
+                    );
                     (
                         Rect::new(area.x, area.y, area.width, first_height),
                         Rect::new(
@@ -2447,6 +2485,8 @@ impl SharedLayoutRuntime {
                     delete_pane: Some(DeletePane { pane_id }),
                     create_tab: None,
                     delete_tab: None,
+                    set_split_ratio: None,
+                    update_pane_grids: None,
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -2458,6 +2498,8 @@ impl SharedLayoutRuntime {
                     delete_pane: None,
                     create_tab: None,
                     delete_tab: Some(DeleteTab { tab_id }),
+                    set_split_ratio: None,
+                    update_pane_grids: None,
                 })?
             }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
@@ -2505,6 +2547,8 @@ impl SharedLayoutRuntime {
                 grid_cols: u32::from(grid_cols),
             }),
             delete_tab: None,
+            set_split_ratio: None,
+            update_pane_grids: None,
         })
     }
 
@@ -3411,7 +3455,7 @@ mod tests {
         FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent, HostPaneChannels,
         HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection,
         PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, contextual_footer, copied_line_count, encode_key,
+        SharedLocalPane, UiIntent, VtScreen, allocate_node, contextual_footer, copied_line_count, encode_key,
         encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
         lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
         pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
@@ -4016,9 +4060,11 @@ mod tests {
                 tab_id: 1,
                 root: Node::Split {
                     axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
                     first: Box::new(Node::Leaf { pane_id: 1 }),
                     second: Box::new(Node::Split {
                         axis: Axis::TopBottom,
+                        first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
                         first: Box::new(Node::Leaf { pane_id: 2 }),
                         second: Box::new(Node::Leaf { pane_id: 3 }),
                     }),
@@ -4029,12 +4075,37 @@ mod tests {
     }
 
     #[test]
+    fn ratio_allocation_respects_recursive_minima_and_small_areas() {
+        let node = Node::Split {
+            axis: Axis::LeftRight,
+            first_share_bps: 7_500,
+            first: Box::new(Node::Leaf { pane_id: 1 }),
+            second: Box::new(Node::Split {
+                axis: Axis::LeftRight,
+                first_share_bps: 5_000,
+                first: Box::new(Node::Leaf { pane_id: 2 }),
+                second: Box::new(Node::Leaf { pane_id: 3 }),
+            }),
+        };
+        let mut panes = BTreeMap::new();
+        allocate_node(&node, Rect::new(0, 0, 12, 9), &mut panes);
+        assert_eq!(panes[&1].width, 6, "nested sibling needs six columns");
+        assert_eq!(panes[&2].width, 3);
+        assert_eq!(panes[&3].width, 3);
+
+        panes.clear();
+        allocate_node(&node, Rect::new(0, 0, 2, 2), &mut panes);
+        assert_eq!(panes[&1].width + panes[&2].width + panes[&3].width, 2);
+    }
+
+    #[test]
     fn pane_title_uses_stable_leaf_order_and_control_state() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
                 root: Node::Split {
                     axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
                     first: Box::new(Node::Leaf { pane_id: 8 }),
                     second: Box::new(Node::Leaf { pane_id: 3 }),
                 },
