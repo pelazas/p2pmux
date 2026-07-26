@@ -2,11 +2,13 @@
 
 > **For agentic workers:** Execute only in `/Users/pelazas/Desktop/p2pmux-agents-overlay` on branch `feat/agents-overlay`. One commit per completed task. Do **not** `git push` or open a PR unless the human/handoff explicitly asks — implementation ends when the suite is green and commits are local.
 
-**Goal:** Ship a `Ctrl+A` agents-only overlay (kind, cwd, host, control, idle/working/done) backed by host-local allowlist detection and coordinator-relayed `AgentRoster` (protocol v4).
+**Goal:** Ship a `Ctrl+A` agents-only overlay (kind, cwd, host, control, idle/working/done) backed by host-local allowlist detection and coordinator-relayed `AgentRoster` (protocol v5).
 
 **Architecture:** Pure `agent_detect` + `sysinfo` sampler adapter (global interval sample). Hosts send `AgentRoster` to the coordinator; coordinator validates/caches/relays on a **new coalesced roster mailbox** separate from layout `publish_state`. TUI owns modal overlay toggle, double-tap Ctrl+A pass-through, selection-by-pane-id, and jump. Layout/lease semantics unchanged.
 
 **Spec:** `docs/superpowers/specs/2026-07-26-agents-overlay-design.md` (authoritative; follow it when this plan and the code would otherwise drift).
+
+**Current contract (post-plan polish):** protocol v5 adds `AgentRosterEntry.working_since_unix_ms` (tag 5). The shipped overlay uses multi-line cards with working duration/spinner and accepts mouse click and wheel scrolling while open. Task text below records the original implementation sequence; its v4/no-mouse scope is superseded by this current contract and the spec.
 
 ---
 

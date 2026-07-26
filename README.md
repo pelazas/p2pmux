@@ -90,13 +90,16 @@ to leave the mode and send that key to the focused PTY.
 
 `Ctrl+A` opens the Agents overlay, which lists supported coding agents running below hosted pane
 shells: Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv),
-Pi (including Node-based launches), and OpenCode (`opencode`). It shows the agent's best-effort
-working directory, pane number, host, and idle/working/done state. Press `Esc` to close, use
-arrows or `j`/`k` to select, and press Enter or left-click a row to jump to that pane (including
-on another tab). To retain readline's beginning-of-line shortcut, press `Ctrl+A` twice within
-400ms to forward one Ctrl+A to the focused PTY instead. Working directories are shared with every
-member as part of the existing trusted shared-shell model, so do not use a session with people who
-should not see repository paths.
+Pi (including Node-based launches), and OpenCode (`opencode`). Each agent is a two-line card: the
+first line shows its kind and best-effort working directory; the second shows its state, chrome
+location (`Tab #N · Pane #M`), host, and control holder. Working cards have an animated spinner
+and live duration, while idle and done cards use distinct `○` and `✓` visuals. Press `Esc` to
+close, use arrows or `j`/`k` to select, and press Enter or left-click a card to jump to that pane
+(including on another tab). Scroll the overlay with the mouse wheel while it is open. To retain
+readline's beginning-of-line shortcut, press `Ctrl+A` twice within 400ms to forward one Ctrl+A to
+the focused PTY instead. Working directories are shared with every member as part of the existing
+trusted shared-shell model, so do not use a session with people who should not see repository
+paths.
 
 Clicking a pane focuses it locally without taking control or sending input. When p2pmux runs
 inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
