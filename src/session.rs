@@ -29,9 +29,9 @@ use crate::{
     },
     lease::LeaseState,
     protocol::{
-        ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
-        LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
-        LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
+        AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
+        Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
+        LayoutSplit, LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
         ReleaseControl, SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
         TakeControl, UpdatePaneGrids, Welcome, envelope,
@@ -49,6 +49,7 @@ pub const DEFAULT_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct LayoutCoordinator {
     state: SessionState,
     reservations: BTreeMap<u64, ReservationContext>,
+    agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     reservation_timeout: Duration,
 }
 
@@ -190,6 +191,7 @@ impl LayoutCoordinator {
                 grid_cols,
             )?,
             reservations: BTreeMap::new(),
+            agent_rosters: BTreeMap::new(),
             reservation_timeout,
         })
     }
@@ -198,6 +200,47 @@ impl LayoutCoordinator {
         Ok(SessionSnapshot {
             state: Some(self.protocol_layout_state()?),
         })
+    }
+
+    /// Return the cached full-replacement rosters in deterministic host order.
+    pub fn agent_rosters(&self) -> Vec<AgentRoster> {
+        self.agent_rosters.values().cloned().collect()
+    }
+
+    /// Accept a host's latest full roster after checking the authoritative layout.
+    ///
+    /// The authenticated connection identity always wins over the message's claimed host ID.
+    pub fn accept_agent_roster(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        mut roster: AgentRoster,
+    ) -> Option<AgentRoster> {
+        if !self
+            .state
+            .members()
+            .iter()
+            .any(|member| member.peer_id == authenticated_peer_id)
+        {
+            return None;
+        }
+        if roster.entries.iter().any(|entry| {
+            self.state
+                .pane(entry.pane_id)
+                .is_none_or(|pane| pane.host_peer_id != authenticated_peer_id)
+        }) {
+            return None;
+        }
+        if self
+            .agent_rosters
+            .get(authenticated_peer_id)
+            .is_some_and(|current| roster.generation <= current.generation)
+        {
+            return None;
+        }
+        roster.host_peer_id = authenticated_peer_id.to_vec();
+        self.agent_rosters
+            .insert(authenticated_peer_id.to_vec(), roster.clone());
+        Some(roster)
     }
 
     pub fn admit(
@@ -240,6 +283,7 @@ impl LayoutCoordinator {
 
     pub fn remove_member(&mut self, peer_id: &[u8]) -> Result<MembershipChange, CoordinatorError> {
         let invalidated = self.state.remove_member(peer_id)?;
+        self.prune_agent_rosters();
         self.membership_change(invalidated)
     }
 
@@ -297,7 +341,12 @@ impl LayoutCoordinator {
         };
 
         match result {
-            Ok(response) => response,
+            Ok(response) => {
+                if matches!(response, CoordinatorResponse::Commit(_)) {
+                    self.prune_agent_rosters();
+                }
+                response
+            }
             Err(error) => reject(request_id, reject_reason(&error)),
         }
     }
@@ -602,6 +651,25 @@ impl LayoutCoordinator {
             commit: self.layout_commit()?,
             invalidated_reservation,
         })
+    }
+
+    fn prune_agent_rosters(&mut self) {
+        self.agent_rosters.retain(|host_peer_id, roster| {
+            if !self
+                .state
+                .members()
+                .iter()
+                .any(|member| member.peer_id == *host_peer_id)
+            {
+                return false;
+            }
+            roster.entries.retain(|entry| {
+                self.state
+                    .pane(entry.pane_id)
+                    .is_some_and(|pane| pane.host_peer_id == *host_peer_id)
+            });
+            true
+        });
     }
 }
 
@@ -1632,6 +1700,7 @@ pub struct SharedLayoutHost {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayoutControlEvent {
     Snapshot(SessionSnapshot),
+    AgentRoster(AgentRoster),
     Reservation(PaneReservation),
     Commit(LayoutCommit),
     Reject(LayoutReject),
@@ -1654,7 +1723,8 @@ impl PaneLayoutReconciler {
         let state = match event {
             LayoutControlEvent::Snapshot(snapshot) => snapshot.state.as_ref(),
             LayoutControlEvent::Commit(commit) => commit.state.as_ref(),
-            LayoutControlEvent::Reservation(_)
+            LayoutControlEvent::AgentRoster(_)
+            | LayoutControlEvent::Reservation(_)
             | LayoutControlEvent::Reject(_)
             | LayoutControlEvent::Disconnected => None,
         };
@@ -1675,6 +1745,7 @@ enum LayoutClientMessage {
     Request(LayoutRequest),
     Ready(PaneReady),
     Failed(PaneFailed),
+    AgentRoster(AgentRoster),
 }
 
 const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
@@ -1683,8 +1754,16 @@ const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
 struct ControlMailbox {
     initial_tx: mpsc::Sender<Envelope>,
     state_tx: watch::Sender<Option<SequencedEnvelope>>,
+    roster_tx: watch::Sender<Option<SequencedEnvelope>>,
     targeted_tx: mpsc::Sender<SequencedEnvelope>,
     next_sequence: Arc<AtomicU64>,
+}
+
+struct ControlMailboxReceivers {
+    initial_rx: mpsc::Receiver<Envelope>,
+    state_rx: watch::Receiver<Option<SequencedEnvelope>>,
+    roster_rx: watch::Receiver<Option<SequencedEnvelope>>,
+    targeted_rx: mpsc::Receiver<SequencedEnvelope>,
 }
 
 #[derive(Clone)]
@@ -1694,25 +1773,25 @@ struct SequencedEnvelope {
 }
 
 impl ControlMailbox {
-    fn new() -> (
-        Self,
-        mpsc::Receiver<Envelope>,
-        watch::Receiver<Option<SequencedEnvelope>>,
-        mpsc::Receiver<SequencedEnvelope>,
-    ) {
-        let (initial_tx, initial_rx) = mpsc::channel(1);
+    fn new() -> (Self, ControlMailboxReceivers) {
+        let (initial_tx, initial_rx) = mpsc::channel(33);
         let (state_tx, state_rx) = watch::channel(None);
+        let (roster_tx, roster_rx) = watch::channel(None);
         let (targeted_tx, targeted_rx) = mpsc::channel(TARGETED_CONTROL_QUEUE_CAPACITY);
         (
             Self {
                 initial_tx,
                 state_tx,
+                roster_tx,
                 targeted_tx,
                 next_sequence: Arc::new(AtomicU64::new(1)),
             },
-            initial_rx,
-            state_rx,
-            targeted_rx,
+            ControlMailboxReceivers {
+                initial_rx,
+                state_rx,
+                roster_rx,
+                targeted_rx,
+            },
         )
     }
 
@@ -1722,6 +1801,10 @@ impl ControlMailbox {
 
     fn publish_state(&self, envelope: Envelope) {
         self.state_tx.send_replace(Some(self.sequenced(envelope)));
+    }
+
+    fn publish_roster(&self, envelope: Envelope) {
+        self.roster_tx.send_replace(Some(self.sequenced(envelope)));
     }
 
     fn enqueue_targeted(&self, envelope: Envelope) -> bool {
@@ -1830,6 +1913,13 @@ impl SharedLayoutMember {
     pub fn try_failed(&self, failed: PaneFailed) -> Result<(), LayoutControlQueueError> {
         self.outbound
             .try_send(LayoutClientMessage::Failed(failed))
+            .map_err(layout_queue_error)
+    }
+
+    /// Publish this member's full hosted-agent replacement to the coordinator.
+    pub fn try_agent_roster(&self, roster: AgentRoster) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::AgentRoster(roster))
             .map_err(layout_queue_error)
     }
 
@@ -1942,6 +2032,23 @@ impl SharedLayoutHost {
             .map_err(|_| SessionError::PeerTask)?
             .session_snapshot()
             .map_err(|_| SessionError::InvalidPostWelcome)
+    }
+
+    /// Publish the coordinator host's own full agent roster through the same relay path.
+    pub fn publish_local_agent_roster(&self, roster: AgentRoster) -> Result<(), SessionError> {
+        let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
+        let accepted = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .accept_agent_roster(&peer_id, roster);
+        if let Some(roster) = accepted {
+            broadcast_roster(
+                &self.peers,
+                coordinator_envelope(&peer_id, envelope::Body::AgentRoster(roster)),
+            );
+        }
+        Ok(())
     }
 
     /// Applies a request made by the coordinator process itself. Remote peers receive the same
@@ -2078,7 +2185,7 @@ impl SharedLayoutHost {
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
             let peer_id = receipt.admitted_peer_id.clone();
-            let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
+            let (mailbox, receivers) = ControlMailbox::new();
             let peer = ControlPeer::pending_reader(mailbox.clone(), connection.clone());
             let reader_abort = peer.reader_abort.clone();
             self.peers
@@ -2097,6 +2204,20 @@ impl SharedLayoutHost {
                 ))
                 .then_some(())
                 .ok_or(SessionError::PeerTask)?;
+            let rosters = self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .agent_rosters();
+            for roster in rosters {
+                mailbox
+                    .enqueue_initial(coordinator_envelope(
+                        self.host.ticket().endpoint_addr().id.as_bytes(),
+                        envelope::Body::AgentRoster(roster),
+                    ))
+                    .then_some(())
+                    .ok_or(SessionError::PeerTask)?;
+            }
 
             let reader_task = tokio::spawn(layout_host_reader_task(
                 reader,
@@ -2112,9 +2233,7 @@ impl SharedLayoutHost {
             }
             tokio::spawn(layout_peer_writer_task(
                 writer,
-                initial_rx,
-                state_rx,
-                targeted_rx,
+                receivers,
                 receipt.admitted_peer_id.clone(),
                 self.peers.clone(),
                 Some((
@@ -2315,6 +2434,17 @@ fn broadcast_envelope(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelo
     }
 }
 
+fn broadcast_roster(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelope: Envelope) {
+    let peers = match peers.lock() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+    for peer in peers.values() {
+        // Roster updates supersede only older rosters, never pending layout commits.
+        peer.mailbox.publish_roster(envelope.clone());
+    }
+}
+
 fn send_to_peer(
     peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     peer_id: &[u8],
@@ -2438,9 +2568,12 @@ pub async fn join_layout_with_display_name(
 
 async fn layout_peer_writer_task<W>(
     mut writer: W,
-    mut initial_rx: mpsc::Receiver<Envelope>,
-    mut state_rx: watch::Receiver<Option<SequencedEnvelope>>,
-    mut targeted_rx: mpsc::Receiver<SequencedEnvelope>,
+    ControlMailboxReceivers {
+        mut initial_rx,
+        mut state_rx,
+        mut roster_rx,
+        mut targeted_rx,
+    }: ControlMailboxReceivers,
     peer_id: Vec<u8>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     coordinator: Option<CoordinatorDeparture>,
@@ -2455,10 +2588,18 @@ async fn layout_peer_writer_task<W>(
         disconnect_or_remove(&peers, coordinator.as_ref(), &peer_id);
         return;
     }
+    while let Ok(initial) = initial_rx.try_recv() {
+        if !writer.write_control(&initial).await {
+            disconnect_or_remove(&peers, coordinator.as_ref(), &peer_id);
+            return;
+        }
+    }
     let mut targeted_open = true;
     let mut state_open = true;
+    let mut roster_open = true;
     let mut pending_targeted = None;
     let mut pending_state = None;
+    let mut pending_roster = None;
     loop {
         if pending_targeted.is_none() {
             match targeted_rx.try_recv() {
@@ -2470,14 +2611,16 @@ async fn layout_peer_writer_task<W>(
         if pending_state.is_none() && state_open && state_rx.has_changed().unwrap_or(false) {
             pending_state = state_rx.borrow_and_update().clone();
         }
+        if pending_roster.is_none() && roster_open && roster_rx.has_changed().unwrap_or(false) {
+            pending_roster = roster_rx.borrow_and_update().clone();
+        }
 
-        let next = match (&pending_state, &pending_targeted) {
-            (Some(state), Some(targeted)) if state.sequence < targeted.sequence => {
-                pending_state.take()
-            }
-            (Some(_), Some(_)) | (None, Some(_)) => pending_targeted.take(),
-            (Some(_), None) => pending_state.take(),
-            (None, None) => {
+        let next = match (
+            pending_state.as_ref().map(|item| item.sequence),
+            pending_roster.as_ref().map(|item| item.sequence),
+            pending_targeted.as_ref().map(|item| item.sequence),
+        ) {
+            (None, None, None) => {
                 tokio::select! {
                     targeted = targeted_rx.recv(), if targeted_open => match targeted {
                         Some(targeted) => pending_targeted = Some(targeted),
@@ -2487,9 +2630,25 @@ async fn layout_peer_writer_task<W>(
                         Ok(()) => pending_state = state_rx.borrow_and_update().clone(),
                         Err(_) => state_open = false,
                     },
+                    changed = roster_rx.changed(), if roster_open => match changed {
+                        Ok(()) => pending_roster = roster_rx.borrow_and_update().clone(),
+                        Err(_) => roster_open = false,
+                    },
                     else => return,
                 }
                 continue;
+            }
+            (state, roster, targeted) => {
+                let state = state.unwrap_or(u64::MAX);
+                let roster = roster.unwrap_or(u64::MAX);
+                let targeted = targeted.unwrap_or(u64::MAX);
+                if targeted <= state && targeted <= roster {
+                    pending_targeted.take()
+                } else if state <= roster {
+                    pending_state.take()
+                } else {
+                    pending_roster.take()
+                }
             }
         };
         let Some(next) = next else {
@@ -2512,6 +2671,7 @@ async fn layout_member_writer_task(
             LayoutClientMessage::Request(request) => envelope::Body::LayoutRequest(request),
             LayoutClientMessage::Ready(ready) => envelope::Body::PaneReady(ready),
             LayoutClientMessage::Failed(failed) => envelope::Body::PaneFailed(failed),
+            LayoutClientMessage::AgentRoster(roster) => envelope::Body::AgentRoster(roster),
         };
         if writer
             .write_next(&coordinator_envelope(&peer_id, body))
@@ -2536,6 +2696,7 @@ async fn layout_member_reader_task(
             Some(envelope::Body::SessionSnapshot(snapshot)) => {
                 LayoutControlEvent::Snapshot(snapshot)
             }
+            Some(envelope::Body::AgentRoster(roster)) => LayoutControlEvent::AgentRoster(roster),
             Some(envelope::Body::PaneReservation(reservation)) => {
                 LayoutControlEvent::Reservation(reservation)
             }
@@ -2624,6 +2785,21 @@ async fn layout_host_reader_task(
                     ),
                 );
                 drop(coordinator_guard);
+            }
+            Some(envelope::Body::AgentRoster(roster)) => {
+                let accepted = match coordinator.lock() {
+                    Ok(mut coordinator) => coordinator.accept_agent_roster(&peer_id, roster),
+                    Err(_) => break,
+                };
+                if let Some(roster) = accepted {
+                    broadcast_roster(
+                        &peers,
+                        coordinator_envelope(
+                            &coordinator_peer_id,
+                            envelope::Body::AgentRoster(roster),
+                        ),
+                    );
+                }
             }
             _ => break,
         }
@@ -3226,6 +3402,7 @@ mod control_queue_tests {
     use std::{future::Future, pin::Pin};
 
     use super::*;
+    use crate::protocol::{AgentRosterEntry, AgentRosterState};
     use tokio::sync::oneshot;
 
     struct FailingWriter;
@@ -3283,10 +3460,26 @@ mod control_queue_tests {
         )
     }
 
+    fn roster(generation: u64) -> Envelope {
+        coordinator_envelope(
+            b"coordinator",
+            envelope::Body::AgentRoster(AgentRoster {
+                host_peer_id: b"host".to_vec(),
+                generation,
+                entries: vec![AgentRosterEntry {
+                    pane_id: 1,
+                    agent_kind: String::from("codex"),
+                    cwd: String::from("/repo"),
+                    state: AgentRosterState::Working as i32,
+                }],
+            }),
+        )
+    }
+
     #[tokio::test]
     async fn failed_writer_removes_the_peer_and_aborts_its_reader() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
@@ -3303,9 +3496,7 @@ mod control_queue_tests {
 
         layout_peer_writer_task(
             FailingWriter,
-            initial_rx,
-            state_rx,
-            targeted_rx,
+            receivers,
             b"slow".to_vec(),
             peers.clone(),
             None,
@@ -3327,16 +3518,14 @@ mod control_queue_tests {
     #[tokio::test]
     async fn stalled_peer_coalesces_commits_while_a_healthy_peer_receives_the_latest() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (slow_mailbox, slow_initial_rx, slow_state_rx, slow_targeted_rx) =
-            ControlMailbox::new();
-        let observed_slow_state = slow_state_rx.clone();
+        let (slow_mailbox, slow_receivers) = ControlMailbox::new();
+        let observed_slow_state = slow_receivers.state_rx.clone();
         let slow_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
             ControlPeer::new(slow_mailbox, slow_reader.abort_handle(), None),
         );
-        let (healthy_mailbox, healthy_initial_rx, healthy_state_rx, healthy_targeted_rx) =
-            ControlMailbox::new();
+        let (healthy_mailbox, healthy_receivers) = ControlMailbox::new();
         let healthy_reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"healthy".to_vec(),
@@ -3369,9 +3558,7 @@ mod control_queue_tests {
                 started: Some(started_tx),
                 release: Some(release_rx),
             },
-            slow_initial_rx,
-            slow_state_rx,
-            slow_targeted_rx,
+            slow_receivers,
             b"slow".to_vec(),
             peers.clone(),
             None,
@@ -3379,9 +3566,7 @@ mod control_queue_tests {
         let (healthy_tx, mut healthy_rx) = mpsc::unbounded_channel();
         let healthy_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(healthy_tx),
-            healthy_initial_rx,
-            healthy_state_rx,
-            healthy_targeted_rx,
+            healthy_receivers,
             b"healthy".to_vec(),
             peers.clone(),
             None,
@@ -3429,7 +3614,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn targeted_queue_overflow_closes_the_peer_before_it_can_keep_reading() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, _initial_rx, _state_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"slow".to_vec(),
@@ -3464,7 +3649,7 @@ mod control_queue_tests {
         assert!(!peers.lock().unwrap().contains_key(b"slow".as_slice()));
         tokio::task::yield_now().await;
         assert!(reader.is_finished());
-        drop(targeted_rx);
+        drop(receivers.targeted_rx);
         assert!(!mailbox.enqueue_targeted(coordinator_envelope(
             b"coordinator",
             envelope::Body::LayoutReject(LayoutReject {
@@ -3477,7 +3662,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn initial_snapshot_is_first_when_a_commit_arrives_before_the_writer_starts() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"member".to_vec(),
@@ -3495,9 +3680,7 @@ mod control_queue_tests {
         let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
         let writer_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(recorded_tx),
-            initial_rx,
-            state_rx,
-            targeted_rx,
+            receivers,
             b"member".to_vec(),
             peers.clone(),
             None,
@@ -3521,7 +3704,7 @@ mod control_queue_tests {
     #[tokio::test]
     async fn targeted_frame_precedes_later_coalesced_state_updates() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let (mailbox, initial_rx, state_rx, targeted_rx) = ControlMailbox::new();
+        let (mailbox, receivers) = ControlMailbox::new();
         let reader = tokio::spawn(std::future::pending::<()>());
         peers.lock().unwrap().insert(
             b"member".to_vec(),
@@ -3545,9 +3728,7 @@ mod control_queue_tests {
         let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
         let writer_task = tokio::spawn(layout_peer_writer_task(
             RecordingWriter(recorded_tx),
-            initial_rx,
-            state_rx,
-            targeted_rx,
+            receivers,
             b"member".to_vec(),
             peers.clone(),
             None,
@@ -3564,6 +3745,61 @@ mod control_queue_tests {
                 })),
                 ..
             })
+        ));
+        remove_control_peer(&peers, b"member");
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn roster_watch_does_not_replace_a_pending_layout_commit() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let (mailbox, receivers) = ControlMailbox::new();
+        let reader = tokio::spawn(std::future::pending::<()>());
+        peers.lock().unwrap().insert(
+            b"member".to_vec(),
+            ControlPeer::new(mailbox.clone(), reader.abort_handle(), None),
+        );
+        assert!(mailbox.enqueue_initial(commit(1)), "initial frame queues");
+        mailbox.publish_state(commit(2));
+        mailbox.publish_roster(roster(1));
+        mailbox.publish_state(commit(3));
+
+        let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(layout_peer_writer_task(
+            RecordingWriter(recorded_tx),
+            receivers,
+            b"member".to_vec(),
+            peers.clone(),
+            None,
+        ));
+
+        assert!(matches!(
+            recorded_rx.recv().await,
+            Some(Envelope {
+                body: Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 1,
+                    ..
+                })),
+                ..
+            })
+        ));
+        let first = recorded_rx.recv().await.expect("first coalesced update");
+        let second = recorded_rx.recv().await.expect("second coalesced update");
+        assert!(matches!(
+            (first.body, second.body),
+            (
+                Some(envelope::Body::AgentRoster(_)),
+                Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 3,
+                    ..
+                }))
+            ) | (
+                Some(envelope::Body::LayoutCommit(LayoutCommit {
+                    revision: 3,
+                    ..
+                })),
+                Some(envelope::Body::AgentRoster(_))
+            )
         ));
         remove_control_peer(&peers, b"member");
         writer_task.abort();

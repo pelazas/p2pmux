@@ -4,8 +4,9 @@ use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
     lease::LeaseState,
     protocol::{
-        CreatePane, CreateTab, DeletePane, DeleteTab, Envelope, Join, LayoutRejectReason,
-        LayoutRequest, PROTOCOL_VERSION, PaneDescriptor, PaneReady, SplitAxis, envelope,
+        AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
+        DeleteTab, Envelope, Join, LayoutRejectReason, LayoutRequest, PROTOCOL_VERSION,
+        PaneDescriptor, PaneReady, SplitAxis, envelope,
     },
     screen::HostScreen,
     session::{
@@ -129,6 +130,103 @@ async fn joining_member_receives_a_snapshot_and_existing_members_receive_admissi
 
     first.shutdown().await;
     second.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut first = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("first joins");
+    accept_first.await.unwrap().unwrap();
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+
+    first
+        .try_request(create_request(1, 2))
+        .expect("first requests a pane");
+    let reservation = match next_event(&mut first).await {
+        LayoutControlEvent::Reservation(reservation) => reservation,
+        event => panic!("expected pane reservation, got {event:?}"),
+    };
+    first
+        .try_ready(PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 2,
+            request_id: 1,
+        })
+        .expect("first marks pane ready");
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Commit(commit) if commit.revision == 3
+    ));
+
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second joins");
+    accept_second.await.unwrap().unwrap();
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Commit(commit) if commit.revision == 4
+    ));
+    assert!(matches!(
+        next_event(&mut second).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+
+    first
+        .try_agent_roster(AgentRoster {
+            host_peer_id: first.peer_id.clone(),
+            generation: 1,
+            entries: vec![AgentRosterEntry {
+                pane_id: reservation.pane_id,
+                agent_kind: String::from("codex"),
+                cwd: String::from("/repo"),
+                state: AgentRosterState::Working as i32,
+            }],
+        })
+        .expect("first publishes roster");
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::AgentRoster(AgentRoster { entries, .. }) if entries.len() == 1
+    ));
+    assert!(matches!(
+        next_event(&mut second).await,
+        LayoutControlEvent::AgentRoster(AgentRoster { entries, .. }) if entries.len() == 1
+    ));
+
+    let accept_third = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut third = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("third joins");
+    accept_third.await.unwrap().unwrap();
+    assert!(matches!(
+        next_event(&mut third).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+    assert!(matches!(
+        next_event(&mut third).await,
+        LayoutControlEvent::AgentRoster(AgentRoster { entries, .. }) if entries.len() == 1
+    ));
+
+    first.shutdown().await;
+    second.shutdown().await;
+    third.shutdown().await;
     coordinator.close().await;
 }
 

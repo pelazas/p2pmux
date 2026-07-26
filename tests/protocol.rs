@@ -1,10 +1,11 @@
 use p2pmux::protocol::{
-    ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope, Input, Join,
-    LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
-    LayoutState, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES,
-    MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor,
-    PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, ProtocolError,
+    AgentRoster, AgentRosterEntry, AgentRosterState, ControlLease, CreatePane, CreateTab,
+    DeletePane, DeleteTab, Delta, Envelope, Input, Join, LayoutCommit, LayoutNode, LayoutReject,
+    LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, MAX_AGENT_CWD_BYTES,
+    MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION,
+    PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, ProtocolError,
     SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
     UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
@@ -273,6 +274,77 @@ fn framed_envelopes_round_trip_all_v1_bodies() {
     for original in sample_envelopes() {
         let frame = encode_frame(&original).expect("valid envelope encodes");
         assert_eq!(decode_frame(&frame).expect("valid frame decodes"), original);
+    }
+}
+
+fn agent_roster(entries: Vec<AgentRosterEntry>) -> AgentRoster {
+    AgentRoster {
+        host_peer_id: b"peer-a".to_vec(),
+        generation: 7,
+        entries,
+    }
+}
+
+fn agent_entry(pane_id: u64) -> AgentRosterEntry {
+    AgentRosterEntry {
+        pane_id,
+        agent_kind: String::from("codex"),
+        cwd: String::from("/repo"),
+        state: AgentRosterState::Working as i32,
+    }
+}
+
+#[test]
+fn agent_roster_uses_tag_26_and_round_trips() {
+    let original = envelope(envelope::Body::AgentRoster(agent_roster(vec![
+        agent_entry(9),
+    ])));
+    let wire = original.encode_to_vec();
+    assert_eq!(
+        field_shape(&parse_fields(&wire)),
+        vec![(1, 0), (2, 2), (26, 2)]
+    );
+    assert_eq!(Envelope::decode(wire.as_slice()).unwrap(), original);
+    let frame = encode_frame(&original).expect("valid roster encodes");
+    assert_eq!(
+        decode_frame(&frame).expect("valid roster decodes"),
+        original
+    );
+}
+
+#[test]
+fn agent_roster_validation_rejects_bad_entries() {
+    let cases = [
+        agent_roster(vec![agent_entry(0)]),
+        agent_roster(vec![agent_entry(1), agent_entry(1)]),
+        agent_roster(vec![AgentRosterEntry {
+            agent_kind: String::from("unknown"),
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            state: 99,
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            agent_kind: "x".repeat(MAX_AGENT_KIND_BYTES + 1),
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            cwd: "x".repeat(MAX_AGENT_CWD_BYTES + 1),
+            ..agent_entry(1)
+        }]),
+        agent_roster(
+            (1..=u64::try_from(MAX_AGENT_ROSTER_ENTRIES + 1).unwrap())
+                .map(agent_entry)
+                .collect(),
+        ),
+    ];
+
+    for roster in cases {
+        assert!(matches!(
+            encode_frame(&envelope(envelope::Body::AgentRoster(roster))),
+            Err(ProtocolError::FieldTooLarge { .. }) | Err(ProtocolError::InvalidLayout(_))
+        ));
     }
 }
 

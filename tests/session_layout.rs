@@ -1,9 +1,9 @@
 use iroh::{EndpointAddr, SecretKey};
 use p2pmux::{
     protocol::{
-        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutCommit, LayoutRejectReason,
-        LayoutRequest, NewPanePosition, PaneFailed, PaneGrid, PaneReady, SetSplitRatio, SplitAxis,
-        UpdatePaneGrids,
+        AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
+        DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, NewPanePosition, PaneFailed,
+        PaneGrid, PaneReady, SetSplitRatio, SplitAxis, UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -167,6 +167,57 @@ fn admission_advances_revision_and_publishes_the_member_endpoint() {
     let state = commit.commit.state.expect("state present");
     assert!(state.members.iter().any(|member| member.peer_id == host_b()
         && member.endpoint_addr == serde_json::to_vec(&addr_b()).unwrap()));
+}
+
+#[test]
+fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("guest admitted");
+
+    let forged = AgentRoster {
+        host_peer_id: host_a(),
+        generation: 1,
+        entries: vec![AgentRosterEntry {
+            pane_id: 1,
+            agent_kind: String::from("codex"),
+            cwd: String::from("/forged"),
+            state: AgentRosterState::Working as i32,
+        }],
+    };
+    assert_eq!(coordinator.accept_agent_roster(&host_b(), forged), None);
+
+    let accepted = coordinator
+        .accept_agent_roster(
+            &host_a(),
+            AgentRoster {
+                host_peer_id: b"mismatch-is-overwritten".to_vec(),
+                generation: 1,
+                entries: vec![AgentRosterEntry {
+                    pane_id: 1,
+                    agent_kind: String::from("codex"),
+                    cwd: String::from("/repo"),
+                    state: AgentRosterState::Working as i32,
+                }],
+            },
+        )
+        .expect("host roster accepted");
+    assert_eq!(accepted.host_peer_id, host_a());
+    assert_eq!(coordinator.agent_rosters(), vec![accepted]);
+
+    let cleared = coordinator
+        .accept_agent_roster(
+            &host_a(),
+            AgentRoster {
+                host_peer_id: host_a(),
+                generation: 2,
+                entries: Vec::new(),
+            },
+        )
+        .expect("empty replacement clears host rows");
+    assert!(cleared.entries.is_empty());
+    assert_eq!(coordinator.agent_rosters(), vec![cleared]);
 }
 
 #[test]
