@@ -63,6 +63,19 @@ Guest render + control/input when controller
 
 **Modules:** `cli`, `tui`, `pty_host`, `session` (coordinator + registry), `protocol`, `transport` (Iroh), ticket helper.
 
+### Local detach / resume
+
+A live session has one headless node process and at most one local TUI client. The same binary
+starts the private node entrypoint; it owns PTYs, Iroh, rendezvous, and in-memory layout/focus.
+The client connects through a Unix socket and Ctrl+Q detaches, releasing local control leases
+without stopping the node. `--resume` shows live sessions and `attach <name>` reconnects.
+`kill <name>` is graceful (and warns before coordinator shutdown).
+
+The durable finder descriptor lives in `~/Library/Application Support/p2pmux/sessions`; its socket
+lives in `/tmp/p2pmux-$UID`. Finder records contain no ticket, PTY, screen, layout, or focus state.
+There is no local-client takeover, launchd registration, disk screen restore, coordinator failover,
+or offline-pane grace in this implementation. Offline host placeholders/grace remain follow-up work.
+
 **Screen:** pane host keeps vt100 canonical state; sequenced snapshot+deltas to all members; gap → resync; never stall PTY on slow viewers.
 
 **PTY grid:** fixed at pane creation; immutable; no Resize message; clients scale/letterbox.
@@ -100,8 +113,8 @@ The last pane in a tab must be removed by deleting the tab; the final tab is ret
 
 `Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` plus arrows
 moves focus. `Ctrl+T` then `N` creates a tab; `Ctrl+T` then `X` requests tab deletion; `Ctrl+T`
-plus left/right switches tabs; `Esc` cancels. These mux chords are consumed locally. Ctrl+Q exits
-the local view; F9 and F10 reach the focused PTY. Pane grids never resize.
+plus left/right switches tabs; `Esc` cancels. These mux chords are consumed locally. Ctrl+Q detaches
+the local view while the session node remains live; F9 and F10 reach the focused PTY. Pane grids never resize.
 
 ### Disconnect grace (any member)
 

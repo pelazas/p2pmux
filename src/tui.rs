@@ -2755,20 +2755,30 @@ impl SharedLayoutRuntime {
 
     /// Node-facing non-terminal operations. Kept small while the old foreground adapter is
     /// retired so pane/Iroh ownership has exactly one home.
-    pub fn drain_node(&mut self) -> Result<bool, Box<dyn Error>> { self.drain() }
+    pub fn drain_node(&mut self) -> Result<bool, Box<dyn Error>> {
+        self.drain()
+    }
 
     pub fn node_input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
-        if let Some(pane) = self.local.get_mut(&pane_id) { pane.input(bytes.clone())?; }
-        if let Some(pane) = self.remote.get_mut(&pane_id) { pane.input(bytes); }
+        if let Some(pane) = self.local.get_mut(&pane_id) {
+            pane.input(bytes.clone())?;
+        }
+        if let Some(pane) = self.remote.get_mut(&pane_id) {
+            pane.input(bytes);
+        }
         self.tui.reset_scrollback(pane_id);
         Ok(())
     }
 
     pub fn release_all_local_control(&mut self) -> Result<(), Box<dyn Error>> {
         let peer_id = self.control.peer_id();
-        for pane in self.local.values_mut() { pane.release_controller(&peer_id)?; }
-        for pane in self.remote.values_mut() { pane.release_controller(); }
+        for pane in self.local.values_mut() {
+            pane.release_controller(&peer_id)?;
+        }
+        for pane in self.remote.values_mut() {
+            pane.release_controller();
+        }
         Ok(())
     }
 
@@ -2778,12 +2788,21 @@ impl SharedLayoutRuntime {
 
     pub fn node_screen_text(&self) -> String {
         let pane_id = self.tui.focused_pane();
-        self.local.get(&pane_id).map(|pane| pane.screen.screen().contents())
-            .or_else(|| self.remote.get(&pane_id).and_then(|pane| pane.screen.screen()).map(vt100::Screen::contents))
+        self.local
+            .get(&pane_id)
+            .map(|pane| pane.screen.screen().contents())
+            .or_else(|| {
+                self.remote
+                    .get(&pane_id)
+                    .and_then(|pane| pane.screen.screen())
+                    .map(vt100::Screen::contents)
+            })
             .unwrap_or_default()
     }
 
-    pub fn shutdown_node(self) { self.shutdown(); }
+    pub fn shutdown_node(self) {
+        self.shutdown();
+    }
 
     fn clear_selection(&mut self) -> bool {
         let selection_cleared = self.tui.clear_selection();

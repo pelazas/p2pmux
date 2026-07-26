@@ -5,7 +5,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -36,13 +36,34 @@ pub struct SessionDescriptor {
 }
 
 impl SessionDescriptor {
-    pub fn new(id: String, name: String, socket_path: PathBuf, node_pid: u32, role: SessionRole) -> Self {
-        Self { version: VERSION, id, name, socket_path, node_pid, role, created_at: now_secs() }
+    pub fn new(
+        id: String,
+        name: String,
+        socket_path: PathBuf,
+        node_pid: u32,
+        role: SessionRole,
+    ) -> Self {
+        Self {
+            version: VERSION,
+            id,
+            name,
+            socket_path,
+            node_pid,
+            role,
+            created_at: now_secs(),
+        }
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.version != VERSION || !valid_id(&self.id) || !valid_name(&self.name) || self.node_pid == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed session descriptor"));
+        if self.version != VERSION
+            || !valid_id(&self.id)
+            || !valid_name(&self.name)
+            || self.node_pid == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed session descriptor",
+            ));
         }
         Ok(())
     }
@@ -56,8 +77,9 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn for_current_user() -> io::Result<Self> {
-        let home = std::env::var_os("HOME").ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-        let uid = unsafe_uid_not_needed();
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        let uid = current_uid()?;
         Ok(Self::at(
             PathBuf::from(home).join("Library/Application Support/p2pmux/sessions"),
             PathBuf::from("/tmp").join(format!("p2pmux-{uid}")),
@@ -66,11 +88,19 @@ impl SessionStore {
 
     /// Test-friendly constructor.  Directories are created lazily with private permissions.
     pub fn at(sessions_dir: PathBuf, socket_dir: PathBuf) -> Self {
-        Self { sessions_dir, socket_dir }
+        Self {
+            sessions_dir,
+            socket_dir,
+        }
     }
 
     pub fn socket_path(&self, id: &str) -> io::Result<PathBuf> {
-        if !valid_id(id) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid session id")); }
+        if !valid_id(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid session id",
+            ));
+        }
         self.ensure_dirs()?;
         Ok(self.socket_dir.join(format!("{id}.sock")))
     }
@@ -79,9 +109,15 @@ impl SessionStore {
         descriptor.validate()?;
         self.ensure_dirs()?;
         let destination = self.sessions_dir.join(format!("{}.json", descriptor.id));
-        let temporary = self.sessions_dir.join(format!(".{}.{}.tmp", descriptor.id, std::process::id()));
+        let temporary =
+            self.sessions_dir
+                .join(format!(".{}.{}.tmp", descriptor.id, std::process::id()));
         let bytes = serde_json::to_vec(descriptor).map_err(io::Error::other)?;
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         fs::rename(temporary, destination)?;
@@ -89,10 +125,18 @@ impl SessionStore {
     }
 
     pub fn read(&self, id: &str) -> io::Result<SessionDescriptor> {
-        let descriptor: SessionDescriptor = serde_json::from_slice(&fs::read(self.sessions_dir.join(format!("{id}.json")))?)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed session descriptor"))?;
+        let descriptor: SessionDescriptor =
+            serde_json::from_slice(&fs::read(self.sessions_dir.join(format!("{id}.json")))?)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed session descriptor")
+                })?;
         descriptor.validate()?;
-        if descriptor.id != id { return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed session descriptor")); }
+        if descriptor.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed session descriptor",
+            ));
+        }
         Ok(descriptor)
     }
 
@@ -116,11 +160,18 @@ impl SessionStore {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") { continue; }
-            let id = match path.file_stem().and_then(|value| value.to_str()) { Some(value) => value, None => continue };
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let id = match path.file_stem().and_then(|value| value.to_str()) {
+                Some(value) => value,
+                None => continue,
+            };
             match self.read(id) {
                 Ok(descriptor) if probe(&descriptor.socket_path) => sessions.push(descriptor),
-                Ok(_) | Err(_) => { let _ = fs::remove_file(path); }
+                Ok(_) | Err(_) => {
+                    let _ = fs::remove_file(path);
+                }
             }
         }
         sessions.sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -128,7 +179,12 @@ impl SessionStore {
     }
 
     pub fn rename(&self, old: &str, new: &str) -> io::Result<SessionDescriptor> {
-        if !valid_name(new) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid session name")); }
+        if !valid_name(new) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid session name",
+            ));
+        }
         let mut descriptor = self.read(old)?;
         descriptor.name = new.to_owned();
         self.write(&descriptor)?;
@@ -138,60 +194,146 @@ impl SessionStore {
     fn ensure_dirs(&self) -> io::Result<()> {
         for directory in [&self.sessions_dir, &self.socket_dir] {
             fs::create_dir_all(directory)?;
-            fs::set_permissions(directory, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+            fs::set_permissions(
+                directory,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
         }
         Ok(())
     }
 }
 
-pub fn generate_id() -> io::Result<String> { random_hex(16) }
+pub fn generate_id() -> io::Result<String> {
+    random_hex(16)
+}
 
 pub fn generate_name() -> io::Result<String> {
-    const ADJECTIVES: &[&str] = &["amber", "brisk", "cobalt", "daring", "ember", "fuzzy", "golden", "lunar"];
-    const NOUNS: &[&str] = &["badger", "comet", "falcon", "harbor", "meadow", "otter", "pine", "river"];
+    const ADJECTIVES: &[&str] = &[
+        "amber", "brisk", "cobalt", "daring", "ember", "fuzzy", "golden", "lunar",
+    ];
+    const NOUNS: &[&str] = &[
+        "badger", "comet", "falcon", "harbor", "meadow", "otter", "pine", "river",
+    ];
     let mut bytes = [0u8; 3];
     fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(format!("{}-{}-{:02x}", ADJECTIVES[usize::from(bytes[0]) % ADJECTIVES.len()], NOUNS[usize::from(bytes[1]) % NOUNS.len()], bytes[2]))
+    Ok(format!(
+        "{}-{}-{:02x}",
+        ADJECTIVES[usize::from(bytes[0]) % ADJECTIVES.len()],
+        NOUNS[usize::from(bytes[1]) % NOUNS.len()],
+        bytes[2]
+    ))
 }
 
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 48 && !name.starts_with('-') && !name.ends_with('-')
-        && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    !name.is_empty()
+        && name.len() <= 48
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn valid_id(id: &str) -> bool { id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) }
-fn random_hex(length: usize) -> io::Result<String> { let mut bytes = vec![0u8; length]; fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?; Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect()) }
-fn now_secs() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() }
-fn probe(path: &Path) -> bool { UnixStream::connect(path).is_ok() }
+fn valid_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn random_hex(length: usize) -> io::Result<String> {
+    let mut bytes = vec![0u8; length];
+    fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+fn probe(path: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(path) else {
+        return false;
+    };
+    if stream.write_all(b"{\"type\":\"probe\"}\n").is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok() && response.contains("\"probe_ack\"")
+}
 
-// libc is deliberately not a dependency. macOS always exports the POSIX uid through this env
-// in normal shells; tests can provide it. Falling back to the process id keeps socket names safe.
-fn unsafe_uid_not_needed() -> String { std::env::var("UID").unwrap_or_else(|_| std::process::id().to_string()) }
+fn current_uid() -> io::Result<String> {
+    let output = std::process::Command::new("id").arg("-u").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("could not determine current uid"));
+    }
+    let uid = String::from_utf8(output.stdout).map_err(|_| io::Error::other("invalid uid"))?;
+    let uid = uid.trim();
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other("invalid uid"));
+    }
+    Ok(uid.to_owned())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn store() -> SessionStore {
-        let root = std::env::temp_dir().join(format!("p2pmux-session-store-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "p2pmux-session-store-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         SessionStore::at(root.join("sessions"), root.join("sockets"))
     }
 
     #[test]
     fn writes_private_atomic_descriptor_and_validates_names() {
-        let store = store(); let id = generate_id().unwrap(); let socket = store.socket_path(&id).unwrap();
-        let descriptor = SessionDescriptor::new(id.clone(), "amber-otter-01".into(), socket, 42, SessionRole::Coordinator);
+        let store = store();
+        let id = generate_id().unwrap();
+        let socket = store.socket_path(&id).unwrap();
+        let descriptor = SessionDescriptor::new(
+            id.clone(),
+            "amber-otter-01".into(),
+            socket,
+            42,
+            SessionRole::Coordinator,
+        );
         store.write(&descriptor).unwrap();
         assert_eq!(store.read(&id).unwrap(), descriptor);
-        assert_eq!(fs::metadata(store.sessions_dir.join(format!("{id}.json"))).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(store.sessions_dir.join(format!("{id}.json")))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(!valid_name("Nope") && !valid_name("-nope") && valid_name("good-name-2"));
     }
 
     #[test]
     fn stale_records_are_removed_only_after_probe_fails() {
-        let store = store(); let id = generate_id().unwrap(); let socket = store.socket_path(&id).unwrap();
-        store.write(&SessionDescriptor::new(id.clone(), "amber-otter-01".into(), socket, 42, SessionRole::Coordinator)).unwrap();
+        let store = store();
+        let id = generate_id().unwrap();
+        let socket = store.socket_path(&id).unwrap();
+        store
+            .write(&SessionDescriptor::new(
+                id.clone(),
+                "amber-otter-01".into(),
+                socket,
+                42,
+                SessionRole::Coordinator,
+            ))
+            .unwrap();
         assert!(store.list_live().unwrap().is_empty());
         assert!(store.read(&id).is_err());
     }

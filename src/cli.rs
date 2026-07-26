@@ -3,8 +3,8 @@
 use std::{
     error::Error,
     io::{self, IsTerminal, Write},
-    str::FromStr,
     process::{Command as ProcessCommand, Stdio},
+    str::FromStr,
     time::{Duration, Instant},
 };
 
@@ -53,7 +53,11 @@ enum Command {
     /// Attach a live local session by memorable name.
     Attach { name: String },
     /// Gracefully stop a live local session.
-    Kill { name: String, #[arg(long)] yes: bool },
+    Kill {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Rename a live local session finder record.
     Rename { old: String, new: String },
     /// Read or write local configuration.
@@ -61,8 +65,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    #[command(hide = true)]
-    Node { #[arg(long)] bootstrap: std::path::PathBuf },
+    #[command(name = "__node", hide = true)]
+    Node {
+        #[arg(long)]
+        bootstrap: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,7 +106,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
     match cli.command {
         None => resume_picker(false),
-        Some(Command::Node { bootstrap }) => crate::node::run_background(crate::node::read_bootstrap(&bootstrap)?).await,
+        Some(Command::Node { bootstrap }) => {
+            crate::node::run_background(crate::node::read_bootstrap(&bootstrap)?).await
+        }
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
             ConfigCommand::Set { key, value } if key == "name" => {
@@ -123,8 +132,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
             let descriptor = launch_background_node(
-                crate::node::NodeBootstrapKind::Create { display_name: display_name.clone(), cols, rows },
-                session_name.map(Ok).unwrap_or_else(crate::session_store::generate_name)?,
+                crate::node::NodeBootstrapKind::Create {
+                    display_name: display_name.clone(),
+                    cols,
+                    rows,
+                },
+                session_name
+                    .map(Ok)
+                    .unwrap_or_else(crate::session_store::generate_name)?,
                 crate::session_store::SessionRole::Coordinator,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
@@ -214,7 +229,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
             let descriptor = launch_background_node(
-                crate::node::NodeBootstrapKind::Join { ticket: ticket.to_string(), display_name: display_name.clone(), cols, rows },
+                crate::node::NodeBootstrapKind::Join {
+                    ticket: ticket.to_string(),
+                    display_name: display_name.clone(),
+                    cols,
+                    rows,
+                },
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
             )?;
@@ -261,12 +281,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Command::Kill { name, yes }) => {
             let descriptor = find_live(&name)?;
             if descriptor.role == crate::session_store::SessionRole::Coordinator && !yes {
-                if !io::stdin().is_terminal() { return Err(CliError("coordinator kill requires --yes outside a terminal").into()); }
-                print!("This stops the coordinator session for all peers. Kill {}? [y/N] ", descriptor.name); io::stdout().flush()?;
-                let mut answer = String::new(); io::stdin().read_line(&mut answer)?;
-                if !matches!(answer.trim(), "y" | "Y" | "yes") { return Ok(()); }
+                if !io::stdin().is_terminal() {
+                    return Err(
+                        CliError("coordinator kill requires --yes outside a terminal").into(),
+                    );
+                }
+                print!(
+                    "This stops the coordinator session for all peers. Kill {}? [y/N] ",
+                    descriptor.name
+                );
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    return Ok(());
+                }
             }
             crate::client::shutdown(&descriptor)?;
+            crate::session_store::SessionStore::for_current_user()?.remove(&descriptor.id)?;
             println!("Stopping {}", descriptor.name);
             Ok(())
         }
@@ -281,7 +313,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
-    crate::session_store::SessionStore::for_current_user()?.list_live()?.into_iter()
+    crate::session_store::SessionStore::for_current_user()?
+        .list_live()?
+        .into_iter()
         .find(|descriptor| descriptor.name == name || descriptor.id == name)
         .ok_or_else(|| CliError("no live session with that name").into())
 }
@@ -289,35 +323,81 @@ fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<
 fn resume_picker(always_picker: bool) -> Result<(), Box<dyn Error>> {
     let sessions = crate::session_store::SessionStore::for_current_user()?.list_live()?;
     if sessions.is_empty() {
-        if always_picker { return Err(CliError("no live p2pmux sessions").into()); }
+        if always_picker {
+            return Err(CliError("no live p2pmux sessions").into());
+        }
         return Err(CliError("no live session; run p2pmux create").into());
     }
     let selected = pick_session(&sessions)?;
     crate::client::run(&selected)
 }
 
-fn pick_session(sessions: &[crate::session_store::SessionDescriptor]) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
-    if !io::stdin().is_terminal() { return Ok(sessions[0].clone()); }
-    let mut selected = 0usize; let mut filter = String::new();
+fn pick_session(
+    sessions: &[crate::session_store::SessionDescriptor],
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    if !io::stdin().is_terminal() {
+        return Ok(sessions[0].clone());
+    }
+    let mut selected = 0usize;
+    let mut filter = String::new();
     crossterm::terminal::enable_raw_mode()?;
     let result = loop {
-        crossterm::execute!(io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        )?;
         println!("p2pmux sessions  (type to filter, ↑/↓, Enter)");
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        let shown = sessions.iter().filter(|session| session.name.contains(&filter)).collect::<Vec<_>>();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let shown = sessions
+            .iter()
+            .filter(|session| session.name.contains(&filter))
+            .collect::<Vec<_>>();
         for (index, session) in shown.iter().enumerate() {
             let marker = if index == selected { '>' } else { ' ' };
-            println!("{marker} {:<18} coordinator: {:<10} tabs: 1 panes: 1 hosts: 1 created: {} running: {}m", session.name, match session.role { crate::session_store::SessionRole::Coordinator => "you", crate::session_store::SessionRole::Member => "remote" }, session.created_at, (now.saturating_sub(session.created_at)) / 60);
+            println!(
+                "{marker} {:<18} coordinator: {:<10} tabs: 1 panes: 1 hosts: 1 created: {} running: {}m",
+                session.name,
+                match session.role {
+                    crate::session_store::SessionRole::Coordinator => "you",
+                    crate::session_store::SessionRole::Member => "remote",
+                },
+                session.created_at,
+                (now.saturating_sub(session.created_at)) / 60
+            );
         }
         match crossterm::event::read()? {
-            crossterm::event::Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => match key.code {
-                crossterm::event::KeyCode::Enter if !shown.is_empty() => break Ok((*shown[selected.min(shown.len() - 1)]).clone()),
-                crossterm::event::KeyCode::Up => selected = selected.saturating_sub(1),
-                crossterm::event::KeyCode::Down => selected = selected.saturating_add(1).min(shown.len().saturating_sub(1)),
-                crossterm::event::KeyCode::Backspace => { filter.pop(); selected = 0; }
-                crossterm::event::KeyCode::Char(character) => { filter.push(character); selected = 0; }
-                crossterm::event::KeyCode::Esc => break Err(CliError("resume cancelled").into()), _ => {}
-            }, _ => {}
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
+                match key.code {
+                    crossterm::event::KeyCode::Enter if !shown.is_empty() => {
+                        break Ok((*shown[selected.min(shown.len() - 1)]).clone());
+                    }
+                    crossterm::event::KeyCode::Up => selected = selected.saturating_sub(1),
+                    crossterm::event::KeyCode::Down => {
+                        selected = selected
+                            .saturating_add(1)
+                            .min(shown.len().saturating_sub(1))
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        filter.pop();
+                        selected = 0;
+                    }
+                    crossterm::event::KeyCode::Char(character) => {
+                        filter.push(character);
+                        selected = 0;
+                    }
+                    crossterm::event::KeyCode::Esc => {
+                        break Err(CliError("resume cancelled").into());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     };
     crossterm::terminal::disable_raw_mode()?;
@@ -334,22 +414,42 @@ pub(crate) fn launch_background_node(
     let store = crate::session_store::SessionStore::for_current_user()?;
     let id = crate::session_store::generate_id()?;
     let socket_path = store.socket_path(&id)?;
-    let descriptor = crate::session_store::SessionDescriptor::new(id.clone(), name, socket_path, 1, role);
-    let bootstrap = crate::node::NodeBootstrap { descriptor: descriptor.clone(), kind };
+    let descriptor =
+        crate::session_store::SessionDescriptor::new(id.clone(), name, socket_path, 1, role);
+    let bootstrap = crate::node::NodeBootstrap {
+        descriptor: descriptor.clone(),
+        kind,
+    };
     let bootstrap_path = descriptor.socket_path.with_extension("bootstrap");
     crate::node::write_bootstrap(&bootstrap_path, &bootstrap)?;
     let mut command = ProcessCommand::new(std::env::current_exe()?);
-    command.arg("__node").arg("--bootstrap").arg(&bootstrap_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .arg("__node")
+        .arg("--bootstrap")
+        .arg(&bootstrap_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(unix)]
-    { use std::os::unix::process::CommandExt; command.process_group(0); }
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command.spawn()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(found) = store.read(&id)
-            && std::os::unix::net::UnixStream::connect(&found.socket_path).is_ok() { return Ok(found); }
+            && found.socket_path.exists()
+        {
+            return Ok(found);
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, "background node did not become ready").into())
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "background node did not become ready",
+    )
+    .into())
 }
 
 fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn Error>> {
@@ -393,28 +493,16 @@ fn wait_for_enter() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn create_releases_stdout_before_starting_the_host_tui() {
+    fn create_uses_the_background_node_and_socket_client() {
         let source = include_str!("cli.rs");
         let create_arm = source
-            .split_once("Command::Create { name } => {")
+            .split_once("Some(Command::Create { name, session_name }) => {")
             .expect("create arm")
             .1
-            .split_once("Command::Join { ticket, name } => {")
+            .split_once("Some(Command::Join { ticket, name }) => {")
             .expect("join arm")
             .0;
-
-        assert!(
-            create_arm
-                .find("drop(stdout);")
-                .expect("stdout is released")
-                < create_arm
-                    .find("SharedLayoutRuntime::host(")
-                    .expect("host TUI starts"),
-            "create must release stdout before the host TUI runs on a blocking thread"
-        );
-        assert!(
-            create_arm.contains("wait_for_enter()?"),
-            "create must pause so the join code can be copied before the TUI starts"
-        );
+        assert!(create_arm.contains("launch_background_node("));
+        assert!(create_arm.contains("crate::client::run(&descriptor)"));
     }
 }

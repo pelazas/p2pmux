@@ -70,9 +70,17 @@ Set a peer-visible display name once with `p2pmux config set name pelazas`; insp
 `~/.config/p2pmux/config.toml`). `create` and `join` accept `--name <name>` to override and save
 the value for that run and future sessions.
 
-`create` prints `Join with: p2pmux join <CODE>`, waits for Enter so you can copy it, then
-enters the shared-layout TUI. The same code stays in the footer. `join` first receives the
-authoritative layout, then attaches directly to every remote pane.
+`create` and `join` start a session-scoped background node, then attach the local TUI client.
+Ctrl+Q detaches that client without stopping shells, Iroh, rendezvous, or hosted panes. It prints
+the exact `--resume`, `attach`, and `kill` commands needed to return. Use `p2pmux --resume` for
+the live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <old> <new>`
+to rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator
+asks for confirmation; use `--yes` for non-interactive scripts.
+
+There is one local client per session: a second attach is refused rather than taking over. The
+finder descriptor is the only durable session data, under `~/Library/Application Support/p2pmux/`;
+the Unix socket is under `/tmp/p2pmux-$UID/`. Screens, PTYs, tickets, layout state, and focus are
+never restored from disk. The node survives terminal closure but is not managed by launchd.
 Short join codes resolve through a restrictive local cache on the same Mac, so they are for current
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
@@ -81,8 +89,8 @@ Only one peer controls a pane while they are actively typing. After about eight 
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key
 claims the free pane and is delivered as its first input; active typing is protected, so there is
 no forced takeover. A pane's host owns its PTY, not its control lease: newly created split and tab
-panes start free. Ctrl+Q exits only the local p2pmux view; F9 and F10 continue through to the
-focused PTY.
+panes start free. Ctrl+Q detaches only the local p2pmux view and releases its local control
+leases; F9 and F10 continue through to the focused PTY.
 
 Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
