@@ -108,6 +108,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             let display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
+            let descriptor = launch_background_node(
+                crate::node::NodeBootstrapKind::Create { display_name: display_name.clone(), cols, rows },
+                crate::session_store::generate_name()?,
+                crate::session_store::SessionRole::Coordinator,
+            )?;
+            if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
+                return crate::client::run(&descriptor);
+            }
+            let (cols, rows) = crossterm::terminal::size()?;
             let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
             let host = SharedLayoutHost::with_display_name(
                 HostSession::create().await?,
@@ -189,6 +198,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             let ticket = resolve_join_ticket(&ticket)?;
             let display_name = resolve_display_name(name)?;
+            let (cols, rows) = crossterm::terminal::size()?;
+            let descriptor = launch_background_node(
+                crate::node::NodeBootstrapKind::Join { ticket: ticket.to_string(), display_name: display_name.clone(), cols, rows },
+                crate::session_store::generate_name()?,
+                crate::session_store::SessionRole::Member,
+            )?;
+            if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
+                return crate::client::run(&descriptor);
+            }
             let transport = Transport::bind().await?;
             let mut member =
                 join_layout_with_display_name(transport, ticket.clone(), display_name).await?;

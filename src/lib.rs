@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_detect;
+pub mod client;
 pub mod cli;
 pub mod config;
 pub mod kitty_keyboard;
