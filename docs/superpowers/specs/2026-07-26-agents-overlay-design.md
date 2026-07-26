@@ -18,8 +18,10 @@ Interaction:
 - **Pass-through:** if overlay is closed and the user presses `Ctrl+A` twice within 400ms, forward a single Ctrl+A to the focused PTY and do **not** open the overlay (readline beginning-of-line escape hatch). A single `Ctrl+A` after the window elapses opens the overlay.
 - While open: modal and **non-expiring** (not subject to the 2s sticky-chord idle timeout). ↑/↓ or `j`/`k` move selection; Enter focuses that pane’s tab+leaf and closes the overlay; Esc closes without jumping.
 - While open: **no keys are forwarded to any PTY** except that Esc/Enter/arrows/jk are handled by the overlay.
-- Overlay is a floating panel (`Clear` + bordered list over the current layout), not a real mux tab
-- **Mouse: cut from v1** (keyboard only)
+- Overlay is a floating panel (`Clear` + bordered list over the current layout), not a real mux tab. Each row is a two-line card: kind + cwd on the first line; state + location + host/control on the second.
+- Working cards show an animated spinner and elapsed working duration; idle and done cards use distinct `○` and `✓` indicators.
+- The location is semantic chrome, `Tab #N · Pane #M`, rather than a raw pane ID.
+- While open, left-clicking a card jumps to its pane and mouse-wheel scrolling moves through cards.
 
 ## Non-goals
 
@@ -29,7 +31,6 @@ Interaction:
 - Always-on sidebar or dashboard home screen
 - Changing lease / control semantics
 - Windows/Linux (macOS only)
-- Mouse hit-testing for overlay rows (v1)
 - Automatic `git push` / PR creation as part of coding tasks (handoff step only)
 
 ## Product framing
@@ -53,9 +54,10 @@ Each pane is a login shell PTY. Agents run as descendants. On the **pane host on
 6. Working directory: cwd of the matched agent process when `sysinfo` provides it; else empty string.
 7. If no allowlisted agent is present → not listed (unless in `done` grace — see state model).
 
-### v1 allowlist (exact)
+### v1 allowlist
 
-Matching uses the process **basename** only (last path component of exe/argv0), compared **case-sensitively** as returned by the sampler.
+Matching uses launcher metadata (process executable/name/argv0) and targeted argv heuristics for
+known Node-based launchers, compared case-sensitively as returned by the sampler.
 
 | Basename equals | `agent_kind` wire value | Display label |
 |-----------------|-------------------------|---------------|
@@ -63,18 +65,21 @@ Matching uses the process **basename** only (last path component of exe/argv0), 
 | `codex` | `codex` | Codex |
 | `cursor-agent` | `cursor` | Cursor Agent |
 | `pi` | `pi` | Pi |
+| `opencode` | `opencode` | OpenCode |
 
-No other names match. Bare `cursor` (the editor) does **not** match. Adding a tool = one table row + tests.
+Bare `cursor` (the editor) does **not** match. Adding a tool = one table row + tests.
 
-Required snapshot fields per process: `pid`, `parent_pid`, `basename` (from exe or argv0), optional `start_time`, optional `cwd`.
+Required snapshot fields per process: `pid`, `parent_pid`, executable basename, process name, argv,
+optional `start_time`, and optional `cwd`.
 
 ## State model
 
 Host tracks per pane:
 
-- `last_output_at: Option<Instant>` — updated in `SharedLocalPane::drain()` when PTY bytes arrive (this timestamp does not exist today; add it)
+- `last_output_at: Option<Instant>` — updated in `SharedLocalPane::drain()` when PTY bytes arrive
 - `active_agent: Option<DetectedAgent>` — current match
 - `done_agent: Option<(kind, cwd, entered_done_at)>` — set when a previously active agent disappears
+- `working_since_unix_ms: u64` — Unix-millisecond start of the current continuous working interval; reset to `0` outside `working`
 
 | State | Meaning |
 |-------|---------|
@@ -89,7 +94,7 @@ If a **different** agent appears before grace expiry: clear `done_agent`, use th
 
 Members send control envelopes **to the coordinator**. Members accept layout/roster **state only from the coordinator**. Hosts never peer-publish rosters sideways.
 
-### Messages (PROTOCOL_VERSION = 4)
+### Messages (PROTOCOL_VERSION = 5)
 
 - `AgentRoster` (new `envelope::Body` tag **26**):
   - `host_peer_id: bytes` — must equal authenticated sender; coordinator overwrites/ignores mismatches
@@ -97,9 +102,10 @@ Members send control envelopes **to the coordinator**. Members accept layout/ros
   - `entries: repeated AgentRosterEntry`
 - `AgentRosterEntry`:
   - `pane_id: u64` — same layout pane id type as `PaneDescriptor.pane_id`
-  - `agent_kind: string` — one of `claude|codex|cursor|pi`
+  - `agent_kind: string` — one of `claude|codex|cursor|pi|opencode`
   - `cwd: string` — may be empty; max length enforced
   - `state: enum` — `idle|working|done`
+  - `working_since_unix_ms: u64` (tag **5**) — Unix-millisecond start of the current working interval; `0` for idle/done (and permitted when a working host has no timestamp)
 
 Caps (normative): max **32** entries per update; `agent_kind` ≤ 32 bytes; `cwd` ≤ 512 bytes; reject unknown state/kind; reject **duplicate** `pane_id` in one update.
 
@@ -112,6 +118,10 @@ Caps (normative): max **32** entries per update; `agent_kind` ≤ 32 bytes; `cwd
 5. Prune stored entries when: pane deleted, pane host changes, member departs, or layout reconcile removes the pane.
 6. Relay accepted rosters to all members on an **independent coalesced roster watch channel** — **not** `publish_state` (that slot coalesces layout commits and must not be shared).
 7. Bootstrap: after the existing initial `SessionSnapshot`, deliver a coordinator-built **full roster snapshot** (concatenate cached per-host rosters, or one synthetic `AgentRoster` per host in order). Late joiners must see current agents without waiting for heartbeats. Heartbeat (~5s) remains a liveness/repair aid, not bootstrap.
+
+Accepted v1 freshness tradeoff: roster entries have no independent TTL. Coordinator pruning removes
+entries for deleted, rehosted, or departed panes; subsequent host full-replacement updates and
+heartbeats repair stale entries after a host-side change.
 
 ### Client merge
 
@@ -136,6 +146,7 @@ Caps (normative): max **32** entries per update; `agent_kind` ≤ 32 bytes; `cwd
 - Jump to agent on another tab: switch tab + focus pane (covered by test).
 - Empty state: panel shows `No agents running`.
 - Narrow terminals: truncate cwd with leading ellipsis; keep kind + state visible.
+- Working rows continuously redraw their spinner and duration while the overlay is open.
 
 ## Keyboard conflicts
 
@@ -146,14 +157,14 @@ Caps (normative): max **32** entries per update; `agent_kind` ≤ 32 bytes; `cwd
 - Pure unit tests for allowlist matching (basename fixtures).
 - Pure unit tests for state transitions including done grace and agent replacement.
 - Pure unit tests for deterministic multi-agent pick rule.
-- TUI: toggle open/close; double-tap forwards Ctrl+A; Esc closes; Enter jumps including other tab; overlay modal (no PTY forward); empty state.
-- Protocol encode/decode + caps + version **4** updates to all version/tag tests.
+- TUI: toggle open/close; double-tap forwards Ctrl+A; Esc closes; Enter/click jumps including other tab; wheel scrolls cards; overlay modal (no PTY forward); empty state.
+- Protocol encode/decode + caps + version **5** updates to all version/tag tests, including `AgentRosterEntry.working_since_unix_ms` tag 5.
 - Session: coordinator relay, bootstrap, forge reject, layout/roster mailbox isolation.
 
 ## Success criteria
 
 1. Only allowlisted agent panes appear (plus short `done` grace rows).
-2. Rows show kind, cwd (when known), host, control, state.
+2. Two-line cards show kind, cwd (when known), state, semantic chrome location, host, and control; working cards animate with a duration.
 3. `Ctrl+A` toggle + double-tap pass-through + Esc/Enter behave as specified.
 4. Remote members see agents via coordinator-relayed roster; late joiners bootstrap correctly.
 5. Roster traffic never coalesces away layout commits.

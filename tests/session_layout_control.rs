@@ -195,6 +195,7 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
                 agent_kind: String::from("codex"),
                 cwd: String::from("/repo"),
                 state: AgentRosterState::Working as i32,
+                working_since_unix_ms: 0,
             }],
         })
         .expect("first publishes roster");

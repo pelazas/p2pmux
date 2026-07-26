@@ -251,18 +251,29 @@ pub struct PaneAgentTracker {
     pub last_output_at: Option<Instant>,
     pub active_agent: Option<DetectedAgent>,
     pub done_agent: Option<DoneAgent>,
+    pub working_since: Option<Instant>,
+    pub working_since_unix_ms: u64,
 }
 
 impl PaneAgentTracker {
     /// Record PTY output for the working/idle state calculation.
-    pub fn record_output(&mut self, now: Instant) {
+    pub fn record_output(&mut self, now: Instant, unix_ms_now: u64) {
         self.last_output_at = Some(now);
+        self.reconcile_working_state(now, unix_ms_now);
     }
 
     /// Apply this pane's latest process-tree classification.
-    pub fn update(&mut self, detected: Option<DetectedAgent>, now: Instant) {
+    pub fn update(&mut self, detected: Option<DetectedAgent>, now: Instant, unix_ms_now: u64) {
         match detected {
             Some(agent) => {
+                if self
+                    .active_agent
+                    .as_ref()
+                    .is_some_and(|active| active != &agent)
+                {
+                    self.last_output_at = None;
+                    self.clear_working_state();
+                }
                 self.active_agent = Some(agent);
                 self.done_agent = None;
             }
@@ -274,6 +285,8 @@ impl PaneAgentTracker {
                         entered_done_at: now,
                     });
                 }
+                self.last_output_at = None;
+                self.clear_working_state();
                 if self
                     .done_agent
                     .as_ref()
@@ -283,15 +296,18 @@ impl PaneAgentTracker {
                 }
             }
         }
+        self.reconcile_working_state(now, unix_ms_now);
     }
 
     /// Return the current agent and coarse state, if the pane should be listed.
-    pub fn listed_agent(&self, now: Instant) -> Option<(DetectedAgent, AgentState)> {
+    pub fn listed_agent(
+        &mut self,
+        now: Instant,
+        unix_ms_now: u64,
+    ) -> Option<(DetectedAgent, AgentState)> {
+        self.reconcile_working_state(now, unix_ms_now);
         if let Some(agent) = &self.active_agent {
-            let state = if self
-                .last_output_at
-                .is_some_and(|last_output| now.duration_since(last_output) <= WORKING_WINDOW)
-            {
+            let state = if self.working_since.is_some() {
                 AgentState::Working
             } else {
                 AgentState::Idle
@@ -311,6 +327,26 @@ impl PaneAgentTracker {
                     AgentState::Done,
                 )
             })
+    }
+
+    fn reconcile_working_state(&mut self, now: Instant, unix_ms_now: u64) {
+        let is_working = self.active_agent.is_some()
+            && self
+                .last_output_at
+                .is_some_and(|last_output| now.duration_since(last_output) <= WORKING_WINDOW);
+        if is_working {
+            if self.working_since.is_none() {
+                self.working_since = Some(now);
+                self.working_since_unix_ms = unix_ms_now;
+            }
+        } else {
+            self.clear_working_state();
+        }
+    }
+
+    fn clear_working_state(&mut self) {
+        self.working_since = None;
+        self.working_since_unix_ms = 0;
     }
 }
 
@@ -447,29 +483,32 @@ mod tests {
             cwd: "/repo".into(),
         };
         let mut tracker = PaneAgentTracker::default();
-        tracker.update(Some(agent.clone()), now);
+        tracker.update(Some(agent.clone()), now, 1_000);
         assert_eq!(
-            tracker.listed_agent(now),
+            tracker.listed_agent(now, 1_000),
             Some((agent.clone(), AgentState::Idle))
         );
 
-        tracker.record_output(now);
+        tracker.record_output(now, 1_001);
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(2)),
+            tracker.listed_agent(now + Duration::from_secs(2), 3_001),
             Some((agent.clone(), AgentState::Working))
         );
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(3)),
+            tracker.listed_agent(now + Duration::from_secs(3), 4_001),
             Some((agent.clone(), AgentState::Idle))
         );
 
-        tracker.update(None, now + Duration::from_secs(4));
+        tracker.update(None, now + Duration::from_secs(4), 5_001);
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(19)),
+            tracker.listed_agent(now + Duration::from_secs(19), 20_001),
             Some((agent.clone(), AgentState::Done))
         );
-        tracker.update(None, now + Duration::from_secs(20));
-        assert_eq!(tracker.listed_agent(now + Duration::from_secs(20)), None);
+        tracker.update(None, now + Duration::from_secs(20), 21_001);
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(20), 21_001),
+            None
+        );
     }
 
     #[test]
@@ -482,18 +521,20 @@ mod tests {
                 cwd: "/old".into(),
             }),
             now,
+            1_000,
         );
-        tracker.update(None, now + Duration::from_secs(1));
+        tracker.update(None, now + Duration::from_secs(1), 2_000);
         tracker.update(
             Some(DetectedAgent {
                 kind: AgentKind::Pi,
                 cwd: "/new".into(),
             }),
             now + Duration::from_secs(2),
+            3_000,
         );
 
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(2)),
+            tracker.listed_agent(now + Duration::from_secs(2), 3_000),
             Some((
                 DetectedAgent {
                     kind: AgentKind::Pi,
@@ -502,6 +543,77 @@ mod tests {
                 AgentState::Idle,
             ))
         );
+    }
+
+    #[test]
+    fn working_interval_tracks_transitions_without_refreshing() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                cwd: "/repo".into(),
+            }),
+            now,
+            1_000,
+        );
+
+        tracker.record_output(now, 1_001);
+        let started_at = tracker.working_since;
+        assert_eq!(tracker.working_since_unix_ms, 1_001);
+
+        tracker.record_output(now + Duration::from_secs(1), 2_001);
+        assert_eq!(tracker.working_since, started_at);
+        assert_eq!(tracker.working_since_unix_ms, 1_001);
+
+        tracker.listed_agent(now + Duration::from_secs(4), 5_001);
+        assert_eq!(tracker.working_since, None);
+        assert_eq!(tracker.working_since_unix_ms, 0);
+    }
+
+    #[test]
+    fn agent_replacement_resets_working_interval() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                cwd: "/old".into(),
+            }),
+            now,
+            1_000,
+        );
+        tracker.record_output(now, 1_001);
+        tracker.update(
+            Some(DetectedAgent {
+                kind: AgentKind::Claude,
+                cwd: "/new".into(),
+            }),
+            now + Duration::from_secs(1),
+            2_001,
+        );
+
+        assert_eq!(tracker.working_since, None);
+        assert_eq!(tracker.working_since_unix_ms, 0);
+    }
+
+    #[test]
+    fn done_clears_working_interval() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                cwd: "/repo".into(),
+            }),
+            now,
+            1_000,
+        );
+        tracker.record_output(now, 1_001);
+        tracker.update(None, now + Duration::from_secs(1), 2_001);
+
+        assert_eq!(tracker.working_since, None);
+        assert_eq!(tracker.working_since_unix_ms, 0);
     }
 
     #[test]

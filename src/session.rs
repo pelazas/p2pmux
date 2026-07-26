@@ -3473,6 +3473,7 @@ mod control_queue_tests {
                     agent_kind: String::from("codex"),
                     cwd: String::from("/repo"),
                     state: AgentRosterState::Working as i32,
+                    working_since_unix_ms: 0,
                 }],
             }),
         )
