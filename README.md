@@ -130,9 +130,13 @@ hosts then resize their own PTY and VT screen and publish their local grids.
 - `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
   focused pane.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
+- `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
+  cancels; a blank title restores `Pane #N`.
 - `Ctrl+P`, then arrows — move focus.
 - `Ctrl+T`, then `N` — create a tab with a local PTY on the requester’s Mac.
 - `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
+- `Ctrl+T`, then `e` — rename the current tab for every admitted member. Enter saves; Esc
+  cancels; a blank title restores `Tab #N`.
 - `Ctrl+T`, then left/right — switch tabs.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.

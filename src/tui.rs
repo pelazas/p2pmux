@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, watch};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -49,13 +50,15 @@ use crate::{
         sample_global_snapshot,
     },
     kitty_keyboard::KittyKeyboardTracker,
-    layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId},
+    layout::{
+        Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId, normalize_title,
+    },
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     local_ipc::AgentOverlaySnapshotRow,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutRequest, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor,
-        PaneFailed, PaneReady, SplitAxis,
+        PaneFailed, PaneReady, RenamePane, RenameTab, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
@@ -127,6 +130,8 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Pane  <"),
     FooterSegment::Key("←↓↑→"),
     FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("e"),
+    FooterSegment::Text("> RENAME   <"),
     FooterSegment::Key("n"),
     FooterSegment::Text("> NEW   <"),
     FooterSegment::Key("r/l/d/u"),
@@ -140,6 +145,8 @@ const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Tab  <"),
     FooterSegment::Key("←→"),
     FooterSegment::Text("> SWITCH   <"),
+    FooterSegment::Key("e"),
+    FooterSegment::Text("> RENAME   <"),
     FooterSegment::Key("n"),
     FooterSegment::Text("> NEW   <"),
     FooterSegment::Key("x"),
@@ -213,6 +220,14 @@ pub enum UiIntent {
         first_share_bps: u16,
         base_revision: u64,
     },
+    RenamePane {
+        pane_id: PaneId,
+        title: String,
+    },
+    RenameTab {
+        tab_id: TabId,
+        title: String,
+    },
 }
 
 /// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
@@ -228,12 +243,35 @@ pub struct AgentOverlayRow {
     pub pane_id: PaneId,
     pub tab_ordinal: usize,
     pub pane_ordinal: usize,
+    pub tab_label: String,
+    pub pane_label: String,
     pub kind: String,
     pub cwd: String,
     pub state: AgentRosterState,
     pub working_since_unix_ms: u64,
     pub host: String,
     pub controller: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RenameTarget {
+    Pane(PaneId),
+    Tab(TabId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenamePrompt {
+    target: RenameTarget,
+    value: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum ModalState {
+    #[default]
+    None,
+    Agents,
+    Rename(RenamePrompt),
 }
 
 /// Rectangles for one rendered terminal frame.
@@ -325,7 +363,7 @@ pub struct MultiPaneTui {
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
-    agent_overlay_open: bool,
+    modal: ModalState,
     agent_selected_pane: Option<PaneId>,
     /// Terminal-line offset into the cards (two card lines plus one spacer each).
     agent_overlay_scroll_line: usize,
@@ -358,7 +396,7 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
-            agent_overlay_open: false,
+            modal: ModalState::None,
             agent_selected_pane: None,
             agent_overlay_scroll_line: 0,
             agent_overlay_viewport_lines: 0,
@@ -393,7 +431,7 @@ impl MultiPaneTui {
     }
 
     pub fn overlay_open(&self) -> bool {
-        self.agent_overlay_open
+        matches!(self.modal, ModalState::Agents)
     }
 
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
@@ -403,6 +441,19 @@ impl MultiPaneTui {
             };
             row.tab_ordinal = tab_ordinal;
             row.pane_ordinal = pane_ordinal;
+            row.tab_label = self
+                .snapshot
+                .tabs
+                .iter()
+                .find(|tab| contains_leaf(&tab.root, row.pane_id))
+                .and_then(|tab| tab.title.clone())
+                .unwrap_or_else(|| format!("Tab #{tab_ordinal}"));
+            row.pane_label = self
+                .snapshot
+                .panes
+                .get(&row.pane_id)
+                .and_then(|pane| pane.title.clone())
+                .unwrap_or_else(|| format!("Pane #{pane_ordinal}"));
             true
         });
         rows.sort_by_key(|row| (row.tab_ordinal, row.pane_ordinal, row.pane_id));
@@ -494,7 +545,7 @@ impl MultiPaneTui {
     }
 
     pub(crate) fn agent_overlay_has_working_rows(&self) -> bool {
-        self.agent_overlay_open
+        self.overlay_open()
             && self
                 .agent_rows
                 .iter()
@@ -520,7 +571,7 @@ impl MultiPaneTui {
             .is_some_and(|then| now.duration_since(then) >= AGENT_TOGGLE_WINDOW)
         {
             self.pending_agent_toggle = None;
-            self.agent_overlay_open = true;
+            self.modal = ModalState::Agents;
             self.exit_chord_mode();
             return true;
         }
@@ -907,7 +958,11 @@ impl MultiPaneTui {
                 if index > 0 {
                     x = x.saturating_add(text_width(TAB_BAR_SEPARATOR));
                 }
-                let label_width = text_width(&tab_label(index + 1, tab.tab_id == self.current_tab));
+                let label_width = text_width(&tab_label(
+                    tab.title.as_deref(),
+                    index + 1,
+                    tab.tab_id == self.current_tab,
+                ));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
@@ -917,7 +972,15 @@ impl MultiPaneTui {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
-        if self.agent_overlay_open {
+        if is_quit(key) {
+            self.modal = ModalState::None;
+            self.exit_chord_mode();
+            return KeyHandling::Quit;
+        }
+        if matches!(self.modal, ModalState::Rename(_)) {
+            return self.handle_rename_key(key);
+        }
+        if self.overlay_open() {
             self.set_agent_overlay_viewport(area);
             return self.handle_agent_overlay_key(key);
         }
@@ -931,10 +994,6 @@ impl MultiPaneTui {
             }
             self.pending_agent_toggle = Some(Instant::now());
             return KeyHandling::Consumed(vec![]);
-        }
-        if is_quit(key) {
-            self.exit_chord_mode();
-            return KeyHandling::Quit;
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
@@ -988,6 +1047,9 @@ impl MultiPaneTui {
         mouse: crossterm::event::MouseEvent,
         area: Rect,
     ) -> Vec<UiIntent> {
+        if matches!(self.modal, ModalState::Rename(_)) {
+            return Vec::new();
+        }
         match mouse.kind {
             MouseEventKind::Moved if !self.overlay_open() => {
                 self.hover_pane_at(mouse.column, mouse.row, area);
@@ -1045,7 +1107,7 @@ impl MultiPaneTui {
     fn handle_agent_overlay_key(&mut self, key: KeyEvent) -> KeyHandling {
         match key.code {
             KeyCode::Esc => {
-                self.agent_overlay_open = false;
+                self.modal = ModalState::None;
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1061,6 +1123,71 @@ impl MultiPaneTui {
                     return KeyHandling::Consumed(vec![]);
                 };
                 KeyHandling::Consumed(self.jump_to_agent_pane(pane_id))
+            }
+            _ => KeyHandling::Consumed(vec![]),
+        }
+    }
+
+    fn open_rename(&mut self, target: RenameTarget) {
+        let value = match target {
+            RenameTarget::Pane(pane_id) => self
+                .snapshot
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.title.clone()),
+            RenameTarget::Tab(tab_id) => self
+                .snapshot
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == tab_id)
+                .and_then(|tab| tab.title.clone()),
+        }
+        .unwrap_or_default();
+        self.modal = ModalState::Rename(RenamePrompt {
+            target,
+            value,
+            error: None,
+        });
+        self.exit_chord_mode();
+        self.clear_selection();
+        self.cancel_resize_drag();
+    }
+
+    fn handle_rename_key(&mut self, key: KeyEvent) -> KeyHandling {
+        let ModalState::Rename(prompt) = &mut self.modal else {
+            unreachable!("rename handler requires an active rename prompt");
+        };
+        match key.code {
+            KeyCode::Esc if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Backspace if key.modifiers.is_empty() => {
+                prompt.value.pop();
+                prompt.error = None;
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => match normalize_title(&prompt.value) {
+                Ok(normalized) => {
+                    let title = normalized.unwrap_or_default();
+                    let intent = match prompt.target {
+                        RenameTarget::Pane(pane_id) => UiIntent::RenamePane { pane_id, title },
+                        RenameTarget::Tab(tab_id) => UiIntent::RenameTab { tab_id, title },
+                    };
+                    self.modal = ModalState::None;
+                    KeyHandling::Consumed(vec![intent])
+                }
+                Err(_) => {
+                    prompt.error = Some(String::from("Max 32 characters; no controls"));
+                    KeyHandling::Consumed(vec![])
+                }
+            },
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                prompt.value.push(character);
+                prompt.error = None;
+                KeyHandling::Consumed(vec![])
             }
             _ => KeyHandling::Consumed(vec![]),
         }
@@ -1100,7 +1227,7 @@ impl MultiPaneTui {
         };
         self.current_tab = tab.tab_id;
         self.focused_pane = pane_id;
-        self.agent_overlay_open = false;
+        self.modal = ModalState::None;
         vec![UiIntent::FocusPane { pane_id }]
     }
 
@@ -1125,6 +1252,10 @@ impl MultiPaneTui {
 
     fn handle_pane_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
         match key.code {
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                self.open_rename(RenameTarget::Pane(self.focused_pane));
+                None
+            }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
                 let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
                 self.create_pane(
@@ -1175,6 +1306,10 @@ impl MultiPaneTui {
 
     fn handle_tab_chord(&mut self, key: KeyEvent, area: Rect) -> Option<UiIntent> {
         match key.code {
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                self.open_rename(RenameTarget::Tab(self.current_tab));
+                None
+            }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
                 let (grid_rows, grid_cols) = grid_for_pane(self.geometry(area).content);
                 Some(UiIntent::CreateTab {
@@ -1333,7 +1468,8 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
     match mode {
         ChordMode::Pane => matches!(
             key.code,
-            KeyCode::Char('n')
+            KeyCode::Char('e')
+                | KeyCode::Char('n')
                 | KeyCode::Char('r')
                 | KeyCode::Char('l')
                 | KeyCode::Char('d')
@@ -1346,7 +1482,11 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
         ),
         ChordMode::Tab => matches!(
             key.code,
-            KeyCode::Char('n') | KeyCode::Char('x') | KeyCode::Left | KeyCode::Right
+            KeyCode::Char('e')
+                | KeyCode::Char('n')
+                | KeyCode::Char('x')
+                | KeyCode::Left
+                | KeyCode::Right
         ),
         ChordMode::None => false,
     }
@@ -1427,34 +1567,62 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 }
 
 fn text_width(text: &str) -> u16 {
-    text.chars().count() as u16
+    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
 }
 
-fn tab_label(index: usize, active: bool) -> String {
-    let label = format!("Tab #{index}");
+fn truncate_trailing(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let mut result = String::new();
+    for character in value.chars() {
+        if UnicodeWidthStr::width(result.as_str()).saturating_add(character.width().unwrap_or(0))
+            > width - 1
+        {
+            break;
+        }
+        result.push(character);
+    }
+    result.push('…');
+    result
+}
+
+fn tab_label(title: Option<&str>, index: usize, active: bool) -> String {
+    let label = title.map_or_else(|| format!("Tab #{index}"), str::to_owned);
     if active { format!(" {label} ") } else { label }
 }
 
 fn pane_title(
+    custom_title: Option<&str>,
     index: usize,
     host_peer_id: &[u8],
     controller_peer_id: Option<&[u8]>,
     members: &[crate::layout::Member],
+    available_width: usize,
 ) -> Line<'static> {
     let control = match controller_peer_id {
         Some([]) => "free".to_owned(),
         Some(peer_id) => member_label(peer_id, members),
         None => "…".to_owned(),
     };
+    let label = truncate_trailing(
+        &custom_title.map_or_else(|| format!("Pane #{index}"), str::to_owned),
+        available_width,
+    );
+    let metadata = format!(
+        " host: {} control: {control}",
+        member_label(host_peer_id, members)
+    );
+    let metadata_width = available_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
     Line::from(vec![
-        Span::styled(
-            format!("Pane #{index}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " host: {} control: {control}",
-            member_label(host_peer_id, members)
-        )),
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(truncate_trailing(&metadata, metadata_width)),
     ])
 }
 
@@ -1812,11 +1980,11 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
+            "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
-            "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
+            "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             TAB_FOOTER,
         ),
     }
@@ -2049,7 +2217,10 @@ fn render_shared_multi_pane(
             } else {
                 Style::default().fg(Color::White).bg(FOOTER_BACKGROUND)
             };
-            let label = tab_label(index + 1, active);
+            let label = truncate_trailing(
+                &tab_label(tab.title.as_deref(), index + 1, active),
+                usize::from(geometry.tab_labels[&tab.tab_id].width),
+            );
             let label_rect = geometry.tab_labels[&tab.tab_id];
             if label_rect.width == 0 {
                 continue;
@@ -2088,10 +2259,12 @@ fn render_shared_multi_pane(
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
         let mut title = pane_title(
+            pane.title.as_deref(),
             index + 1,
             &pane.host_peer_id,
             view.controller_peer_id.as_deref(),
             &tui.snapshot.members,
+            usize::from(rect.width.saturating_sub(2).saturating_sub(2)),
         );
         title.spans.insert(0, Span::raw(" "));
         title.spans.push(Span::raw(" "));
@@ -2136,8 +2309,11 @@ fn render_shared_multi_pane(
             frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), content);
         }
     }
-    if tui.agent_overlay_open {
+    if tui.overlay_open() {
         render_agents_overlay(frame, tui, unix_ms_now());
+    }
+    if let ModalState::Rename(prompt) = &tui.modal {
+        render_rename_prompt(frame, prompt);
     }
 }
 
@@ -2206,6 +2382,46 @@ fn agents_overlay_inner(area: Rect) -> Rect {
     Block::bordered().inner(agents_overlay_panel(area))
 }
 
+fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(8).clamp(28, 64).min(area.width);
+    let height = 7_u16.min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    let title = match prompt.target {
+        RenameTarget::Pane(_) => " Rename pane ",
+        RenameTarget::Tab(_) => " Rename tab ",
+    };
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::bordered()
+            .title(Line::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(FOOTER_ACCENT)),
+        panel,
+    );
+    let inner = Block::bordered().inner(panel);
+    let field = truncate_trailing(&prompt.value, usize::from(inner.width));
+    let mut lines = vec![Line::raw(field)];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+    } else {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(
+        "Enter save · Esc cancel",
+        Style::default().fg(FOOTER_MUTED),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn format_agent_overlay_card(
     row: &AgentOverlayRow,
     selected: bool,
@@ -2253,8 +2469,10 @@ fn format_agent_overlay_card(
         AgentRosterState::Done => ("✓", "done", None),
     };
     let location = format!(
-        " · Tab #{} · Pane #{} · host: {}",
-        row.tab_ordinal, row.pane_ordinal, row.host
+        " · {} · {} · host: {}",
+        truncate_trailing(&row.tab_label, usize::from(width / 3)),
+        truncate_trailing(&row.pane_label, usize::from(width / 3)),
+        row.host
     );
     let state_prefix = match elapsed.as_deref() {
         Some(elapsed) => format!("{glyph} {state} {elapsed}"),
@@ -2366,29 +2584,26 @@ fn format_agent_elapsed(working_since_unix_ms: u64, now_unix_ms: u64) -> String 
     }
 }
 
-fn truncate_trailing(value: &str, width: usize) -> String {
-    let count = value.chars().count();
-    if count <= width {
-        return value.into();
-    }
-    if width <= 1 {
-        return "…".into();
-    }
-    format!("{}…", value.chars().take(width - 1).collect::<String>())
-}
-
 fn truncate_leading(value: &str, width: usize) -> String {
-    let count = value.chars().count();
-    if count <= width {
+    if UnicodeWidthStr::width(value) <= width {
         return value.into();
     }
-    if width <= 1 {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
         return "…".into();
     }
-    format!(
-        "…{}",
-        value.chars().skip(count - width + 1).collect::<String>()
-    )
+    let mut result = String::new();
+    for character in value.chars().rev() {
+        if UnicodeWidthStr::width(result.as_str()).saturating_add(character.width().unwrap_or(0))
+            > width - 1
+        {
+            break;
+        }
+        result.insert(0, character);
+    }
+    format!("…{result}")
 }
 
 fn sanitize_single_line(value: &str) -> String {
@@ -3679,6 +3894,12 @@ impl SharedLayoutRuntime {
                     let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
                     let view = self.tui.pane_view(entry.pane_id)?;
                     let &(tab_ordinal, pane_ordinal) = pane_locations.get(&entry.pane_id)?;
+                    let tab = self
+                        .tui
+                        .snapshot()
+                        .tabs
+                        .iter()
+                        .find(|tab| contains_leaf(&tab.root, entry.pane_id))?;
                     let host = sanitize_single_line(&member_label(
                         &pane.host_peer_id,
                         &self.tui.snapshot().members,
@@ -3695,6 +3916,14 @@ impl SharedLayoutRuntime {
                         pane_id: entry.pane_id,
                         tab_ordinal,
                         pane_ordinal,
+                        tab_label: tab
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| format!("Tab #{tab_ordinal}")),
+                        pane_label: pane
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| format!("Pane #{pane_ordinal}")),
                         kind: sanitize_single_line(&entry.agent_kind),
                         cwd: sanitize_single_line(&entry.cwd),
                         state: AgentRosterState::try_from(entry.state).ok()?,
@@ -3845,6 +4074,9 @@ impl SharedLayoutRuntime {
                 delete_tab: None,
                 set_split_ratio: None,
                 update_pane_grids: Some(crate::protocol::UpdatePaneGrids { panes: updates }),
+
+                rename_pane: None,
+                rename_tab: None,
             })?;
         }
         Ok(())
@@ -3897,6 +4129,9 @@ impl SharedLayoutRuntime {
                     delete_tab: None,
                     set_split_ratio: None,
                     update_pane_grids: None,
+
+                    rename_pane: None,
+                    rename_tab: None,
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -3910,6 +4145,9 @@ impl SharedLayoutRuntime {
                     delete_tab: Some(DeleteTab { tab_id }),
                     set_split_ratio: None,
                     update_pane_grids: None,
+
+                    rename_pane: None,
+                    rename_tab: None,
                 })?
             }
             UiIntent::SetSplitRatio {
@@ -3935,6 +4173,38 @@ impl SharedLayoutRuntime {
                         first_share_bps: u32::from(first_share_bps),
                     }),
                     update_pane_grids: None,
+                    rename_pane: None,
+                    rename_tab: None,
+                })?;
+            }
+            UiIntent::RenamePane { pane_id, title } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision: self.tui.snapshot().revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: None,
+                    set_split_ratio: None,
+                    update_pane_grids: None,
+                    rename_pane: Some(RenamePane { pane_id, title }),
+                    rename_tab: None,
+                })?;
+            }
+            UiIntent::RenameTab { tab_id, title } => {
+                let request_id = self.next_id();
+                self.send_request(LayoutRequest {
+                    request_id,
+                    base_revision: self.tui.snapshot().revision,
+                    create_pane: None,
+                    delete_pane: None,
+                    create_tab: None,
+                    delete_tab: None,
+                    set_split_ratio: None,
+                    update_pane_grids: None,
+                    rename_pane: None,
+                    rename_tab: Some(RenameTab { tab_id, title }),
                 })?;
             }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
@@ -3984,6 +4254,8 @@ impl SharedLayoutRuntime {
             delete_tab: None,
             set_split_ratio: None,
             update_pane_grids: None,
+            rename_pane: None,
+            rename_tab: None,
         })
     }
 
@@ -4033,6 +4305,8 @@ impl SharedLayoutRuntime {
             host_peer_id,
             grid_rows: u32::from(pending.grid_rows),
             grid_cols: u32::from(pending.grid_cols),
+
+            title: None,
         };
         if let Err(error) = self.panes.register_local_pane(descriptor, pane.channels()) {
             let _ = self.control.try_failed(PaneFailed {
@@ -4982,6 +5256,7 @@ mod tests {
                             host_peer_id: b"host".to_vec(),
                             grid_rows: *rows,
                             grid_cols: *cols,
+                            title: None,
                         },
                     )
                 })
@@ -4994,6 +5269,8 @@ mod tests {
             pane_id,
             tab_ordinal,
             pane_ordinal,
+            tab_label: format!("Tab #{tab_ordinal}"),
+            pane_label: format!("Pane #{pane_ordinal}"),
             kind: String::from("codex"),
             cwd: String::from("/very/long/repository/path"),
             state: crate::protocol::AgentRosterState::Working,
@@ -5008,6 +5285,7 @@ mod tests {
             .map(|pane_id| Tab {
                 tab_id: pane_id,
                 root: Node::Leaf { pane_id },
+                title: None,
             })
             .collect();
         let panes = (1..=count)
@@ -5019,7 +5297,7 @@ mod tests {
                 .map(|pane_id| agent_row(pane_id, pane_id as usize, 1))
                 .collect(),
         );
-        tui.agent_overlay_open = true;
+        tui.modal = super::ModalState::Agents;
         tui
     }
 
@@ -5029,6 +5307,7 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+                title: None,
             }],
             &[(1, 2, 8)],
         ))
@@ -5066,10 +5345,12 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+                    title: None,
                 },
             ],
             &[(1, 2, 8), (2, 2, 8)],
@@ -5151,10 +5432,14 @@ mod tests {
                         first: Box::new(Node::Leaf { pane_id: 8 }),
                         second: Box::new(Node::Leaf { pane_id: 6 }),
                     },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 20,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
             ],
             &[(8, 2, 8), (6, 2, 8), (3, 2, 8)],
@@ -5187,6 +5472,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 8)],
         ))
@@ -5228,10 +5515,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 8), (2, 2, 8)],
@@ -5367,6 +5658,8 @@ mod tests {
                     host_peer_id: host_id,
                     grid_rows: 2,
                     grid_cols: 8,
+
+                    title: None,
                 },
                 initial.channels(),
             )
@@ -5467,6 +5760,8 @@ mod tests {
             host_peer_id: host_id.clone(),
             grid_rows: 1,
             grid_cols: 1,
+
+            title: None,
         };
         host_panes
             .register_local_pane(
@@ -5567,6 +5862,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5611,6 +5908,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5638,6 +5937,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5673,6 +5974,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5905,6 +6208,8 @@ mod tests {
                         second: Box::new(Node::Leaf { pane_id: 3 }),
                     }),
                 },
+
+                title: None,
             }],
             &[(1, 4, 10), (2, 4, 10), (3, 4, 10)],
         )
@@ -6051,6 +6356,8 @@ mod tests {
                     first: Box::new(Node::Leaf { pane_id: 8 }),
                     second: Box::new(Node::Leaf { pane_id: 3 }),
                 },
+
+                title: None,
             }],
             &[(3, 1, 1), (8, 1, 1)],
         );
@@ -6064,17 +6371,121 @@ mod tests {
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
-            pane_title(1, b"host", Some(b""), &members).to_string(),
+            pane_title(None, 1, b"host", Some(b""), &members, 80).to_string(),
             "Pane #1 host: Host control: free"
         );
         assert_eq!(
-            pane_title(2, b"host", Some(b"guest"), &members).to_string(),
+            pane_title(None, 2, b"host", Some(b"guest"), &members, 80).to_string(),
             "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
-            pane_title(2, b"host", None, &members).to_string(),
+            pane_title(None, 2, b"host", None, &members, 80).to_string(),
             "Pane #2 host: Host control: …"
         );
+    }
+
+    #[test]
+    fn title_chrome_uses_custom_labels_and_cell_width_ellipsis() {
+        assert_eq!(super::tab_label(Some("build logs"), 1, false), "build logs");
+        assert_eq!(super::tab_label(None, 2, false), "Tab #2");
+        assert_eq!(super::truncate_trailing("界界", 3), "界…");
+        assert_eq!(super::truncate_trailing("界", 1), "…");
+        assert_eq!(super::truncate_trailing("title", 0), "");
+
+        let members = vec![crate::layout::Member {
+            peer_id: b"host".to_vec(),
+            endpoint_addr: b"endpoint".to_vec(),
+            display_name: String::from("Host"),
+        }];
+        assert_eq!(
+            pane_title(Some("build logs"), 1, b"host", Some(b""), &members, 12).to_string(),
+            "build logs …"
+        );
+    }
+
+    #[test]
+    fn rename_prompt_captures_chord_target_edits_and_consumes_modal_input() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        tui.snapshot.panes.get_mut(&1).unwrap().title = Some(String::from("old"));
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(matches!(
+            &tui.modal,
+            super::ModalState::Rename(prompt) if prompt.value == "old"
+        ));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('🙂'), KeyModifiers::SHIFT),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::RenamePane {
+                pane_id: 1,
+                title: String::from("old"),
+            }])
+        );
+        assert!(!tui.overlay_open());
+    }
+
+    #[test]
+    fn rename_prompt_rejects_invalid_input_and_ctrl_q_wins() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        tui.open_rename(super::RenameTarget::Tab(1));
+        for character in "x".repeat(33).chars() {
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                area,
+            );
+        }
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(matches!(tui.modal, super::ModalState::Rename(_)));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Quit
+        );
+        assert!(matches!(tui.modal, super::ModalState::None));
     }
 
     #[test]
@@ -6167,6 +6578,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 19, 78)],
         ))
@@ -6262,10 +6675,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -6312,10 +6729,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -6327,6 +6748,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6342,6 +6765,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6377,6 +6802,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6411,6 +6838,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 3)],
         ))
@@ -6443,6 +6872,8 @@ mod tests {
                 vec![Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 }],
                 &[(1, 1, 3)],
             ))
@@ -6475,6 +6906,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 3, 6)],
         ))
@@ -6496,6 +6929,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 5)],
         ))
@@ -6771,6 +7206,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6784,11 +7221,11 @@ mod tests {
             ),
             (
                 ChordMode::Pane,
-                "Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
+                "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
-                "Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK",
+                "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
         ] {
             tui.chord_mode = mode;
@@ -6814,6 +7251,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6858,10 +7297,14 @@ mod tests {
                 Tab {
                     tab_id: 10,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 20,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -6919,6 +7362,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         ))
@@ -6940,6 +7385,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         ))
@@ -6989,6 +7436,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -7113,6 +7562,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -7124,10 +7575,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 3,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (3, 2, 2)],
@@ -7140,14 +7595,20 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 3,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
@@ -7165,10 +7626,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -7216,14 +7681,20 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 3,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],

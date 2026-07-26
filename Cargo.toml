@@ -18,3 +18,4 @@ sysinfo = "0.37"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net", "io-util"] }
 toml = "0.8"
 vt100 = "0.16"
+unicode-width = "0.2"
