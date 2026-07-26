@@ -2607,8 +2607,9 @@ impl SharedLayoutRuntime {
         self.subscriptions.nudge();
         self.start_eligible_subscriptions();
         self.refresh_local_views();
-        let (width, height) = terminal::size()?;
-        self.reflow_local_panes(Rect::new(0, 0, width, height))?;
+        if let Some(area) = area_from_terminal_size(terminal::size()) {
+            self.reflow_local_panes(area)?;
+        }
         Ok(())
     }
 
@@ -2937,6 +2938,11 @@ impl SharedLayoutRuntime {
         }
         self.runtime.block_on(self.control.shutdown());
     }
+}
+
+fn area_from_terminal_size(size: io::Result<(u16, u16)>) -> Option<Rect> {
+    size.ok()
+        .map(|(width, height)| Rect::new(0, 0, width, height))
 }
 
 pub struct HostPaneRuntime {
@@ -3667,6 +3673,7 @@ fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
+        io,
         net::Ipv4Addr,
         thread,
         time::{Duration, Instant},
@@ -3697,10 +3704,11 @@ mod tests {
         FOOTER_MUTED, FOOTER_ORANGE, FooterSegment, HostControlEvent, HostPaneChannels,
         HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui, PaneTextSelection,
         PaneViewState, PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, allocate_node, contextual_footer, copied_line_count,
-        encode_key, encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
-        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        SharedLocalPane, UiIntent, VtScreen, allocate_node, area_from_terminal_size,
+        contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
+        initial_root_pane_grid, is_chord_command, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
@@ -3728,6 +3736,14 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>(),
         }
+    }
+
+    #[test]
+    fn terminal_area_is_absent_when_terminal_size_is_unavailable() {
+        assert_eq!(
+            area_from_terminal_size(Err(io::Error::from(io::ErrorKind::WouldBlock))),
+            None
+        );
     }
 
     #[test]
