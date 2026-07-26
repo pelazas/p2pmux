@@ -585,6 +585,7 @@ mod tests {
     ) {
         apply_snapshot(
             tui,
+            crate::config::UiTheme::default(),
             &mut BTreeMap::new(),
             String::from("room"),
             layout(pane_ids),
