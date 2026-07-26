@@ -94,9 +94,8 @@ const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
 const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
-const AGENT_OVERLAY_CHROME: Color = Color::Rgb(56, 132, 255);
-const AGENT_OVERLAY_BACKGROUND: Color = Color::Rgb(10, 18, 35);
-const AGENT_OVERLAY_SELECTED_BACKGROUND: Color = Color::Rgb(31, 74, 142);
+const AGENT_OVERLAY_CHROME: Color = Color::Rgb(255, 69, 0);
+const AGENT_OVERLAY_SELECTED_BACKGROUND: Color = Color::DarkGray;
 const AGENT_OVERLAY_MUTED: Color = Color::Rgb(145, 157, 180);
 const AGENT_OVERLAY_WARM: Color = Color::Rgb(255, 184, 77);
 
@@ -2148,10 +2147,11 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
     let block = Block::bordered()
         .title(Line::styled(
             " Agents ",
-            Style::default().fg(AGENT_OVERLAY_CHROME),
+            Style::default()
+                .fg(AGENT_OVERLAY_CHROME)
+                .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(AGENT_OVERLAY_CHROME))
-        .style(Style::default().bg(AGENT_OVERLAY_BACKGROUND));
+        .border_style(Style::default().fg(AGENT_OVERLAY_CHROME));
     let inner = agents_overlay_inner(area);
     frame.render_widget(block, panel);
     if tui.agent_rows.is_empty() {
@@ -5164,7 +5164,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_overlay_uses_blue_chrome_and_selected_card_background() {
+    fn agents_overlay_uses_orange_red_chrome_gray_selection_and_pane_background() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -5183,18 +5183,23 @@ mod tests {
         let inner = super::agents_overlay_inner(Rect::new(0, 0, 80, 24));
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(panel.x, panel.y)].fg, super::AGENT_OVERLAY_CHROME);
+        assert_eq!(buffer[(panel.x, panel.y)].fg, Color::Rgb(255, 69, 0));
         assert_eq!(
-            buffer[(inner.x, inner.y)].bg,
-            super::AGENT_OVERLAY_SELECTED_BACKGROUND
+            buffer[(panel.x.saturating_add(1), panel.y)].modifier,
+            Modifier::BOLD
         );
+        assert_eq!(buffer[(inner.x, inner.y)].bg, Color::DarkGray);
         assert_eq!(
             buffer[(inner.x, inner.y.saturating_add(1))].bg,
-            super::AGENT_OVERLAY_SELECTED_BACKGROUND
+            Color::DarkGray
         );
         assert_eq!(
             buffer[(inner.x.saturating_add(50), inner.y)].bg,
-            super::AGENT_OVERLAY_SELECTED_BACKGROUND
+            Color::DarkGray
+        );
+        assert_eq!(
+            buffer[(inner.x, inner.y.saturating_add(3))].bg,
+            Color::Reset
         );
     }
 
