@@ -16,6 +16,107 @@ use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 
+const CITY_NAMES: &[&str] = &[
+    "abu-dhabi",
+    "accra",
+    "amsterdam",
+    "ankara",
+    "athens",
+    "auckland",
+    "bangkok",
+    "barcelona",
+    "beijing",
+    "beirut",
+    "belgrade",
+    "berlin",
+    "bogota",
+    "boston",
+    "brasilia",
+    "brussels",
+    "buenos-aires",
+    "cairo",
+    "calgary",
+    "cape-town",
+    "caracas",
+    "chicago",
+    "copenhagen",
+    "dakar",
+    "dallas",
+    "delhi",
+    "denver",
+    "dhaka",
+    "doha",
+    "dublin",
+    "edinburgh",
+    "firenze",
+    "frankfurt",
+    "geneva",
+    "guangzhou",
+    "guatemala-city",
+    "hanoi",
+    "helsinki",
+    "hong-kong",
+    "honolulu",
+    "houston",
+    "istanbul",
+    "jakarta",
+    "jerusalem",
+    "johannesburg",
+    "kathmandu",
+    "kuala-lumpur",
+    "kyiv",
+    "lagos",
+    "lima",
+    "lisbon",
+    "london",
+    "los-angeles",
+    "madrid",
+    "manila",
+    "melbourne",
+    "mexico-city",
+    "miami",
+    "milan",
+    "montreal",
+    "mumbai",
+    "munich",
+    "nairobi",
+    "new-york",
+    "osaka",
+    "oslo",
+    "ottawa",
+    "paris",
+    "perth",
+    "philadelphia",
+    "prague",
+    "reykjavik",
+    "rio-de-janeiro",
+    "riyadh",
+    "rome",
+    "san-diego",
+    "san-francisco",
+    "san-jose",
+    "santiago",
+    "sao-paulo",
+    "seattle",
+    "seoul",
+    "shanghai",
+    "singapore",
+    "stockholm",
+    "sydney",
+    "taipei",
+    "tallinn",
+    "tehran",
+    "tel-aviv",
+    "tokyo",
+    "toronto",
+    "vancouver",
+    "vienna",
+    "warsaw",
+    "washington",
+    "wellington",
+    "zurich",
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRole {
@@ -208,20 +309,10 @@ pub fn generate_id() -> io::Result<String> {
 }
 
 pub fn generate_name() -> io::Result<String> {
-    const ADJECTIVES: &[&str] = &[
-        "amber", "brisk", "cobalt", "daring", "ember", "fuzzy", "golden", "lunar",
-    ];
-    const NOUNS: &[&str] = &[
-        "badger", "comet", "falcon", "harbor", "meadow", "otter", "pine", "river",
-    ];
-    let mut bytes = [0u8; 3];
+    let mut bytes = [0u8; 8];
     fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(format!(
-        "{}-{}-{:02x}",
-        ADJECTIVES[usize::from(bytes[0]) % ADJECTIVES.len()],
-        NOUNS[usize::from(bytes[1]) % NOUNS.len()],
-        bytes[2]
-    ))
+    let index = u64::from_le_bytes(bytes) as usize % CITY_NAMES.len();
+    Ok(CITY_NAMES[index].to_owned())
 }
 
 pub fn valid_name(name: &str) -> bool {
