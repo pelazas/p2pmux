@@ -34,6 +34,7 @@ use crate::{
         LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
         ReleaseControl, SessionSnapshot, Snapshot, SplitAxis, TabDescriptor, TakeControl, Welcome,
+        SetSplitRatio, UpdatePaneGrids,
         envelope,
     },
     screen::ScreenFrame,
@@ -261,7 +262,9 @@ impl LayoutCoordinator {
         let action_count = usize::from(request.create_pane.is_some())
             + usize::from(request.delete_pane.is_some())
             + usize::from(request.create_tab.is_some())
-            + usize::from(request.delete_tab.is_some());
+            + usize::from(request.delete_tab.is_some())
+            + usize::from(request.set_split_ratio.is_some())
+            + usize::from(request.update_pane_grids.is_some());
         if request_id == 0 || request.base_revision == 0 || action_count != 1 {
             return reject(request_id, LayoutRejectReason::Malformed);
         }
@@ -286,6 +289,10 @@ impl LayoutCoordinator {
             )
         } else if let Some(delete) = request.delete_tab {
             self.delete_tab(authenticated_peer_id, request.base_revision, delete)
+        } else if let Some(ratio) = request.set_split_ratio {
+            self.set_split_ratio(authenticated_peer_id, request.base_revision, ratio)
+        } else if let Some(grids) = request.update_pane_grids {
+            self.update_pane_grids(authenticated_peer_id, request.base_revision, grids)
         } else {
             Err(LayoutError::InvalidSnapshot)
         };
@@ -518,6 +525,51 @@ impl LayoutCoordinator {
         ))
     }
 
+    fn set_split_ratio(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        base_revision: u64,
+        ratio: SetSplitRatio,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        let axis = protocol_axis(ratio.axis)?;
+        let first_share_bps = u16::try_from(ratio.first_share_bps)
+            .map_err(|_| LayoutError::InvalidSplitRatio)?;
+        self.state.set_split_ratio(
+            authenticated_peer_id,
+            base_revision,
+            ratio.pane_id,
+            axis,
+            first_share_bps,
+        )?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
+    fn update_pane_grids(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        base_revision: u64,
+        update: UpdatePaneGrids,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        let grids = update
+            .panes
+            .into_iter()
+            .map(|pane| {
+                Ok((
+                    pane.pane_id,
+                    u16::try_from(pane.grid_rows).map_err(|_| LayoutError::InvalidGrid)?,
+                    u16::try_from(pane.grid_cols).map_err(|_| LayoutError::InvalidGrid)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        self.state
+            .update_pane_grids(authenticated_peer_id, base_revision, &grids)?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
     fn layout_commit(&self) -> Result<LayoutCommit, CoordinatorError> {
         let state = self.protocol_layout_state()?;
         Ok(LayoutCommit {
@@ -718,6 +770,11 @@ fn layout_node_from_protocol(node: &LayoutNode) -> Result<Node, LayoutError> {
         (Some(pane_id), None) if *pane_id != 0 => Ok(Node::Leaf { pane_id: *pane_id }),
         (None, Some(split)) => Ok(Node::Split {
             axis: protocol_axis(split.axis)?,
+            first_share_bps: split
+                .first_share_bps
+                .map(|share| u16::try_from(share).map_err(|_| LayoutError::InvalidSnapshot))
+                .transpose()?
+                .unwrap_or(crate::layout::DEFAULT_FIRST_SHARE_BPS),
             first: Box::new(layout_node_from_protocol(
                 split.first.as_ref().ok_or(LayoutError::InvalidSnapshot)?,
             )?),
@@ -737,6 +794,7 @@ fn protocol_node(node: Node) -> LayoutNode {
         },
         Node::Split {
             axis,
+            first_share_bps,
             first,
             second,
         } => LayoutNode {
@@ -748,6 +806,7 @@ fn protocol_node(node: Node) -> LayoutNode {
                 }),
                 first: Some(protocol_node(*first)),
                 second: Some(protocol_node(*second)),
+                first_share_bps: Some(u32::from(first_share_bps)),
             })),
         },
     }
@@ -772,7 +831,7 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         | LayoutError::PaneLimit
         | LayoutError::SplitDepthLimit
         | LayoutError::IdExhausted => LayoutRejectReason::Limit,
-        LayoutError::UnknownPane { .. } | LayoutError::UnknownTab { .. } => {
+        LayoutError::UnknownPane { .. } | LayoutError::NoMatchingSplit { .. } | LayoutError::UnknownTab { .. } => {
             LayoutRejectReason::UnknownId
         }
         LayoutError::LastPaneInTab { .. } | LayoutError::LastTab => {
@@ -786,6 +845,7 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         | LayoutError::InvalidEndpointAddress
         | LayoutError::InvalidDisplayName
         | LayoutError::InvalidGrid
+        | LayoutError::InvalidSplitRatio
         | LayoutError::AlreadyMember
         | LayoutError::InvalidSnapshot => LayoutRejectReason::Malformed,
     }
