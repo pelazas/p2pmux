@@ -1,6 +1,7 @@
 use p2pmux::layout::{
     Axis, LayoutError, LayoutSnapshot, MAX_ENDPOINT_ADDR_BYTES, MAX_MEMBERS, MAX_PANES_PER_TAB,
     MAX_PEER_ID_BYTES, MAX_TABS, NewPanePosition, Node, ReservationCommit, SessionState,
+    DEFAULT_FIRST_SHARE_BPS,
 };
 
 const HOST_A: &[u8] = b"host-a";
@@ -57,6 +58,62 @@ fn initial_state_has_one_tab_and_one_hosted_pane() {
     assert_eq!(snapshot.tabs[0].root, Node::Leaf { pane_id: 1 });
     assert_eq!(snapshot.panes[&1].host_peer_id, HOST_A);
     assert_eq!(snapshot.members[0].endpoint_addr, ADDR_A);
+}
+
+#[test]
+fn splits_default_to_a_valid_shared_ratio_and_ratio_updates_are_revisioned() {
+    let mut state = state();
+    let second = state
+        .create_pane(HOST_A, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("split");
+    assert!(matches!(
+        snapshot(&state).tabs[0].root,
+        Node::Split { first_share_bps: DEFAULT_FIRST_SHARE_BPS, .. }
+    ));
+
+    state
+        .set_split_ratio(HOST_A, state.revision(), second, Axis::LeftRight, 7_500)
+        .expect("ratio update");
+    assert!(matches!(
+        snapshot(&state).tabs[0].root,
+        Node::Split { first_share_bps: 7_500, .. }
+    ));
+}
+
+#[test]
+fn ratios_and_host_grid_batches_are_strict_and_atomic() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member");
+    let second = state
+        .create_pane(HOST_B, state.revision(), 1, Axis::LeftRight, 24, 80)
+        .expect("pane");
+    let before = snapshot(&state);
+    assert_eq!(
+        state.set_split_ratio(HOST_B, state.revision(), second, Axis::TopBottom, 5_000),
+        Err(LayoutError::NoMatchingSplit { pane_id: second, axis: Axis::TopBottom })
+    );
+    assert_eq!(
+        state.set_split_ratio(HOST_B, state.revision(), 99, Axis::LeftRight, 5_000),
+        Err(LayoutError::UnknownPane { pane_id: 99 })
+    );
+    assert_eq!(snapshot(&state), before);
+
+    state
+        .update_pane_grids(HOST_B, state.revision(), &[(second, 30, 100)])
+        .expect("host grid update");
+    assert_eq!(state.pane(second).expect("pane").grid_rows, 30);
+    let after = snapshot(&state);
+    assert_eq!(
+        state.update_pane_grids(HOST_A, state.revision(), &[(second, 31, 100)]),
+        Err(LayoutError::NotPaneHost { pane_id: second })
+    );
+    assert_eq!(
+        state.update_pane_grids(HOST_B, state.revision(), &[(second, 0, 100)]),
+        Err(LayoutError::InvalidGrid)
+    );
+    assert_eq!(snapshot(&state), after);
 }
 
 #[test]
@@ -137,6 +194,7 @@ fn creating_panes_uses_the_requested_split_axis() {
                 axis: Axis::TopBottom,
                 first,
                 second,
+                ..
             } if matches!(first.as_ref(), Node::Leaf { pane_id } if *pane_id == right)
                 && matches!(second.as_ref(), Node::Leaf { pane_id } if *pane_id == down)
         )

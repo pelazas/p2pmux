@@ -4,6 +4,9 @@ pub const MAX_MEMBERS: usize = 8;
 pub const MAX_TABS: usize = 9;
 pub const MAX_PANES_PER_TAB: usize = 8;
 pub const MAX_SPLIT_DEPTH: usize = 4;
+pub const DEFAULT_FIRST_SHARE_BPS: u16 = 5_000;
+pub const MIN_FIRST_SHARE_BPS: u16 = 1;
+pub const MAX_FIRST_SHARE_BPS: u16 = 9_999;
 /// Maximum peer-identifier size, aligned with the protocol boundary.
 pub const MAX_PEER_ID_BYTES: usize = 64;
 /// Maximum serialized endpoint-address size accepted by this pure model.
@@ -33,6 +36,7 @@ pub enum Node {
     },
     Split {
         axis: Axis,
+        first_share_bps: u16,
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -138,7 +142,9 @@ pub enum LayoutError {
     PaneLimit,
     SplitDepthLimit,
     InvalidGrid,
+    InvalidSplitRatio,
     UnknownPane { pane_id: PaneId },
+    NoMatchingSplit { pane_id: PaneId, axis: Axis },
     UnknownTab { tab_id: TabId },
     NotPaneHost { pane_id: PaneId },
     NotTabHost { tab_id: TabId },
@@ -264,6 +270,9 @@ impl SessionState {
             if !tab.root.collect_pane_ids(0, &mut pane_ids)
                 || pane_ids.len() - before > MAX_PANES_PER_TAB
             {
+                return Err(LayoutError::InvalidSnapshot);
+            }
+            if !tab.root.has_valid_ratios() {
                 return Err(LayoutError::InvalidSnapshot);
             }
         }
@@ -520,6 +529,7 @@ impl SessionState {
                 };
                 let split = Node::Split {
                     axis,
+                    first_share_bps: DEFAULT_FIRST_SHARE_BPS,
                     first,
                     second,
                 };
@@ -736,6 +746,66 @@ impl SessionState {
         Ok(())
     }
 
+    pub fn set_split_ratio(
+        &mut self,
+        requester: &[u8],
+        base_revision: u64,
+        pane_id: PaneId,
+        axis: Axis,
+        first_share_bps: u16,
+    ) -> Result<(), LayoutError> {
+        self.check_mutation(base_revision)?;
+        self.require_member(requester)?;
+        self.ensure_no_reservation()?;
+        validate_first_share_bps(first_share_bps)?;
+        let tab_index = self
+            .tab_index_for_pane(pane_id)
+            .ok_or(LayoutError::UnknownPane { pane_id })?;
+        if !self.tabs[tab_index]
+            .root
+            .set_nearest_split_ratio(pane_id, axis, first_share_bps)
+        {
+            return Err(LayoutError::NoMatchingSplit { pane_id, axis });
+        }
+        self.advance_revision();
+        Ok(())
+    }
+
+    pub fn update_pane_grids(
+        &mut self,
+        requester: &[u8],
+        base_revision: u64,
+        grids: &[(PaneId, u16, u16)],
+    ) -> Result<(), LayoutError> {
+        self.check_mutation(base_revision)?;
+        self.require_member(requester)?;
+        self.ensure_no_reservation()?;
+        if grids.is_empty() {
+            return Err(LayoutError::InvalidGrid);
+        }
+        let mut pane_ids = BTreeSet::new();
+        for &(pane_id, rows, cols) in grids {
+            validate_grid(rows, cols)?;
+            if !pane_ids.insert(pane_id) {
+                return Err(LayoutError::InvalidGrid);
+            }
+            let pane = self
+                .panes
+                .get(&pane_id)
+                .ok_or(LayoutError::UnknownPane { pane_id })?;
+            if pane.host_peer_id != requester {
+                return Err(LayoutError::NotPaneHost { pane_id });
+            }
+        }
+        for &(pane_id, rows, cols) in grids {
+            let pane = self.panes.get_mut(&pane_id).expect("validated pane exists");
+            pane.grid_rows = rows;
+            pane.grid_cols = cols;
+        }
+        self.advance_revision();
+        Ok(())
+    }
+
     pub fn pane_ids_in_tab(&self, tab_id: TabId) -> Vec<PaneId> {
         self.tabs
             .iter()
@@ -887,6 +957,22 @@ impl Node {
         }
     }
 
+    fn has_valid_ratios(&self) -> bool {
+        match self {
+            Self::Leaf { .. } => true,
+            Self::Split {
+                first_share_bps,
+                first,
+                second,
+                ..
+            } => {
+                validate_first_share_bps(*first_share_bps).is_ok()
+                    && first.has_valid_ratios()
+                    && second.has_valid_ratios()
+            }
+        }
+    }
+
     fn replace_leaf(&mut self, wanted: PaneId, replacement: Node) -> bool {
         match self {
             Self::Leaf { pane_id } if *pane_id == wanted => {
@@ -901,11 +987,47 @@ impl Node {
         }
     }
 
+    fn set_nearest_split_ratio(
+        &mut self,
+        wanted: PaneId,
+        axis: Axis,
+        first_share_bps: u16,
+    ) -> bool {
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Split {
+                axis: split_axis,
+                first,
+                second,
+                ..
+            } => {
+                if first.contains_leaf(wanted)
+                    && first.set_nearest_split_ratio(wanted, axis, first_share_bps)
+                {
+                    return true;
+                }
+                if second.contains_leaf(wanted)
+                    && second.set_nearest_split_ratio(wanted, axis, first_share_bps)
+                {
+                    return true;
+                }
+                if *split_axis == axis && (first.contains_leaf(wanted) || second.contains_leaf(wanted)) {
+                    if let Self::Split { first_share_bps: share, .. } = self {
+                        *share = first_share_bps;
+                    }
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
     fn remove_leaf(self, wanted: PaneId) -> Option<Node> {
         match self {
             Self::Leaf { pane_id } => (pane_id != wanted).then_some(Self::Leaf { pane_id }),
             Self::Split {
                 axis,
+                first_share_bps,
                 first,
                 second,
             } => {
@@ -913,6 +1035,7 @@ impl Node {
                     match first.remove_leaf(wanted) {
                         Some(first) => Some(Self::Split {
                             axis,
+                            first_share_bps,
                             first: Box::new(first),
                             second,
                         }),
@@ -922,6 +1045,7 @@ impl Node {
                     match second.remove_leaf(wanted) {
                         Some(second) => Some(Self::Split {
                             axis,
+                            first_share_bps,
                             first,
                             second: Box::new(second),
                         }),
@@ -930,6 +1054,7 @@ impl Node {
                 } else {
                     Some(Self::Split {
                         axis,
+                        first_share_bps,
                         first,
                         second,
                     })
@@ -937,6 +1062,13 @@ impl Node {
             }
         }
     }
+}
+
+pub fn validate_first_share_bps(first_share_bps: u16) -> Result<(), LayoutError> {
+    if !(MIN_FIRST_SHARE_BPS..=MAX_FIRST_SHARE_BPS).contains(&first_share_bps) {
+        return Err(LayoutError::InvalidSplitRatio);
+    }
+    Ok(())
 }
 
 fn validate_grid(grid_rows: u16, grid_cols: u16) -> Result<(), LayoutError> {
