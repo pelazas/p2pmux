@@ -345,12 +345,12 @@ fn run_socket_loop(
                 Ok(None) => detached = true,
                 Err(_) => detached = true,
             }
-            if changed && !detached {
-                if let Err(error) = write_snapshot(reader.get_mut(), descriptor, node, *generation)
-                {
-                    eprintln!("p2pmux node: failed to write local snapshot: {error}");
-                    detached = true;
-                }
+            if changed
+                && !detached
+                && let Err(error) = write_snapshot(reader.get_mut(), descriptor, node, *generation)
+            {
+                eprintln!("p2pmux node: failed to write local snapshot: {error}");
+                detached = true;
             }
         }
         if (detached || shutdown)
