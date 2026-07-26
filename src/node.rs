@@ -220,21 +220,25 @@ fn run_socket_loop(
                             if let Ok(generation) = gate.attach() {
                                 node.resize(cols, rows)
                                     .map_err(|error| io::Error::other(error.to_string()))?;
-                                let attached = write_message(
+                                match write_message(
                                     reader.get_mut(),
                                     &NodeMessage::AttachAccepted { generation },
                                 )
                                 .and_then(|()| {
                                     write_snapshot(reader.get_mut(), descriptor, node, generation)
-                                })
-                                .is_ok();
-                                if attached {
-                                    reader
-                                        .get_mut()
-                                        .set_read_timeout(Some(Duration::from_millis(1)))?;
-                                    client = Some((reader, generation));
-                                } else {
-                                    let _ = gate.detach(generation);
+                                }) {
+                                    Ok(()) => {
+                                        reader
+                                            .get_mut()
+                                            .set_read_timeout(Some(Duration::from_millis(1)))?;
+                                        client = Some((reader, generation));
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "p2pmux node: failed to write initial local snapshot: {error}"
+                                        );
+                                        let _ = gate.detach(generation);
+                                    }
                                 }
                             } else {
                                 let _ = write_message(
@@ -341,11 +345,12 @@ fn run_socket_loop(
                 Ok(None) => detached = true,
                 Err(_) => detached = true,
             }
-            if changed
-                && !detached
-                && write_snapshot(reader.get_mut(), descriptor, node, *generation).is_err()
-            {
-                detached = true;
+            if changed && !detached {
+                if let Err(error) = write_snapshot(reader.get_mut(), descriptor, node, *generation)
+                {
+                    eprintln!("p2pmux node: failed to write local snapshot: {error}");
+                    detached = true;
+                }
             }
         }
         if (detached || shutdown)
