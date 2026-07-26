@@ -26,8 +26,8 @@ use crate::{
     screen::GuestScreen,
     session_store::SessionDescriptor,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneViewState, render_multi_pane,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, AGENT_TOGGLE_WINDOW, AgentOverlayRow, KeyHandling,
+        MultiPaneTui, PaneViewState, render_multi_pane,
     },
 };
 
@@ -746,11 +746,7 @@ mod tests {
                 area,
             );
             let mut animation = Instant::now();
-            refresh_tui_timers(
-                tui,
-                Instant::now() + Duration::from_millis(400),
-                &mut animation,
-            );
+            refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
             assert_eq!(
                 tui.handle_key(
                     crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -766,11 +762,7 @@ mod tests {
             area,
         );
         let mut animation = Instant::now();
-        refresh_tui_timers(
-            tui,
-            Instant::now() + Duration::from_millis(400),
-            &mut animation,
-        );
+        refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
         assert_eq!(
             tui.handle_key(
                 crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -800,11 +792,7 @@ mod tests {
             area,
         );
         let mut animation = Instant::now();
-        refresh_tui_timers(
-            tui,
-            Instant::now() + Duration::from_millis(400),
-            &mut animation,
-        );
+        refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
 
         assert!(!should_forward_paste(tui));
         assert!(tui.scroll_agent_overlay(area, false));

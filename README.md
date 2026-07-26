@@ -116,7 +116,7 @@ location (`Tab #N · Pane #M`), host, and control holder. Working cards have an 
 and live duration, while idle and done cards use distinct `○` and `✓` visuals. Press `Esc` to
 close, use arrows or `j`/`k` to select, and press Enter or left-click a card to jump to that pane
 (including on another tab). Scroll the overlay with the mouse wheel while it is open. To retain
-readline's beginning-of-line shortcut, press `Ctrl+A` twice within 400ms to forward one Ctrl+A to
+readline's beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A to
 the focused PTY instead. Working directories are shared with every member as part of the existing
 trusted shared-shell model, so do not use a session with people who should not see repository
 paths.

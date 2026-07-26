@@ -139,7 +139,7 @@ EOF
 - TUI unit tests
 
 Must implement:
-- `Ctrl+A` toggle; double-tap ≤400ms → encode/forward Ctrl+A to focused PTY
+- `Ctrl+A` toggle; double-tap ≤200ms → encode/forward Ctrl+A to focused PTY
 - Modal: while open, no arbitrary PTY forwarding; not chord-idle-expiring
 - Selection by `pane_id`; stable sort; empty state `No agents running`
 - Enter jumps (including other tab) and closes; Esc closes

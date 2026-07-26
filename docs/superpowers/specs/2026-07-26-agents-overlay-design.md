@@ -15,7 +15,7 @@ Fields per row:
 Interaction:
 
 - `Ctrl+A` **toggles** the Agents overlay open/closed
-- **Pass-through:** if overlay is closed and the user presses `Ctrl+A` twice within 400ms, forward a single Ctrl+A to the focused PTY and do **not** open the overlay (readline beginning-of-line escape hatch). A single `Ctrl+A` after the window elapses opens the overlay.
+- **Pass-through:** a closed overlay opens immediately on `Ctrl+A`; press `Ctrl+A` again within 200ms to close it and forward a single Ctrl+A to the focused PTY (readline beginning-of-line escape hatch). A later `Ctrl+A` closes it without forwarding.
 - While open: modal and **non-expiring** (not subject to the 2s sticky-chord idle timeout). ↑/↓ or `j`/`k` move selection; Enter focuses that pane’s tab+leaf and closes the overlay; Esc closes without jumping.
 - While open: **no keys are forwarded to any PTY** except that Esc/Enter/arrows/jk are handled by the overlay.
 - Overlay is a floating panel (`Clear` + bordered list over the current layout), not a real mux tab. Each row is a two-line card: kind + cwd on the first line; state + location + host/control on the second.

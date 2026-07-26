@@ -2,13 +2,16 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     error::Error,
+    fmt,
     fs::OpenOptions,
     io,
     io::Write,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self as sync_mpsc, Receiver},
     },
@@ -92,9 +95,51 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
+pub(crate) const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
+
+struct UiDebugLog {
+    path: Option<PathBuf>,
+    start: Instant,
+    write_lock: Mutex<()>,
+}
+
+fn ui_debug_log(event: &str, fields: fmt::Arguments<'_>) {
+    static UI_DEBUG_LOG: OnceLock<UiDebugLog> = OnceLock::new();
+    let debug_log = UI_DEBUG_LOG.get_or_init(|| {
+        let path = env::var("P2PMUX_DEBUG_UI").ok().and_then(|value| {
+            if value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false") {
+                None
+            } else if value.contains('/') || value.starts_with('.') {
+                Some(PathBuf::from(value))
+            } else {
+                Some(PathBuf::from("/tmp/p2pmux-ui.log"))
+            }
+        });
+        UiDebugLog {
+            path,
+            start: Instant::now(),
+            write_lock: Mutex::new(()),
+        }
+    });
+    let Some(path) = &debug_log.path else {
+        return;
+    };
+    let line = format!(
+        "p2pmux ui: {} {} {}\n",
+        debug_log.start.elapsed().as_millis(),
+        event,
+        fields
+    );
+    let Ok(_write_lock) = debug_log.write_lock.lock() else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
+}
 
 enum FooterSegment {
     Text(&'static str),
@@ -867,8 +912,17 @@ impl MultiPaneTui {
             .iter()
             .find(|tab| tab.tab_id == tab_id)
             .ok_or(LayoutError::UnknownTab { tab_id })?;
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
         self.current_tab = tab_id;
         self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
+        self.log_selection_change(
+            "tab_switch",
+            old_tab,
+            old_pane,
+            self.current_tab,
+            self.focused_pane,
+        );
         Ok(())
     }
 
@@ -879,7 +933,16 @@ impl MultiPaneTui {
         if self.focused_pane == pane_id {
             return false;
         }
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
         self.focused_pane = pane_id;
+        self.log_selection_change(
+            "mouse",
+            old_tab,
+            old_pane,
+            self.current_tab,
+            self.focused_pane,
+        );
         true
     }
 
@@ -992,14 +1055,23 @@ impl MultiPaneTui {
                 self.modal = ModalState::None;
                 self.pending_agent_toggle = None;
                 return if forward {
+                    ui_debug_log(
+                        "agents_toggle_forward",
+                        format_args!("window_ms={}", AGENT_TOGGLE_WINDOW.as_millis()),
+                    );
                     KeyHandling::Forward
                 } else {
+                    ui_debug_log("agents_overlay_close", format_args!("reason=ctrl_a"));
                     KeyHandling::Consumed(vec![])
                 };
             }
             self.modal = ModalState::Agents;
             self.pending_agent_toggle = Some(Instant::now());
             self.exit_chord_mode();
+            ui_debug_log(
+                "agents_overlay_open",
+                format_args!("window_ms={}", AGENT_TOGGLE_WINDOW.as_millis()),
+            );
             return KeyHandling::Consumed(vec![]);
         }
         if self.overlay_open() {
@@ -1104,14 +1176,26 @@ impl MultiPaneTui {
 
     /// Aligns a reattached client's local selection with the node-owned focus.
     pub fn set_focus(&mut self, tab_id: TabId, pane_id: PaneId) -> Result<(), LayoutError> {
-        self.select_tab(tab_id)?;
-        if !self
-            .current_tab_layout()
-            .is_some_and(|tab| contains_leaf(&tab.root, pane_id))
-        {
+        let tab = self
+            .snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .ok_or(LayoutError::UnknownTab { tab_id })?;
+        if !contains_leaf(&tab.root, pane_id) {
             return Err(LayoutError::UnknownPane { pane_id });
         }
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
+        self.current_tab = tab_id;
         self.focused_pane = pane_id;
+        self.log_selection_change(
+            "node_sync",
+            old_tab,
+            old_pane,
+            self.current_tab,
+            self.focused_pane,
+        );
         Ok(())
     }
 
@@ -1120,6 +1204,7 @@ impl MultiPaneTui {
             KeyCode::Esc => {
                 self.modal = ModalState::None;
                 self.pending_agent_toggle = None;
+                ui_debug_log("agents_overlay_close", format_args!("reason=esc"));
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1134,7 +1219,7 @@ impl MultiPaneTui {
                 let Some(pane_id) = self.agent_selected_pane else {
                     return KeyHandling::Consumed(vec![]);
                 };
-                KeyHandling::Consumed(self.jump_to_agent_pane(pane_id))
+                KeyHandling::Consumed(self.jump_to_agent_pane(pane_id, "enter"))
             }
             _ => KeyHandling::Consumed(vec![]),
         }
@@ -1210,7 +1295,7 @@ impl MultiPaneTui {
             return Vec::new();
         };
         self.agent_selected_pane = Some(pane_id);
-        self.jump_to_agent_pane(pane_id)
+        self.jump_to_agent_pane(pane_id, "mouse")
     }
 
     fn agent_overlay_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
@@ -1228,7 +1313,7 @@ impl MultiPaneTui {
             .map(|agent| agent.pane_id)
     }
 
-    fn jump_to_agent_pane(&mut self, pane_id: PaneId) -> Vec<UiIntent> {
+    fn jump_to_agent_pane(&mut self, pane_id: PaneId, close_reason: &str) -> Vec<UiIntent> {
         let Some(tab) = self
             .snapshot
             .tabs
@@ -1237,10 +1322,23 @@ impl MultiPaneTui {
         else {
             return Vec::new();
         };
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
         self.current_tab = tab.tab_id;
         self.focused_pane = pane_id;
         self.modal = ModalState::None;
         self.pending_agent_toggle = None;
+        self.log_selection_change(
+            "overlay_jump",
+            old_tab,
+            old_pane,
+            self.current_tab,
+            self.focused_pane,
+        );
+        ui_debug_log(
+            "agents_overlay_close",
+            format_args!("reason={close_reason} pane_id={pane_id}"),
+        );
         vec![UiIntent::FocusPane { pane_id }]
     }
 
@@ -1360,7 +1458,16 @@ impl MultiPaneTui {
                 direction_distance(source_center, rect_center(*rect), direction, *pane_id)
             })?
             .0;
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
         self.focused_pane = pane_id;
+        self.log_selection_change(
+            "key",
+            old_tab,
+            old_pane,
+            self.current_tab,
+            self.focused_pane,
+        );
         Some(UiIntent::FocusPane { pane_id })
     }
 
@@ -1390,12 +1497,21 @@ impl MultiPaneTui {
     }
 
     fn repair_selection(&mut self) {
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
         if let Some(tab_id) = self.pending_created_tab
             && let Some(tab) = self.snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)
         {
             self.current_tab = tab_id;
             self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
             self.pending_created_tab = None;
+            self.log_selection_change(
+                "snapshot_repair",
+                old_tab,
+                old_pane,
+                self.current_tab,
+                self.focused_pane,
+            );
             return;
         }
         let current_tab = self.current_tab_layout();
@@ -1420,6 +1536,31 @@ impl MultiPaneTui {
         if let Some(pane_id) = created_pane {
             self.focused_pane = pane_id;
             self.pending_created_pane = None;
+        }
+        self.log_selection_change(
+            "snapshot_repair",
+            old_tab,
+            old_pane,
+            self.current_tab,
+            self.focused_pane,
+        );
+    }
+
+    fn log_selection_change(
+        &self,
+        reason: &str,
+        old_tab: TabId,
+        old_pane: PaneId,
+        new_tab: TabId,
+        new_pane: PaneId,
+    ) {
+        if old_tab != new_tab || old_pane != new_pane {
+            ui_debug_log(
+                "selection_change",
+                format_args!(
+                    "reason={reason} old_tab={old_tab} old_pane={old_pane} new_tab={new_tab} new_pane={new_pane}"
+                ),
+            );
         }
     }
 }
