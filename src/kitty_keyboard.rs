@@ -63,6 +63,7 @@ impl KittyKeyboardTracker {
             if end == data.len() {
                 break;
             }
+            let flags_end = end;
             if operation == b'=' && data[end] == b';' {
                 end += 1;
                 while end < data.len() && data[end].is_ascii_digit() {
@@ -77,7 +78,7 @@ impl KittyKeyboardTracker {
                 continue;
             }
 
-            let value = std::str::from_utf8(&data[digits_start..end])
+            let value = std::str::from_utf8(&data[digits_start..flags_end])
                 .ok()
                 .and_then(|digits| (!digits.is_empty()).then_some(digits))
                 .and_then(|digits| digits.parse::<u8>().ok());
