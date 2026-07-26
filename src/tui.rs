@@ -13,7 +13,8 @@ use tokio::sync::{mpsc, watch};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -2063,6 +2064,7 @@ impl SharedLayoutRuntime {
         let mut guard = TerminalGuard::new();
         enable_raw_mode()?;
         guard.raw_mode = true;
+        guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         execute!(io::stdout(), SetTitle("p2pmux"))?;
         guard.alternate_screen = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
@@ -2834,8 +2836,8 @@ fn encode_key(key: KeyEvent, screen: &vt100::Screen) -> Option<Vec<u8>> {
             bytes
         }
         KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
-        // CSI-u encodes Shift+Return distinctly for nested TUIs.
-        KeyCode::Enter if modifiers == 2 => b"\x1b[13;2u".to_vec(),
+        // terminal-setup / Alt+Enter encoding for nested agents (Claude Code, etc.).
+        KeyCode::Enter if modifiers == 2 => b"\x1b\r".to_vec(),
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
         KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
@@ -2920,6 +2922,7 @@ fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
 
 struct TerminalGuard {
     raw_mode: bool,
+    keyboard_enhancement: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
     mouse_capture: bool,
@@ -2929,6 +2932,7 @@ impl TerminalGuard {
     fn new() -> Self {
         Self {
             raw_mode: false,
+            keyboard_enhancement: false,
             alternate_screen: false,
             bracketed_paste: false,
             mouse_capture: false,
@@ -2939,6 +2943,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
+        if self.keyboard_enhancement {
+            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        }
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
         }
@@ -2951,6 +2958,21 @@ impl Drop for TerminalGuard {
         if self.raw_mode {
             let _ = disable_raw_mode();
         }
+    }
+}
+
+fn enable_keyboard_enhancement() -> io::Result<bool> {
+    if matches!(terminal::supports_keyboard_enhancement(), Ok(true)) {
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -2969,6 +2991,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     execute!(io::stdout(), SetTitle("p2pmux"))?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -3044,6 +3067,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
@@ -3190,6 +3214,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
@@ -5555,7 +5580,24 @@ mod tests {
         );
 
         assert_eq!(plain, Some(b"\r".to_vec()));
-        assert_eq!(shifted, Some(b"\x1b[13;2u".to_vec()));
+        assert_eq!(shifted, Some(b"\x1b\r".to_vec()));
+        assert_ne!(shifted, plain);
+    }
+
+    #[test]
+    fn shift_enter_uses_escape_carriage_return_for_nested_agents() {
+        let parser = vt100::Parser::new(1, 1, 0);
+        let plain = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            parser.screen(),
+        );
+        let shifted = encode_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            parser.screen(),
+        );
+
+        assert_eq!(plain, Some(b"\r".to_vec()));
+        assert_eq!(shifted, Some(b"\x1b\r".to_vec()));
         assert_ne!(shifted, plain);
     }
 }
