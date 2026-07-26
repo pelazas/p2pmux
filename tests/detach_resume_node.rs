@@ -15,6 +15,8 @@ use p2pmux::{
 
 struct NodeChild(Child);
 
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(8);
+
 impl Drop for NodeChild {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
@@ -43,8 +45,8 @@ fn detached_node_serves_real_snapshots_and_accepts_a_new_attachment() {
             descriptor: descriptor.clone(),
             kind: NodeBootstrapKind::Create {
                 display_name: "Test User".into(),
-                cols: 320,
-                rows: 100,
+                cols: 80,
+                rows: 24,
             },
         },
     )
@@ -169,11 +171,13 @@ fn attach(socket_path: &std::path::Path) -> (UnixStream, BufReader<UnixStream>, 
 }
 
 fn receive_until_snapshot(reader: &mut BufReader<UnixStream>) -> NodeMessage {
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
     loop {
-        let message = receive(reader);
+        let message = receive_until_deadline(reader, deadline);
         if matches!(message, NodeMessage::Snapshot { .. }) {
             return message;
         }
+        assert!(Instant::now() < deadline, "timed out waiting for snapshot");
     }
 }
 
@@ -184,5 +188,31 @@ fn send(stream: &mut UnixStream, message: &ClientMessage) {
 }
 
 fn receive(reader: &mut BufReader<UnixStream>) -> NodeMessage {
-    client::read_message(reader).unwrap().unwrap()
+    receive_until_deadline(reader, Instant::now() + RECEIVE_TIMEOUT)
+}
+
+fn receive_until_deadline(reader: &mut BufReader<UnixStream>, deadline: Instant) -> NodeMessage {
+    loop {
+        match client::read_message(reader) {
+            Ok(Some(message)) => return message,
+            Ok(None) => panic!("node closed its socket"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!("timed out waiting for node message: {error}")
+            }
+            Err(error) => panic!("failed to receive node message: {error}"),
+        }
+    }
 }
