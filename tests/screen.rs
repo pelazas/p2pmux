@@ -35,6 +35,20 @@ fn host_screen_tracks_child_kitty_keyboard_mode() {
 }
 
 #[test]
+fn host_screen_replies_to_kitty_keyboard_queries() {
+    let mut host = HostScreen::new(1, 1).expect("valid fixed grid");
+    host.process_pty(b"\x1b[?u").expect("kitty query");
+    assert_eq!(
+        host.take_kitty_keyboard_query_reply(),
+        Some(b"\x1b[?0u".to_vec())
+    );
+    assert!(!host.kitty_keyboard_active());
+
+    host.process_pty(b"\x1b[>1u").expect("kitty push");
+    assert!(host.kitty_keyboard_active());
+}
+
+#[test]
 fn host_snapshots_the_live_edge_after_scrollback_accumulates() {
     let mut host = HostScreen::new(1, 3).expect("valid fixed grid");
     let frame = host.process_pty(b"a\r\nb\r\nc").expect("scrollback update");

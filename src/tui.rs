@@ -2111,6 +2111,9 @@ impl SharedLocalPane {
             };
             self.agent_tracker.record_output(Instant::now());
             let frame = self.screen.process_pty(&bytes)?;
+            if let Some(reply) = self.screen.take_kitty_keyboard_query_reply() {
+                self.host.write_input(&reply)?;
+            }
             self.screen_tx.send_replace(frame);
             changed = true;
         }
@@ -3917,6 +3920,9 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             };
             kitty_keyboard.observe(&bytes);
             parser.process(&bytes);
+            if let Some(reply) = kitty_keyboard.take_query_reply() {
+                host.write_input(&reply)?;
+            }
             dirty = true;
         }
         if host.output_closed() {
@@ -4037,6 +4043,9 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 break;
             };
             if let Ok(frame) = runtime.screen.process_pty(&bytes) {
+                if let Some(reply) = runtime.screen.take_kitty_keyboard_query_reply() {
+                    runtime.host.write_input(&reply)?;
+                }
                 runtime.screen_tx.send_replace(frame);
             }
             dirty = true;

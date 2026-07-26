@@ -131,6 +131,10 @@ impl HostScreen {
     pub fn kitty_keyboard_active(&self) -> bool {
         self.kitty_keyboard.active()
     }
+
+    pub fn take_kitty_keyboard_query_reply(&mut self) -> Option<Vec<u8>> {
+        self.kitty_keyboard.take_query_reply()
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
