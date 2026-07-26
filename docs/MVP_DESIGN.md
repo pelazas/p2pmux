@@ -111,9 +111,11 @@ The last pane in a tab must be removed by deleting the tab; the final tab is ret
 
 ### Spike 3 controls
 
-`Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` plus arrows
-moves focus. `Ctrl+T` then `N` creates a tab; `Ctrl+T` then `X` requests tab deletion; `Ctrl+T`
-plus left/right switches tabs; `Esc` cancels. These mux chords are consumed locally. Ctrl+Q detaches
+`Ctrl+P` then `N` splits; `Ctrl+P` then `X` requests focused-pane deletion; `Ctrl+P` then `e`
+renames the focused pane for all admitted members. `Ctrl+P` plus arrows moves focus. `Ctrl+T` then
+`N` creates a tab; `Ctrl+T` then `X` requests tab deletion; `Ctrl+T` then `e` renames the current
+tab for all admitted members; `Ctrl+T` plus left/right switches tabs. Rename uses Enter to save and
+Esc to cancel; a blank title restores the ordinal label. These mux chords are consumed locally. Ctrl+Q detaches
 the local view while the session node remains live; F9 and F10 reach the focused PTY. Pane grids never resize.
 
 ### Disconnect grace (any member)

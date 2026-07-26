@@ -86,14 +86,14 @@ git commit -m "feat: store shared pane and tab titles"
 - Modify: `tests/protocol.rs`
 - Modify: `tests/module_surface.rs`
 
-- [ ] Bump `PROTOCOL_VERSION` from 5 to 6, including explicit test names/assertions and all expected envelopes.
-- [ ] Add `PaneDescriptor.title: Option<String>` at Prost tag 5 and `TabDescriptor.title: Option<String>` at tag 3.
-- [ ] Add `RenamePane { pane_id: u64 tag 1, title: String tag 2 }` and `RenameTab { tab_id: u64 tag 1, title: String tag 2 }`.
-- [ ] Add `LayoutRequest.rename_pane` tag 9 and `rename_tab` tag 10. Extend the exact-one-action count from six to eight, including every request fixture/default.
-- [ ] Define `MAX_LAYOUT_TITLE_BYTES: usize = 128`; protocol validation accepts empty title (clear), rejects zero IDs and title byte lengths above the cap. Keep scalar/control/normalization authority in `layout.rs` as specified.
-- [ ] Ensure layout-state decode/conversion reaches layout snapshot validation so descriptor `Some("")`, overlong, control-containing, or untrimmed titles cannot render locally.
-- [ ] Test byte cap; v6 encode/decode; descriptor optional-title round trip; both exact message tags/actions; empty clear; zero target; multiple action; malformed title; and v5/v7 rejection.
-- [ ] Run:
+- [x] Bump `PROTOCOL_VERSION` from 5 to 6, including explicit test names/assertions and all expected envelopes.
+- [x] Add `PaneDescriptor.title: Option<String>` at Prost tag 5 and `TabDescriptor.title: Option<String>` at tag 3.
+- [x] Add `RenamePane { pane_id: u64 tag 1, title: String tag 2 }` and `RenameTab { tab_id: u64 tag 1, title: String tag 2 }`.
+- [x] Add `LayoutRequest.rename_pane` tag 9 and `rename_tab` tag 10. Extend the exact-one-action count from six to eight, including every request fixture/default.
+- [x] Define `MAX_LAYOUT_TITLE_BYTES: usize = 128`; protocol validation accepts empty title (clear), rejects zero IDs and title byte lengths above the cap. Keep scalar/control/normalization authority in `layout.rs` as specified.
+- [x] Ensure layout-state decode/conversion reaches layout snapshot validation so descriptor `Some("")`, overlong, control-containing, or untrimmed titles cannot render locally.
+- [x] Test byte cap; v6 encode/decode; descriptor optional-title round trip; both exact message tags/actions; empty clear; zero target; multiple action; malformed title; and v5/v7 rejection.
+- [x] Run:
 
 ```bash
 cargo test --test protocol
@@ -101,7 +101,7 @@ cargo test --test module_surface
 cargo fmt --check
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add src/protocol.rs tests/protocol.rs tests/module_surface.rs
@@ -118,12 +118,12 @@ git commit -m "feat: add rename layout actions in protocol v6"
 - Modify: `tests/session_layout_control.rs`
 - Modify any session fixtures made exhaustive by descriptor/request fields
 
-- [ ] Map title fields in `protocol_layout_state` and `layout_snapshot_from_state`.
-- [ ] Import/dispatch `RenamePane` and `RenameTab` in `LayoutCoordinator::handle_request_at`; include both in action counting and call the Task 2 mutations.
-- [ ] Preserve existing reject mapping: unknown target → `UnknownId`, invalid title/multiple action → `Malformed`, stale → `Stale`, and non-member → `NotHost`. Do not add title ACLs.
-- [ ] Add coordinator tests for remote-member rename of both kinds, commit revision/state contents, stale/unknown/invalid rejections, and a joining member receiving title-bearing `SessionSnapshot`.
-- [ ] Add shared-layout control tests proving a member-issued rename reaches peers as `LayoutControlEvent::Commit`; verify a rejection does not mutate title.
-- [ ] Run:
+- [x] Map title fields in `protocol_layout_state` and `layout_snapshot_from_state`.
+- [x] Import/dispatch `RenamePane` and `RenameTab` in `LayoutCoordinator::handle_request_at`; include both in action counting and call the Task 2 mutations.
+- [x] Preserve existing reject mapping: unknown target → `UnknownId`, invalid title/multiple action → `Malformed`, stale → `Stale`, and non-member → `NotHost`. Do not add title ACLs.
+- [x] Add coordinator tests for remote-member rename of both kinds, commit revision/state contents, stale/unknown/invalid rejections, and a joining member receiving title-bearing `SessionSnapshot`.
+- [x] Add shared-layout control tests proving a member-issued rename reaches peers as `LayoutControlEvent::Commit`; verify a rejection does not mutate title.
+- [x] Run:
 
 ```bash
 cargo test --test session_layout
@@ -131,7 +131,7 @@ cargo test --test session_layout_control
 cargo fmt --check
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add src/session.rs tests/session_layout.rs tests/session_layout_control.rs
@@ -146,21 +146,21 @@ git commit -m "feat: replicate pane and tab title changes"
 - Modify: `src/tui.rs`
 - Modify/add: TUI unit tests in `src/tui.rs`
 
-- [ ] Refactor modal state enough to make agents overlay and rename mutually exclusive (an enum is preferred over independent booleans). Preserve all existing agents-overlay behavior and its tests (including Ctrl+A double-tap, navigation, click/Enter selection, scrolling, and rendering); do not make drive-by overlay UX changes while adding rename.
-- [ ] Add a rename state with target kind/ID, editable `String`, and local validation error. On `Ctrl+P e` capture `focused_pane`; on `Ctrl+T e` capture `current_tab`; exit chord mode when opening.
-- [ ] Add lowercase `e` to `handle_pane_chord`, `handle_tab_chord`, `is_chord_command`, and contextual footer segments/text. Keep lowercase `r` exclusively the pane right-split action.
-- [ ] Process active rename before `expire_chord_mode`, normal chords, overlay toggle, mouse focus/selection/resize, and PTY forwarding. Implement printable input, Backspace, Enter normalization/validation → `UiIntent::RenamePane`/`RenameTab`, Esc cancel, and Ctrl+Q global detach precedence. Consume unsupported input. Route global Ctrl+Q ahead of either modal as necessary, but otherwise retain the agents overlay's present key semantics.
-- [ ] Emit intents to the existing session runner; construct one-action `LayoutRequest`s with title fields and all non-rename action fields `None`. Ensure a prompt closes before a request/rejection is handled and never silently retargets after a layout update.
-- [ ] Render the centered `Clear`/bordered prompt plus edit field, prompt-local error, and `Enter save · Esc cancel`; it must be non-idle-expiring.
-- [ ] Test chord target capture and `e` recognition/footer; prefill; printable/shifted Unicode and Backspace; Enter sends expected intent including empty clear; invalid stays open; Esc has no intent; timeout does not close; Ctrl+P/Ctrl+T/Ctrl+A/arrows/mouse do not escape the modal; Ctrl+Q wins; no PTY forwarding; and overlay/rename exclusion.
-- [ ] Run:
+- [x] Refactor modal state enough to make agents overlay and rename mutually exclusive (an enum is preferred over independent booleans). Preserve all existing agents-overlay behavior and its tests (including Ctrl+A double-tap, navigation, click/Enter selection, scrolling, and rendering); do not make drive-by overlay UX changes while adding rename.
+- [x] Add a rename state with target kind/ID, editable `String`, and local validation error. On `Ctrl+P e` capture `focused_pane`; on `Ctrl+T e` capture `current_tab`; exit chord mode when opening.
+- [x] Add lowercase `e` to `handle_pane_chord`, `handle_tab_chord`, `is_chord_command`, and contextual footer segments/text. Keep lowercase `r` exclusively the pane right-split action.
+- [x] Process active rename before `expire_chord_mode`, normal chords, overlay toggle, mouse focus/selection/resize, and PTY forwarding. Implement printable input, Backspace, Enter normalization/validation → `UiIntent::RenamePane`/`RenameTab`, Esc cancel, and Ctrl+Q global detach precedence. Consume unsupported input. Route global Ctrl+Q ahead of either modal as necessary, but otherwise retain the agents overlay's present key semantics.
+- [x] Emit intents to the existing session runner; construct one-action `LayoutRequest`s with title fields and all non-rename action fields `None`. Ensure a prompt closes before a request/rejection is handled and never silently retargets after a layout update.
+- [x] Render the centered `Clear`/bordered prompt plus edit field, prompt-local error, and `Enter save · Esc cancel`; it must be non-idle-expiring.
+- [x] Test chord target capture and `e` recognition/footer; prefill; printable/shifted Unicode and Backspace; Enter sends expected intent including empty clear; invalid stays open; Esc has no intent; timeout does not close; Ctrl+P/Ctrl+T/Ctrl+A/arrows/mouse do not escape the modal; Ctrl+Q wins; no PTY forwarding; and overlay/rename exclusion.
+- [x] Run:
 
 ```bash
 cargo test --lib tui -- --nocapture
 cargo fmt --check
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add src/tui.rs
@@ -178,10 +178,10 @@ git commit -m "feat: add modal pane and tab rename prompts"
 - Modify: `docs/MVP_DESIGN.md` (if its locked controls/chrome paragraph must name `e`)
 - Modify/add: TUI rendering tests in `src/tui.rs`
 
-- [ ] Replace ordinal-only `tab_label`/`pane_title` inputs with title-aware helpers: use custom title exactly when `Some`, otherwise `Tab #N` / `Pane #N`; retain existing host/control pane chrome and active-tab styling. Carry the resolved tab/pane labels into `AgentOverlayRow` and render those labels in its location line under the same custom-title/ordinal-fallback rule; rows remain selected by `pane_id` and do not append an ordinal beside a custom title.
-- [ ] Add `unicode-width` as a direct dependency and replace scalar-count width calculations on these render paths with terminal-cell-width-aware helpers. Add display-width-aware single-line ellipsis truncation at tab, pane, and agents-overlay render allocation boundaries. For pane chrome, allocate/protect the title first (custom or ordinal), ellipsize it within the block-title width, and only then append host/control from leftover width; host/control may clip or disappear before title does. Test narrow widths, Unicode-width characters, the title-versus-host/control precedence, overlay custom-title/fallback labels, and no border/tab overlap. Do not alter the canonical stored title while truncating.
-- [ ] Update README/MVP controls text only where necessary: document `Ctrl+P e` / `Ctrl+T e`, all-member label authority, Enter/Esc, and blank-to-ordinal behavior; explicitly do not describe the unrelated session CLI `rename` as pane/tab rename.
-- [ ] Run the complete quality gate:
+- [x] Replace ordinal-only `tab_label`/`pane_title` inputs with title-aware helpers: use custom title exactly when `Some`, otherwise `Tab #N` / `Pane #N`; retain existing host/control pane chrome and active-tab styling. Carry the resolved tab/pane labels into `AgentOverlayRow` and render those labels in its location line under the same custom-title/ordinal-fallback rule; rows remain selected by `pane_id` and do not append an ordinal beside a custom title.
+- [x] Add `unicode-width` as a direct dependency and replace scalar-count width calculations on these render paths with terminal-cell-width-aware helpers. Add display-width-aware single-line ellipsis truncation at tab, pane, and agents-overlay render allocation boundaries. For pane chrome, allocate/protect the title first (custom or ordinal), ellipsize it within the block-title width, and only then append host/control from leftover width; host/control may clip or disappear before title does. Test narrow widths, Unicode-width characters, the title-versus-host/control precedence, overlay custom-title/fallback labels, and no border/tab overlap. Do not alter the canonical stored title while truncating.
+- [x] Update README/MVP controls text only where necessary: document `Ctrl+P e` / `Ctrl+T e`, all-member label authority, Enter/Esc, and blank-to-ordinal behavior; explicitly do not describe the unrelated session CLI `rename` as pane/tab rename.
+- [x] Run the complete quality gate:
 
 ```bash
 cargo fmt --check
@@ -189,7 +189,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add Cargo.toml Cargo.lock src/tui.rs README.md docs/MVP_DESIGN.md

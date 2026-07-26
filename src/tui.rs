@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, watch};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -242,6 +243,8 @@ pub struct AgentOverlayRow {
     pub pane_id: PaneId,
     pub tab_ordinal: usize,
     pub pane_ordinal: usize,
+    pub tab_label: String,
+    pub pane_label: String,
     pub kind: String,
     pub cwd: String,
     pub state: AgentRosterState,
@@ -438,6 +441,19 @@ impl MultiPaneTui {
             };
             row.tab_ordinal = tab_ordinal;
             row.pane_ordinal = pane_ordinal;
+            row.tab_label = self
+                .snapshot
+                .tabs
+                .iter()
+                .find(|tab| contains_leaf(&tab.root, row.pane_id))
+                .and_then(|tab| tab.title.clone())
+                .unwrap_or_else(|| format!("Tab #{tab_ordinal}"));
+            row.pane_label = self
+                .snapshot
+                .panes
+                .get(&row.pane_id)
+                .and_then(|pane| pane.title.clone())
+                .unwrap_or_else(|| format!("Pane #{pane_ordinal}"));
             true
         });
         rows.sort_by_key(|row| (row.tab_ordinal, row.pane_ordinal, row.pane_id));
@@ -942,7 +958,11 @@ impl MultiPaneTui {
                 if index > 0 {
                     x = x.saturating_add(text_width(TAB_BAR_SEPARATOR));
                 }
-                let label_width = text_width(&tab_label(index + 1, tab.tab_id == self.current_tab));
+                let label_width = text_width(&tab_label(
+                    tab.title.as_deref(),
+                    index + 1,
+                    tab.tab_id == self.current_tab,
+                ));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
@@ -1547,34 +1567,62 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 }
 
 fn text_width(text: &str) -> u16 {
-    text.chars().count() as u16
+    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
 }
 
-fn tab_label(index: usize, active: bool) -> String {
-    let label = format!("Tab #{index}");
+fn truncate_trailing(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let mut result = String::new();
+    for character in value.chars() {
+        if UnicodeWidthStr::width(result.as_str()).saturating_add(character.width().unwrap_or(0))
+            > width - 1
+        {
+            break;
+        }
+        result.push(character);
+    }
+    result.push('…');
+    result
+}
+
+fn tab_label(title: Option<&str>, index: usize, active: bool) -> String {
+    let label = title.map_or_else(|| format!("Tab #{index}"), str::to_owned);
     if active { format!(" {label} ") } else { label }
 }
 
 fn pane_title(
+    custom_title: Option<&str>,
     index: usize,
     host_peer_id: &[u8],
     controller_peer_id: Option<&[u8]>,
     members: &[crate::layout::Member],
+    available_width: usize,
 ) -> Line<'static> {
     let control = match controller_peer_id {
         Some([]) => "free".to_owned(),
         Some(peer_id) => member_label(peer_id, members),
         None => "…".to_owned(),
     };
+    let label = truncate_trailing(
+        &custom_title.map_or_else(|| format!("Pane #{index}"), str::to_owned),
+        available_width,
+    );
+    let metadata = format!(
+        " host: {} control: {control}",
+        member_label(host_peer_id, members)
+    );
+    let metadata_width = available_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
     Line::from(vec![
-        Span::styled(
-            format!("Pane #{index}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " host: {} control: {control}",
-            member_label(host_peer_id, members)
-        )),
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(truncate_trailing(&metadata, metadata_width)),
     ])
 }
 
@@ -2169,7 +2217,10 @@ fn render_shared_multi_pane(
             } else {
                 Style::default().fg(Color::White).bg(FOOTER_BACKGROUND)
             };
-            let label = tab_label(index + 1, active);
+            let label = truncate_trailing(
+                &tab_label(tab.title.as_deref(), index + 1, active),
+                usize::from(geometry.tab_labels[&tab.tab_id].width),
+            );
             let label_rect = geometry.tab_labels[&tab.tab_id];
             if label_rect.width == 0 {
                 continue;
@@ -2208,10 +2259,12 @@ fn render_shared_multi_pane(
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
         let mut title = pane_title(
+            pane.title.as_deref(),
             index + 1,
             &pane.host_peer_id,
             view.controller_peer_id.as_deref(),
             &tui.snapshot.members,
+            usize::from(rect.width.saturating_sub(2).saturating_sub(2)),
         );
         title.spans.insert(0, Span::raw(" "));
         title.spans.push(Span::raw(" "));
@@ -2416,8 +2469,10 @@ fn format_agent_overlay_card(
         AgentRosterState::Done => ("✓", "done", None),
     };
     let location = format!(
-        " · Tab #{} · Pane #{} · host: {}",
-        row.tab_ordinal, row.pane_ordinal, row.host
+        " · {} · {} · host: {}",
+        truncate_trailing(&row.tab_label, usize::from(width / 3)),
+        truncate_trailing(&row.pane_label, usize::from(width / 3)),
+        row.host
     );
     let state_prefix = match elapsed.as_deref() {
         Some(elapsed) => format!("{glyph} {state} {elapsed}"),
@@ -2529,29 +2584,26 @@ fn format_agent_elapsed(working_since_unix_ms: u64, now_unix_ms: u64) -> String 
     }
 }
 
-fn truncate_trailing(value: &str, width: usize) -> String {
-    let count = value.chars().count();
-    if count <= width {
-        return value.into();
-    }
-    if width <= 1 {
-        return "…".into();
-    }
-    format!("{}…", value.chars().take(width - 1).collect::<String>())
-}
-
 fn truncate_leading(value: &str, width: usize) -> String {
-    let count = value.chars().count();
-    if count <= width {
+    if UnicodeWidthStr::width(value) <= width {
         return value.into();
     }
-    if width <= 1 {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
         return "…".into();
     }
-    format!(
-        "…{}",
-        value.chars().skip(count - width + 1).collect::<String>()
-    )
+    let mut result = String::new();
+    for character in value.chars().rev() {
+        if UnicodeWidthStr::width(result.as_str()).saturating_add(character.width().unwrap_or(0))
+            > width - 1
+        {
+            break;
+        }
+        result.insert(0, character);
+    }
+    format!("…{result}")
 }
 
 fn sanitize_single_line(value: &str) -> String {
@@ -3842,6 +3894,12 @@ impl SharedLayoutRuntime {
                     let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
                     let view = self.tui.pane_view(entry.pane_id)?;
                     let &(tab_ordinal, pane_ordinal) = pane_locations.get(&entry.pane_id)?;
+                    let tab = self
+                        .tui
+                        .snapshot()
+                        .tabs
+                        .iter()
+                        .find(|tab| contains_leaf(&tab.root, entry.pane_id))?;
                     let host = sanitize_single_line(&member_label(
                         &pane.host_peer_id,
                         &self.tui.snapshot().members,
@@ -3858,6 +3916,14 @@ impl SharedLayoutRuntime {
                         pane_id: entry.pane_id,
                         tab_ordinal,
                         pane_ordinal,
+                        tab_label: tab
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| format!("Tab #{tab_ordinal}")),
+                        pane_label: pane
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| format!("Pane #{pane_ordinal}")),
                         kind: sanitize_single_line(&entry.agent_kind),
                         cwd: sanitize_single_line(&entry.cwd),
                         state: AgentRosterState::try_from(entry.state).ok()?,
@@ -5203,6 +5269,8 @@ mod tests {
             pane_id,
             tab_ordinal,
             pane_ordinal,
+            tab_label: format!("Tab #{tab_ordinal}"),
+            pane_label: format!("Pane #{pane_ordinal}"),
             kind: String::from("codex"),
             cwd: String::from("/very/long/repository/path"),
             state: crate::protocol::AgentRosterState::Working,
@@ -6303,16 +6371,35 @@ mod tests {
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
-            pane_title(1, b"host", Some(b""), &members).to_string(),
+            pane_title(None, 1, b"host", Some(b""), &members, 80).to_string(),
             "Pane #1 host: Host control: free"
         );
         assert_eq!(
-            pane_title(2, b"host", Some(b"guest"), &members).to_string(),
+            pane_title(None, 2, b"host", Some(b"guest"), &members, 80).to_string(),
             "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
-            pane_title(2, b"host", None, &members).to_string(),
+            pane_title(None, 2, b"host", None, &members, 80).to_string(),
             "Pane #2 host: Host control: …"
+        );
+    }
+
+    #[test]
+    fn title_chrome_uses_custom_labels_and_cell_width_ellipsis() {
+        assert_eq!(super::tab_label(Some("build logs"), 1, false), "build logs");
+        assert_eq!(super::tab_label(None, 2, false), "Tab #2");
+        assert_eq!(super::truncate_trailing("界界", 3), "界…");
+        assert_eq!(super::truncate_trailing("界", 1), "…");
+        assert_eq!(super::truncate_trailing("title", 0), "");
+
+        let members = vec![crate::layout::Member {
+            peer_id: b"host".to_vec(),
+            endpoint_addr: b"endpoint".to_vec(),
+            display_name: String::from("Host"),
+        }];
+        assert_eq!(
+            pane_title(Some("build logs"), 1, b"host", Some(b""), &members, 12).to_string(),
+            "build logs …"
         );
     }
 
