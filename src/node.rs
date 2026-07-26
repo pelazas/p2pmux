@@ -504,7 +504,11 @@ mod tests {
     use super::*;
     use std::{
         io::Write,
-        os::unix::{fs::PermissionsExt, net::UnixStream},
+        os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
+        thread,
     };
 
     #[test]
@@ -530,6 +534,71 @@ mod tests {
             read_message(&mut reader).unwrap(),
             Some(ClientMessage::Detach { generation: 7 })
         ));
+    }
+
+    #[test]
+    fn large_snapshot_survives_nonblocking_listener_accept() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/p2pmux-large-snapshot-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let stream = UnixStream::connect(client_path).unwrap();
+            let mut reader = BufReader::new(stream);
+            crate::client::read_message(&mut reader).unwrap().unwrap()
+        });
+
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::yield_now(),
+                Err(error) => panic!("failed to accept local IPC client: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        write_message(
+            &mut stream,
+            &NodeMessage::Snapshot {
+                room_name: "test".into(),
+                role: "coordinator".into(),
+                summary: SessionSummary::default(),
+                layout: Box::new(crate::layout::LayoutSnapshot {
+                    revision: 0,
+                    members: vec![],
+                    tabs: vec![],
+                    panes: Default::default(),
+                }),
+                screens: vec![PaneScreenSnapshot {
+                    pane_id: 1,
+                    sequence: 1,
+                    snapshot: vec![b'x'; 256 * 1024],
+                    kitty_keyboard_active: false,
+                }],
+                leases: vec![],
+                rosters: vec![],
+                tab_id: 1,
+                pane_id: 1,
+            },
+        )
+        .unwrap();
+
+        let NodeMessage::Snapshot { screens, .. } = client.join().unwrap() else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(screens[0].snapshot, vec![b'x'; 256 * 1024]);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
