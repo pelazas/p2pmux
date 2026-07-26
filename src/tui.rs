@@ -2349,7 +2349,7 @@ fn render_shared_multi_pane(
         render_agents_overlay(frame, tui, unix_ms_now());
     }
     if let ModalState::Rename(prompt) = &tui.modal {
-        render_rename_prompt(frame, prompt);
+        render_rename_prompt(frame, prompt, &tui.theme);
     }
 }
 
@@ -2419,7 +2419,7 @@ fn agents_overlay_inner(area: Rect) -> Rect {
     Block::bordered().inner(agents_overlay_panel(area))
 }
 
-fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt) {
+fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt, theme: &UiTheme) {
     let area = frame.area();
     let width = area.width.saturating_sub(8).clamp(28, 64).min(area.width);
     let height = 7_u16.min(area.height);
@@ -2441,7 +2441,7 @@ fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt) {
                 title,
                 Style::default().add_modifier(Modifier::BOLD),
             ))
-            .border_style(Style::default().fg(FOOTER_ACCENT)),
+            .border_style(Style::default().fg(theme.footer_accent)),
         panel,
     );
     let inner = Block::bordered().inner(panel);
@@ -2454,7 +2454,7 @@ fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt) {
     }
     lines.push(Line::styled(
         "Enter save · Esc cancel",
-        Style::default().fg(FOOTER_MUTED),
+        Style::default().fg(theme.footer_muted),
     ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -7399,6 +7399,7 @@ mod tests {
                 vec![Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+                    title: None,
                 }],
                 &[(1, 2, 2)],
             ),
