@@ -87,6 +87,11 @@ fn unix_ms_now() -> u64 {
 }
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
+const AGENT_OVERLAY_CHROME: Color = Color::Rgb(56, 132, 255);
+const AGENT_OVERLAY_BACKGROUND: Color = Color::Rgb(10, 18, 35);
+const AGENT_OVERLAY_SELECTED_BACKGROUND: Color = Color::Rgb(31, 74, 142);
+const AGENT_OVERLAY_MUTED: Color = Color::Rgb(145, 157, 180);
+const AGENT_OVERLAY_WARM: Color = Color::Rgb(255, 184, 77);
 
 enum FooterSegment {
     Text(&'static str),
@@ -880,8 +885,12 @@ impl MultiPaneTui {
         if !rect_contains(inner, column, row) {
             return None;
         }
+        let line = row.saturating_sub(inner.y);
+        if line % 3 == 2 {
+            return None;
+        }
         self.agent_rows
-            .get(usize::from(row.saturating_sub(inner.y)))
+            .get(usize::from(line) / 3)
             .map(|agent| agent.pane_id)
     }
 
@@ -1932,41 +1941,51 @@ fn render_shared_multi_pane(
         }
     }
     if tui.agent_overlay_open {
-        render_agents_overlay(frame, tui);
+        render_agents_overlay(frame, tui, unix_ms_now());
     }
 }
 
-fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui) {
+fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
     let area = frame.area();
     let panel = agents_overlay_panel(area);
     frame.render_widget(Clear, panel);
-    let block = Block::bordered().title(" Agents ");
+    let block = Block::bordered()
+        .title(Line::styled(
+            " Agents ",
+            Style::default().fg(AGENT_OVERLAY_CHROME),
+        ))
+        .border_style(Style::default().fg(AGENT_OVERLAY_CHROME))
+        .style(Style::default().bg(AGENT_OVERLAY_BACKGROUND));
     let inner = agents_overlay_inner(area);
     frame.render_widget(block, panel);
     if tui.agent_rows.is_empty() {
-        frame.render_widget(Paragraph::new("No agents running"), inner);
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "No agents running",
+                Style::default().fg(AGENT_OVERLAY_MUTED),
+            )),
+            inner,
+        );
         return;
     }
-    let lines = tui
-        .agent_rows
-        .iter()
-        .map(|row| {
-            Line::styled(
-                format_agent_overlay_row(
-                    row,
-                    tui.agent_selected_pane == Some(row.pane_id),
-                    inner.width,
-                ),
-                Style::default().fg(Color::Yellow),
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut lines = Vec::with_capacity(tui.agent_rows.len().saturating_mul(3));
+    for (index, row) in tui.agent_rows.iter().enumerate() {
+        lines.extend(format_agent_overlay_card(
+            row,
+            tui.agent_selected_pane == Some(row.pane_id),
+            inner.width,
+            now_unix_ms,
+        ));
+        if index + 1 < tui.agent_rows.len() {
+            lines.push(Line::raw(""));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn agents_overlay_panel(area: Rect) -> Rect {
     let width = area.width.saturating_sub(4).clamp(24, 88);
-    let height = area.height.saturating_sub(4).clamp(5, 18);
+    let height = area.height.saturating_sub(4).clamp(5, 24);
     Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
         area.y
@@ -1980,22 +1999,124 @@ fn agents_overlay_inner(area: Rect) -> Rect {
     Block::bordered().inner(agents_overlay_panel(area))
 }
 
-fn format_agent_overlay_row(row: &AgentOverlayRow, selected: bool, width: u16) -> String {
+fn format_agent_overlay_card(
+    row: &AgentOverlayRow,
+    selected: bool,
+    width: u16,
+    now_unix_ms: u64,
+) -> [Line<'static>; 2] {
     let marker = if selected { "›" } else { " " };
-    let prefix = format!(
-        "{marker} {}  {}  ",
-        overlay_kind_label(&row.kind),
-        overlay_state_label(row.state)
+    let kind = overlay_kind_label(&row.kind);
+    let first_prefix = format!("{marker} {kind} · ");
+    let cwd = truncate_leading(
+        &row.cwd,
+        usize::from(width.saturating_sub(text_width(&first_prefix))),
     );
-    let suffix = format!(
-        "  Tab #{} · Pane #{}  host: {}",
+    let card_style = selected
+        .then_some(Style::default().bg(AGENT_OVERLAY_SELECTED_BACKGROUND))
+        .unwrap_or_default();
+    let first_line = agent_overlay_line(
+        vec![
+            Span::styled(marker, Style::default().fg(AGENT_OVERLAY_CHROME)),
+            Span::raw(" "),
+            Span::styled(
+                kind,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(AGENT_OVERLAY_MUTED)),
+            Span::styled(cwd, Style::default().fg(Color::Gray)),
+        ],
+        card_style,
+        selected,
+        width,
+    );
+
+    let (glyph, state, elapsed) = match row.state {
+        AgentRosterState::Working => (
+            "◐",
+            "working",
+            Some(format_agent_elapsed(row.working_since_unix_ms, now_unix_ms)),
+        ),
+        AgentRosterState::Idle => ("○", "idle", None),
+        AgentRosterState::Done => ("✓", "done", None),
+    };
+    let location = format!(
+        " · Tab #{} · Pane #{} · host: {}",
         row.tab_ordinal, row.pane_ordinal, row.host
     );
-    let cwd_width = width.saturating_sub(text_width(&prefix).saturating_add(text_width(&suffix)));
-    format!(
-        "{prefix}{}{suffix}",
-        truncate_leading(&row.cwd, usize::from(cwd_width))
-    )
+    let state_prefix = match elapsed.as_deref() {
+        Some(elapsed) => format!("{glyph} {state} {elapsed}"),
+        None => format!("{glyph} {state}"),
+    };
+    let controller_prefix = " · control: ";
+    let controller_width = width.saturating_sub(
+        text_width(&state_prefix)
+            .saturating_add(text_width(&location))
+            .saturating_add(text_width(controller_prefix)),
+    );
+    let controller = (controller_width > 0)
+        .then(|| truncate_trailing(&row.controller, usize::from(controller_width)));
+    let mut second_spans = vec![
+        Span::styled(
+            glyph,
+            Style::default().fg(if row.state == AgentRosterState::Working {
+                AGENT_OVERLAY_CHROME
+            } else {
+                AGENT_OVERLAY_MUTED
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            state,
+            Style::default().fg(if row.state == AgentRosterState::Working {
+                Color::White
+            } else {
+                AGENT_OVERLAY_MUTED
+            }),
+        ),
+    ];
+    if let Some(elapsed) = elapsed {
+        second_spans.push(Span::raw(" "));
+        second_spans.push(Span::styled(
+            elapsed,
+            Style::default().fg(AGENT_OVERLAY_WARM),
+        ));
+    }
+    second_spans.push(Span::styled(
+        location,
+        Style::default().fg(AGENT_OVERLAY_MUTED),
+    ));
+    if let Some(controller) = controller {
+        second_spans.push(Span::styled(
+            controller_prefix,
+            Style::default().fg(AGENT_OVERLAY_MUTED),
+        ));
+        second_spans.push(Span::styled(controller, Style::default().fg(Color::Gray)));
+    }
+    [
+        first_line,
+        agent_overlay_line(second_spans, card_style, selected, width),
+    ]
+}
+
+fn agent_overlay_line(
+    mut spans: Vec<Span<'static>>,
+    card_style: Style,
+    selected: bool,
+    width: u16,
+) -> Line<'static> {
+    if selected {
+        let content_width = spans.iter().fold(0_u16, |total, span| {
+            total.saturating_add(text_width(&span.content))
+        });
+        spans.push(Span::styled(
+            " ".repeat(usize::from(width.saturating_sub(content_width))),
+            card_style,
+        ));
+    }
+    Line::from(spans).style(card_style)
 }
 
 fn overlay_kind_label(kind: &str) -> &'static str {
@@ -2009,12 +2130,32 @@ fn overlay_kind_label(kind: &str) -> &'static str {
     }
 }
 
-fn overlay_state_label(state: AgentRosterState) -> &'static str {
-    match state {
-        AgentRosterState::Idle => "idle",
-        AgentRosterState::Working => "working",
-        AgentRosterState::Done => "done",
+fn format_agent_elapsed(working_since_unix_ms: u64, now_unix_ms: u64) -> String {
+    let elapsed_seconds = now_unix_ms
+        .saturating_sub(working_since_unix_ms)
+        .saturating_div(1_000);
+    if elapsed_seconds >= 3_600 {
+        format!(
+            "{}h {}m",
+            elapsed_seconds / 3_600,
+            (elapsed_seconds % 3_600) / 60
+        )
+    } else if elapsed_seconds >= 60 {
+        format!("{}m {}s", elapsed_seconds / 60, elapsed_seconds % 60)
+    } else {
+        format!("{elapsed_seconds}s")
     }
+}
+
+fn truncate_trailing(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value.into();
+    }
+    if width <= 1 {
+        return "…".into();
+    }
+    format!("{}…", value.chars().take(width - 1).collect::<String>())
 }
 
 fn truncate_leading(value: &str, width: usize) -> String {
@@ -4577,15 +4718,46 @@ mod tests {
     }
 
     #[test]
-    fn agents_overlay_rows_include_location_pane_and_host() {
+    fn agents_overlay_cards_show_state_elapsed_and_location() {
         let row = agent_row(2, 2, 1);
 
-        let rendered = super::format_agent_overlay_row(&row, true, 120);
+        let rendered = super::format_agent_overlay_card(&row, true, 120, 1_725_000_084_123);
 
-        assert!(rendered.starts_with("› Codex  working  "));
-        assert!(rendered.contains("/very/long/repository/path"));
-        assert!(rendered.contains("Tab #2 · Pane #1"));
-        assert!(rendered.ends_with("host: Host"));
+        assert!(rendered[0].to_string().starts_with("› Codex · "));
+        assert!(
+            rendered[0]
+                .to_string()
+                .contains("/very/long/repository/path")
+        );
+        assert!(rendered[1].to_string().starts_with("◐ working 1m 24s"));
+        assert!(rendered[1].to_string().contains("Tab #2 · Pane #1"));
+        assert!(rendered[1].to_string().contains("host: Host"));
+        assert!(rendered[1].to_string().contains("control: free"));
+    }
+
+    #[test]
+    fn agents_overlay_cards_distinguish_idle_done_and_future_work() {
+        let mut row = agent_row(2, 2, 1);
+        row.state = crate::protocol::AgentRosterState::Idle;
+        let idle = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123);
+        assert!(idle[1].to_string().starts_with("○ idle"));
+
+        row.state = crate::protocol::AgentRosterState::Done;
+        let done = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123);
+        assert!(done[1].to_string().starts_with("✓ done"));
+
+        row.state = crate::protocol::AgentRosterState::Working;
+        row.working_since_unix_ms = 1_725_000_001_123;
+        let future = super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123);
+        assert!(future[1].to_string().starts_with("◐ working 0s"));
+    }
+
+    #[test]
+    fn agents_overlay_elapsed_uses_compact_saturating_durations() {
+        assert_eq!(super::format_agent_elapsed(1_000, 43_000), "42s");
+        assert_eq!(super::format_agent_elapsed(1_000, 85_000), "1m 24s");
+        assert_eq!(super::format_agent_elapsed(1_000, 3_721_000), "1h 2m");
+        assert_eq!(super::format_agent_elapsed(2_000, 1_000), "0s");
     }
 
     #[test]
@@ -4624,8 +4796,44 @@ mod tests {
             vec![(8, 1, 1), (6, 1, 2), (3, 2, 1)]
         );
         assert!(
-            super::format_agent_overlay_row(&tui.agent_rows[2], false, 120)
+            super::format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0)[1]
+                .to_string()
                 .contains("Tab #2 · Pane #1")
+        );
+    }
+
+    #[test]
+    fn agents_overlay_uses_blue_chrome_and_selected_card_background() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+            }],
+            &[(1, 2, 8)],
+        ))
+        .expect("valid layout");
+        tui.set_agent_rows(vec![agent_row(1, 1, 1)]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| super::render_agents_overlay(frame, &tui, 1_725_000_084_123))
+            .expect("render");
+        let panel = super::agents_overlay_panel(Rect::new(0, 0, 80, 24));
+        let inner = super::agents_overlay_inner(Rect::new(0, 0, 80, 24));
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(panel.x, panel.y)].fg, super::AGENT_OVERLAY_CHROME);
+        assert_eq!(
+            buffer[(inner.x, inner.y)].bg,
+            super::AGENT_OVERLAY_SELECTED_BACKGROUND
+        );
+        assert_eq!(
+            buffer[(inner.x, inner.y.saturating_add(1))].bg,
+            super::AGENT_OVERLAY_SELECTED_BACKGROUND
+        );
+        assert_eq!(
+            buffer[(inner.x.saturating_add(50), inner.y)].bg,
+            super::AGENT_OVERLAY_SELECTED_BACKGROUND
         );
     }
 
@@ -4645,15 +4853,20 @@ mod tests {
             &[(1, 2, 8), (2, 2, 8)],
         );
         let mut tui = MultiPaneTui::new(snapshot).unwrap();
-        tui.set_agent_rows(vec![agent_row(2, 2, 1)]);
+        tui.set_agent_rows(vec![agent_row(1, 1, 1), agent_row(2, 2, 1)]);
         tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
         tui.expire_agent_toggle(Instant::now());
         let area = Rect::new(0, 0, 80, 24);
 
         assert_eq!(tui.handle_agent_overlay_click(0, 0, area), Vec::new());
         assert!(tui.overlay_open());
+        let inner = super::agents_overlay_inner(area);
         assert_eq!(
-            tui.handle_agent_overlay_click(4, 4, area),
+            tui.agent_overlay_row_at(4, inner.y.saturating_add(2), area),
+            None
+        );
+        assert_eq!(
+            tui.handle_agent_overlay_click(4, inner.y.saturating_add(3), area),
             vec![UiIntent::FocusPane { pane_id: 2 }]
         );
         assert!(!tui.overlay_open());
