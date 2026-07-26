@@ -147,6 +147,13 @@ const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
+const AGENT_OVERLAY_HELP: &[FooterSegment] = &[
+    FooterSegment::Text("<"),
+    FooterSegment::Key("↑↓"),
+    FooterSegment::Text("> MOVE   <"),
+    FooterSegment::Key("Enter"),
+    FooterSegment::Text("> FOCUS"),
+];
 
 /// The in-progress multi-pane command prefix, kept entirely local to one terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -475,7 +482,7 @@ impl MultiPaneTui {
     }
 
     pub(crate) fn set_agent_overlay_viewport(&mut self, area: Rect) {
-        self.agent_overlay_viewport_lines = agents_overlay_inner(area).height;
+        self.agent_overlay_viewport_lines = agents_overlay_content(area).height;
         self.clamp_agent_overlay_scroll();
     }
 
@@ -1201,12 +1208,12 @@ impl MultiPaneTui {
     }
 
     fn agent_overlay_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
-        let inner = agents_overlay_inner(area);
-        if !rect_contains(inner, column, row) {
+        let content = agents_overlay_content(area);
+        if !rect_contains(content, column, row) {
             return None;
         }
-        let line =
-            usize::from(row.saturating_sub(inner.y)).saturating_add(self.agent_overlay_scroll_line);
+        let line = usize::from(row.saturating_sub(content.y))
+            .saturating_add(self.agent_overlay_scroll_line);
         if line % AGENT_OVERLAY_CARD_LINES == 2 {
             return None;
         }
@@ -2365,7 +2372,7 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
                 .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
-    let inner = agents_overlay_inner(area);
+    let content = agents_overlay_content(area);
     frame.render_widget(block, panel);
     if tui.agent_rows.is_empty() {
         frame.render_widget(
@@ -2373,39 +2380,40 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
                 "No agents running",
                 Style::default().fg(tui.theme.agent_overlay_muted),
             )),
-            inner,
+            content,
         );
-        return;
-    }
-    let mut lines = Vec::with_capacity(tui.agent_rows.len().saturating_mul(3));
-    let animation_phase = agent_overlay_animation_phase(now_unix_ms);
-    for (index, row) in tui.agent_rows.iter().enumerate() {
-        lines.extend(format_agent_overlay_card(
-            row,
-            tui.agent_selected_pane == Some(row.pane_id),
-            inner.width,
-            now_unix_ms,
-            animation_phase,
-            &tui.theme,
-        ));
-        if index + 1 < tui.agent_rows.len() {
-            lines.push(Line::raw(""));
+    } else {
+        let mut lines = Vec::with_capacity(tui.agent_rows.len().saturating_mul(3));
+        let animation_phase = agent_overlay_animation_phase(now_unix_ms);
+        for (index, row) in tui.agent_rows.iter().enumerate() {
+            lines.extend(format_agent_overlay_card(
+                row,
+                tui.agent_selected_pane == Some(row.pane_id),
+                content.width,
+                now_unix_ms,
+                animation_phase,
+                &tui.theme,
+            ));
+            if index + 1 < tui.agent_rows.len() {
+                lines.push(Line::raw(""));
+            }
         }
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(tui.agent_overlay_scroll_line)
+                    .collect::<Vec<_>>(),
+            ),
+            content,
+        );
     }
-    frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(tui.agent_overlay_scroll_line)
-                .collect::<Vec<_>>(),
-        ),
-        inner,
-    );
+    render_agents_overlay_help(frame.buffer_mut(), &tui.theme, agents_overlay_help(area));
 }
 
 fn agents_overlay_panel(area: Rect) -> Rect {
-    let width = area.width.saturating_sub(4).clamp(24, 88);
-    let height = area.height.saturating_sub(4).clamp(5, 24);
+    let width = area.width.saturating_sub(2).clamp(24, 96);
+    let height = area.height.saturating_sub(2).clamp(5, 28);
     Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
         area.y
@@ -2417,6 +2425,53 @@ fn agents_overlay_panel(area: Rect) -> Rect {
 
 fn agents_overlay_inner(area: Rect) -> Rect {
     Block::bordered().inner(agents_overlay_panel(area))
+}
+
+fn agents_overlay_help(area: Rect) -> Option<Rect> {
+    let inner = agents_overlay_inner(area);
+    (inner.height >= 4).then(|| {
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(inner.height.saturating_sub(1)),
+            inner.width,
+            1,
+        )
+    })
+}
+
+fn agents_overlay_content(area: Rect) -> Rect {
+    let inner = agents_overlay_inner(area);
+    let y = inner.y.saturating_add(1);
+    let height = agents_overlay_help(area)
+        .map(|help| help.y.saturating_sub(y))
+        .unwrap_or_else(|| inner.height.saturating_sub(1));
+    Rect::new(
+        inner.x.saturating_add(1),
+        y,
+        inner.width.saturating_sub(2),
+        height,
+    )
+}
+
+fn render_agents_overlay_help(buffer: &mut Buffer, theme: &UiTheme, help: Option<Rect>) {
+    let Some(help) = help else {
+        return;
+    };
+    buffer.set_stringn(
+        help.x,
+        help.y,
+        " ".repeat(usize::from(help.width)),
+        usize::from(help.width),
+        Style::default().bg(theme.footer_background),
+    );
+    render_footer_segments(
+        buffer,
+        theme,
+        help.x.saturating_add(1),
+        help.y,
+        help.right(),
+        AGENT_OVERLAY_HELP,
+    );
 }
 
 fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt, theme: &UiTheme) {
@@ -5543,7 +5598,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_overlay_uses_orange_red_chrome_gray_selection_and_pane_background() {
+    fn agents_overlay_uses_orange_red_chrome_soft_selection_and_modal_padding() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -5560,28 +5615,66 @@ mod tests {
         terminal
             .draw(|frame| super::render_agents_overlay(frame, &tui, 1_725_000_084_123))
             .expect("render");
-        let panel = super::agents_overlay_panel(Rect::new(0, 0, 80, 24));
-        let inner = super::agents_overlay_inner(Rect::new(0, 0, 80, 24));
+        let area = Rect::new(0, 0, 80, 24);
+        let panel = super::agents_overlay_panel(area);
+        let inner = super::agents_overlay_inner(area);
+        let content = super::agents_overlay_content(area);
+        let help = super::agents_overlay_help(area).expect("help row");
         let buffer = terminal.backend().buffer();
 
+        assert_eq!(panel, Rect::new(1, 1, 78, 22));
         assert_eq!(buffer[(panel.x, panel.y)].fg, Color::Rgb(255, 69, 0));
         assert_eq!(
             buffer[(panel.x.saturating_add(1), panel.y)].modifier,
             Modifier::BOLD
         );
-        assert_eq!(buffer[(inner.x, inner.y)].bg, Color::DarkGray);
+        assert_eq!(buffer[(content.x, content.y)].bg, Color::Rgb(42, 42, 42));
         assert_eq!(
-            buffer[(inner.x, inner.y.saturating_add(1))].bg,
-            Color::DarkGray
+            buffer[(content.x.saturating_add(50), content.y.saturating_add(1))].bg,
+            Color::Rgb(42, 42, 42)
         );
         assert_eq!(
-            buffer[(inner.x.saturating_add(50), inner.y)].bg,
-            Color::DarkGray
+            buffer[(content.right().saturating_sub(1), content.y)].bg,
+            Color::Rgb(42, 42, 42)
         );
+        assert_eq!(buffer[(inner.x, content.y)].bg, Color::Reset);
+        assert_eq!(buffer[(content.x, inner.y)].bg, Color::Reset);
         assert_eq!(
-            buffer[(inner.x, inner.y.saturating_add(3))].bg,
+            buffer[(content.x, content.y.saturating_add(2))].bg,
             Color::Reset
         );
+        for x in help.x..help.right() {
+            assert_eq!(buffer[(x, help.y)].bg, tui.theme.footer_background);
+        }
+        assert_eq!(buffer[(help.x.saturating_add(1), help.y)].symbol(), "<");
+        assert_eq!(buffer[(help.x.saturating_add(2), help.y)].symbol(), "↑");
+        assert_eq!(buffer[(help.x.saturating_add(14), help.y)].symbol(), "E");
+    }
+
+    #[test]
+    fn agents_overlay_help_renders_for_empty_rosters() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| super::render_agents_overlay(frame, &tui, 1_725_000_084_123))
+            .expect("render");
+        let help = super::agents_overlay_help(Rect::new(0, 0, 80, 24)).expect("help row");
+        let buffer = terminal.backend().buffer();
+
+        for x in help.x..help.right() {
+            assert_eq!(buffer[(x, help.y)].bg, tui.theme.footer_background);
+        }
+        assert_eq!(buffer[(help.x.saturating_add(2), help.y)].symbol(), "↑");
+        assert_eq!(buffer[(help.x.saturating_add(14), help.y)].symbol(), "E");
     }
 
     #[test]
@@ -5612,12 +5705,32 @@ mod tests {
         assert_eq!(tui.handle_agent_overlay_click(0, 0, area), Vec::new());
         assert!(tui.overlay_open());
         let inner = super::agents_overlay_inner(area);
+        let content = super::agents_overlay_content(area);
+        let help = super::agents_overlay_help(area).expect("help row");
         assert_eq!(
-            tui.agent_overlay_row_at(4, inner.y.saturating_add(2), area),
+            tui.agent_overlay_row_at(content.x.saturating_sub(1), content.y, area),
             None
         );
+        assert_eq!(tui.agent_overlay_row_at(content.x, inner.y, area), None);
+        assert_eq!(tui.agent_overlay_row_at(help.x, help.y, area), None);
         assert_eq!(
-            tui.handle_agent_overlay_click(4, inner.y.saturating_add(3), area),
+            tui.agent_overlay_row_at(content.x, content.y, area),
+            Some(1)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(1), area),
+            Some(1)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(3), area),
+            Some(2)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(4), area),
+            Some(2)
+        );
+        assert_eq!(
+            tui.handle_agent_overlay_click(content.x, content.y.saturating_add(3), area),
             vec![UiIntent::FocusPane { pane_id: 2 }]
         );
         assert!(!tui.overlay_open());
@@ -5629,13 +5742,16 @@ mod tests {
     fn agents_overlay_hit_test_accounts_for_terminal_line_scroll() {
         let area = Rect::new(0, 0, 80, 8);
         let mut tui = agent_overlay_tui(3);
-        let inner = super::agents_overlay_inner(area);
+        let content = super::agents_overlay_content(area);
 
         assert!(tui.scroll_agent_overlay(area, false));
         assert_eq!(tui.agent_overlay_scroll_line, 3);
-        assert_eq!(tui.agent_overlay_row_at(inner.x, inner.y, area), Some(2));
         assert_eq!(
-            tui.agent_overlay_row_at(inner.x, inner.y.saturating_add(2), area),
+            tui.agent_overlay_row_at(content.x, content.y, area),
+            Some(2)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(2), area),
             None
         );
     }
@@ -5647,10 +5763,22 @@ mod tests {
 
         tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
         assert_eq!(tui.agent_selected_pane, Some(2));
-        assert_eq!(tui.agent_overlay_scroll_line, 2);
+        assert_eq!(tui.agent_overlay_scroll_line, 3);
         tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
         assert_eq!(tui.agent_selected_pane, Some(3));
-        assert_eq!(tui.agent_overlay_scroll_line, 5);
+        assert_eq!(tui.agent_overlay_scroll_line, 6);
+    }
+
+    #[test]
+    fn agents_overlay_hides_help_below_the_minimum_content_height() {
+        let short = Rect::new(0, 0, 80, 7);
+        let threshold = Rect::new(0, 0, 80, 8);
+
+        assert_eq!(super::agents_overlay_inner(short).height, 3);
+        assert_eq!(super::agents_overlay_help(short), None);
+        assert_eq!(super::agents_overlay_content(short).height, 2);
+        assert!(super::agents_overlay_help(threshold).is_some());
+        assert_eq!(super::agents_overlay_content(threshold).height, 2);
     }
 
     #[test]
