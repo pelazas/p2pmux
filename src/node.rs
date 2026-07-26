@@ -199,7 +199,10 @@ fn run_socket_loop(
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                    // Prevent stalled clients from wedging the node on large Snapshot writes.
+                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                     let mut reader = BufReader::new(stream);
                     match read_message(&mut reader) {
                         // Probes and shutdowns are control requests. They must not consume or
@@ -219,21 +222,25 @@ fn run_socket_loop(
                             if let Ok(generation) = gate.attach() {
                                 node.resize(cols, rows)
                                     .map_err(|error| io::Error::other(error.to_string()))?;
-                                let attached = write_message(
+                                match write_message(
                                     reader.get_mut(),
                                     &NodeMessage::AttachAccepted { generation },
                                 )
                                 .and_then(|()| {
                                     write_snapshot(reader.get_mut(), descriptor, node, generation)
-                                })
-                                .is_ok();
-                                if attached {
-                                    reader
-                                        .get_mut()
-                                        .set_read_timeout(Some(Duration::from_millis(1)))?;
-                                    client = Some((reader, generation));
-                                } else {
-                                    let _ = gate.detach(generation);
+                                }) {
+                                    Ok(()) => {
+                                        reader
+                                            .get_mut()
+                                            .set_read_timeout(Some(Duration::from_millis(1)))?;
+                                        client = Some((reader, generation));
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "p2pmux node: failed to write initial local snapshot: {error}"
+                                        );
+                                        let _ = gate.detach(generation);
+                                    }
                                 }
                             } else {
                                 let _ = write_message(
@@ -342,8 +349,9 @@ fn run_socket_loop(
             }
             if changed
                 && !detached
-                && write_snapshot(reader.get_mut(), descriptor, node, *generation).is_err()
+                && let Err(error) = write_snapshot(reader.get_mut(), descriptor, node, *generation)
             {
+                eprintln!("p2pmux node: failed to write local snapshot: {error}");
                 detached = true;
             }
         }
@@ -498,7 +506,11 @@ mod tests {
     use super::*;
     use std::{
         io::Write,
-        os::unix::{fs::PermissionsExt, net::UnixStream},
+        os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
+        thread,
     };
 
     #[test]
@@ -524,6 +536,71 @@ mod tests {
             read_message(&mut reader).unwrap(),
             Some(ClientMessage::Detach { generation: 7 })
         ));
+    }
+
+    #[test]
+    fn large_snapshot_survives_nonblocking_listener_accept() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/p2pmux-large-snapshot-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let stream = UnixStream::connect(client_path).unwrap();
+            let mut reader = BufReader::new(stream);
+            crate::client::read_message(&mut reader).unwrap().unwrap()
+        });
+
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::yield_now(),
+                Err(error) => panic!("failed to accept local IPC client: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        write_message(
+            &mut stream,
+            &NodeMessage::Snapshot {
+                room_name: "test".into(),
+                role: "coordinator".into(),
+                summary: SessionSummary::default(),
+                layout: Box::new(crate::layout::LayoutSnapshot {
+                    revision: 0,
+                    members: vec![],
+                    tabs: vec![],
+                    panes: Default::default(),
+                }),
+                screens: vec![PaneScreenSnapshot {
+                    pane_id: 1,
+                    sequence: 1,
+                    snapshot: vec![b'x'; 256 * 1024],
+                    kitty_keyboard_active: false,
+                }],
+                leases: vec![],
+                rosters: vec![],
+                tab_id: 1,
+                pane_id: 1,
+            },
+        )
+        .unwrap();
+
+        let NodeMessage::Snapshot { screens, .. } = client.join().unwrap() else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(screens[0].snapshot, vec![b'x'; 256 * 1024]);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
