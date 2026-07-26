@@ -498,7 +498,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let descriptor = SessionDescriptor::new(
             "0123456789abcdef0123456789abcdef".into(),
-            "amber-otter-01".into(),
+            "lisbon".into(),
             "/tmp/p2pmux-test.sock".into(),
             1,
             SessionRole::Coordinator,

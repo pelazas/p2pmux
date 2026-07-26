@@ -6,7 +6,7 @@ use p2pmux::{
 #[test]
 fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
     let message = NodeMessage::Snapshot {
-        room_name: "amber-otter-01".into(),
+        room_name: "lisbon".into(),
         role: "coordinator".into(),
         summary: SessionSummary::default(),
         layout: Box::new(LayoutSnapshot {

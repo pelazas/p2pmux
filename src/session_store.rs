@@ -425,7 +425,7 @@ mod tests {
         let socket = store.socket_path(&id).unwrap();
         let descriptor = SessionDescriptor::new(
             id.clone(),
-            "amber-otter-01".into(),
+            "lisbon".into(),
             socket,
             42,
             SessionRole::Coordinator,
@@ -451,7 +451,7 @@ mod tests {
         store
             .write(&SessionDescriptor::new(
                 id.clone(),
-                "amber-otter-01".into(),
+                "lisbon".into(),
                 socket,
                 42,
                 SessionRole::Coordinator,
@@ -488,7 +488,7 @@ mod tests {
         store
             .write(&SessionDescriptor::new(
                 id.clone(),
-                "amber-otter-01".into(),
+                "lisbon".into(),
                 socket.clone(),
                 42,
                 SessionRole::Coordinator,
@@ -499,5 +499,36 @@ mod tests {
         assert_eq!(live[0].id, id);
         server.join().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_names_are_valid_world_cities() {
+        let name = generate_name_from_store(&store()).unwrap();
+
+        assert!((80..=150).contains(&CITY_NAMES.len()));
+        assert!(CITY_NAMES.iter().all(|city| valid_name(city)));
+        assert!(CITY_NAMES.contains(&name.as_str()));
+    }
+
+    #[test]
+    fn city_name_skips_live_names() {
+        let live_names = HashSet::from([CITY_NAMES[0].to_owned()]);
+
+        assert_eq!(available_city_name(&live_names, 0), CITY_NAMES[1]);
+    }
+
+    #[test]
+    fn city_name_adds_suffix_after_all_cities_are_live() {
+        let mut live_names: HashSet<_> = CITY_NAMES.iter().map(|city| (*city).to_owned()).collect();
+
+        assert_eq!(
+            available_city_name(&live_names, 0),
+            format!("{}-2", CITY_NAMES[0])
+        );
+        live_names.insert(format!("{}-2", CITY_NAMES[0]));
+        assert_eq!(
+            available_city_name(&live_names, 0),
+            format!("{}-3", CITY_NAMES[0])
+        );
     }
 }
