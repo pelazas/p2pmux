@@ -5,7 +5,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufRead, Write},
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -259,8 +259,12 @@ fn probe(path: &Path) -> bool {
     {
         return false;
     }
+    // Read one newline-delimited ack. Do not use read_to_string: the node keeps the
+    // connection open, so waiting for EOF falsely marks live sessions as dead and
+    // list_live would delete their descriptors.
+    let mut reader = io::BufReader::new(stream);
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok() && response.contains("\"probe_ack\"")
+    matches!(reader.read_line(&mut response), Ok(n) if n > 0) && response.contains("\"probe_ack\"")
 }
 
 fn current_uid() -> io::Result<String> {
@@ -336,5 +340,40 @@ mod tests {
             .unwrap();
         assert!(store.list_live().unwrap().is_empty());
         assert!(store.read(&id).is_err());
+    }
+
+    #[test]
+    fn live_probe_reads_one_ack_without_waiting_for_eof() {
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let store = store();
+        let id = generate_id().unwrap();
+        let socket = store.socket_path(&id).unwrap();
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("probe"));
+            stream.write_all(b"{\"type\":\"probe_ack\"}\n").unwrap();
+            // Keep the connection open briefly; a correct probe must not require EOF.
+            thread::sleep(Duration::from_millis(50));
+        });
+        store
+            .write(&SessionDescriptor::new(
+                id.clone(),
+                "amber-otter-01".into(),
+                socket,
+                42,
+                SessionRole::Coordinator,
+            ))
+            .unwrap();
+        let live = store.list_live().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, id);
+        server.join().unwrap();
     }
 }
