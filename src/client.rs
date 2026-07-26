@@ -75,6 +75,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut detach_sent = false;
     let mut last_agent_overlay_animation = Instant::now();
     let mut pending_focus = None;
+    let mut local_peer_id = Vec::new();
 
     'attached: loop {
         loop {
@@ -86,6 +87,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         screens: next_screens,
                         leases,
                         rosters,
+                        local_peer_id: next_local_peer_id,
                         tab_id,
                         pane_id,
                         ..
@@ -104,6 +106,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             pane_id,
                             &mut pending_focus,
                         )?;
+                        local_peer_id = next_local_peer_id;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
                         }
@@ -162,14 +165,16 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         dirty = true;
                     }
                     KeyHandling::Forward => {
-                        if let Some(bytes) = client_key_bytes(key.code, key.modifiers) {
+                        if input_allowed(tui, &local_peer_id)
+                            && let Some(bytes) = client_key_bytes(key.code, key.modifiers)
+                        {
                             write_message(&mut stream, &ClientMessage::Input { bytes })?;
                         }
                     }
                 }
             }
             Event::Paste(text) => {
-                if should_forward_paste(tui) {
+                if should_forward_paste(tui, &local_peer_id) {
                     write_message(
                         &mut stream,
                         &ClientMessage::Input {
@@ -261,8 +266,15 @@ fn refresh_tui_timers(
     dirty
 }
 
-fn should_forward_paste(tui: &MultiPaneTui) -> bool {
-    !tui.overlay_open()
+fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
+    tui.snapshot()
+        .panes
+        .get(&tui.focused_pane())
+        .is_none_or(|pane| !pane.locked || pane.host_peer_id == local_peer_id)
+}
+
+fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
+    !tui.overlay_open() && input_allowed(tui, local_peer_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,7 +807,19 @@ mod tests {
         let mut animation = Instant::now();
         refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
 
-        assert!(!should_forward_paste(tui));
+        assert!(!should_forward_paste(tui, b"host"));
         assert!(tui.scroll_agent_overlay(area, false));
+    }
+
+    #[test]
+    fn locked_guest_pane_suppresses_key_and_paste_forwarding() {
+        let mut layout = layout(&[1]);
+        layout.panes.get_mut(&1).expect("pane").locked = true;
+        let tui = MultiPaneTui::new(layout).expect("layout");
+
+        assert!(!input_allowed(&tui, b"guest"));
+        assert!(!should_forward_paste(&tui, b"guest"));
+        assert!(input_allowed(&tui, b"host"));
+        assert!(should_forward_paste(&tui, b"host"));
     }
 }

@@ -18,6 +18,7 @@ fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
         screens: Default::default(),
         leases: Default::default(),
         rosters: vec![],
+        local_peer_id: vec![],
         tab_id: 2,
         pane_id: 3,
     };
