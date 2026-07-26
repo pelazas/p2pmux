@@ -90,7 +90,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> + <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
-    FooterSegment::Text("   Option+Shift+drag RESIZE"),
+    FooterSegment::Text("   drag border RESIZE"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("Pane  <"),
@@ -209,8 +209,17 @@ struct ResizeDrag {
     origin_column: u16,
     origin_row: u16,
     axis: Option<Axis>,
+    horizontal: bool,
+    vertical: bool,
     original_share_bps: u16,
-    first_child: bool,
+    span: u16,
+    content: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitTarget {
+    first_share_bps: u16,
+    span: u16,
 }
 
 impl PaneTextSelection {
@@ -362,36 +371,31 @@ impl MultiPaneTui {
         std::mem::replace(&mut self.selection_dragging, false)
     }
 
-    fn begin_resize_drag(
-        &mut self,
-        column: u16,
-        row: u16,
-        area: Rect,
-        modifiers: KeyModifiers,
-    ) -> bool {
-        if !modifiers.contains(KeyModifiers::ALT) || !modifiers.contains(KeyModifiers::SHIFT) {
-            return false;
-        }
-        let Some((pane_id, rect)) = self
-            .geometry(area)
-            .panes
-            .iter()
-            .find_map(|(pane_id, rect)| {
-                rect_contains(pane_content_rect(*rect), column, row).then_some((*pane_id, *rect))
-            })
+    fn begin_resize_drag(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let geometry = self.geometry(area);
+        let Some((pane_id, horizontal, vertical)) = resize_border_hit(&geometry.panes, column, row)
         else {
             return false;
         };
-        let _ = rect;
         self.resize_drag = Some(ResizeDrag {
             pane_id,
             base_revision: self.snapshot.revision,
             origin_column: column,
             origin_row: row,
             axis: None,
+            horizontal,
+            vertical,
             original_share_bps: 0,
-            first_child: false,
+            span: 1,
+            content: geometry.content,
         });
+        if horizontal != vertical {
+            self.lock_resize_drag(if horizontal {
+                Axis::LeftRight
+            } else {
+                Axis::TopBottom
+            });
+        }
         true
     }
 
@@ -407,42 +411,49 @@ impl MultiPaneTui {
         if horizontal.unsigned_abs().max(vertical.unsigned_abs()) < 2 {
             return true;
         }
-        let axis = if horizontal.unsigned_abs() >= vertical.unsigned_abs() {
-            Axis::LeftRight
-        } else {
-            Axis::TopBottom
+        let axis = match (drag.horizontal, drag.vertical) {
+            (true, false) => Axis::LeftRight,
+            (false, true) => Axis::TopBottom,
+            (true, true) if horizontal.unsigned_abs() >= vertical.unsigned_abs() => Axis::LeftRight,
+            (true, true) => Axis::TopBottom,
+            (false, false) => {
+                self.resize_drag = None;
+                return true;
+            }
         };
-        let Some(tab) = self.current_tab_layout() else {
-            self.resize_drag = None;
-            return true;
-        };
-        let Some((share, first_child)) = nearest_split_for_pane(&tab.root, drag.pane_id, axis)
-        else {
-            self.resize_drag = None;
-            return true;
-        };
-        let drag = self.resize_drag.as_mut().expect("drag remains active");
-        drag.axis = Some(axis);
-        drag.original_share_bps = share;
-        drag.first_child = first_child;
+        self.lock_resize_drag(axis);
         true
     }
 
-    fn end_resize_drag(&mut self, column: u16, row: u16, area: Rect) -> Option<UiIntent> {
+    fn lock_resize_drag(&mut self, axis: Axis) {
+        let Some(drag) = self.resize_drag else {
+            return;
+        };
+        let Some(tab) = self.current_tab_layout() else {
+            self.resize_drag = None;
+            return;
+        };
+        let Some(target) = nearest_split_for_pane(&tab.root, drag.pane_id, axis, drag.content)
+        else {
+            self.resize_drag = None;
+            return;
+        };
+        let drag = self.resize_drag.as_mut().expect("drag remains active");
+        drag.axis = Some(axis);
+        drag.original_share_bps = target.first_share_bps;
+        drag.span = target.span;
+    }
+
+    fn end_resize_drag(&mut self, column: u16, row: u16) -> Option<UiIntent> {
         let drag = self.resize_drag.take()?;
         let axis = drag.axis?;
         let delta = match axis {
             Axis::LeftRight => i32::from(column) - i32::from(drag.origin_column),
             Axis::TopBottom => i32::from(row) - i32::from(drag.origin_row),
         };
-        let span = match axis {
-            Axis::LeftRight => area.width,
-            Axis::TopBottom => area.height,
-        }
-        .max(1);
-        let signed = if drag.first_child { delta } else { -delta };
-        let proposed = (i32::from(drag.original_share_bps) + signed * 10_000 / i32::from(span))
-            .clamp(1, 9_999) as u16;
+        let proposed = (i32::from(drag.original_share_bps)
+            + delta * 10_000 / i32::from(drag.span.max(1)))
+        .clamp(1, 9_999) as u16;
         (proposed != drag.original_share_bps).then_some(UiIntent::SetSplitRatio {
             pane_id: drag.pane_id,
             axis,
@@ -952,6 +963,49 @@ fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<Pane
         .find_map(|(pane_id, rect)| rect_contains(*rect, column, row).then_some(*pane_id))
 }
 
+fn resize_border_hit(
+    panes: &BTreeMap<PaneId, Rect>,
+    column: u16,
+    row: u16,
+) -> Option<(PaneId, bool, bool)> {
+    panes.iter().find_map(|(pane_id, rect)| {
+        if !rect_contains(*rect, column, row)
+            || rect_contains(pane_content_rect(*rect), column, row)
+        {
+            return None;
+        }
+        let vertical = (rect.width > 0
+            && column == rect.x
+            && panes.iter().any(|(other_id, other)| {
+                other_id != pane_id
+                    && other.right() == rect.x
+                    && rect_contains(*other, other.x, row)
+            }))
+            || (rect.width > 0
+                && column == rect.right().saturating_sub(1)
+                && panes.iter().any(|(other_id, other)| {
+                    other_id != pane_id
+                        && other.x == rect.right()
+                        && rect_contains(*other, other.x, row)
+                }));
+        let horizontal = (rect.height > 0
+            && row == rect.y
+            && panes.iter().any(|(other_id, other)| {
+                other_id != pane_id
+                    && other.bottom() == rect.y
+                    && rect_contains(*other, column, other.y)
+            }))
+            || (rect.height > 0
+                && row == rect.bottom().saturating_sub(1)
+                && panes.iter().any(|(other_id, other)| {
+                    other_id != pane_id
+                        && other.y == rect.bottom()
+                        && rect_contains(*other, column, other.y)
+                }));
+        (vertical || horizontal).then_some((*pane_id, vertical, horizontal))
+    })
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     u32::from(column) >= u32::from(rect.x)
         && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
@@ -1015,7 +1069,12 @@ fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
     }
 }
 
-fn nearest_split_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> Option<(u16, bool)> {
+fn nearest_split_for_pane(
+    node: &Node,
+    pane_id: PaneId,
+    axis: Axis,
+    area: Rect,
+) -> Option<SplitTarget> {
     let Node::Split {
         axis: split_axis,
         first_share_bps,
@@ -1025,12 +1084,27 @@ fn nearest_split_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> Option<(u
     else {
         return None;
     };
+    let (first_area, second_area) = split_areas(*split_axis, *first_share_bps, first, second, area);
     if contains_leaf(first, pane_id) {
-        nearest_split_for_pane(first, pane_id, axis)
-            .or_else(|| (*split_axis == axis).then_some((*first_share_bps, true)))
+        nearest_split_for_pane(first, pane_id, axis, first_area).or_else(|| {
+            (*split_axis == axis).then_some(SplitTarget {
+                first_share_bps: *first_share_bps,
+                span: match axis {
+                    Axis::LeftRight => area.width,
+                    Axis::TopBottom => area.height,
+                },
+            })
+        })
     } else if contains_leaf(second, pane_id) {
-        nearest_split_for_pane(second, pane_id, axis)
-            .or_else(|| (*split_axis == axis).then_some((*first_share_bps, false)))
+        nearest_split_for_pane(second, pane_id, axis, second_area).or_else(|| {
+            (*split_axis == axis).then_some(SplitTarget {
+                first_share_bps: *first_share_bps,
+                span: match axis {
+                    Axis::LeftRight => area.width,
+                    Axis::TopBottom => area.height,
+                },
+            })
+        })
     } else {
         None
     }
@@ -1070,6 +1144,47 @@ fn allocated_first_span(span: u16, share_bps: u16, first_min: u16, second_min: u
     }
 }
 
+fn split_areas(
+    axis: Axis,
+    first_share_bps: u16,
+    first: &Node,
+    second: &Node,
+    area: Rect,
+) -> (Rect, Rect) {
+    match axis {
+        Axis::LeftRight => {
+            let (first_min, _) = node_minimum(first);
+            let (second_min, _) = node_minimum(second);
+            let first_width =
+                allocated_first_span(area.width, first_share_bps, first_min, second_min);
+            (
+                Rect::new(area.x, area.y, first_width, area.height),
+                Rect::new(
+                    area.x.saturating_add(first_width),
+                    area.y,
+                    area.width - first_width,
+                    area.height,
+                ),
+            )
+        }
+        Axis::TopBottom => {
+            let (_, first_min) = node_minimum(first);
+            let (_, second_min) = node_minimum(second);
+            let first_height =
+                allocated_first_span(area.height, first_share_bps, first_min, second_min);
+            (
+                Rect::new(area.x, area.y, area.width, first_height),
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(first_height),
+                    area.width,
+                    area.height - first_height,
+                ),
+            )
+        }
+    }
+}
+
 fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
     match node {
         Node::Leaf { pane_id } => {
@@ -1081,38 +1196,8 @@ fn allocate_node(node: &Node, area: Rect, panes: &mut BTreeMap<PaneId, Rect>) {
             first,
             second,
         } => {
-            let (first_area, second_area) = match axis {
-                Axis::LeftRight => {
-                    let (first_min, _) = node_minimum(first);
-                    let (second_min, _) = node_minimum(second);
-                    let first_width =
-                        allocated_first_span(area.width, *first_share_bps, first_min, second_min);
-                    (
-                        Rect::new(area.x, area.y, first_width, area.height),
-                        Rect::new(
-                            area.x.saturating_add(first_width),
-                            area.y,
-                            area.width - first_width,
-                            area.height,
-                        ),
-                    )
-                }
-                Axis::TopBottom => {
-                    let (_, first_min) = node_minimum(first);
-                    let (_, second_min) = node_minimum(second);
-                    let first_height =
-                        allocated_first_span(area.height, *first_share_bps, first_min, second_min);
-                    (
-                        Rect::new(area.x, area.y, area.width, first_height),
-                        Rect::new(
-                            area.x,
-                            area.y.saturating_add(first_height),
-                            area.width,
-                            area.height - first_height,
-                        ),
-                    )
-                }
-            };
+            let (first_area, second_area) =
+                split_areas(*axis, *first_share_bps, first, second, area);
             allocate_node(first, first_area, panes);
             allocate_node(second, second_area, panes);
         }
@@ -2355,10 +2440,7 @@ impl SharedLayoutRuntime {
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
                     dirty |= self.clear_selection();
-                    if self
-                        .tui
-                        .begin_resize_drag(mouse.column, mouse.row, area, mouse.modifiers)
-                    {
+                    if self.tui.begin_resize_drag(mouse.column, mouse.row, area) {
                         dirty = true;
                     } else if let Some(intent) =
                         self.tui.switch_tab_at(mouse.column, mouse.row, area)
@@ -2387,8 +2469,7 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
                 {
-                    let area = Rect::new(0, 0, cols, rows);
-                    if let Some(intent) = self.tui.end_resize_drag(mouse.column, mouse.row, area) {
+                    if let Some(intent) = self.tui.end_resize_drag(mouse.column, mouse.row) {
                         self.handle_intent(intent)?;
                     } else if self.tui.end_selection_drag() {
                         self.copy_selection_to_clipboard();
@@ -4421,25 +4502,58 @@ mod tests {
     }
 
     #[test]
-    fn option_shift_drag_locks_once_and_emits_one_ratio_intent() {
+    fn content_drag_keeps_the_selection_path() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
-        assert!(tui.begin_resize_drag(10, 5, area, KeyModifiers::ALT | KeyModifiers::SHIFT));
-        assert!(
-            tui.extend_resize_drag(11, 5),
-            "under threshold remains pending"
-        );
-        assert!(tui.extend_resize_drag(20, 6), "horizontal lock");
+        assert!(!tui.begin_resize_drag(2, 3, area));
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        assert!(tui.end_selection_drag());
+        assert!(tui.selection().is_some());
+    }
+
+    #[test]
+    fn dragging_a_shared_vertical_border_resizes_its_split() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(39, 5, area));
         assert!(matches!(
-            tui.end_resize_drag(20, 6, area),
+            tui.end_resize_drag(49, 5),
             Some(UiIntent::SetSplitRatio {
                 pane_id: 1,
                 axis: Axis::LeftRight,
+                first_share_bps: 6_250,
                 base_revision: 1,
-                ..
             })
         ));
-        assert!(tui.end_resize_drag(20, 6, area).is_none());
+        assert!(tui.end_resize_drag(49, 5).is_none());
+
+        assert!(tui.begin_resize_drag(40, 5, area));
+        assert!(matches!(
+            tui.end_resize_drag(50, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 2,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn dragging_a_shared_horizontal_border_resizes_its_split() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(60, 11, area));
+        assert!(matches!(
+            tui.end_resize_drag(60, 16),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 2,
+                axis: Axis::TopBottom,
+                first_share_bps: 7_272,
+                base_revision: 1,
+            })
+        ));
     }
 
     #[test]
@@ -5204,6 +5318,9 @@ mod tests {
                 footer.starts_with(expected),
                 "mode: {mode:?}, footer: {footer}"
             );
+            if mode == ChordMode::None {
+                assert!(footer.contains("drag border RESIZE"), "footer: {footer}");
+            }
         }
     }
 
