@@ -580,6 +580,7 @@ mod tests {
                         Pane {
                             pane_id: *pane_id,
                             host_peer_id: b"host".to_vec(),
+                            locked: false,
                             grid_rows: 2,
                             grid_cols: 8,
                             title: None,
