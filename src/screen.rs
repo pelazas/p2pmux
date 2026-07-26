@@ -221,7 +221,8 @@ impl GuestScreen {
     }
 }
 
-fn snapshot_payload(screen: &vt100::Screen) -> Result<Arc<[u8]>, ScreenError> {
+/// Encodes a complete fixed-grid screen for a fresh local or remote renderer.
+pub fn snapshot_payload(screen: &vt100::Screen) -> Result<Arc<[u8]>, ScreenError> {
     let (rows, cols) = screen.size();
     validate_dimensions(rows, cols)?;
     let state = screen.state_formatted();

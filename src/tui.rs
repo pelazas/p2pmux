@@ -17,6 +17,8 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
+use serde::{Deserialize, Serialize};
+
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
@@ -64,6 +66,9 @@ use crate::{
     },
     transport::Transport,
 };
+
+pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, (u64, Vec<u8>, bool)>;
+pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
@@ -161,8 +166,23 @@ pub struct PaneViewState {
     scrollback: usize,
 }
 
+impl PaneViewState {
+    pub fn from_chrome(
+        ready: bool,
+        controller_peer_id: Option<Vec<u8>>,
+        controller_active: bool,
+    ) -> Self {
+        Self {
+            ready,
+            controller_peer_id,
+            controller_active,
+            scrollback: 0,
+        }
+    }
+}
+
 /// User operations emitted by the TUI. Session code owns all resulting mutations and PTYs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum UiIntent {
     CreatePane {
         target_pane_id: PaneId,
@@ -292,6 +312,7 @@ impl PaneTextSelection {
 /// Pure local rendering and selection state for a revisioned shared layout.
 #[derive(Clone, Debug)]
 pub struct MultiPaneTui {
+    title: String,
     snapshot: LayoutSnapshot,
     current_tab: TabId,
     focused_pane: PaneId,
@@ -324,6 +345,7 @@ impl MultiPaneTui {
             .map(|pane_id| (*pane_id, PaneViewState::default()))
             .collect();
         Ok(Self {
+            title: TOP_BAR_BRAND.into(),
             snapshot,
             current_tab,
             focused_pane,
@@ -347,6 +369,15 @@ impl MultiPaneTui {
 
     pub fn snapshot(&self) -> &LayoutSnapshot {
         &self.snapshot
+    }
+
+    /// Local clients may decorate the shared chrome without changing layout state.
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
     }
 
     pub fn current_tab(&self) -> TabId {
@@ -691,6 +722,22 @@ impl MultiPaneTui {
         pane_at(&self.geometry(area).panes, column, row).unwrap_or(self.focused_pane)
     }
 
+    pub fn pane_at_or_focused_for_mouse(&self, column: u16, row: u16, area: Rect) -> PaneId {
+        self.pane_at_or_focused(column, row, area)
+    }
+
+    pub fn scroll_mouse_pane(
+        &mut self,
+        column: u16,
+        row: u16,
+        area: Rect,
+        scrollback_len: usize,
+        up: bool,
+    ) -> bool {
+        let pane_id = self.pane_at_or_focused(column, row, area);
+        self.scroll_pane(pane_id, scrollback_len, up)
+    }
+
     fn scroll_pane(&mut self, pane_id: PaneId, scrollback_len: usize, up: bool) -> bool {
         let Some(view) = self.pane_views.get_mut(&pane_id) else {
             return false;
@@ -849,7 +896,7 @@ impl MultiPaneTui {
     fn tab_label_rects(&self, tab_bar: Rect) -> BTreeMap<TabId, Rect> {
         let mut x = tab_bar
             .x
-            .saturating_add(text_width(TOP_BAR_BRAND))
+            .saturating_add(text_width(&self.title))
             .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR));
         let right = tab_bar.x.saturating_add(tab_bar.width);
         self.snapshot
@@ -933,6 +980,66 @@ impl MultiPaneTui {
             self.exit_chord_mode();
             KeyHandling::Forward
         }
+    }
+
+    /// Applies the local half of mouse interaction and returns mutations for the node.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        area: Rect,
+    ) -> Vec<UiIntent> {
+        match mouse.kind {
+            MouseEventKind::Moved if !self.overlay_open() => {
+                self.hover_pane_at(mouse.column, mouse.row, area);
+                Vec::new()
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.overlay_open() {
+                    return self.handle_agent_overlay_click(mouse.column, mouse.row, area);
+                }
+                self.clear_selection();
+                if self.begin_resize_drag(mouse.column, mouse.row, area) {
+                    return Vec::new();
+                }
+                if let Some(intent) = self.switch_tab_at(mouse.column, mouse.row, area) {
+                    return vec![intent];
+                }
+                let changed = self.focus_pane_at(mouse.column, mouse.row, area);
+                self.begin_selection_at(mouse.column, mouse.row, area);
+                changed
+                    .then_some(UiIntent::FocusPane {
+                        pane_id: self.focused_pane,
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.extend_resize_drag(mouse.column, mouse.row) {
+                    self.extend_selection_at(mouse.column, mouse.row, area);
+                }
+                Vec::new()
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.end_selection_drag();
+                self.end_resize_drag(mouse.column, mouse.row)
+                    .into_iter()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Aligns a reattached client's local selection with the node-owned focus.
+    pub fn set_focus(&mut self, tab_id: TabId, pane_id: PaneId) -> Result<(), LayoutError> {
+        self.select_tab(tab_id)?;
+        if !self
+            .current_tab_layout()
+            .is_some_and(|tab| contains_leaf(&tab.root, pane_id))
+        {
+            return Err(LayoutError::UnknownPane { pane_id });
+        }
+        self.focused_pane = pane_id;
+        Ok(())
     }
 
     fn handle_agent_overlay_key(&mut self, key: KeyEvent) -> KeyHandling {
@@ -1907,7 +2014,7 @@ fn render_shared_multi_pane(
             .set_stringn(
                 geometry.tab_bar.x,
                 geometry.tab_bar.y,
-                TOP_BAR_BRAND,
+                tui.title(),
                 usize::from(geometry.tab_bar.width),
                 Style::default().fg(Color::White).bg(FOOTER_BACKGROUND),
             )
@@ -2112,9 +2219,11 @@ fn format_agent_overlay_card(
         &row.cwd,
         usize::from(width.saturating_sub(text_width(&first_prefix))),
     );
-    let card_style = selected
-        .then_some(Style::default().bg(AGENT_OVERLAY_SELECTED_BACKGROUND))
-        .unwrap_or_default();
+    let card_style = if selected {
+        Style::default().bg(AGENT_OVERLAY_SELECTED_BACKGROUND)
+    } else {
+        Style::default()
+    };
     let first_line = agent_overlay_line(
         vec![
             Span::styled(marker, Style::default().fg(AGENT_OVERLAY_CHROME)),
@@ -3034,6 +3143,105 @@ impl SharedLayoutRuntime {
 
     pub fn set_session_id(&mut self, session_id: Vec<u8>) {
         self.session_id = session_id;
+    }
+
+    /// Node-facing non-terminal operations. Kept small while the old foreground adapter is
+    /// retired so pane/Iroh ownership has exactly one home.
+    pub fn drain_node(&mut self) -> Result<bool, Box<dyn Error>> {
+        self.drain()
+    }
+
+    pub fn node_input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let pane_id = self.tui.focused_pane();
+        if let Some(pane) = self.local.get_mut(&pane_id) {
+            pane.input(bytes.clone())?;
+        }
+        if let Some(pane) = self.remote.get_mut(&pane_id) {
+            pane.input(bytes);
+        }
+        self.tui.reset_scrollback(pane_id);
+        Ok(())
+    }
+
+    pub fn release_all_local_control(&mut self) -> Result<(), Box<dyn Error>> {
+        let peer_id = self.control.peer_id();
+        for pane in self.local.values_mut() {
+            pane.release_controller(&peer_id)?;
+        }
+        for pane in self.remote.values_mut() {
+            pane.release_controller();
+        }
+        Ok(())
+    }
+
+    pub fn local_focus(&self) -> (u64, u64) {
+        (self.tui.current_tab(), self.tui.focused_pane())
+    }
+
+    /// A complete node-owned view for a newly attached local renderer. Frames are deliberately
+    /// snapshots: the client can always rebuild a `GuestScreen` without owning a PTY.
+    pub fn node_snapshot(&self) -> (LayoutSnapshot, NodeScreenSnapshots, NodeLeaseSnapshots) {
+        let mut screens = BTreeMap::new();
+        let mut chrome = BTreeMap::new();
+        for (pane_id, pane) in &self.local {
+            let frame = pane.screen.current_frame();
+            screens.insert(
+                *pane_id,
+                (
+                    frame.sequence,
+                    frame.snapshot.as_ref().to_vec(),
+                    frame.kitty_keyboard_active,
+                ),
+            );
+            let view = pane.view_state();
+            chrome.insert(
+                *pane_id,
+                (view.ready, view.controller_peer_id, view.controller_active),
+            );
+        }
+        for (pane_id, pane) in &self.remote {
+            if let Some(screen) = pane.screen.screen()
+                && let Ok(snapshot) = crate::screen::snapshot_payload(screen)
+            {
+                screens.insert(
+                    *pane_id,
+                    (
+                        pane.screen.sequence().unwrap_or(1),
+                        snapshot.as_ref().to_vec(),
+                        pane.screen.kitty_keyboard_active(),
+                    ),
+                );
+            }
+            let view = pane.view_state();
+            chrome.insert(
+                *pane_id,
+                (view.ready, view.controller_peer_id, view.controller_active),
+            );
+        }
+        (self.tui.snapshot().clone(), screens, chrome)
+    }
+
+    pub fn node_resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
+        if cols == 0 || rows == 0 {
+            return Ok(());
+        }
+        self.reflow_local_panes(Rect::new(0, 0, cols, rows))
+    }
+
+    pub fn node_focus(&mut self, tab_id: TabId, pane_id: PaneId) -> Result<(), Box<dyn Error>> {
+        let previous = self.tui.focused_pane();
+        self.tui
+            .set_focus(tab_id, pane_id)
+            .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))?;
+        self.release_blurred_pane(previous)
+    }
+
+    pub fn node_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
+        self.handle_intent(intent)
+    }
+
+    pub fn shutdown_node(self) {
+        self.shutdown();
     }
 
     fn clear_selection(&mut self) -> bool {
