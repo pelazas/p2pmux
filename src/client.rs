@@ -7,7 +7,7 @@ use std::{
     os::unix::net::UnixStream,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -25,7 +25,10 @@ use crate::{
     protocol::AgentRosterState,
     screen::GuestScreen,
     session_store::SessionDescriptor,
-    tui::{AgentOverlayRow, KeyHandling, MultiPaneTui, PaneViewState, render_multi_pane},
+    tui::{
+        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
+        PaneViewState, render_multi_pane,
+    },
 };
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
@@ -60,6 +63,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut node_ended = false;
     let mut attach_error = None;
     let mut detach_sent = false;
+    let mut last_agent_overlay_animation = Instant::now();
 
     'attached: loop {
         loop {
@@ -87,6 +91,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             tab_id,
                             pane_id,
                         )?;
+                        if let Some(tui) = tui.as_mut() {
+                            tui.set_agent_overlay_viewport(terminal.size()?.into());
+                        }
                         dirty = true;
                     }
                 }
@@ -104,6 +111,18 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     break 'attached;
                 }
                 Err(TryRecvError::Empty) => break,
+            }
+        }
+        if let Some(tui) = tui.as_mut() {
+            let now = Instant::now();
+            dirty |= tui.expire_chord_mode(now);
+            dirty |= tui.expire_agent_toggle(now);
+            if tui.agent_overlay_has_working_rows()
+                && now.duration_since(last_agent_overlay_animation)
+                    >= AGENT_OVERLAY_ANIMATION_INTERVAL
+            {
+                last_agent_overlay_animation = now;
+                dirty = true;
             }
         }
         if dirty {
@@ -145,15 +164,33 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                 }
             }
-            Event::Paste(text) => write_message(
-                &mut stream,
-                &ClientMessage::Input {
-                    bytes: text.into_bytes(),
-                },
-            )?,
+            Event::Paste(text) => {
+                if !tui.overlay_open() {
+                    write_message(
+                        &mut stream,
+                        &ClientMessage::Input {
+                            bytes: text.into_bytes(),
+                        },
+                    )?;
+                }
+                dirty = true;
+            }
             Event::Mouse(mouse) => {
                 let area = terminal.size()?.into();
-                if matches!(
+                if tui.overlay_open() {
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) {
+                        tui.scroll_agent_overlay(
+                            area,
+                            matches!(mouse.kind, MouseEventKind::ScrollUp),
+                        );
+                    } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                        let intents = tui.handle_mouse(mouse, area);
+                        send_intents(&mut stream, tui, intents)?;
+                    }
+                } else if matches!(
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
@@ -178,6 +215,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
             Event::Resize(cols, rows) => {
                 terminal.resize(Rect::new(0, 0, cols, rows))?;
+                tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
                 write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
                 dirty = true;
             }

@@ -93,7 +93,7 @@ fn unix_ms_now() -> u64 {
 }
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(400);
-const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
 const AGENT_OVERLAY_CHROME: Color = Color::Rgb(255, 69, 0);
 const AGENT_OVERLAY_SELECTED_BACKGROUND: Color = Color::DarkGray;
@@ -424,7 +424,7 @@ impl MultiPaneTui {
         true
     }
 
-    fn set_agent_overlay_viewport(&mut self, area: Rect) {
+    pub(crate) fn set_agent_overlay_viewport(&mut self, area: Rect) {
         self.agent_overlay_viewport_lines = agents_overlay_inner(area).height;
         self.clamp_agent_overlay_scroll();
     }
@@ -477,7 +477,7 @@ impl MultiPaneTui {
         self.clamp_agent_overlay_scroll();
     }
 
-    fn scroll_agent_overlay(&mut self, area: Rect, up: bool) -> bool {
+    pub(crate) fn scroll_agent_overlay(&mut self, area: Rect, up: bool) -> bool {
         self.set_agent_overlay_viewport(area);
         let previous = self.agent_overlay_scroll_line;
         if up {
@@ -493,7 +493,7 @@ impl MultiPaneTui {
         self.agent_overlay_scroll_line != previous
     }
 
-    fn agent_overlay_has_working_rows(&self) -> bool {
+    pub(crate) fn agent_overlay_has_working_rows(&self) -> bool {
         self.agent_overlay_open
             && self
                 .agent_rows
@@ -514,7 +514,7 @@ impl MultiPaneTui {
             })
     }
 
-    fn expire_agent_toggle(&mut self, now: Instant) -> bool {
+    pub(crate) fn expire_agent_toggle(&mut self, now: Instant) -> bool {
         if self
             .pending_agent_toggle
             .is_some_and(|then| now.duration_since(then) >= AGENT_TOGGLE_WINDOW)
@@ -544,7 +544,7 @@ impl MultiPaneTui {
     }
 
     /// Clears sticky pane/tab mode after [`CHORD_IDLE_TIMEOUT`] without a key.
-    fn expire_chord_mode(&mut self, now: Instant) -> bool {
+    pub(crate) fn expire_chord_mode(&mut self, now: Instant) -> bool {
         let Some(last) = self.chord_last_activity else {
             return false;
         };
