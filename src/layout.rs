@@ -85,12 +85,14 @@ pub struct Pane {
     pub host_peer_id: Vec<u8>,
     pub grid_rows: u16,
     pub grid_cols: u16,
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Tab {
     pub tab_id: TabId,
     pub root: Node,
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,6 +171,7 @@ pub enum LayoutError {
     InvalidPeerId,
     InvalidEndpointAddress,
     InvalidDisplayName,
+    InvalidTitle,
     TabLimit,
     PaneLimit,
     SplitDepthLimit,
@@ -221,6 +224,7 @@ impl SessionState {
             host_peer_id: initial_host.clone(),
             grid_rows,
             grid_cols,
+            title: None,
         };
         let mut panes = BTreeMap::new();
         panes.insert(1, initial_pane);
@@ -234,6 +238,7 @@ impl SessionState {
             tabs: vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+                title: None,
             }],
             panes,
             next_tab_id: 2,
@@ -294,7 +299,7 @@ impl SessionState {
         let mut tab_ids = BTreeSet::new();
         let mut pane_ids = BTreeSet::new();
         for tab in &snapshot.tabs {
-            if tab.tab_id == 0 || !tab_ids.insert(tab.tab_id) {
+            if tab.tab_id == 0 || !tab_ids.insert(tab.tab_id) || !is_normalized_title(&tab.title) {
                 return Err(LayoutError::InvalidSnapshot);
             }
             let before = pane_ids.len();
@@ -317,6 +322,7 @@ impl SessionState {
                 || !pane_ids.contains(pane_id)
                 || validate_grid(pane.grid_rows, pane.grid_cols).is_err()
                 || !peer_ids.contains(&pane.host_peer_id)
+                || !is_normalized_title(&pane.title)
             {
                 return Err(LayoutError::InvalidSnapshot);
             }
@@ -406,6 +412,7 @@ impl SessionState {
                 tabs.push(Tab {
                     tab_id: tab.tab_id,
                     root,
+                    title: tab.title,
                 });
             }
         }
@@ -577,6 +584,7 @@ impl SessionState {
                         host_peer_id: creator.to_vec(),
                         grid_rows,
                         grid_cols,
+                        title: None,
                     },
                 );
                 self.pending_reservation = None;
@@ -595,6 +603,7 @@ impl SessionState {
                 self.tabs.push(Tab {
                     tab_id,
                     root: Node::Leaf { pane_id },
+                    title: None,
                 });
                 self.panes.insert(
                     pane_id,
@@ -603,6 +612,7 @@ impl SessionState {
                         host_peer_id: creator.to_vec(),
                         grid_rows,
                         grid_cols,
+                        title: None,
                     },
                 );
                 self.pending_reservation = None;
@@ -833,6 +843,47 @@ impl SessionState {
             pane.grid_rows = rows;
             pane.grid_cols = cols;
         }
+        self.advance_revision();
+        Ok(())
+    }
+
+    pub fn rename_pane(
+        &mut self,
+        requester: &[u8],
+        base_revision: u64,
+        pane_id: PaneId,
+        title: String,
+    ) -> Result<(), LayoutError> {
+        self.check_mutation(base_revision)?;
+        self.require_member(requester)?;
+        self.ensure_no_reservation()?;
+        let title = normalize_title(&title)?;
+        let pane = self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or(LayoutError::UnknownPane { pane_id })?;
+        pane.title = title;
+        self.advance_revision();
+        Ok(())
+    }
+
+    pub fn rename_tab(
+        &mut self,
+        requester: &[u8],
+        base_revision: u64,
+        tab_id: TabId,
+        title: String,
+    ) -> Result<(), LayoutError> {
+        self.check_mutation(base_revision)?;
+        self.require_member(requester)?;
+        self.ensure_no_reservation()?;
+        let title = normalize_title(&title)?;
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.tab_id == tab_id)
+            .ok_or(LayoutError::UnknownTab { tab_id })?;
+        tab.title = title;
         self.advance_revision();
         Ok(())
     }
@@ -1121,6 +1172,26 @@ fn validate_display_name(display_name: &str) -> Result<(), LayoutError> {
     Ok(())
 }
 
+pub fn normalize_title(title: &str) -> Result<Option<String>, LayoutError> {
+    let normalized = title.trim();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.chars().count() > 32 || normalized.chars().any(char::is_control) {
+        return Err(LayoutError::InvalidTitle);
+    }
+    Ok(Some(normalized.to_owned()))
+}
+
+fn is_normalized_title(title: &Option<String>) -> bool {
+    match title {
+        None => true,
+        Some(title) => {
+            normalize_title(title).is_ok_and(|normalized| normalized.as_deref() == Some(title))
+        }
+    }
+}
+
 fn validate_endpoint_addr(endpoint_addr: &[u8]) -> Result<(), LayoutError> {
     (!endpoint_addr.is_empty() && endpoint_addr.len() <= MAX_ENDPOINT_ADDR_BYTES)
         .then_some(())
@@ -1131,4 +1202,115 @@ fn validate_peer_id(peer_id: &[u8]) -> Result<(), LayoutError> {
     (!peer_id.is_empty() && peer_id.len() <= MAX_PEER_ID_BYTES)
         .then_some(())
         .ok_or(LayoutError::InvalidPeerId)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOST_A: &[u8] = b"host-a";
+    const HOST_B: &[u8] = b"host-b";
+
+    fn state() -> SessionState {
+        SessionState::new(HOST_A.to_vec(), b"endpoint-a".to_vec(), 24, 80).unwrap()
+    }
+
+    #[test]
+    fn titles_normalize_and_validate_at_the_layout_boundary() {
+        assert_eq!(
+            normalize_title("  build logs\u{2003}").unwrap(),
+            Some("build logs".into())
+        );
+        assert_eq!(normalize_title(" \t ").unwrap(), None);
+        assert_eq!(
+            normalize_title(&"x".repeat(32)).unwrap(),
+            Some("x".repeat(32))
+        );
+        assert_eq!(
+            normalize_title(&"x".repeat(33)),
+            Err(LayoutError::InvalidTitle)
+        );
+        assert_eq!(
+            normalize_title("line\nbreak"),
+            Err(LayoutError::InvalidTitle)
+        );
+    }
+
+    #[test]
+    fn any_member_can_rename_remote_panes_and_tabs_or_clear_them() {
+        let mut state = state();
+        state
+            .add_member(state.revision(), HOST_B.to_vec(), b"endpoint-b".to_vec())
+            .unwrap();
+        let roots = state.tabs().to_vec();
+        let hosts = state
+            .panes()
+            .map(|pane| (pane.pane_id, pane.host_peer_id.clone()))
+            .collect::<Vec<_>>();
+
+        state
+            .rename_pane(HOST_B, state.revision(), 1, " remote pane ".into())
+            .unwrap();
+        assert_eq!(state.pane(1).unwrap().title.as_deref(), Some("remote pane"));
+        assert_eq!(state.tabs(), roots.as_slice());
+        assert_eq!(
+            state
+                .panes()
+                .map(|pane| (pane.pane_id, pane.host_peer_id.clone()))
+                .collect::<Vec<_>>(),
+            hosts
+        );
+
+        let tab_id = state.create_tab(HOST_B, state.revision(), 24, 80).unwrap();
+        state
+            .rename_tab(HOST_A, state.revision(), tab_id, "tab title".into())
+            .unwrap();
+        assert_eq!(
+            state
+                .tabs()
+                .iter()
+                .find(|tab| tab.tab_id == tab_id)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("tab title")
+        );
+        state
+            .rename_pane(HOST_A, state.revision(), 1, "  ".into())
+            .unwrap();
+        assert_eq!(state.pane(1).unwrap().title, None);
+    }
+
+    #[test]
+    fn title_renames_reject_invalid_targets_stale_revisions_and_reservations() {
+        let mut state = state();
+        assert_eq!(
+            state.rename_pane(HOST_A, state.revision(), 99, "missing".into()),
+            Err(LayoutError::UnknownPane { pane_id: 99 })
+        );
+        assert_eq!(
+            state.rename_tab(HOST_A, 0, 1, "stale".into()),
+            Err(LayoutError::StaleRevision {
+                expected: 1,
+                got: 0
+            })
+        );
+        state.reserve_tab(HOST_A, state.revision(), 24, 80).unwrap();
+        assert_eq!(
+            state.rename_tab(HOST_A, state.revision(), 1, "blocked".into()),
+            Err(LayoutError::ReservationPending)
+        );
+
+        let mut snapshot = state.snapshot();
+        snapshot.tabs[0].title = Some(String::new());
+        assert_eq!(
+            SessionState::validate_snapshot(&snapshot),
+            Err(LayoutError::InvalidSnapshot)
+        );
+        snapshot.tabs[0].title = Some(" untrimmed ".into());
+        assert_eq!(
+            SessionState::validate_snapshot(&snapshot),
+            Err(LayoutError::InvalidSnapshot)
+        );
+    }
 }

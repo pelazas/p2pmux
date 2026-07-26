@@ -806,6 +806,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
                     host_peer_id: pane.host_peer_id.clone(),
                     grid_rows,
                     grid_cols,
+                    title: None,
                 },
             ))
         })
@@ -819,6 +820,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
                 root: layout_node_from_protocol(
                     tab.root.as_ref().ok_or(LayoutError::InvalidSnapshot)?,
                 )?,
+                title: None,
             })
         })
         .collect::<Result<_, LayoutError>>()?;
@@ -911,6 +913,7 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         LayoutError::InvalidPeerId
         | LayoutError::InvalidEndpointAddress
         | LayoutError::InvalidDisplayName
+        | LayoutError::InvalidTitle
         | LayoutError::InvalidGrid
         | LayoutError::InvalidSplitRatio
         | LayoutError::AlreadyMember

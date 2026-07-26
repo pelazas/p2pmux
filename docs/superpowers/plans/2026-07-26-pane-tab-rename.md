@@ -59,18 +59,18 @@ separate docs commit.
 - Modify: `src/layout.rs`
 - Modify/add: layout unit tests in `src/layout.rs`
 
-- [ ] Add `title: Option<String>` to `Pane` and `Tab`; update every fixture/construction site deliberately rather than defaulting silently.
-- [ ] Add a layout-owned normalization helper returning `Result<Option<String>, LayoutError>`: trim Unicode whitespace; empty => `None`; otherwise enforce ≤32 Unicode scalars and no controls. Snapshot validation additionally rejects non-normalized values (`Some("")` and values whose trim changes them).
-- [ ] Add `SessionState::rename_pane(requester, base_revision, pane_id, title)` and `rename_tab(...)`. Both must call `check_mutation`, `require_member`, and `ensure_no_reservation`; lookup IDs; normalize/store; then `advance_revision` exactly once. Do not require target hosting. Keep the reservation gate: `reserve_*` captures a base revision that its later `PaneReady` must still match, so allowing a title-only commit during a pending reservation would falsely stale that ready. Rename may proceed after the reservation commits, cancels, fails, or expires.
-- [ ] Write focused failing/passing tests for any-member authorization, remote-host rename, clear, whitespace clear, bounds/control failures, unknown IDs, stale revision, pending-reservation rejection, snapshot round-trip/invalid snapshot, and unchanged roots/grids/hosts.
-- [ ] Run:
+- [x] Add `title: Option<String>` to `Pane` and `Tab`; update every fixture/construction site deliberately rather than defaulting silently.
+- [x] Add a layout-owned normalization helper returning `Result<Option<String>, LayoutError>`: trim Unicode whitespace; empty => `None`; otherwise enforce ≤32 Unicode scalars and no controls. Snapshot validation additionally rejects non-normalized values (`Some("")` and values whose trim changes them).
+- [x] Add `SessionState::rename_pane(requester, base_revision, pane_id, title)` and `rename_tab(...)`. Both must call `check_mutation`, `require_member`, and `ensure_no_reservation`; lookup IDs; normalize/store; then `advance_revision` exactly once. Do not require target hosting. Keep the reservation gate: `reserve_*` captures a base revision that its later `PaneReady` must still match, so allowing a title-only commit during a pending reservation would falsely stale that ready. Rename may proceed after the reservation commits, cancels, fails, or expires.
+- [x] Write focused failing/passing tests for any-member authorization, remote-host rename, clear, whitespace clear, bounds/control failures, unknown IDs, stale revision, pending-reservation rejection, snapshot round-trip/invalid snapshot, and unchanged roots/grids/hosts.
+- [x] Run:
 
 ```bash
 cargo test --lib layout -- --nocapture
 cargo fmt --check
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add src/layout.rs

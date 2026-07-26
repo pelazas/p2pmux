@@ -4982,6 +4982,7 @@ mod tests {
                             host_peer_id: b"host".to_vec(),
                             grid_rows: *rows,
                             grid_cols: *cols,
+                            title: None,
                         },
                     )
                 })
@@ -5008,6 +5009,7 @@ mod tests {
             .map(|pane_id| Tab {
                 tab_id: pane_id,
                 root: Node::Leaf { pane_id },
+                title: None,
             })
             .collect();
         let panes = (1..=count)
@@ -5029,6 +5031,7 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+                title: None,
             }],
             &[(1, 2, 8)],
         ))
@@ -5066,10 +5069,12 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+                    title: None,
                 },
             ],
             &[(1, 2, 8), (2, 2, 8)],
@@ -5151,10 +5156,14 @@ mod tests {
                         first: Box::new(Node::Leaf { pane_id: 8 }),
                         second: Box::new(Node::Leaf { pane_id: 6 }),
                     },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 20,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
             ],
             &[(8, 2, 8), (6, 2, 8), (3, 2, 8)],
@@ -5187,6 +5196,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 8)],
         ))
@@ -5228,10 +5239,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 8), (2, 2, 8)],
@@ -5567,6 +5582,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5611,6 +5628,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5638,6 +5657,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5673,6 +5694,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         );
@@ -5905,6 +5928,8 @@ mod tests {
                         second: Box::new(Node::Leaf { pane_id: 3 }),
                     }),
                 },
+
+                title: None,
             }],
             &[(1, 4, 10), (2, 4, 10), (3, 4, 10)],
         )
@@ -6051,6 +6076,8 @@ mod tests {
                     first: Box::new(Node::Leaf { pane_id: 8 }),
                     second: Box::new(Node::Leaf { pane_id: 3 }),
                 },
+
+                title: None,
             }],
             &[(3, 1, 1), (8, 1, 1)],
         );
@@ -6167,6 +6194,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 19, 78)],
         ))
@@ -6262,10 +6291,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -6312,10 +6345,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -6327,6 +6364,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6342,6 +6381,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6377,6 +6418,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6411,6 +6454,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 3)],
         ))
@@ -6443,6 +6488,8 @@ mod tests {
                 vec![Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 }],
                 &[(1, 1, 3)],
             ))
@@ -6475,6 +6522,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 3, 6)],
         ))
@@ -6496,6 +6545,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 5)],
         ))
@@ -6771,6 +6822,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6814,6 +6867,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -6858,10 +6913,14 @@ mod tests {
                 Tab {
                     tab_id: 10,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 20,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -6919,6 +6978,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         ))
@@ -6940,6 +7001,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 1, 1)],
         ))
@@ -6989,6 +7052,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -7113,6 +7178,8 @@ mod tests {
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
+
+                title: None,
             }],
             &[(1, 2, 2)],
         ))
@@ -7124,10 +7191,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 3,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (3, 2, 2)],
@@ -7140,14 +7211,20 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 3,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
@@ -7165,10 +7242,14 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2)],
@@ -7216,14 +7297,20 @@ mod tests {
                 Tab {
                     tab_id: 1,
                     root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 2,
                     root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
                 },
                 Tab {
                     tab_id: 3,
                     root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
                 },
             ],
             &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
