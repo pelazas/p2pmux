@@ -33,8 +33,8 @@ use crate::{
         Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
         LayoutSplit, LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-        ReleaseControl, SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
-        TakeControl, UpdatePaneGrids, Welcome, envelope,
+        ReleaseControl, RenamePane, RenameTab, SessionSnapshot, SetSplitRatio, Snapshot, SplitAxis,
+        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -308,6 +308,9 @@ impl LayoutCoordinator {
             + usize::from(request.delete_tab.is_some())
             + usize::from(request.set_split_ratio.is_some())
             + usize::from(request.update_pane_grids.is_some());
+        let action_count = action_count
+            + usize::from(request.rename_pane.is_some())
+            + usize::from(request.rename_tab.is_some());
         if request_id == 0 || request.base_revision == 0 || action_count != 1 {
             return reject(request_id, LayoutRejectReason::Malformed);
         }
@@ -336,6 +339,10 @@ impl LayoutCoordinator {
             self.set_split_ratio(authenticated_peer_id, request.base_revision, ratio)
         } else if let Some(grids) = request.update_pane_grids {
             self.update_pane_grids(authenticated_peer_id, request.base_revision, grids)
+        } else if let Some(rename) = request.rename_pane {
+            self.rename_pane(authenticated_peer_id, request.base_revision, rename)
+        } else if let Some(rename) = request.rename_tab {
+            self.rename_tab(authenticated_peer_id, request.base_revision, rename)
         } else {
             Err(LayoutError::InvalidSnapshot)
         };
@@ -618,6 +625,38 @@ impl LayoutCoordinator {
         ))
     }
 
+    fn rename_pane(
+        &mut self,
+        peer: &[u8],
+        revision: u64,
+        rename: RenamePane,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        if rename.pane_id == 0 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.state
+            .rename_pane(peer, revision, rename.pane_id, rename.title)?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
+    fn rename_tab(
+        &mut self,
+        peer: &[u8],
+        revision: u64,
+        rename: RenameTab,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        if rename.tab_id == 0 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.state
+            .rename_tab(peer, revision, rename.tab_id, rename.title)?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
     fn layout_commit(&self) -> Result<LayoutCommit, CoordinatorError> {
         let state = self.protocol_layout_state()?;
         Ok(LayoutCommit {
@@ -767,8 +806,7 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
                 host_peer_id: pane.host_peer_id,
                 grid_rows: u32::from(pane.grid_rows),
                 grid_cols: u32::from(pane.grid_cols),
-
-                title: None,
+                title: pane.title,
             })
             .collect(),
         tabs: snapshot
@@ -777,8 +815,7 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
             .map(|tab| TabDescriptor {
                 tab_id: tab.tab_id,
                 root: Some(protocol_node(tab.root)),
-
-                title: None,
+                title: tab.title,
             })
             .collect(),
     }
@@ -810,7 +847,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
                     host_peer_id: pane.host_peer_id.clone(),
                     grid_rows,
                     grid_cols,
-                    title: None,
+                    title: pane.title.clone(),
                 },
             ))
         })
@@ -824,7 +861,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
                 root: layout_node_from_protocol(
                     tab.root.as_ref().ok_or(LayoutError::InvalidSnapshot)?,
                 )?,
-                title: None,
+                title: tab.title.clone(),
             })
         })
         .collect::<Result<_, LayoutError>>()?;

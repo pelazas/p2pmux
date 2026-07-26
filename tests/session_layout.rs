@@ -44,6 +44,8 @@ fn request(request_id: u64, base_revision: u64) -> LayoutRequest {
         delete_tab: None,
         set_split_ratio: None,
         update_pane_grids: None,
+        rename_pane: None,
+        rename_tab: None,
     }
 }
 
