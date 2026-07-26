@@ -48,7 +48,7 @@ pub enum NodeMessage {
         layout: Box<LayoutSnapshot>,
         screens: Vec<PaneScreenSnapshot>,
         leases: Vec<PaneLeaseSnapshot>,
-        rosters: serde_json::Value,
+        rosters: Vec<AgentOverlaySnapshotRow>,
         tab_id: u64,
         pane_id: u64,
     },
@@ -64,6 +64,32 @@ pub enum NodeMessage {
     Error {
         message: String,
     },
+}
+
+/// Render-ready agent data included atomically with an attachment snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentOverlaySnapshotRow {
+    pub pane_id: u64,
+    pub kind: String,
+    pub cwd: String,
+    pub state: i32,
+    pub working_since_unix_ms: u64,
+    pub host: String,
+    pub controller: String,
+}
+
+impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
+    fn from(row: &crate::tui::AgentOverlayRow) -> Self {
+        Self {
+            pane_id: row.pane_id,
+            kind: row.kind.clone(),
+            cwd: row.cwd.clone(),
+            state: row.state as i32,
+            working_since_unix_ms: row.working_since_unix_ms,
+            host: row.host.clone(),
+            controller: row.controller.clone(),
+        }
+    }
 }
 
 /// Complete screen state for one pane. Attachments replace their local `GuestScreen` from this
