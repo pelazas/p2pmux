@@ -204,7 +204,7 @@ fn run_detach_resume_round_trip(
         if layout.panes.contains_key(&1) && screens.iter().any(|frame| frame.pane_id == 1))
     );
     // A shutdown control request must work even while this interactive attachment is live.
-    client::shutdown(&descriptor).unwrap();
+    client::shutdown(descriptor).unwrap();
     drop(reader);
     drop(_stream);
     let deadline = Instant::now() + Duration::from_secs(5);
