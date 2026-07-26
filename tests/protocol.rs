@@ -28,7 +28,7 @@ fn envelope(body: envelope::Body) -> Envelope {
 
 #[test]
 fn protocol_version_is_v5() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
 }
 
 #[test]
@@ -46,6 +46,9 @@ fn ratio_and_grid_actions_validate_strictly() {
             first_share_bps: 7_500,
         }),
         update_pane_grids: None,
+
+        rename_pane: None,
+        rename_tab: None,
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid request");
@@ -70,6 +73,8 @@ fn ratio_and_grid_actions_validate_strictly() {
                 delete_tab: None,
                 set_split_ratio: None,
                 update_pane_grids: None,
+                rename_pane: None,
+                rename_tab: None,
             }
         };
         assert!(encode_frame(&envelope(envelope::Body::LayoutRequest(invalid))).is_err());
@@ -90,6 +95,9 @@ fn ratio_and_grid_actions_validate_strictly() {
                 grid_cols: 80,
             }],
         }),
+
+        rename_pane: None,
+        rename_tab: None,
     };
     assert!(
         decode_frame(
@@ -419,10 +427,14 @@ fn layout_state(root: LayoutNode) -> LayoutState {
             host_peer_id: b"peer-a".to_vec(),
             grid_rows: 24,
             grid_cols: 80,
+
+            title: None,
         }],
         tabs: vec![TabDescriptor {
             tab_id: 1,
             root: Some(root),
+
+            title: None,
         }],
     }
 }
@@ -448,6 +460,9 @@ fn v2_envelopes() -> Vec<Envelope> {
             delete_tab: None,
             set_split_ratio: None,
             update_pane_grids: None,
+
+            rename_pane: None,
+            rename_tab: None,
         })),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
@@ -532,6 +547,9 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         delete_tab: None,
         set_split_ratio: None,
         update_pane_grids: None,
+
+        rename_pane: None,
+        rename_tab: None,
     };
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
@@ -551,6 +569,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                 leaf_pane_id: None,
                 split: None,
             }),
+
+            title: None,
         }],
         ..state.clone()
     };
@@ -566,6 +586,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                     first_share_bps: None,
                 })),
             }),
+
+            title: None,
         }],
         ..state.clone()
     };
@@ -586,6 +608,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                 host_peer_id: b"peer-a".to_vec(),
                 grid_rows: 24,
                 grid_cols: 80,
+                title: None,
             })
             .collect(),
         ..state.clone()
@@ -595,6 +618,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             .map(|tab_id| TabDescriptor {
                 tab_id,
                 root: Some(leaf(1)),
+                title: None,
             })
             .collect(),
         ..state.clone()
@@ -605,6 +629,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             host_peer_id: b"peer-a".to_vec(),
             grid_rows: 0,
             grid_cols: 80,
+
+            title: None,
         }],
         ..state.clone()
     };
@@ -742,6 +768,9 @@ fn create_pane_axis_and_position_are_validated() {
             delete_tab: None,
             set_split_ratio: None,
             update_pane_grids: None,
+
+            rename_pane: None,
+            rename_tab: None,
         }))
     }
 
@@ -753,12 +782,16 @@ fn create_pane_axis_and_position_are_validated() {
                     host_peer_id: b"peer-a".to_vec(),
                     grid_rows: 24,
                     grid_cols: 80,
+
+                    title: None,
                 },
                 PaneDescriptor {
                     pane_id: 2,
                     host_peer_id: b"peer-a".to_vec(),
                     grid_rows: 24,
                     grid_cols: 80,
+
+                    title: None,
                 },
             ],
             tabs: vec![TabDescriptor {
@@ -772,6 +805,8 @@ fn create_pane_axis_and_position_are_validated() {
                         first_share_bps: None,
                     })),
                 }),
+
+                title: None,
             }],
             ..layout_state(leaf(1))
         };
@@ -841,6 +876,9 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         delete_tab: None,
         set_split_ratio: None,
         update_pane_grids: None,
+
+        rename_pane: None,
+        rename_tab: None,
     };
 
     for valid in [
@@ -1047,6 +1085,8 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
                     first_share_bps: None,
                 })),
             }),
+
+            title: None,
         }],
         ..state.clone()
     };
@@ -1054,6 +1094,8 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
         tabs: vec![TabDescriptor {
             tab_id: 1,
             root: Some(leaf(2)),
+
+            title: None,
         }],
         ..state.clone()
     };
@@ -1061,6 +1103,8 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
         tabs: vec![TabDescriptor {
             tab_id: 1,
             root: Some(leaf(0)),
+
+            title: None,
         }],
         ..state.clone()
     };
@@ -1072,6 +1116,7 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
                 host_peer_id: b"peer-a".to_vec(),
                 grid_rows: 24,
                 grid_cols: 80,
+                title: None,
             },
         ],
         ..state
@@ -1121,6 +1166,8 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
             host_peer_id: b"peer-a".to_vec(),
             grid_rows: 24,
             grid_cols: 80,
+
+            title: None,
         }],
         tabs: vec![TabDescriptor {
             tab_id: 13,
@@ -1133,6 +1180,8 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
                     first_share_bps: None,
                 })),
             }),
+
+            title: None,
         }],
     };
     let state_fields = parse_fields(&state.encode_to_vec());
@@ -1206,6 +1255,8 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         tabs: vec![TabDescriptor {
             tab_id: 1,
             root: Some(wide_tree),
+
+            title: None,
         }],
         ..layout_state(leaf(1))
     };
@@ -1213,6 +1264,8 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         tabs: vec![TabDescriptor {
             tab_id: 1,
             root: Some(deep_tree),
+
+            title: None,
         }],
         ..layout_state(leaf(1))
     };

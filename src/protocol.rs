@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -16,6 +16,7 @@ pub const MAX_DELTA_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_ROSTER_ENTRIES: usize = 32;
 pub const MAX_AGENT_KIND_BYTES: usize = 32;
 pub const MAX_AGENT_CWD_BYTES: usize = 512;
+pub const MAX_LAYOUT_TITLE_BYTES: usize = 128;
 
 #[derive(Debug)]
 pub enum ProtocolError {
@@ -282,6 +283,8 @@ pub struct PaneDescriptor {
     pub grid_rows: u32,
     #[prost(uint32, tag = "4")]
     pub grid_cols: u32,
+    #[prost(string, optional, tag = "5")]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -290,6 +293,8 @@ pub struct TabDescriptor {
     pub tab_id: u64,
     #[prost(message, optional, tag = "2")]
     pub root: Option<LayoutNode>,
+    #[prost(string, optional, tag = "3")]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -344,6 +349,26 @@ pub struct LayoutRequest {
     pub set_split_ratio: Option<SetSplitRatio>,
     #[prost(message, optional, tag = "8")]
     pub update_pane_grids: Option<UpdatePaneGrids>,
+    #[prost(message, optional, tag = "9")]
+    pub rename_pane: Option<RenamePane>,
+    #[prost(message, optional, tag = "10")]
+    pub rename_tab: Option<RenameTab>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenamePane {
+    #[prost(uint64, tag = "1")]
+    pub pane_id: u64,
+    #[prost(string, tag = "2")]
+    pub title: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenameTab {
+    #[prost(uint64, tag = "1")]
+    pub tab_id: u64,
+    #[prost(string, tag = "2")]
+    pub title: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -875,7 +900,9 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
         + usize::from(request.create_tab.is_some())
         + usize::from(request.delete_tab.is_some())
         + usize::from(request.set_split_ratio.is_some())
-        + usize::from(request.update_pane_grids.is_some());
+        + usize::from(request.update_pane_grids.is_some())
+        + usize::from(request.rename_pane.is_some())
+        + usize::from(request.rename_tab.is_some());
     if actions != 1 {
         return Err(ProtocolError::InvalidLayout("layout_request.action"));
     }
@@ -936,6 +963,22 @@ fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError>
             }
         }
     }
+    if let Some(rename) = &request.rename_pane {
+        validate_nonzero("layout_request.rename_pane.pane_id", rename.pane_id)?;
+        validate_field_size(
+            "layout_request.rename_pane.title",
+            rename.title.len(),
+            MAX_LAYOUT_TITLE_BYTES,
+        )?;
+    }
+    if let Some(rename) = &request.rename_tab {
+        validate_nonzero("layout_request.rename_tab.tab_id", rename.tab_id)?;
+        validate_field_size(
+            "layout_request.rename_tab.title",
+            rename.title.len(),
+            MAX_LAYOUT_TITLE_BYTES,
+        )?;
+    }
     Ok(())
 }
 
@@ -977,6 +1020,13 @@ fn validate_layout_state(state: &LayoutState) -> Result<(), ProtocolError> {
             MAX_PEER_ID_BYTES,
         )?;
         validate_grid("layout_state.pane.grid", pane.grid_rows, pane.grid_cols)?;
+        if let Some(title) = &pane.title {
+            validate_field_size(
+                "layout_state.pane.title",
+                title.len(),
+                MAX_LAYOUT_TITLE_BYTES,
+            )?;
+        }
         if !pane_ids.insert(pane.pane_id) {
             return Err(ProtocolError::InvalidLayout("layout_state.pane.pane_id"));
         }
@@ -991,6 +1041,13 @@ fn validate_layout_state(state: &LayoutState) -> Result<(), ProtocolError> {
     let mut leaf_pane_ids = HashSet::with_capacity(state.panes.len());
     for tab in &state.tabs {
         validate_nonzero("layout_state.tab.tab_id", tab.tab_id)?;
+        if let Some(title) = &tab.title {
+            validate_field_size(
+                "layout_state.tab.title",
+                title.len(),
+                MAX_LAYOUT_TITLE_BYTES,
+            )?;
+        }
         if !tab_ids.insert(tab.tab_id) {
             return Err(ProtocolError::InvalidLayout("layout_state.tab.tab_id"));
         }

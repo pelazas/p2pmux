@@ -3845,6 +3845,9 @@ impl SharedLayoutRuntime {
                 delete_tab: None,
                 set_split_ratio: None,
                 update_pane_grids: Some(crate::protocol::UpdatePaneGrids { panes: updates }),
+
+                rename_pane: None,
+                rename_tab: None,
             })?;
         }
         Ok(())
@@ -3897,6 +3900,9 @@ impl SharedLayoutRuntime {
                     delete_tab: None,
                     set_split_ratio: None,
                     update_pane_grids: None,
+
+                    rename_pane: None,
+                    rename_tab: None,
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -3910,6 +3916,9 @@ impl SharedLayoutRuntime {
                     delete_tab: Some(DeleteTab { tab_id }),
                     set_split_ratio: None,
                     update_pane_grids: None,
+
+                    rename_pane: None,
+                    rename_tab: None,
                 })?
             }
             UiIntent::SetSplitRatio {
@@ -3935,6 +3944,8 @@ impl SharedLayoutRuntime {
                         first_share_bps: u32::from(first_share_bps),
                     }),
                     update_pane_grids: None,
+                    rename_pane: None,
+                    rename_tab: None,
                 })?;
             }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
@@ -3984,6 +3995,8 @@ impl SharedLayoutRuntime {
             delete_tab: None,
             set_split_ratio: None,
             update_pane_grids: None,
+            rename_pane: None,
+            rename_tab: None,
         })
     }
 
@@ -4033,6 +4046,8 @@ impl SharedLayoutRuntime {
             host_peer_id,
             grid_rows: u32::from(pending.grid_rows),
             grid_cols: u32::from(pending.grid_cols),
+
+            title: None,
         };
         if let Err(error) = self.panes.register_local_pane(descriptor, pane.channels()) {
             let _ = self.control.try_failed(PaneFailed {
@@ -5382,6 +5397,8 @@ mod tests {
                     host_peer_id: host_id,
                     grid_rows: 2,
                     grid_cols: 8,
+
+                    title: None,
                 },
                 initial.channels(),
             )
@@ -5482,6 +5499,8 @@ mod tests {
             host_peer_id: host_id.clone(),
             grid_rows: 1,
             grid_cols: 1,
+
+            title: None,
         };
         host_panes
             .register_local_pane(

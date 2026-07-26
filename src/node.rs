@@ -107,6 +107,8 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     host_peer_id,
                     grid_rows: u32::from(shell_rows),
                     grid_cols: u32::from(shell_cols),
+
+                    title: None,
                 },
                 initial.channels(),
             )?;

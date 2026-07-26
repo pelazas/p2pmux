@@ -767,6 +767,8 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
                 host_peer_id: pane.host_peer_id,
                 grid_rows: u32::from(pane.grid_rows),
                 grid_cols: u32::from(pane.grid_cols),
+
+                title: None,
             })
             .collect(),
         tabs: snapshot
@@ -775,6 +777,8 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
             .map(|tab| TabDescriptor {
                 tab_id: tab.tab_id,
                 root: Some(protocol_node(tab.root)),
+
+                title: None,
             })
             .collect(),
     }
