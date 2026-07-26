@@ -1,10 +1,15 @@
 use std::{
     env, fmt, fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use ratatui::style::Color;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"dark_gray\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -13,7 +18,6 @@ pub enum ConfigError {
     InvalidColor { key: &'static str, value: String },
     Io(io::Error),
     Parse(toml::de::Error),
-    Serialize(toml::ser::Error),
 }
 
 impl fmt::Display for ConfigError {
@@ -24,7 +28,6 @@ impl fmt::Display for ConfigError {
             Self::InvalidColor { key, value } => write!(f, "invalid color for {key}: {value}"),
             Self::Io(error) => error.fmt(f),
             Self::Parse(error) => error.fmt(f),
-            Self::Serialize(error) => error.fmt(f),
         }
     }
 }
@@ -326,15 +329,34 @@ fn parse_color(value: &str) -> Option<Color> {
 
 pub fn save_to(path: &Path, name: &str) -> Result<String, ConfigError> {
     let display_name = validate_display_name(name)?;
-    let config = toml::map::Map::from_iter([(
-        "display_name".into(),
-        toml::Value::String(display_name.clone()),
-    )]);
-    let text = toml::to_string_pretty(&config).map_err(ConfigError::Serialize)?;
+    let mut document = match fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(error) => return Err(error.into()),
+    };
+    document["display_name"] = toml_edit::value(display_name.as_str());
+    atomic_write(path, &document.to_string())?;
+    Ok(display_name)
+}
+
+fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
     let parent = path.parent().ok_or(ConfigError::MissingHome)?;
     fs::create_dir_all(parent)?;
-    fs::write(path, text)?;
-    Ok(display_name)
+    let file_name = path.file_name().ok_or(ConfigError::MissingHome)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        CONFIG_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    fs::write(&temporary, text)?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub fn load() -> Result<Option<String>, ConfigError> {
@@ -347,6 +369,21 @@ pub fn load_config() -> Result<Config, ConfigError> {
 
 pub fn save(name: &str) -> Result<String, ConfigError> {
     save_to(&config_path()?, name)
+}
+
+pub fn init() -> Result<(), ConfigError> {
+    init_to(&config_path()?)
+}
+
+pub fn init_to(path: &Path) -> Result<(), ConfigError> {
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("config file already exists: {}", path.display()),
+        )
+        .into());
+    }
+    atomic_write(path, DEFAULT_CONFIG_TEMPLATE)
 }
 
 #[cfg(test)]
@@ -425,5 +462,44 @@ mod tests {
     fn display_name_validation_still_works() {
         assert_eq!(validate_display_name("  pelazas  ").unwrap(), "pelazas");
         assert!(validate_display_name("\n").is_err());
+    }
+
+    #[test]
+    fn save_name_preserves_theme_and_comments() {
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# keep this comment\n[ui.theme]\nfooter_background = \"#010203\"\nunknown = \"value\"\n",
+        )
+        .unwrap();
+
+        save_to(&path, "pelazas").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this comment"));
+        assert!(text.contains("[ui.theme]"));
+        assert!(text.contains("footer_background = \"#010203\""));
+        assert!(text.contains("unknown = \"value\""));
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn init_creates_default_template_only_when_missing() {
+        let path = temp_config_path();
+
+        init_to(&path).unwrap();
+        assert_eq!(load_config_from(&path).unwrap(), Config::default());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# footer_background"));
+
+        let error = init_to(&path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("config file already exists: {}", path.display())
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
