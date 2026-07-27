@@ -97,9 +97,11 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
         let decoded: NodeMessage = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, message);
         if let NodeMessage::Screens { screens } = decoded {
-            assert!(screens
-                .iter()
-                .all(|frame| !matches!(frame.state, ScreenUpdate::Unchanged { .. })));
+            assert!(
+                screens
+                    .iter()
+                    .all(|frame| !matches!(frame.state, ScreenUpdate::Unchanged { .. }))
+            );
         }
     }
 }
