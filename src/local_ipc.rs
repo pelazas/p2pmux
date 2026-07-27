@@ -54,6 +54,22 @@ pub enum NodeMessage {
         tab_id: u64,
         pane_id: u64,
     },
+    Screens {
+        screens: Vec<PaneScreenSnapshot>,
+    },
+    Layout {
+        layout: Box<LayoutSnapshot>,
+    },
+    Leases {
+        leases: Vec<PaneLeaseSnapshot>,
+    },
+    Rosters {
+        rosters: Vec<AgentOverlaySnapshotRow>,
+    },
+    Focus {
+        tab_id: u64,
+        pane_id: u64,
+    },
     Update {
         state: serde_json::Value,
     },
