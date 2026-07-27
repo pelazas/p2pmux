@@ -3837,7 +3837,6 @@ impl SharedLayoutRuntime {
         let mut guard = TerminalGuard::new();
         enable_raw_mode()?;
         guard.raw_mode = true;
-        guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         execute!(io::stdout(), SetTitle("p2pmux"))?;
         guard.alternate_screen = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
@@ -3845,6 +3844,7 @@ impl SharedLayoutRuntime {
         execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
         guard.mouse_capture = true;
         execute!(io::stdout(), EnableMouseCapture)?;
+        guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,
@@ -5154,12 +5154,12 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
-    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     execute!(io::stdout(), SetTitle("p2pmux"))?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let fixed_area = Rect::new(0, 0, cols, rows);
@@ -5234,11 +5234,11 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
-    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
@@ -5388,11 +5388,11 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
-    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
