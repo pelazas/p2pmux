@@ -165,7 +165,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("   drag border RESIZE"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
-    FooterSegment::Text("Pane  <"),
+    FooterSegment::Text("  <"),
     FooterSegment::Key("←↓↑→"),
     FooterSegment::Text("> FOCUS   <"),
     FooterSegment::Key("e"),
@@ -182,7 +182,7 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> BACK"),
 ];
 const TAB_FOOTER: &[FooterSegment] = &[
-    FooterSegment::Text("Tab  <"),
+    FooterSegment::Text("  <"),
     FooterSegment::Key("←→"),
     FooterSegment::Text("> SWITCH   <"),
     FooterSegment::Key("e"),
@@ -2157,11 +2157,11 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
+            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
-            "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
+            "  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             TAB_FOOTER,
         ),
     }
@@ -2203,6 +2203,33 @@ fn render_footer_segments(
             .0;
     }
     x
+}
+
+fn footer_segments_width(segments: &[FooterSegment]) -> u16 {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            FooterSegment::Text(text)
+            | FooterSegment::Key(text)
+            | FooterSegment::OrangeKey(text) => text_width(text),
+        })
+        .sum()
+}
+
+fn chord_footer_badge(chord_mode: ChordMode, width: u16) -> Option<&'static str> {
+    let (full, compact) = match chord_mode {
+        ChordMode::Pane => ("PANE MODE", "PANE"),
+        ChordMode::Tab => ("TAB MODE", "TAB"),
+        ChordMode::None => return None,
+    };
+
+    if width >= text_width(full) {
+        Some(full)
+    } else if width >= text_width(compact) {
+        Some(compact)
+    } else {
+        None
+    }
 }
 
 fn render_copy_feedback(
@@ -2283,6 +2310,81 @@ fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&st
     0
 }
 
+fn render_chord_footer(
+    buffer: &mut Buffer,
+    theme: &UiTheme,
+    area: Rect,
+    status: &str,
+    footer_notice: Option<&str>,
+    join_code: Option<&str>,
+    chord_mode: ChordMode,
+) {
+    let Some(badge) = chord_footer_badge(chord_mode, area.width) else {
+        return;
+    };
+    let end_x = area.right();
+    let mut x = buffer
+        .set_stringn(
+            area.x,
+            area.y,
+            badge,
+            usize::from(end_x.saturating_sub(area.x)),
+            Style::default()
+                .fg(theme.footer_orange)
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::BOLD),
+        )
+        .0;
+    let (_, segments) = contextual_footer(chord_mode);
+    if end_x.saturating_sub(x) < footer_segments_width(segments) {
+        render_footer_segments(buffer, theme, x, area.y, end_x, segments);
+        return;
+    }
+    x = render_footer_segments(buffer, theme, x, area.y, end_x, segments);
+
+    let status = (!status.is_empty()).then(|| format!("{status}  "));
+    let notice = footer_notice.map(|notice| format!("  {notice}"));
+    for (text, style) in [
+        (
+            status.as_deref(),
+            Style::default()
+                .fg(theme.footer_muted)
+                .bg(theme.footer_background),
+        ),
+        (
+            notice.as_deref(),
+            Style::default()
+                .fg(theme.footer_orange)
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ] {
+        if let Some(text) = text
+            && end_x.saturating_sub(x) >= text_width(text)
+        {
+            x = buffer
+                .set_stringn(x, area.y, text, usize::from(text_width(text)), style)
+                .0;
+        }
+    }
+
+    if let Some(join_code) = join_code {
+        let join = format!("join: p2pmux join {join_code}");
+        let join_width = text_width(&join);
+        if end_x.saturating_sub(x) >= join_width {
+            buffer.set_stringn(
+                x,
+                area.y,
+                join,
+                usize::from(join_width),
+                Style::default()
+                    .fg(theme.footer_muted)
+                    .bg(theme.footer_background),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_contextual_footer(
     buffer: &mut Buffer,
@@ -2301,6 +2403,19 @@ fn render_contextual_footer(
         usize::from(area.width),
         Style::default().bg(theme.footer_background),
     );
+
+    if chord_mode != ChordMode::None {
+        render_chord_footer(
+            buffer,
+            theme,
+            area,
+            status,
+            footer_notice,
+            join_code,
+            chord_mode,
+        );
+        return;
+    }
 
     let end_x = area.right();
     let mut x = area.x;
