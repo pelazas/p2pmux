@@ -160,6 +160,12 @@ Slow viewers may receive coalesced screen deltas and then a fresh snapshot to re
 outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any
 changed host-owned grids. Guests only receive the resulting commit and screen snapshot.
 
+### Performance logging
+
+Set `P2PMUX_PERF=1` to write optional local performance timing logs. By default they append to
+`std::env::temp_dir()/p2pmux-perf.log`; set `P2PMUX_PERF_LOG` to override that path. Logging is
+best-effort and remains silent if the destination cannot be opened.
+
 Full product/architecture docs live in [`docs/`](./docs/).
 
 | Doc | Description |
