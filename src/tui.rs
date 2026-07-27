@@ -341,6 +341,10 @@ enum ModalState {
     None,
     Agents,
     Rename(RenamePrompt),
+    ConfirmDeleteTab {
+        tab_id: TabId,
+        pane_count: usize,
+    },
 }
 
 /// Rectangles for one rendered terminal frame.
@@ -507,6 +511,14 @@ impl MultiPaneTui {
 
     pub fn overlay_open(&self) -> bool {
         matches!(self.modal, ModalState::Agents)
+    }
+
+    /// Whether a blocking dialog is open, excluding the interactive agents overlay.
+    pub fn modal_open(&self) -> bool {
+        matches!(
+            self.modal,
+            ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. }
+        )
     }
 
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
@@ -870,6 +882,9 @@ impl MultiPaneTui {
         scrollback_len: usize,
         up: bool,
     ) -> bool {
+        if self.modal_open() {
+            return false;
+        }
         let pane_id = self.pane_at_or_focused(column, row, area);
         self.scroll_pane(pane_id, scrollback_len, up)
     }
@@ -1124,6 +1139,9 @@ impl MultiPaneTui {
         if matches!(self.modal, ModalState::Rename(_)) {
             return self.handle_rename_key(key);
         }
+        if matches!(self.modal, ModalState::ConfirmDeleteTab { .. }) {
+            return self.handle_confirm_delete_tab_key(key);
+        }
         if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
             if self.overlay_open() {
                 let forward = self
@@ -1192,8 +1210,12 @@ impl MultiPaneTui {
             ChordMode::Tab => self.handle_tab_chord(key, area),
             ChordMode::None => None,
         };
-        if intent.is_some() || is_chord_command(chord, key) {
-            self.touch_chord_activity();
+        if is_chord_command(chord, key) {
+            if is_chord_navigation(chord, key) {
+                self.touch_chord_activity();
+            } else {
+                self.exit_chord_mode();
+            }
             KeyHandling::Consumed(intent.into_iter().collect())
         } else {
             self.exit_chord_mode();
@@ -1207,7 +1229,7 @@ impl MultiPaneTui {
         mouse: crossterm::event::MouseEvent,
         area: Rect,
     ) -> MouseHandling {
-        if matches!(self.modal, ModalState::Rename(_)) {
+        if self.modal_open() {
             return MouseHandling::default();
         }
         match mouse.kind {
@@ -1378,6 +1400,31 @@ impl MultiPaneTui {
         }
     }
 
+    fn confirm_delete_tab(&mut self, tab_id: TabId, pane_count: usize) {
+        self.modal = ModalState::ConfirmDeleteTab { tab_id, pane_count };
+        self.exit_chord_mode();
+        self.clear_selection();
+        self.cancel_resize_drag();
+    }
+
+    fn handle_confirm_delete_tab_key(&mut self, key: KeyEvent) -> KeyHandling {
+        let tab_id = match &self.modal {
+            ModalState::ConfirmDeleteTab { tab_id, .. } => *tab_id,
+            _ => unreachable!("delete confirmation handler requires an active confirmation"),
+        };
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+                KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id }])
+            }
+            KeyCode::Esc | KeyCode::Char('n') if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+                KeyHandling::Consumed(vec![])
+            }
+            _ => KeyHandling::Consumed(vec![]),
+        }
+    }
+
     fn handle_agent_overlay_click(&mut self, column: u16, row: u16, area: Rect) -> Vec<UiIntent> {
         let Some(pane_id) = self.agent_overlay_row_at(column, row, area) else {
             return Vec::new();
@@ -1524,9 +1571,20 @@ impl MultiPaneTui {
                     grid_cols,
                 })
             }
-            KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeleteTab {
-                tab_id: self.current_tab,
-            }),
+            KeyCode::Char('x') if key.modifiers.is_empty() => {
+                let tab = self
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == self.current_tab)?;
+                let pane_count = visible_leaf_panes(&tab.root).len();
+                if pane_count > 1 {
+                    self.confirm_delete_tab(tab.tab_id, pane_count);
+                    None
+                } else {
+                    Some(UiIntent::DeleteTab { tab_id: tab.tab_id })
+                }
+            }
             KeyCode::Left if key.modifiers.is_empty() => self.switch_tab(false),
             KeyCode::Right if key.modifiers.is_empty() => self.switch_tab(true),
             _ => None,
@@ -1739,6 +1797,20 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
                 | KeyCode::Left
                 | KeyCode::Right
         ),
+        ChordMode::None => false,
+    }
+}
+
+fn is_chord_navigation(mode: ChordMode, key: KeyEvent) -> bool {
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+    match mode {
+        ChordMode::Pane => matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+        ),
+        ChordMode::Tab => matches!(key.code, KeyCode::Left | KeyCode::Right),
         ChordMode::None => false,
     }
 }
@@ -2761,6 +2833,9 @@ fn render_shared_multi_pane(
     if let ModalState::Rename(prompt) = &tui.modal {
         render_rename_prompt(frame, prompt, &tui.theme);
     }
+    if let ModalState::ConfirmDeleteTab { pane_count, .. } = &tui.modal {
+        render_delete_tab_confirmation(frame, *pane_count, &tui.theme);
+    }
 }
 
 fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
@@ -2915,6 +2990,38 @@ fn render_rename_prompt(frame: &mut Frame<'_>, prompt: &RenamePrompt, theme: &Ui
         Style::default().fg(theme.footer_muted),
     ));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_delete_tab_confirmation(frame: &mut Frame<'_>, pane_count: usize, theme: &UiTheme) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(8).clamp(28, 64).min(area.width);
+    let height = 7_u16.min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::bordered().border_style(Style::default().fg(theme.footer_accent)),
+        panel,
+    );
+    let inner = Block::bordered().inner(panel);
+    let pane_label = if pane_count == 1 { "pane" } else { "panes" };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("Delete tab?", Style::default().add_modifier(Modifier::BOLD)),
+            Line::raw(format!("{pane_count} {pane_label}")),
+            Line::raw(""),
+            Line::styled(
+                "Enter/y yes · Esc/n no",
+                Style::default().fg(theme.footer_muted),
+            ),
+        ]),
+        inner,
+    );
 }
 
 fn format_agent_overlay_card(
@@ -4154,14 +4261,14 @@ impl SharedLayoutRuntime {
                     dirty = true;
                 }
                 Event::Paste(text) => {
-                    if !self.tui.overlay_open() {
+                    if !self.tui.overlay_open() && !self.tui.modal_open() {
                         self.tui.exit_chord_mode();
                         self.forward_paste(&text)?;
                     }
                     dirty = true;
                 }
                 Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
-                    if !self.tui.overlay_open() {
+                    if !self.tui.overlay_open() && !self.tui.modal_open() {
                         dirty |= self.tui.hover_pane_at(
                             mouse.column,
                             mouse.row,
@@ -4172,6 +4279,9 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
+                    if self.tui.modal_open() {
+                        continue;
+                    }
                     if self.tui.overlay_open() {
                         let previously_focused = self.tui.focused_pane();
                         for intent in self.tui.handle_agent_overlay_click(
@@ -4204,6 +4314,9 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
                 {
+                    if self.tui.modal_open() {
+                        continue;
+                    }
                     if self.tui.extend_resize_drag(mouse.column, mouse.row) {
                         dirty = true;
                     } else {
@@ -4217,6 +4330,9 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
                 {
+                    if self.tui.modal_open() {
+                        continue;
+                    }
                     let handling = self.tui.handle_mouse(mouse, Rect::new(0, 0, cols, rows));
                     for intent in handling.intents {
                         self.handle_intent(intent)?;
@@ -4233,6 +4349,9 @@ impl SharedLayoutRuntime {
                     ) =>
                 {
                     let area = Rect::new(0, 0, cols, rows);
+                    if self.tui.modal_open() {
+                        continue;
+                    }
                     if self.tui.overlay_open() {
                         dirty |= self.tui.scroll_agent_overlay(
                             area,
@@ -4259,6 +4378,9 @@ impl SharedLayoutRuntime {
                     );
                 }
                 Event::Resize(width, height) => {
+                    if self.tui.modal_open() {
+                        continue;
+                    }
                     cols = width;
                     rows = height;
                     self.tui
@@ -5841,10 +5963,10 @@ mod tests {
         ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
         allocate_node_with_preview, area_from_terminal_size, chord_footer_badge, contextual_footer,
         copied_line_count, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
-        is_chord_command, lease_allows_held_input, member_label, mouse_to_screen_cell,
-        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
-        text_width, viewed_screen, visible_leaf_panes,
+        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
     #[test]
@@ -7430,6 +7552,104 @@ mod tests {
     }
 
     #[test]
+    fn multi_pane_tab_delete_requires_confirmation_and_blocks_pane_input() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(tui.modal_open());
+        assert!(matches!(
+            &tui.modal,
+            super::ModalState::ConfirmDeleteTab {
+                tab_id: 1,
+                pane_count: 3
+            }
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let mut rendered = String::new();
+        for row in 0..24 {
+            for column in 0..80 {
+                rendered.push_str(terminal.backend().buffer()[(column, row)].symbol());
+            }
+        }
+        assert!(rendered.contains("Delete tab?"));
+        assert!(rendered.contains("3 panes"));
+        assert!(rendered.contains("Enter/y yes · Esc/n no"));
+
+        let mouse = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 60,
+            row: 17,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            tui.handle_mouse(mouse, area),
+            super::MouseHandling::default()
+        );
+        assert_eq!(tui.focused_pane(), 1);
+        assert!(!tui.scroll_mouse_pane(60, 17, area, 10, true));
+        assert!(tui.resize_drag.is_none());
+        assert!(tui.selection.is_none());
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.modal_open());
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(!tui.modal_open());
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 1 }])
+        );
+        assert!(!tui.modal_open());
+    }
+
+    #[test]
+    fn single_pane_tab_delete_is_immediate() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .expect("layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 1 }])
+        );
+        assert!(!tui.modal_open());
+    }
+
+    #[test]
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         let theme = UiTheme::default();
         assert_eq!(
@@ -7957,7 +8177,7 @@ mod tests {
                 grid_cols: 38,
             }])
         );
-        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(tui.chord_mode(), ChordMode::None);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
@@ -8074,14 +8294,18 @@ mod tests {
                 "key: {key}"
             );
             assert_eq!(tui.focused_pane(), 1, "key: {key}");
-            assert_eq!(tui.chord_mode(), ChordMode::Pane, "key: {key}");
+            assert_eq!(tui.chord_mode(), ChordMode::None, "key: {key}");
         }
     }
 
     #[test]
-    fn directional_split_keys_are_sticky_pane_commands_even_without_an_intent() {
+    fn directional_split_keys_are_commands_but_not_chord_navigation() {
         for key in ['r', 'l', 'd', 'u'] {
             assert!(is_chord_command(
+                ChordMode::Pane,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+            ));
+            assert!(!is_chord_navigation(
                 ChordMode::Pane,
                 KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
             ));
@@ -8089,7 +8313,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_lock_chord_toggles_lock_and_stays_sticky() {
+    fn pane_lock_chord_toggles_lock_and_exits_mode() {
         let area = Rect::new(0, 0, 80, 24);
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
 
@@ -8104,11 +8328,32 @@ mod tests {
                 locked: true,
             }])
         );
-        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(tui.chord_mode(), ChordMode::None);
         assert!(is_chord_command(
             ChordMode::Pane,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
         ));
+        assert!(!is_chord_navigation(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn pane_commands_exit_mode_even_when_no_intent_is_available() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        tui.snapshot.panes.clear();
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 
     #[test]
@@ -8821,6 +9066,7 @@ mod tests {
                 grid_cols: 10,
             }])
         );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
@@ -8830,6 +9076,7 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 2 }])
         );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 
     #[test]

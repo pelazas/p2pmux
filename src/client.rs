@@ -270,7 +270,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
             Event::Mouse(mouse) => {
                 let area = terminal.size()?.into();
-                if tui.overlay_open() {
+                if tui.modal_open() {
+                    // Blocking dialogs consume mouse input without affecting panes.
+                } else if tui.overlay_open() {
                     if matches!(
                         mouse.kind,
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -319,8 +321,10 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
             Event::Resize(cols, rows) => {
                 terminal.resize(Rect::new(0, 0, cols, rows))?;
-                tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
-                write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
+                if !tui.modal_open() {
+                    tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
+                    write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
+                }
                 dirty = true;
             }
             _ => {}
@@ -369,7 +373,7 @@ fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
 }
 
 fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
-    !tui.overlay_open() && input_allowed(tui, local_peer_id)
+    !tui.overlay_open() && !tui.modal_open() && input_allowed(tui, local_peer_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1028,6 +1032,25 @@ mod tests {
 
         assert!(!should_forward_paste(tui, b"host"));
         assert!(tui.scroll_agent_overlay(area, false));
+    }
+
+    #[test]
+    fn delete_confirmation_blocks_paste_and_scrolling() {
+        let mut tui = MultiPaneTui::new(layout(&[1, 2])).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            area,
+        );
+
+        assert!(tui.modal_open());
+        assert!(!should_forward_paste(&tui, b"host"));
+        assert!(!tui.scroll_mouse_pane(10, 2, area, 10, true));
     }
 
     #[test]
