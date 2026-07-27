@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#3dd68c\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -94,7 +94,7 @@ impl Default for UiTheme {
             agent_overlay_secondary: Color::Gray,
             pane_border_free_focused: Color::White,
             pane_border_unknown_focused: Color::Yellow,
-            pane_border_chord_focused: Color::Rgb(61, 214, 140),
+            pane_border_chord_focused: Color::Rgb(255, 26, 26),
             pane_border_hovered: Color::Gray,
             pane_border_idle: Color::DarkGray,
             pane_border_remote_control: Color::Rgb(255, 69, 0),
@@ -435,12 +435,12 @@ mod tests {
     }
 
     #[test]
-    fn chord_focused_pane_border_defaults_to_soft_green_and_is_configurable() {
+    fn chord_focused_pane_border_defaults_to_vivid_red_and_is_configurable() {
         assert_eq!(
             UiTheme::default().pane_border_chord_focused,
-            Color::Rgb(61, 214, 140)
+            Color::Rgb(255, 26, 26)
         );
-        assert!(DEFAULT_CONFIG_TEMPLATE.contains("pane_border_chord_focused = \"#3dd68c\""));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("pane_border_chord_focused = \"#ff1a1a\""));
 
         let path = temp_config_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
