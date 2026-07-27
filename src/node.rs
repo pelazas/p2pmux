@@ -943,7 +943,7 @@ mod tests {
                 frame: screen.current_frame().clone(),
             },
         )]);
-        let updates = pane_screen_updates(initial, &mut sequences, |_| None, |_| None);
+        let updates = pane_screen_updates(initial, &sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
         update_screen_sequences(&mut sequences, &updates);
 
@@ -954,7 +954,7 @@ mod tests {
                 frame: screen.current_frame().clone(),
             },
         )]);
-        let updates = pane_screen_updates(changed, &mut sequences, |_| None, |_| None);
+        let updates = pane_screen_updates(changed, &sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Delta { .. }));
         update_screen_sequences(&mut sequences, &updates);
 
@@ -964,7 +964,7 @@ mod tests {
                 frame: screen.current_frame().clone(),
             },
         )]);
-        let updates = pane_screen_updates(unchanged, &mut sequences, |_| None, |_| None);
+        let updates = pane_screen_updates(unchanged, &sequences, |_| None, |_| None);
         assert!(updates.is_empty());
 
         screen.resize(2, 3).unwrap();
@@ -974,7 +974,7 @@ mod tests {
                 frame: screen.current_frame().clone(),
             },
         )]);
-        let updates = pane_screen_updates(resized, &mut sequences, |_| None, |_| None);
+        let updates = pane_screen_updates(resized, &sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
     }
 
@@ -990,7 +990,7 @@ mod tests {
         )]);
         let updates = pane_screen_updates(
             initial,
-            &mut sequences,
+            &sequences,
             |_| {
                 Some(LocalHistorySnapshot {
                     total_rows: 1,
@@ -1010,7 +1010,7 @@ mod tests {
         )]);
         let updates = pane_screen_updates(
             unchanged,
-            &mut sequences,
+            &sequences,
             |_| panic!("unchanged local panes must not fetch history"),
             |_| None,
         );
@@ -1028,7 +1028,7 @@ mod tests {
         let initial = BTreeMap::from([(1, remote())]);
         let updates = pane_screen_updates(
             initial,
-            &mut sequences,
+            &sequences,
             |_| None,
             |_| {
                 calls.set(calls.get() + 1);
@@ -1042,7 +1042,7 @@ mod tests {
         let unchanged = BTreeMap::from([(1, remote())]);
         let updates = pane_screen_updates(
             unchanged,
-            &mut sequences,
+            &sequences,
             |_| None,
             |_| panic!("unchanged remote panes must not encode a snapshot"),
         );
