@@ -1803,7 +1803,12 @@ fn pane_border_color(
     _controller_active: bool,
     focused: bool,
     hovered: bool,
+    chord_mode: ChordMode,
 ) -> Color {
+    if focused && chord_mode == ChordMode::Pane {
+        return theme.pane_border_chord_focused;
+    }
+
     match controller_peer_id {
         Some([]) if focused => theme.pane_border_free_focused,
         None if focused => theme.pane_border_unknown_focused,
@@ -2492,6 +2497,7 @@ fn render_shared_multi_pane(
             view.controller_active,
             focused,
             tui.hovered_pane == Some(pane_id),
+            tui.chord_mode,
         );
         let mut block = Block::bordered()
             .title(title)
@@ -7119,35 +7125,35 @@ mod tests {
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         let theme = UiTheme::default();
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, true, false),
+            pane_border_color(&theme, Some(b""), false, true, false, ChordMode::None),
             Color::White
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, false, true),
+            pane_border_color(&theme, Some(b""), false, false, true, ChordMode::None),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, false, false),
+            pane_border_color(&theme, Some(b""), false, false, false, ChordMode::None),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, true, false),
+            pane_border_color(&theme, None, false, true, false, ChordMode::None),
             Color::Yellow
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, false, true),
+            pane_border_color(&theme, None, false, false, true, ChordMode::None),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, false, false),
+            pane_border_color(&theme, None, false, false, false, ChordMode::None),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), true, true, true),
+            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::None),
             Color::Rgb(255, 69, 0)
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), false, false, true),
+            pane_border_color(&theme, Some(b"guest"), false, false, true, ChordMode::None),
             Color::Rgb(255, 69, 0)
         );
 
@@ -7156,7 +7162,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            pane_border_color(&themed, Some(b"guest"), false, false, false),
+            pane_border_color(
+                &themed,
+                Some(b"guest"),
+                false,
+                false,
+                false,
+                ChordMode::None,
+            ),
             Color::Rgb(1, 2, 3)
         );
     }
