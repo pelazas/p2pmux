@@ -149,11 +149,12 @@ hosts then resize their own PTY and VT screen and publish their local grids.
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
 Nested ratio-controlled splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
-border and actively controlled panes use red-orange. Click tab labels to switch tabs without
+border and actively controlled panes use red-orange. Pane mode gives the locally focused pane a
+soft-green border; Tab mode dims inactive tab labels. Click tab labels to switch tabs without
 claiming control or sending input. Mouse wheel scrolls pane history locally. The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`; pane mode is
-`Pane  <←↓↑→> FOCUS   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <Esc> BACK`; tab mode is
-`Tab  <←→> SWITCH   <n> NEW   <x> CLOSE   <Esc> BACK`.
+`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK`; tab mode is
+`TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any

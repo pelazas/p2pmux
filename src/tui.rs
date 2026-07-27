@@ -177,7 +177,7 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("   drag border RESIZE"),
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
-    FooterSegment::Text("Pane  <"),
+    FooterSegment::Text("  <"),
     FooterSegment::Key("←↓↑→"),
     FooterSegment::Text("> FOCUS   <"),
     FooterSegment::Key("e"),
@@ -194,7 +194,7 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> BACK"),
 ];
 const TAB_FOOTER: &[FooterSegment] = &[
-    FooterSegment::Text("Tab  <"),
+    FooterSegment::Text("  <"),
     FooterSegment::Key("←→"),
     FooterSegment::Text("> SWITCH   <"),
     FooterSegment::Key("e"),
@@ -1885,7 +1885,12 @@ fn pane_border_color(
     _controller_active: bool,
     focused: bool,
     hovered: bool,
+    chord_mode: ChordMode,
 ) -> Color {
+    if focused && chord_mode == ChordMode::Pane {
+        return theme.pane_border_chord_focused;
+    }
+
     match controller_peer_id {
         Some([]) if focused => theme.pane_border_free_focused,
         None if focused => theme.pane_border_unknown_focused,
@@ -2249,11 +2254,11 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
+            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
-            "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
+            "  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             TAB_FOOTER,
         ),
     }
@@ -2295,6 +2300,33 @@ fn render_footer_segments(
             .0;
     }
     x
+}
+
+fn footer_segments_width(segments: &[FooterSegment]) -> u16 {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            FooterSegment::Text(text)
+            | FooterSegment::Key(text)
+            | FooterSegment::OrangeKey(text) => text_width(text),
+        })
+        .sum()
+}
+
+fn chord_footer_badge(chord_mode: ChordMode, width: u16) -> Option<&'static str> {
+    let (full, compact) = match chord_mode {
+        ChordMode::Pane => ("PANE MODE", "PANE"),
+        ChordMode::Tab => ("TAB MODE", "TAB"),
+        ChordMode::None => return None,
+    };
+
+    if width >= text_width(full) {
+        Some(full)
+    } else if width >= text_width(compact) {
+        Some(compact)
+    } else {
+        None
+    }
 }
 
 fn render_copy_feedback(
@@ -2375,6 +2407,81 @@ fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&st
     0
 }
 
+fn render_chord_footer(
+    buffer: &mut Buffer,
+    theme: &UiTheme,
+    area: Rect,
+    status: &str,
+    footer_notice: Option<&str>,
+    join_code: Option<&str>,
+    chord_mode: ChordMode,
+) {
+    let Some(badge) = chord_footer_badge(chord_mode, area.width) else {
+        return;
+    };
+    let end_x = area.right();
+    let mut x = buffer
+        .set_stringn(
+            area.x,
+            area.y,
+            badge,
+            usize::from(end_x.saturating_sub(area.x)),
+            Style::default()
+                .fg(theme.footer_orange)
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::BOLD),
+        )
+        .0;
+    let (_, segments) = contextual_footer(chord_mode);
+    if end_x.saturating_sub(x) < footer_segments_width(segments) {
+        render_footer_segments(buffer, theme, x, area.y, end_x, segments);
+        return;
+    }
+    x = render_footer_segments(buffer, theme, x, area.y, end_x, segments);
+
+    let status = (!status.is_empty()).then(|| format!("{status}  "));
+    let notice = footer_notice.map(|notice| format!("  {notice}"));
+    for (text, style) in [
+        (
+            status.as_deref(),
+            Style::default()
+                .fg(theme.footer_muted)
+                .bg(theme.footer_background),
+        ),
+        (
+            notice.as_deref(),
+            Style::default()
+                .fg(theme.footer_orange)
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ] {
+        if let Some(text) = text
+            && end_x.saturating_sub(x) >= text_width(text)
+        {
+            x = buffer
+                .set_stringn(x, area.y, text, usize::from(text_width(text)), style)
+                .0;
+        }
+    }
+
+    if let Some(join_code) = join_code {
+        let join = format!("join: p2pmux join {join_code}");
+        let join_width = text_width(&join);
+        if end_x.saturating_sub(x) >= join_width {
+            buffer.set_stringn(
+                x,
+                area.y,
+                join,
+                usize::from(join_width),
+                Style::default()
+                    .fg(theme.footer_muted)
+                    .bg(theme.footer_background),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_contextual_footer(
     buffer: &mut Buffer,
@@ -2393,6 +2500,19 @@ fn render_contextual_footer(
         usize::from(area.width),
         Style::default().bg(theme.footer_background),
     );
+
+    if chord_mode != ChordMode::None {
+        render_chord_footer(
+            buffer,
+            theme,
+            area,
+            status,
+            footer_notice,
+            join_code,
+            chord_mode,
+        );
+        return;
+    }
 
     let end_x = area.right();
     let mut x = area.x;
@@ -2517,7 +2637,11 @@ fn render_shared_multi_pane(
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(theme.tab_foreground)
+                    .fg(if tui.chord_mode == ChordMode::Tab {
+                        theme.tab_separator
+                    } else {
+                        theme.tab_foreground
+                    })
                     .bg(theme.footer_background)
             };
             let label = truncate_trailing(
@@ -2589,6 +2713,7 @@ fn render_shared_multi_pane(
             view.controller_active,
             focused,
             tui.hovered_pane == Some(pane_id),
+            tui.chord_mode,
         );
         let mut block = Block::bordered()
             .title(title)
@@ -3934,7 +4059,6 @@ impl SharedLayoutRuntime {
         let mut guard = TerminalGuard::new();
         enable_raw_mode()?;
         guard.raw_mode = true;
-        guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         execute!(io::stdout(), SetTitle("p2pmux"))?;
         guard.alternate_screen = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
@@ -3942,6 +4066,7 @@ impl SharedLayoutRuntime {
         execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
         guard.mouse_capture = true;
         execute!(io::stdout(), EnableMouseCapture)?;
+        guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,
@@ -5252,12 +5377,12 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
-    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     execute!(io::stdout(), SetTitle("p2pmux"))?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let fixed_area = Rect::new(0, 0, cols, rows);
@@ -5332,11 +5457,11 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
-    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
@@ -5486,11 +5611,11 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
     guard.raw_mode = true;
-    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
     guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    guard.keyboard_enhancement = enable_keyboard_enhancement()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
@@ -5714,11 +5839,12 @@ mod tests {
         HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
         MultiPaneTui, PaneTextSelection, PaneViewState, PendingEscape, RemoteSubscriptionState,
         ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
-        allocate_node_with_preview, area_from_terminal_size, contextual_footer, copied_line_count,
-        encode_key, encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
-        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
-        render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
+        allocate_node_with_preview, area_from_terminal_size, chord_footer_badge, contextual_footer,
+        copied_line_count, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
+        is_chord_command, lease_allows_held_input, member_label, mouse_to_screen_cell,
+        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
+        text_width, viewed_screen, visible_leaf_panes,
     };
 
     #[test]
@@ -7307,35 +7433,35 @@ mod tests {
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         let theme = UiTheme::default();
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, true, false),
+            pane_border_color(&theme, Some(b""), false, true, false, ChordMode::None),
             Color::White
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, false, true),
+            pane_border_color(&theme, Some(b""), false, false, true, ChordMode::None),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, false, false),
+            pane_border_color(&theme, Some(b""), false, false, false, ChordMode::None),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, true, false),
+            pane_border_color(&theme, None, false, true, false, ChordMode::None),
             Color::Yellow
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, false, true),
+            pane_border_color(&theme, None, false, false, true, ChordMode::None),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, false, false),
+            pane_border_color(&theme, None, false, false, false, ChordMode::None),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), true, true, true),
+            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::None),
             Color::Rgb(255, 69, 0)
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), false, false, true),
+            pane_border_color(&theme, Some(b"guest"), false, false, true, ChordMode::None),
             Color::Rgb(255, 69, 0)
         );
 
@@ -7344,8 +7470,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            pane_border_color(&themed, Some(b"guest"), false, false, false),
+            pane_border_color(
+                &themed,
+                Some(b"guest"),
+                false,
+                false,
+                false,
+                ChordMode::None,
+            ),
             Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(
+            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::Pane,),
+            theme.pane_border_chord_focused
+        );
+        assert_eq!(
+            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::Tab,),
+            theme.pane_border_remote_control
         );
     }
 
@@ -8087,11 +8228,11 @@ mod tests {
             ),
             (
                 ChordMode::Pane,
-                "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
+                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
-                "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
+                "TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
         ] {
             tui.chord_mode = mode;
@@ -8135,6 +8276,15 @@ mod tests {
             assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
             let (_, segments) = contextual_footer(mode);
             let mut x = 0;
+            if let Some(badge) = chord_footer_badge(mode, 120) {
+                for character in badge.chars() {
+                    assert_eq!(footer[(x, 3)].fg, theme.footer_orange);
+                    assert_eq!(footer[(x, 3)].bg, theme.footer_background);
+                    assert!(footer[(x, 3)].modifier.contains(Modifier::BOLD));
+                    assert_eq!(footer[(x, 3)].symbol(), character.to_string());
+                    x += 1;
+                }
+            }
             for segment in segments {
                 let (text, fg, bg, bold) = match segment {
                     FooterSegment::Text(text) => {
@@ -8159,6 +8309,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chord_footer_badges_fall_back_atomically_on_narrow_terminals() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+
+        for (mode, width, expected) in [
+            (ChordMode::Pane, 9, "PANE MODE"),
+            (ChordMode::Pane, 8, "PANE"),
+            (ChordMode::Pane, 4, "PANE"),
+            (ChordMode::Pane, 3, ""),
+            (ChordMode::Tab, 8, "TAB MODE"),
+            (ChordMode::Tab, 7, "TAB"),
+        ] {
+            let mut tui = tui.clone();
+            tui.chord_mode = mode;
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).expect("test terminal");
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+                .expect("render");
+            let footer = (0..width)
+                .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+                .collect::<String>();
+
+            assert!(
+                footer.starts_with(expected),
+                "mode: {mode:?}, footer: {footer}"
+            );
+            assert!(
+                !footer.starts_with("PANE MO") || footer.starts_with("PANE MODE"),
+                "footer: {footer}"
+            );
+            assert!(
+                !footer.starts_with("TAB MOD") || footer.starts_with("TAB MODE"),
+                "footer: {footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn chord_mode_chrome_switches_and_restores_remote_focused_pane_colors() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState::from_chrome(true, Some(b"guest".to_vec()), true),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("test terminal");
+
+        tui.chord_mode = ChordMode::Pane;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].fg, tui.theme.pane_border_chord_focused);
+        assert_eq!(
+            (0..9).map(|x| buffer[(x, 7)].symbol()).collect::<String>(),
+            "PANE MODE"
+        );
+
+        tui.chord_mode = ChordMode::Tab;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].fg, tui.theme.pane_border_remote_control);
+        assert_eq!(
+            (0..8).map(|x| buffer[(x, 7)].symbol()).collect::<String>(),
+            "TAB MODE"
+        );
+
+        tui.chord_mode = ChordMode::None;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].fg, tui.theme.pane_border_remote_control);
+        assert!(
+            (0..4)
+                .map(|x| buffer[(x, 7)].symbol())
+                .collect::<String>()
+                .starts_with("Ctrl")
+        );
     }
 
     #[test]
@@ -8192,7 +8432,7 @@ mod tests {
 
     #[test]
     fn tab_bar_uses_a_branded_footer_like_strip_and_highlights_the_active_tab() {
-        let tui = MultiPaneTui::new(layout(
+        let mut tui = MultiPaneTui::new(layout(
             vec![
                 Tab {
                     tab_id: 10,
@@ -8227,6 +8467,22 @@ mod tests {
         assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
         assert_eq!(buffer[(20, 0)].fg, Color::White);
         assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
+
+        tui.chord_mode = ChordMode::Tab;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(9, 0)].fg, Color::White);
+        assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(20, 0)].fg, Color::DarkGray);
+        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
+
+        tui.chord_mode = ChordMode::None;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        assert_eq!(terminal.backend().buffer()[(20, 0)].fg, Color::White);
     }
 
     #[test]
