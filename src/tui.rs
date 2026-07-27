@@ -76,7 +76,11 @@ use crate::{
 };
 
 pub(crate) enum NodeScreenSnapshot {
-    Local(ScreenFrame),
+    Local {
+        frame: ScreenFrame,
+        history_total_rows: usize,
+        history_rows: Vec<Vec<u8>>,
+    },
     Remote {
         sequence: u64,
         snapshot: Vec<u8>,
@@ -875,6 +879,30 @@ impl MultiPaneTui {
             return false;
         }
         view.scrollback = 0;
+        true
+    }
+
+    /// Keeps a scrolled-back local viewport pinned while the host appends visual rows.
+    pub fn pin_scrollback_after_output(
+        &mut self,
+        pane_id: PaneId,
+        appended_rows: usize,
+        scrollback_len: usize,
+    ) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        if view.scrollback == 0 {
+            return false;
+        }
+        let scrollback = view
+            .scrollback
+            .saturating_add(appended_rows)
+            .min(scrollback_len);
+        if view.scrollback == scrollback {
+            return false;
+        }
+        view.scrollback = scrollback;
         true
     }
 
@@ -3747,9 +3775,15 @@ impl SharedLayoutRuntime {
         let mut screens = BTreeMap::new();
         let mut chrome = BTreeMap::new();
         for (pane_id, pane) in &self.local {
+            let (history_total_rows, history_rows) =
+                pane.screen.visual_scrollback(1_000, 256 * 1024);
             screens.insert(
                 *pane_id,
-                NodeScreenSnapshot::Local(pane.screen.current_frame().clone()),
+                NodeScreenSnapshot::Local {
+                    frame: pane.screen.current_frame().clone(),
+                    history_total_rows,
+                    history_rows,
+                },
             );
             let view = pane.view_state();
             chrome.insert(
@@ -7308,6 +7342,17 @@ mod tests {
         assert!(tui.reset_scrollback(1));
         assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 0);
         assert!(!tui.reset_scrollback(1));
+    }
+
+    #[test]
+    fn appended_local_history_pins_a_scrolled_back_viewport() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 10, true));
+        assert!(tui.scroll_pane(1, 10, true));
+        assert!(tui.pin_scrollback_after_output(1, 3, 10));
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 5);
+        tui.reset_scrollback(1);
+        assert!(!tui.pin_scrollback_after_output(1, 3, 10));
     }
 
     #[test]

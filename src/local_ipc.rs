@@ -98,6 +98,14 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
 pub struct PaneScreenSnapshot {
     pub pane_id: u64,
     pub state: ScreenUpdate,
+    pub local_history: Option<LocalHistorySnapshot>,
+}
+
+/// Bounded local-host visual rows, encoded so terminal control bytes remain JSON-safe.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LocalHistorySnapshot {
+    pub total_rows: usize,
+    pub rows: Vec<String>,
 }
 
 /// The screen state carried inside every local attachment snapshot.

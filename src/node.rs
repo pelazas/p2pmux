@@ -17,12 +17,13 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     local_ipc::{
-        AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
-        PaneScreenSnapshot, ScreenUpdate, SessionSummary,
+        AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, LocalHistorySnapshot, NodeMessage,
+        PaneLeaseSnapshot, PaneScreenSnapshot, ScreenUpdate, SessionSummary,
     },
     rendezvous::LocalRendezvous,
     session::{
@@ -460,8 +461,12 @@ fn pane_screen_updates(
     screens
         .into_iter()
         .map(|(pane_id, screen)| {
-            let (sequence, state) = match screen {
-                crate::tui::NodeScreenSnapshot::Local(frame) => {
+            let (sequence, state, local_history) = match screen {
+                crate::tui::NodeScreenSnapshot::Local {
+                    frame,
+                    history_total_rows,
+                    history_rows,
+                } => {
                     let state = if sequences.get(&pane_id) == Some(&frame.sequence) {
                         ScreenUpdate::Unchanged {
                             sequence: frame.sequence,
@@ -481,7 +486,17 @@ fn pane_screen_updates(
                             kitty_keyboard_active: frame.kitty_keyboard_active,
                         }
                     };
-                    (frame.sequence, state)
+                    (
+                        frame.sequence,
+                        state,
+                        Some(LocalHistorySnapshot {
+                            total_rows: history_total_rows,
+                            rows: history_rows
+                                .into_iter()
+                                .map(|row| STANDARD.encode(row))
+                                .collect(),
+                        }),
+                    )
                 }
                 crate::tui::NodeScreenSnapshot::Remote {
                     sequence,
@@ -500,11 +515,15 @@ fn pane_screen_updates(
                             kitty_keyboard_active,
                         }
                     };
-                    (sequence, state)
+                    (sequence, state, None)
                 }
             };
             sequences.insert(pane_id, sequence);
-            PaneScreenSnapshot { pane_id, state }
+            PaneScreenSnapshot {
+                pane_id,
+                state,
+                local_history,
+            }
         })
         .collect()
 }
@@ -605,7 +624,11 @@ mod tests {
         let mut sequences = BTreeMap::new();
         let initial = BTreeMap::from([(
             1,
-            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+            crate::tui::NodeScreenSnapshot::Local {
+                frame: screen.current_frame().clone(),
+                history_total_rows: 0,
+                history_rows: vec![],
+            },
         )]);
         let updates = pane_screen_updates(initial, &mut sequences);
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
@@ -613,14 +636,22 @@ mod tests {
         screen.process_pty(b"a").unwrap();
         let changed = BTreeMap::from([(
             1,
-            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+            crate::tui::NodeScreenSnapshot::Local {
+                frame: screen.current_frame().clone(),
+                history_total_rows: 0,
+                history_rows: vec![],
+            },
         )]);
         let updates = pane_screen_updates(changed, &mut sequences);
         assert!(matches!(updates[0].state, ScreenUpdate::Delta { .. }));
 
         let unchanged = BTreeMap::from([(
             1,
-            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+            crate::tui::NodeScreenSnapshot::Local {
+                frame: screen.current_frame().clone(),
+                history_total_rows: 0,
+                history_rows: vec![],
+            },
         )]);
         let updates = pane_screen_updates(unchanged, &mut sequences);
         assert!(matches!(updates[0].state, ScreenUpdate::Unchanged { .. }));
@@ -628,7 +659,11 @@ mod tests {
         screen.resize(2, 3).unwrap();
         let resized = BTreeMap::from([(
             1,
-            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+            crate::tui::NodeScreenSnapshot::Local {
+                frame: screen.current_frame().clone(),
+                history_total_rows: 0,
+                history_rows: vec![],
+            },
         )]);
         let updates = pane_screen_updates(resized, &mut sequences);
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
@@ -742,6 +777,7 @@ mod tests {
                         snapshot: vec![b'x'; 256 * 1024],
                         kitty_keyboard_active: false,
                     },
+                    local_history: None,
                 }],
                 leases: vec![],
                 rosters: vec![],

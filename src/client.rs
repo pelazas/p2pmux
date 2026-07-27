@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -22,7 +23,7 @@ use crossterm::{
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 
 use crate::{
-    local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
+    local_ipc::{ClientMessage, LocalHistorySnapshot, NodeMessage, ScreenUpdate},
     protocol::AgentRosterState,
     screen::{ApplyDelta, GuestScreen},
     session_store::SessionDescriptor,
@@ -31,6 +32,49 @@ use crate::{
         PaneViewState, render_multi_pane,
     },
 };
+
+#[derive(Default)]
+struct LocalHistory {
+    grid: Option<(u16, u16)>,
+    total_rows: usize,
+    rows: Vec<Vec<u8>>,
+}
+
+impl LocalHistory {
+    fn replace(&mut self, snapshot: LocalHistorySnapshot, grid: (u16, u16)) -> usize {
+        let grid_changed = self
+            .grid
+            .replace(grid)
+            .is_some_and(|previous| previous != grid);
+        let previous_total = if grid_changed { 0 } else { self.total_rows };
+        self.rows = snapshot
+            .rows
+            .into_iter()
+            .filter_map(|row| STANDARD.decode(row).ok())
+            .collect();
+        self.total_rows = snapshot.total_rows;
+        if grid_changed || snapshot.total_rows < previous_total {
+            0
+        } else {
+            snapshot.total_rows.saturating_sub(previous_total)
+        }
+    }
+
+    fn available_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn viewport(&self, live: &vt100::Screen) -> vt100::Screen {
+        let (rows, cols) = live.size();
+        let mut parser = vt100::Parser::new(rows, cols, self.rows.len());
+        for row in &self.rows {
+            parser.process(row);
+            parser.process(b"\r\n");
+        }
+        parser.process(&live.contents_formatted());
+        parser.screen().clone()
+    }
+}
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::config::config_path()?;
@@ -70,6 +114,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     )?;
     let mut tui = None;
     let mut screens = BTreeMap::new();
+    let mut local_history = BTreeMap::new();
     let mut dirty = false;
     let mut node_ended = false;
     let mut attach_error = None;
@@ -98,6 +143,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut tui,
                             theme,
                             &mut screens,
+                            &mut local_history,
                             room_name,
                             *layout,
                             next_screens,
@@ -139,11 +185,24 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         if dirty {
             if let Some(tui) = tui.as_ref() {
                 terminal.draw(|frame| {
-                    let visible = screens
+                    let viewport_screens = screens
                         .iter()
                         .filter_map(|(pane_id, screen)| {
-                            screen.screen().map(|screen| (*pane_id, screen))
+                            screen.screen().map(|screen| {
+                                let screen = local_history
+                                    .get(pane_id)
+                                    .filter(|history| !history.rows.is_empty())
+                                    .map_or_else(
+                                        || screen.clone(),
+                                        |history| history.viewport(screen),
+                                    );
+                                (*pane_id, screen)
+                            })
                         })
+                        .collect::<BTreeMap<_, _>>();
+                    let visible = viewport_screens
+                        .iter()
+                        .map(|(pane_id, screen)| (*pane_id, screen))
                         .collect();
                     render_multi_pane(frame, tui, &visible);
                 })?;
@@ -212,11 +271,16 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
                     let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
-                    let scrollback_len = screens
-                        .get(&pane_id)
-                        .and_then(GuestScreen::screen)
-                        .map(available_scrollback)
-                        .unwrap_or_default();
+                    let scrollback_len = local_history.get(&pane_id).map_or_else(
+                        || {
+                            screens
+                                .get(&pane_id)
+                                .and_then(GuestScreen::screen)
+                                .map(available_scrollback)
+                                .unwrap_or_default()
+                        },
+                        LocalHistory::available_rows,
+                    );
                     tui.scroll_mouse_pane(
                         mouse.column,
                         mouse.row,
@@ -290,6 +354,7 @@ fn apply_snapshot(
     tui: &mut Option<MultiPaneTui>,
     theme: crate::config::UiTheme,
     screens: &mut BTreeMap<u64, GuestScreen>,
+    local_history: &mut BTreeMap<u64, LocalHistory>,
     room_name: String,
     layout: crate::layout::LayoutSnapshot,
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
@@ -312,8 +377,10 @@ fn apply_snapshot(
     };
     view.set_title(format!("p2pmux ({room_name})"));
     screens.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
+    local_history.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
     let mut resync = Vec::new();
     for frame in next_screens {
+        let pane_id = frame.pane_id;
         let screen = screens.entry(frame.pane_id).or_default();
         match frame.state {
             ScreenUpdate::Snapshot {
@@ -337,6 +404,15 @@ fn apply_snapshot(
                 sequence: _,
                 kitty_keyboard_active,
             } => screen.set_kitty_keyboard_active(kitty_keyboard_active),
+        }
+        if let Some(snapshot) = frame.local_history
+            && let Some(screen) = screen.screen()
+        {
+            let local = local_history.entry(pane_id).or_default();
+            let appended = local.replace(snapshot, screen.size());
+            if appended > 0 {
+                view.pin_scrollback_after_output(pane_id, appended, local.available_rows());
+            }
         }
     }
     for lease in leases {
@@ -611,7 +687,8 @@ mod tests {
 
     use crate::{
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
-        local_ipc::AgentOverlaySnapshotRow,
+        local_ipc::{AgentOverlaySnapshotRow, LocalHistorySnapshot},
+        screen::HostScreen,
         tui::{AGENT_TOGGLE_WINDOW, UiIntent},
     };
 
@@ -682,6 +759,7 @@ mod tests {
             tui,
             crate::config::UiTheme::default(),
             &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             String::from("room"),
             layout(pane_ids),
             vec![],
@@ -704,6 +782,7 @@ mod tests {
         apply_snapshot(
             tui,
             crate::config::UiTheme::default(),
+            &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             String::from("room"),
             layout,
@@ -754,6 +833,27 @@ mod tests {
             client_key_bytes(KeyCode::Enter, KeyModifiers::CONTROL, true),
             Some(b"\r".to_vec())
         );
+    }
+
+    #[test]
+    fn local_history_rebuilds_a_scrollback_viewport() {
+        let mut host = HostScreen::new(1, 3).unwrap();
+        host.process_pty(b"one\r\ntwo").unwrap();
+        let (total_rows, rows) = host.visual_scrollback(1_000, 256 * 1024);
+        let mut history = LocalHistory::default();
+        assert!(
+            history.replace(
+                LocalHistorySnapshot {
+                    total_rows,
+                    rows: rows.into_iter().map(|row| STANDARD.encode(row)).collect(),
+                },
+                host.screen().size(),
+            ) > 0
+        );
+
+        let mut viewport = history.viewport(host.screen());
+        viewport.set_scrollback(history.available_rows());
+        assert!(viewport.contents().contains("one"));
     }
 
     #[test]
