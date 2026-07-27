@@ -1192,8 +1192,12 @@ impl MultiPaneTui {
             ChordMode::Tab => self.handle_tab_chord(key, area),
             ChordMode::None => None,
         };
-        if intent.is_some() || is_chord_command(chord, key) {
-            self.touch_chord_activity();
+        if is_chord_command(chord, key) {
+            if is_chord_navigation(chord, key) {
+                self.touch_chord_activity();
+            } else {
+                self.exit_chord_mode();
+            }
             KeyHandling::Consumed(intent.into_iter().collect())
         } else {
             self.exit_chord_mode();
@@ -1739,6 +1743,20 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
                 | KeyCode::Left
                 | KeyCode::Right
         ),
+        ChordMode::None => false,
+    }
+}
+
+fn is_chord_navigation(mode: ChordMode, key: KeyEvent) -> bool {
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+    match mode {
+        ChordMode::Pane => matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+        ),
+        ChordMode::Tab => matches!(key.code, KeyCode::Left | KeyCode::Right),
         ChordMode::None => false,
     }
 }
@@ -5841,10 +5859,10 @@ mod tests {
         ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
         allocate_node_with_preview, area_from_terminal_size, chord_footer_badge, contextual_footer,
         copied_line_count, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
-        is_chord_command, lease_allows_held_input, member_label, mouse_to_screen_cell,
-        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
-        text_width, viewed_screen, visible_leaf_panes,
+        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
     #[test]
@@ -7957,7 +7975,7 @@ mod tests {
                 grid_cols: 38,
             }])
         );
-        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(tui.chord_mode(), ChordMode::None);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
@@ -8074,14 +8092,18 @@ mod tests {
                 "key: {key}"
             );
             assert_eq!(tui.focused_pane(), 1, "key: {key}");
-            assert_eq!(tui.chord_mode(), ChordMode::Pane, "key: {key}");
+            assert_eq!(tui.chord_mode(), ChordMode::None, "key: {key}");
         }
     }
 
     #[test]
-    fn directional_split_keys_are_sticky_pane_commands_even_without_an_intent() {
+    fn directional_split_keys_are_commands_but_not_chord_navigation() {
         for key in ['r', 'l', 'd', 'u'] {
             assert!(is_chord_command(
+                ChordMode::Pane,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+            ));
+            assert!(!is_chord_navigation(
                 ChordMode::Pane,
                 KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
             ));
@@ -8089,7 +8111,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_lock_chord_toggles_lock_and_stays_sticky() {
+    fn pane_lock_chord_toggles_lock_and_exits_mode() {
         let area = Rect::new(0, 0, 80, 24);
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
 
@@ -8104,11 +8126,32 @@ mod tests {
                 locked: true,
             }])
         );
-        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(tui.chord_mode(), ChordMode::None);
         assert!(is_chord_command(
             ChordMode::Pane,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
         ));
+        assert!(!is_chord_navigation(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn pane_commands_exit_mode_even_when_no_intent_is_available() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        tui.snapshot.panes.clear();
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 
     #[test]
@@ -8821,6 +8864,7 @@ mod tests {
                 grid_cols: 10,
             }])
         );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
 
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
@@ -8830,6 +8874,7 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 2 }])
         );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 
     #[test]
