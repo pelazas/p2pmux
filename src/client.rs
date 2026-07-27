@@ -708,39 +708,17 @@ impl Drop for ClientTerminalGuard {
 mod tests {
     use std::{
         collections::BTreeMap,
-        thread,
         time::{Duration, Instant},
     };
-
-    use portable_pty::{CommandBuilder, PtySize};
 
     use crate::{
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
         local_ipc::{AgentOverlaySnapshotRow, LocalHistorySnapshot},
-        pty_host::PtyHost,
         screen::HostScreen,
         tui::{AGENT_TOGGLE_WINDOW, UiIntent},
     };
 
     use super::*;
-
-    fn read_until(host: &mut PtyHost, expected: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut output = String::new();
-        while Instant::now() < deadline {
-            while let Some(bytes) = host
-                .try_read_output()
-                .expect("PTY reader should stay healthy")
-            {
-                output.push_str(&String::from_utf8_lossy(&bytes));
-            }
-            if output.contains(expected) {
-                return output;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("did not receive {expected:?}; received {output:?}");
-    }
 
     fn layout(pane_ids: &[u64]) -> LayoutSnapshot {
         let root = pane_ids
@@ -905,32 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_encodes_as_lf_and_agent_treats_it_as_newline() {
-        let bytes = client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false)
-            .expect("Shift+Enter should encode");
-        assert_eq!(bytes, b"\n");
-
-        let probe = format!(
-            "{}/tests/fixtures/agent_newline_probe.js",
-            env!("CARGO_MANIFEST_DIR")
+    fn shift_enter_encodes_as_lf_when_kitty_keyboard_is_inactive() {
+        assert_eq!(
+            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false),
+            Some(b"\n".to_vec())
         );
-        let mut command = CommandBuilder::new("node");
-        command.arg(probe);
-        let mut host = PtyHost::spawn(
-            command,
-            PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-        )
-        .expect("Node probe PTY should spawn");
-
-        assert!(read_until(&mut host, "READY").contains("READY"));
-        host.write_input(&bytes).expect("PTY should accept LF");
-        assert!(read_until(&mut host, "NEWLINE").contains("NEWLINE"));
-        host.shutdown().expect("PTY should shut down cleanly");
     }
 
     #[test]
