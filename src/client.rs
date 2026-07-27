@@ -170,11 +170,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             .get(&tui.focused_pane())
                             .is_some_and(GuestScreen::kitty_keyboard_active);
                         if input_allowed(tui, &local_peer_id)
-                            && let Some(bytes) = client_key_bytes(
-                                key.code,
-                                key.modifiers,
-                                kitty_keyboard_active,
-                            )
+                            && let Some(bytes) =
+                                client_key_bytes(key.code, key.modifiers, kitty_keyboard_active)
                         {
                             write_message(&mut stream, &ClientMessage::Input { bytes })?;
                         }
@@ -703,6 +700,34 @@ mod tests {
         assert_eq!(
             client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL, false),
             Some(vec![17])
+        );
+    }
+
+    #[test]
+    fn encodes_shift_enter_for_the_focused_pane_keyboard_mode() {
+        assert_eq!(
+            client_key_bytes(KeyCode::Enter, KeyModifiers::NONE, false),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, true),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Char('j'), KeyModifiers::CONTROL, false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Enter, KeyModifiers::ALT, true),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Enter, KeyModifiers::CONTROL, true),
+            Some(b"\r".to_vec())
         );
     }
 
