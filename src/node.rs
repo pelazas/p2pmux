@@ -14,7 +14,7 @@ use std::{
         fs::OpenOptionsExt,
         net::{UnixListener, UnixStream},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -238,6 +238,7 @@ fn run_socket_loop(
                                         descriptor,
                                         node,
                                         &mut screen_sequences,
+                                        Duration::ZERO,
                                     )
                                 }) {
                                     Ok(()) => {
@@ -287,9 +288,11 @@ fn run_socket_loop(
                 Err(error) => return Err(error),
             }
         }
+        let drain_started = Instant::now();
         let mut changed = node
             .drain()
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut drain_elapsed = drain_started.elapsed();
         did_work |= changed;
         let mut detached = false;
         if !shutdown && let Some((reader, generation, screen_sequences)) = client.as_mut() {
@@ -297,9 +300,11 @@ fn run_socket_loop(
                 Ok(Some(ClientMessage::Input { bytes })) => {
                     node.input(bytes)
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    let drain_started = Instant::now();
                     changed |= node
                         .drain()
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    drain_elapsed += drain_started.elapsed();
                 }
                 Ok(Some(ClientMessage::StructuralIntent { intent })) => {
                     node.intent(intent)
@@ -371,12 +376,20 @@ fn run_socket_loop(
             did_work |= changed;
             if changed
                 && !detached
-                && let Err(error) =
-                    write_snapshot(reader.get_mut(), descriptor, node, screen_sequences)
+                && let Err(error) = write_snapshot(
+                    reader.get_mut(),
+                    descriptor,
+                    node,
+                    screen_sequences,
+                    drain_elapsed,
+                )
             {
                 eprintln!("p2pmux node: failed to write local snapshot: {error}");
                 detached = true;
             }
+        }
+        if !changed {
+            log_slow_drain(drain_elapsed);
         }
         if (detached || shutdown)
             && let Some((mut reader, generation, _)) = client.take()
@@ -425,10 +438,18 @@ fn write_snapshot(
     descriptor: &SessionDescriptor,
     node: &SharedLayoutNode,
     screen_sequences: &mut BTreeMap<u64, u64>,
+    drain_elapsed: Duration,
 ) -> io::Result<()> {
+    let snapshot_started = Instant::now();
     let (tab_id, pane_id) = node.local_focus();
     let local_peer_id = node.local_peer_id();
     let (layout, screens, leases, rosters) = node.snapshot();
+    let snapshot_build = snapshot_started.elapsed();
+    let local_panes = screens
+        .values()
+        .filter(|screen| matches!(screen, crate::tui::NodeScreenSnapshot::Local { .. }))
+        .count();
+    let remote_panes = screens.len().saturating_sub(local_panes);
     let hosts = layout
         .panes
         .values()
@@ -440,56 +461,111 @@ fn write_snapshot(
         .first()
         .map(|member| member.display_name.clone())
         .unwrap_or_default();
-    write_message(
-        stream,
-        &NodeMessage::Snapshot {
-            room_name: descriptor.name.clone(),
-            role: match descriptor.role {
-                SessionRole::Coordinator => "coordinator",
-                SessionRole::Member => "member",
-            }
-            .into(),
-            summary: SessionSummary {
-                tabs: layout.tabs.len() as u32,
-                panes: layout.panes.len() as u32,
-                hosts,
-                coordinator_name,
-            },
-            layout: Box::new(layout),
-            screens: pane_screen_updates(screens, screen_sequences),
-            leases: leases
-                .into_iter()
-                .map(
-                    |(pane_id, (ready, controller_peer_id, controller_active))| PaneLeaseSnapshot {
-                        pane_id,
-                        ready,
-                        controller_peer_id,
-                        controller_active,
-                    },
-                )
-                .collect(),
-            rosters,
-            local_peer_id,
-            tab_id,
-            pane_id,
+    let mut history_extract = Duration::ZERO;
+    let screens = pane_screen_updates(
+        screens,
+        screen_sequences,
+        |pane_id| {
+            let started = Instant::now();
+            let history =
+                node.node_local_history(pane_id)
+                    .map(|(total_rows, rows)| LocalHistorySnapshot {
+                        total_rows,
+                        rows: rows.into_iter().map(|row| STANDARD.encode(row)).collect(),
+                    });
+            history_extract += started.elapsed();
+            history
         },
-    )
+        |pane_id| node.node_remote_snapshot(pane_id),
+    );
+    let updates = ScreenUpdateStats::from_screens(&screens);
+    let message = NodeMessage::Snapshot {
+        room_name: descriptor.name.clone(),
+        role: match descriptor.role {
+            SessionRole::Coordinator => "coordinator",
+            SessionRole::Member => "member",
+        }
+        .into(),
+        summary: SessionSummary {
+            tabs: layout.tabs.len() as u32,
+            panes: layout.panes.len() as u32,
+            hosts,
+            coordinator_name,
+        },
+        layout: Box::new(layout),
+        screens,
+        leases: leases
+            .into_iter()
+            .map(
+                |(pane_id, (ready, controller_peer_id, controller_active))| PaneLeaseSnapshot {
+                    pane_id,
+                    ready,
+                    controller_peer_id,
+                    controller_active,
+                },
+            )
+            .collect(),
+        rosters,
+        local_peer_id,
+        tab_id,
+        pane_id,
+    };
+    let json_started = Instant::now();
+    let mut frame = serde_json::to_vec(&message).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    let json_serialize = json_started.elapsed();
+    let write_started = Instant::now();
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    let json_write = write_started.elapsed();
+    if perf_enabled()
+        && [
+            drain_elapsed,
+            snapshot_build,
+            history_extract,
+            json_serialize,
+            json_write,
+        ]
+        .into_iter()
+        .any(|elapsed| elapsed >= Duration::from_millis(5))
+    {
+        eprintln!(
+            "P2PMUX_PERF node drain_ms={} snapshot_build_ms={} history_extract_ms={} history_panes={} json_serialize_ms={} json_write_ms={} write_bytes={} panes_local={} panes_remote={} updates_snapshot={}({}B) updates_delta={}({}B) updates_unchanged={}",
+            drain_elapsed.as_millis(),
+            snapshot_build.as_millis(),
+            history_extract.as_millis(),
+            updates.history_panes,
+            json_serialize.as_millis(),
+            json_write.as_millis(),
+            frame.len(),
+            local_panes,
+            remote_panes,
+            updates.snapshots,
+            updates.snapshot_bytes,
+            updates.deltas,
+            updates.delta_bytes,
+            updates.unchanged,
+        );
+    }
+    Ok(())
 }
 
-fn pane_screen_updates(
+fn pane_screen_updates<LocalHistory, RemoteSnapshot>(
     screens: crate::tui::NodeScreenSnapshots,
     sequences: &mut BTreeMap<u64, u64>,
-) -> Vec<PaneScreenSnapshot> {
+    mut local_history: LocalHistory,
+    mut remote_snapshot: RemoteSnapshot,
+) -> Vec<PaneScreenSnapshot>
+where
+    LocalHistory: FnMut(u64) -> Option<LocalHistorySnapshot>,
+    RemoteSnapshot: FnMut(u64) -> Option<Vec<u8>>,
+{
     sequences.retain(|pane_id, _| screens.contains_key(pane_id));
     screens
         .into_iter()
-        .map(|(pane_id, screen)| {
+        .filter_map(|(pane_id, screen)| {
             let (sequence, state, local_history) = match screen {
-                crate::tui::NodeScreenSnapshot::Local {
-                    frame,
-                    history_total_rows,
-                    history_rows,
-                } => {
+                crate::tui::NodeScreenSnapshot::Local { frame } => {
                     let state = if sequences.get(&pane_id) == Some(&frame.sequence) {
                         ScreenUpdate::Unchanged {
                             sequence: frame.sequence,
@@ -509,21 +585,13 @@ fn pane_screen_updates(
                             kitty_keyboard_active: frame.kitty_keyboard_active,
                         }
                     };
-                    (
-                        frame.sequence,
-                        state,
-                        Some(LocalHistorySnapshot {
-                            total_rows: history_total_rows,
-                            rows: history_rows
-                                .into_iter()
-                                .map(|row| STANDARD.encode(row))
-                                .collect(),
-                        }),
-                    )
+                    let history = (!matches!(&state, ScreenUpdate::Unchanged { .. }))
+                        .then(|| local_history(pane_id))
+                        .flatten();
+                    (frame.sequence, state, history)
                 }
                 crate::tui::NodeScreenSnapshot::Remote {
                     sequence,
-                    snapshot,
                     kitty_keyboard_active,
                 } => {
                     let state = if sequences.get(&pane_id) == Some(&sequence) {
@@ -534,7 +602,7 @@ fn pane_screen_updates(
                     } else {
                         ScreenUpdate::Snapshot {
                             sequence,
-                            snapshot,
+                            snapshot: remote_snapshot(pane_id)?,
                             kitty_keyboard_active,
                         }
                     };
@@ -542,13 +610,54 @@ fn pane_screen_updates(
                 }
             };
             sequences.insert(pane_id, sequence);
-            PaneScreenSnapshot {
+            Some(PaneScreenSnapshot {
                 pane_id,
                 state,
                 local_history,
-            }
+            })
         })
         .collect()
+}
+
+#[derive(Default)]
+struct ScreenUpdateStats {
+    snapshots: usize,
+    snapshot_bytes: usize,
+    deltas: usize,
+    delta_bytes: usize,
+    unchanged: usize,
+    history_panes: usize,
+}
+
+impl ScreenUpdateStats {
+    fn from_screens(screens: &[PaneScreenSnapshot]) -> Self {
+        let mut stats = Self::default();
+        for screen in screens {
+            stats.history_panes += usize::from(screen.local_history.is_some());
+            match &screen.state {
+                ScreenUpdate::Snapshot { snapshot, .. } => {
+                    stats.snapshots += 1;
+                    stats.snapshot_bytes += snapshot.len();
+                }
+                ScreenUpdate::Delta { delta, .. } => {
+                    stats.deltas += 1;
+                    stats.delta_bytes += delta.len();
+                }
+                ScreenUpdate::Unchanged { .. } => stats.unchanged += 1,
+            }
+        }
+        stats
+    }
+}
+
+fn perf_enabled() -> bool {
+    std::env::var_os("P2PMUX_PERF").is_some_and(|value| value == "1")
+}
+
+fn log_slow_drain(elapsed: Duration) {
+    if perf_enabled() && elapsed >= Duration::from_millis(5) {
+        eprintln!("P2PMUX_PERF node drain_ms={}", elapsed.as_millis());
+    }
 }
 
 impl SharedLayoutNode {
@@ -584,6 +693,12 @@ impl SharedLayoutNode {
     ) {
         self.runtime.node_snapshot()
     }
+    pub(crate) fn node_local_history(&self, pane_id: u64) -> Option<(usize, Vec<Vec<u8>>)> {
+        self.runtime.node_local_history(pane_id)
+    }
+    pub(crate) fn node_remote_snapshot(&self, pane_id: u64) -> Option<Vec<u8>> {
+        self.runtime.node_remote_snapshot(pane_id)
+    }
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
         self.runtime.node_resize(cols, rows)
     }
@@ -608,6 +723,7 @@ mod tests {
         tui::SharedLocalPane,
     };
     use std::{
+        cell::Cell,
         io::Write,
         os::unix::{
             fs::PermissionsExt,
@@ -663,11 +779,9 @@ mod tests {
             1,
             crate::tui::NodeScreenSnapshot::Local {
                 frame: screen.current_frame().clone(),
-                history_total_rows: 0,
-                history_rows: vec![],
             },
         )]);
-        let updates = pane_screen_updates(initial, &mut sequences);
+        let updates = pane_screen_updates(initial, &mut sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
 
         screen.process_pty(b"a").unwrap();
@@ -675,22 +789,18 @@ mod tests {
             1,
             crate::tui::NodeScreenSnapshot::Local {
                 frame: screen.current_frame().clone(),
-                history_total_rows: 0,
-                history_rows: vec![],
             },
         )]);
-        let updates = pane_screen_updates(changed, &mut sequences);
+        let updates = pane_screen_updates(changed, &mut sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Delta { .. }));
 
         let unchanged = BTreeMap::from([(
             1,
             crate::tui::NodeScreenSnapshot::Local {
                 frame: screen.current_frame().clone(),
-                history_total_rows: 0,
-                history_rows: vec![],
             },
         )]);
-        let updates = pane_screen_updates(unchanged, &mut sequences);
+        let updates = pane_screen_updates(unchanged, &mut sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Unchanged { .. }));
 
         screen.resize(2, 3).unwrap();
@@ -698,12 +808,80 @@ mod tests {
             1,
             crate::tui::NodeScreenSnapshot::Local {
                 frame: screen.current_frame().clone(),
-                history_total_rows: 0,
-                history_rows: vec![],
             },
         )]);
-        let updates = pane_screen_updates(resized, &mut sequences);
+        let updates = pane_screen_updates(resized, &mut sequences, |_| None, |_| None);
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
+    }
+
+    #[test]
+    fn unchanged_local_screen_updates_omit_history() {
+        let screen = HostScreen::new(1, 3).unwrap();
+        let mut sequences = BTreeMap::new();
+        let initial = BTreeMap::from([(
+            1,
+            crate::tui::NodeScreenSnapshot::Local {
+                frame: screen.current_frame().clone(),
+            },
+        )]);
+        let updates = pane_screen_updates(
+            initial,
+            &mut sequences,
+            |_| {
+                Some(LocalHistorySnapshot {
+                    total_rows: 1,
+                    rows: vec![STANDARD.encode(b"history")],
+                })
+            },
+            |_| None,
+        );
+        assert!(updates[0].local_history.is_some());
+
+        let unchanged = BTreeMap::from([(
+            1,
+            crate::tui::NodeScreenSnapshot::Local {
+                frame: screen.current_frame().clone(),
+            },
+        )]);
+        let updates = pane_screen_updates(
+            unchanged,
+            &mut sequences,
+            |_| panic!("unchanged local panes must not fetch history"),
+            |_| None,
+        );
+        assert!(matches!(updates[0].state, ScreenUpdate::Unchanged { .. }));
+        assert!(updates[0].local_history.is_none());
+    }
+
+    #[test]
+    fn unchanged_remote_screen_updates_skip_snapshot_encoding() {
+        let mut sequences = BTreeMap::new();
+        let calls = Cell::new(0);
+        let remote = || crate::tui::NodeScreenSnapshot::Remote {
+            sequence: 1,
+            kitty_keyboard_active: false,
+        };
+        let initial = BTreeMap::from([(1, remote())]);
+        let updates = pane_screen_updates(
+            initial,
+            &mut sequences,
+            |_| None,
+            |_| {
+                calls.set(calls.get() + 1);
+                Some(vec![1])
+            },
+        );
+        assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
+        assert_eq!(calls.get(), 1);
+
+        let unchanged = BTreeMap::from([(1, remote())]);
+        let updates = pane_screen_updates(
+            unchanged,
+            &mut sequences,
+            |_| None,
+            |_| panic!("unchanged remote panes must not encode a snapshot"),
+        );
+        assert!(matches!(updates[0].state, ScreenUpdate::Unchanged { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

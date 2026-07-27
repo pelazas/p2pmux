@@ -144,14 +144,14 @@ impl HostScreen {
         if self.parser.screen().alternate_screen() {
             return (0, Vec::new());
         }
-        let total_rows =
-            screen_scrollback_len(self.parser.screen()).saturating_sub(self.history_floor);
+        let mut screen = self.parser.screen().clone();
+        screen.set_scrollback(SCROLLBACK_LINES);
+        let total_rows = screen.scrollback().saturating_sub(self.history_floor);
         let first_row = total_rows.saturating_sub(max_rows);
         let mut rows = Vec::new();
         let mut bytes = 0_usize;
         for row in first_row..total_rows {
             let offset = total_rows.saturating_sub(row);
-            let mut screen = self.parser.screen().clone();
             screen.set_scrollback(offset);
             let Some(formatted) = screen.rows_formatted(0, screen.size().1).next() else {
                 continue;

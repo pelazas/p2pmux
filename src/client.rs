@@ -156,6 +156,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         ..
                     } = *message
                     {
+                        let apply_started = Instant::now();
                         let resync = apply_snapshot(
                             &mut tui,
                             theme,
@@ -170,6 +171,14 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             pane_id,
                             &mut pending_focus,
                         )?;
+                        let apply_elapsed = apply_started.elapsed();
+                        if perf_enabled() && apply_elapsed >= Duration::from_millis(5) {
+                            eprintln!(
+                                "P2PMUX_PERF client apply_ms={} panes={}",
+                                apply_elapsed.as_millis(),
+                                screens.len(),
+                            );
+                        }
                         for pane_id in resync {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
                         }
@@ -201,18 +210,23 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         }
         if dirty {
             if let Some(tui) = tui.as_ref() {
+                let draw_started = Instant::now();
                 terminal.draw(|frame| {
                     let viewport_screens = screens
                         .iter()
                         .filter_map(|(pane_id, screen)| {
                             screen.screen().map(|screen| {
-                                let screen = local_history
-                                    .get(pane_id)
-                                    .filter(|history| !history.rows.is_empty())
-                                    .map_or_else(
-                                        || screen.clone(),
-                                        |history| history.viewport(screen),
-                                    );
+                                let screen = if tui.pane_scrollback_offset(*pane_id) == 0 {
+                                    screen.clone()
+                                } else {
+                                    local_history
+                                        .get(pane_id)
+                                        .filter(|history| !history.rows.is_empty())
+                                        .map_or_else(
+                                            || screen.clone(),
+                                            |history| history.viewport(screen),
+                                        )
+                                };
                                 (*pane_id, screen)
                             })
                         })
@@ -223,6 +237,14 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         .collect();
                     render_multi_pane_with_copy_feedback(frame, tui, &visible, copied_lines);
                 })?;
+                let draw_elapsed = draw_started.elapsed();
+                if perf_enabled() && draw_elapsed >= Duration::from_millis(5) {
+                    eprintln!(
+                        "P2PMUX_PERF client draw_ms={} panes={}",
+                        draw_elapsed.as_millis(),
+                        screens.len(),
+                    );
+                }
             }
             dirty = false;
         }
@@ -363,6 +385,10 @@ fn refresh_tui_timers(
         dirty = true;
     }
     dirty
+}
+
+fn perf_enabled() -> bool {
+    std::env::var_os("P2PMUX_PERF").is_some_and(|value| value == "1")
 }
 
 fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
@@ -717,7 +743,7 @@ mod tests {
 
     use crate::{
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
-        local_ipc::{AgentOverlaySnapshotRow, LocalHistorySnapshot},
+        local_ipc::{AgentOverlaySnapshotRow, LocalHistorySnapshot, PaneScreenSnapshot},
         screen::HostScreen,
         tui::{AGENT_TOGGLE_WINDOW, UiIntent},
     };
@@ -884,6 +910,66 @@ mod tests {
         let mut viewport = history.viewport(host.screen());
         viewport.set_scrollback(history.available_rows());
         assert!(viewport.contents().contains("one"));
+    }
+
+    #[test]
+    fn unchanged_screen_update_preserves_local_history() {
+        let host = HostScreen::new(2, 8).unwrap();
+        let mut tui = None;
+        let mut screens = BTreeMap::new();
+        let mut local_history = BTreeMap::new();
+        let mut pending_focus = None;
+        apply_snapshot(
+            &mut tui,
+            crate::config::UiTheme::default(),
+            &mut screens,
+            &mut local_history,
+            String::from("room"),
+            layout(&[1]),
+            vec![PaneScreenSnapshot {
+                pane_id: 1,
+                state: ScreenUpdate::Snapshot {
+                    sequence: 1,
+                    snapshot: host.current_frame().snapshot.as_ref().to_vec(),
+                    kitty_keyboard_active: false,
+                },
+                local_history: Some(LocalHistorySnapshot {
+                    total_rows: 1,
+                    rows: vec![STANDARD.encode(b"history")],
+                }),
+            }],
+            vec![],
+            vec![],
+            1,
+            1,
+            &mut pending_focus,
+        )
+        .unwrap();
+        assert_eq!(local_history[&1].available_rows(), 1);
+
+        apply_snapshot(
+            &mut tui,
+            crate::config::UiTheme::default(),
+            &mut screens,
+            &mut local_history,
+            String::from("room"),
+            layout(&[1]),
+            vec![PaneScreenSnapshot {
+                pane_id: 1,
+                state: ScreenUpdate::Unchanged {
+                    sequence: 1,
+                    kitty_keyboard_active: false,
+                },
+                local_history: None,
+            }],
+            vec![],
+            vec![],
+            1,
+            1,
+            &mut pending_focus,
+        )
+        .unwrap();
+        assert_eq!(local_history[&1].available_rows(), 1);
     }
 
     #[test]

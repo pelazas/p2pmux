@@ -78,12 +78,9 @@ use crate::{
 pub(crate) enum NodeScreenSnapshot {
     Local {
         frame: ScreenFrame,
-        history_total_rows: usize,
-        history_rows: Vec<Vec<u8>>,
     },
     Remote {
         sequence: u64,
-        snapshot: Vec<u8>,
         kitty_keyboard_active: bool,
     },
 }
@@ -4055,14 +4052,10 @@ impl SharedLayoutRuntime {
         let mut screens = BTreeMap::new();
         let mut chrome = BTreeMap::new();
         for (pane_id, pane) in &self.local {
-            let (history_total_rows, history_rows) =
-                pane.screen.visual_scrollback(1_000, 256 * 1024);
             screens.insert(
                 *pane_id,
                 NodeScreenSnapshot::Local {
                     frame: pane.screen.current_frame().clone(),
-                    history_total_rows,
-                    history_rows,
                 },
             );
             let view = pane.view_state();
@@ -4072,14 +4065,11 @@ impl SharedLayoutRuntime {
             );
         }
         for (pane_id, pane) in &self.remote {
-            if let Some(screen) = pane.screen.screen()
-                && let Ok(snapshot) = crate::screen::snapshot_payload(screen)
-            {
+            if pane.screen.screen().is_some() {
                 screens.insert(
                     *pane_id,
                     NodeScreenSnapshot::Remote {
                         sequence: pane.screen.sequence().unwrap_or(1),
-                        snapshot: snapshot.as_ref().to_vec(),
                         kitty_keyboard_active: pane.screen.kitty_keyboard_active(),
                     },
                 );
@@ -4099,6 +4089,18 @@ impl SharedLayoutRuntime {
                 .map(AgentOverlaySnapshotRow::from)
                 .collect(),
         )
+    }
+
+    pub(crate) fn node_local_history(&self, pane_id: PaneId) -> Option<(usize, Vec<Vec<u8>>)> {
+        let pane = self.local.get(&pane_id)?;
+        Some(pane.screen.visual_scrollback(1_000, 256 * 1024))
+    }
+
+    pub(crate) fn node_remote_snapshot(&self, pane_id: PaneId) -> Option<Vec<u8>> {
+        let screen = self.remote.get(&pane_id)?.screen.screen()?;
+        crate::screen::snapshot_payload(screen)
+            .ok()
+            .map(|snapshot| snapshot.as_ref().to_vec())
     }
 
     pub fn node_resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
