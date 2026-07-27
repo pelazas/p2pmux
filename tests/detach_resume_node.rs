@@ -177,7 +177,7 @@ fn run_detach_resume_round_trip(
         },
     );
     let updated = receive_until_screen_update(&mut reader, 1, "snapshot after input");
-    let NodeMessage::Snapshot { screens, .. } = updated else {
+    let NodeMessage::Screens { screens } = updated else {
         unreachable!()
     };
     assert!(
@@ -268,7 +268,7 @@ fn receive_until_screen_update(
         let message = receive_until_deadline(reader, deadline, phase);
         if matches!(
             &message,
-            NodeMessage::Snapshot { screens, .. }
+            NodeMessage::Screens { screens }
                 if screens.iter().any(|frame|
                     frame.pane_id == pane_id
                         && matches!(
