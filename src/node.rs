@@ -41,6 +41,7 @@ use crate::tui::SharedLayoutRuntime;
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
 const ATTACHED_IDLE_BACKOFF: Duration = Duration::from_millis(1);
 const DETACHED_IDLE_BACKOFF: Duration = Duration::from_millis(16);
+const SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 
 pub struct SharedLayoutNode {
     runtime: SharedLayoutRuntime,
@@ -295,6 +296,7 @@ fn run_socket_loop(
         let mut drain_elapsed = drain_started.elapsed();
         did_work |= changed;
         let mut detached = false;
+        let mut full_snapshot = false;
         if !shutdown && let Some((reader, generation, publish)) = client.as_mut() {
             match read_message(reader) {
                 Ok(Some(ClientMessage::Input { bytes })) => {
@@ -318,7 +320,9 @@ fn run_socket_loop(
                 }
                 Ok(Some(ClientMessage::ResyncScreen { pane_id })) => {
                     publish.screen_sequences.remove(&pane_id);
+                    publish.force_screens = true;
                     changed = true;
+                    full_snapshot = true;
                 }
                 Ok(Some(ClientMessage::Focus { tab_id, pane_id })) => {
                     node.focus(tab_id, pane_id)
@@ -375,7 +379,19 @@ fn run_socket_loop(
             }
             did_work |= changed;
             if !detached {
-                match write_updates(reader.get_mut(), node, publish, drain_elapsed) {
+                let result = if full_snapshot {
+                    write_snapshot(reader.get_mut(), descriptor, node, publish, drain_elapsed)
+                        .map(|()| true)
+                } else {
+                    write_updates(
+                        reader.get_mut(),
+                        node,
+                        publish,
+                        drain_elapsed,
+                        Instant::now(),
+                    )
+                };
+                match result {
                     Ok(published) => did_work |= published,
                     Err(error) => {
                         eprintln!("p2pmux node: failed to write local update: {error}");
@@ -520,6 +536,8 @@ fn write_snapshot(
     publish.rosters = Some(rosters);
     publish.focus = Some((tab_id, pane_id));
     update_screen_sequences(&mut publish.screen_sequences, &screens);
+    publish.last_screen_publish = Some(Instant::now());
+    publish.force_screens = false;
     if crate::perf::enabled()
         && [
             drain_elapsed,
@@ -559,6 +577,9 @@ struct AttachmentPublishState {
     rosters: Option<Vec<AgentOverlaySnapshotRow>>,
     focus: Option<(u64, u64)>,
     screen_sequences: BTreeMap<u64, u64>,
+    last_screen_publish: Option<Instant>,
+    pending_screens: bool,
+    force_screens: bool,
 }
 
 fn write_updates(
@@ -566,6 +587,7 @@ fn write_updates(
     node: &SharedLayoutNode,
     publish: &mut AttachmentPublishState,
     _drain_elapsed: Duration,
+    now: Instant,
 ) -> io::Result<bool> {
     let (layout, screens, leases, rosters) = node.snapshot();
     let leases = leases
@@ -583,9 +605,12 @@ fn write_updates(
     let layout_changed = publish.layout.as_ref() != Some(&layout);
     let mut published = false;
     if layout_changed {
-        write_message(stream, &NodeMessage::Layout {
-            layout: Box::new(layout.clone()),
-        })?;
+        write_message(
+            stream,
+            &NodeMessage::Layout {
+                layout: Box::new(layout.clone()),
+            },
+        )?;
         publish.layout = Some(layout.clone());
         publish
             .screen_sequences
@@ -593,16 +618,22 @@ fn write_updates(
         published = true;
     }
     if publish.leases.as_ref() != Some(&leases) {
-        write_message(stream, &NodeMessage::Leases {
-            leases: leases.clone(),
-        })?;
+        write_message(
+            stream,
+            &NodeMessage::Leases {
+                leases: leases.clone(),
+            },
+        )?;
         publish.leases = Some(leases);
         published = true;
     }
     if publish.rosters.as_ref() != Some(&rosters) {
-        write_message(stream, &NodeMessage::Rosters {
-            rosters: rosters.clone(),
-        })?;
+        write_message(
+            stream,
+            &NodeMessage::Rosters {
+                rosters: rosters.clone(),
+            },
+        )?;
         publish.rosters = Some(rosters);
         published = true;
     }
@@ -630,13 +661,33 @@ fn write_updates(
         |pane_id| node.node_remote_snapshot(pane_id),
     );
     if frames.is_empty() {
+        publish.pending_screens = false;
+        publish.force_screens = false;
         return Ok(published);
     }
-    write_message(stream, &NodeMessage::Screens {
-        screens: frames.clone(),
-    })?;
+    if !screens_due(publish, published, now) {
+        publish.pending_screens = true;
+        return Ok(published);
+    }
+    write_message(
+        stream,
+        &NodeMessage::Screens {
+            screens: frames.clone(),
+        },
+    )?;
     update_screen_sequences(&mut publish.screen_sequences, &frames);
+    publish.last_screen_publish = Some(now);
+    publish.pending_screens = false;
+    publish.force_screens = false;
     Ok(true)
+}
+
+fn screens_due(publish: &AttachmentPublishState, structural: bool, now: Instant) -> bool {
+    structural
+        || publish.force_screens
+        || publish
+            .last_screen_publish
+            .is_none_or(|last| now.duration_since(last) >= SCREEN_PUBLISH_INTERVAL)
 }
 
 fn pane_screen_updates<LocalHistory, RemoteSnapshot>(
@@ -862,6 +913,24 @@ mod tests {
             Some(Duration::from_millis(16))
         );
         assert!(FIRST_MESSAGE_TIMEOUT <= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn screen_publishes_are_throttled_but_structural_and_resync_are_immediate() {
+        let now = Instant::now();
+        let mut publish = AttachmentPublishState {
+            last_screen_publish: Some(now),
+            ..Default::default()
+        };
+        assert!(!screens_due(
+            &publish,
+            false,
+            now + SCREEN_PUBLISH_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(screens_due(&publish, false, now + SCREEN_PUBLISH_INTERVAL));
+        assert!(screens_due(&publish, true, now + Duration::from_millis(1)));
+        publish.force_screens = true;
+        assert!(screens_due(&publish, false, now + Duration::from_millis(1)));
     }
 
     #[test]
