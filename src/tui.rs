@@ -301,6 +301,12 @@ pub enum KeyHandling {
     Quit,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MouseHandling {
+    pub intents: Vec<UiIntent>,
+    pub copy_selection_requested: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentOverlayRow {
     pub pane_id: PaneId,
@@ -814,6 +820,15 @@ impl MultiPaneTui {
         self.selection.filter(|selection| !selection.is_empty())
     }
 
+    pub(crate) fn selection_pane(&self) -> Option<PaneId> {
+        self.selection().map(|selection| selection.pane_id)
+    }
+
+    pub(crate) fn selected_text(&self, screen: &vt100::Screen) -> Option<String> {
+        self.selection()
+            .and_then(|selection| selection_text(screen, selection))
+    }
+
     fn screen_cell_at(&self, column: u16, row: u16, area: Rect) -> Option<(PaneId, ScreenCell)> {
         let geometry = self.geometry(area);
         let (pane_id, pane_rect) = geometry.panes.iter().find_map(|(pane_id, rect)| {
@@ -833,6 +848,10 @@ impl MultiPaneTui {
         self.pane_views
             .get(&pane_id)
             .map_or(0, |view| view.scrollback)
+    }
+
+    pub(crate) fn pane_scrollback_offset(&self, pane_id: PaneId) -> usize {
+        self.scrollback_offset(pane_id)
     }
 
     fn pane_at_or_focused(&self, column: u16, row: u16, area: Rect) -> PaneId {
@@ -1187,48 +1206,59 @@ impl MultiPaneTui {
         &mut self,
         mouse: crossterm::event::MouseEvent,
         area: Rect,
-    ) -> Vec<UiIntent> {
+    ) -> MouseHandling {
         if matches!(self.modal, ModalState::Rename(_)) {
-            return Vec::new();
+            return MouseHandling::default();
         }
         match mouse.kind {
             MouseEventKind::Moved if !self.overlay_open() => {
                 self.hover_pane_at(mouse.column, mouse.row, area);
-                Vec::new()
+                MouseHandling::default()
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.overlay_open() {
-                    return self.handle_agent_overlay_click(mouse.column, mouse.row, area);
+                    return MouseHandling {
+                        intents: self.handle_agent_overlay_click(mouse.column, mouse.row, area),
+                        copy_selection_requested: false,
+                    };
                 }
                 self.clear_selection();
                 if self.begin_resize_drag(mouse.column, mouse.row, area) {
-                    return Vec::new();
+                    return MouseHandling::default();
                 }
                 if let Some(intent) = self.switch_tab_at(mouse.column, mouse.row, area) {
-                    return vec![intent];
+                    return MouseHandling {
+                        intents: vec![intent],
+                        copy_selection_requested: false,
+                    };
                 }
                 let changed = self.focus_pane_at(mouse.column, mouse.row, area);
                 self.begin_selection_at(mouse.column, mouse.row, area);
-                changed
-                    .then_some(UiIntent::FocusPane {
-                        pane_id: self.focused_pane,
-                    })
-                    .into_iter()
-                    .collect()
+                MouseHandling {
+                    intents: changed
+                        .then_some(UiIntent::FocusPane {
+                            pane_id: self.focused_pane,
+                        })
+                        .into_iter()
+                        .collect(),
+                    copy_selection_requested: false,
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if !self.extend_resize_drag(mouse.column, mouse.row) {
                     self.extend_selection_at(mouse.column, mouse.row, area);
                 }
-                Vec::new()
+                MouseHandling::default()
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.end_selection_drag();
-                self.end_resize_drag(mouse.column, mouse.row)
-                    .into_iter()
-                    .collect()
+                let resize_intent = self.end_resize_drag(mouse.column, mouse.row);
+                MouseHandling {
+                    copy_selection_requested: resize_intent.is_none() && self.selection().is_some(),
+                    intents: resize_intent.into_iter().collect(),
+                }
             }
-            _ => Vec::new(),
+            _ => MouseHandling::default(),
         }
     }
 
@@ -2172,6 +2202,11 @@ fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Optio
     Some(lines.join("\n"))
 }
 
+pub(crate) fn copy_selection_to_clipboard(text: &str) -> io::Result<usize> {
+    copy_to_macos_clipboard(text)?;
+    Ok(copied_line_count(text))
+}
+
 fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
     let mut stdin = child
@@ -2198,6 +2233,16 @@ pub fn render_multi_pane(
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
     render_shared_multi_pane(frame, tui, screens, "", None, None, None);
+}
+
+/// Renders the local attachment footer with its own copy feedback.
+pub fn render_multi_pane_with_copy_feedback(
+    frame: &mut Frame<'_>,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
+    copied_lines: Option<usize>,
+) {
+    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, None);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -4047,9 +4092,11 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
                 {
-                    if let Some(intent) = self.tui.end_resize_drag(mouse.column, mouse.row) {
+                    let handling = self.tui.handle_mouse(mouse, Rect::new(0, 0, cols, rows));
+                    for intent in handling.intents {
                         self.handle_intent(intent)?;
-                    } else if self.tui.end_selection_drag() {
+                    }
+                    if handling.copy_selection_requested {
                         self.copy_selection_to_clipboard();
                     }
                     dirty = true;
@@ -4124,10 +4171,10 @@ impl SharedLayoutRuntime {
         let Some(text) = text else {
             return;
         };
-        match copy_to_macos_clipboard(&text) {
-            Ok(()) => {
+        match copy_selection_to_clipboard(&text) {
+            Ok(lines) => {
                 self.status.clear();
-                self.copied_lines = Some(copied_line_count(&text));
+                self.copied_lines = Some(lines);
             }
             Err(error) => {
                 self.copied_lines = None;
@@ -5640,7 +5687,9 @@ mod tests {
     };
     use tokio::sync::{mpsc, watch};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    };
     use portable_pty::PtySize;
     use ratatui::{
         Terminal,
@@ -6889,6 +6938,63 @@ mod tests {
         assert!(tui.extend_selection_at(3, 3, area));
         assert!(tui.end_selection_drag());
         assert!(tui.selection().is_some());
+    }
+
+    #[test]
+    fn mouse_up_requests_copy_only_for_a_nonempty_selection_without_resize_commit() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(tui.handle_mouse(down, area).intents.is_empty());
+        tui.handle_mouse(drag, area);
+        let handling = tui.handle_mouse(up, area);
+        assert!(handling.intents.is_empty());
+        assert!(handling.copy_selection_requested);
+
+        let resize_down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let resize_drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 49,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let resize_up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 49,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        tui.handle_mouse(resize_down, area);
+        tui.handle_mouse(resize_drag, area);
+        let handling = tui.handle_mouse(resize_up, area);
+        assert!(matches!(
+            handling.intents.as_slice(),
+            [UiIntent::SetSplitRatio { .. }]
+        ));
+        assert!(!handling.copy_selection_requested);
     }
 
     #[test]

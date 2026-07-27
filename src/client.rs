@@ -14,8 +14,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
@@ -29,7 +29,7 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneViewState, render_multi_pane,
+        PaneViewState, copy_selection_to_clipboard, render_multi_pane_with_copy_feedback,
     },
 };
 
@@ -76,6 +76,22 @@ impl LocalHistory {
     }
 }
 
+fn copy_attach_selection(
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+    local_history: &BTreeMap<u64, LocalHistory>,
+) -> Option<usize> {
+    let pane_id = tui.selection_pane()?;
+    let live = screens.get(&pane_id)?.screen()?;
+    let mut viewport = local_history
+        .get(&pane_id)
+        .filter(|history| !history.rows.is_empty())
+        .map_or_else(|| live.clone(), |history| history.viewport(live));
+    viewport.set_scrollback(tui.pane_scrollback_offset(pane_id));
+    let text = tui.selected_text(&viewport)?;
+    copy_selection_to_clipboard(&text).ok()
+}
+
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::config::config_path()?;
     let theme = crate::config::load_config_from(&config_path)
@@ -115,6 +131,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut tui = None;
     let mut screens = BTreeMap::new();
     let mut local_history = BTreeMap::new();
+    let mut copied_lines = None;
     let mut dirty = false;
     let mut node_ended = false;
     let mut attach_error = None;
@@ -204,7 +221,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         .iter()
                         .map(|(pane_id, screen)| (*pane_id, screen))
                         .collect();
-                    render_multi_pane(frame, tui, &visible);
+                    render_multi_pane_with_copy_feedback(frame, tui, &visible, copied_lines);
                 })?;
             }
             dirty = false;
@@ -263,8 +280,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             matches!(mouse.kind, MouseEventKind::ScrollUp),
                         );
                     } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                        let intents = tui.handle_mouse(mouse, area);
-                        send_intents(&mut stream, tui, intents, &mut pending_focus)?;
+                        let handling = tui.handle_mouse(mouse, area);
+                        send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     }
                 } else if matches!(
                     mouse.kind,
@@ -289,8 +306,14 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         matches!(mouse.kind, MouseEventKind::ScrollUp),
                     );
                 } else {
-                    let intents = tui.handle_mouse(mouse, area);
-                    send_intents(&mut stream, tui, intents, &mut pending_focus)?;
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        copied_lines = None;
+                    }
+                    let handling = tui.handle_mouse(mouse, area);
+                    send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
+                    if handling.copy_selection_requested {
+                        copied_lines = copy_attach_selection(tui, &screens, &local_history);
+                    }
                 }
                 dirty = true;
             }
