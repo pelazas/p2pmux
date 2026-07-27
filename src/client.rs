@@ -13,7 +13,8 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
@@ -500,40 +501,56 @@ fn available_scrollback(screen: &vt100::Screen) -> usize {
 }
 
 struct ClientTerminalGuard {
+    stdout: io::Stdout,
     raw: bool,
+    keyboard_enhancement: bool,
     alternate: bool,
     paste: bool,
     mouse: bool,
 }
 impl ClientTerminalGuard {
     fn enter(name: &str) -> io::Result<Self> {
+        let mut guard = Self {
+            stdout: io::stdout(),
+            raw: false,
+            keyboard_enhancement: false,
+            alternate: false,
+            paste: false,
+            mouse: false,
+        };
         terminal::enable_raw_mode()?;
+        guard.raw = true;
         execute!(
-            io::stdout(),
-            SetTitle(format!("p2pmux ({name})")),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture,
+            guard.stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         )?;
-        Ok(Self {
-            raw: true,
-            alternate: true,
-            paste: true,
-            mouse: true,
-        })
+        guard.keyboard_enhancement = true;
+        execute!(guard.stdout, SetTitle(format!("p2pmux ({name})")))?;
+        execute!(guard.stdout, EnterAlternateScreen)?;
+        guard.alternate = true;
+        execute!(guard.stdout, EnableBracketedPaste)?;
+        guard.paste = true;
+        execute!(guard.stdout, EnableMouseCapture)?;
+        guard.mouse = true;
+        Ok(guard)
     }
     fn leave(&mut self) -> io::Result<()> {
         if self.mouse {
-            execute!(io::stdout(), DisableMouseCapture)?;
+            execute!(self.stdout, DisableMouseCapture)?;
             self.mouse = false;
         }
         if self.paste {
-            execute!(io::stdout(), DisableBracketedPaste)?;
+            execute!(self.stdout, DisableBracketedPaste)?;
             self.paste = false;
         }
         if self.alternate {
-            execute!(io::stdout(), LeaveAlternateScreen)?;
+            execute!(self.stdout, LeaveAlternateScreen)?;
             self.alternate = false;
+        }
+        if self.keyboard_enhancement {
+            execute!(self.stdout, PopKeyboardEnhancementFlags)?;
+            self.stdout.flush()?;
+            self.keyboard_enhancement = false;
         }
         if self.raw {
             terminal::disable_raw_mode()?;
