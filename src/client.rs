@@ -535,11 +535,6 @@ impl ClientTerminalGuard {
         };
         terminal::enable_raw_mode()?;
         guard.raw = true;
-        execute!(
-            guard.stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        )?;
-        guard.keyboard_enhancement = true;
         execute!(guard.stdout, SetTitle(format!("p2pmux ({name})")))?;
         execute!(guard.stdout, EnterAlternateScreen)?;
         guard.alternate = true;
@@ -547,6 +542,11 @@ impl ClientTerminalGuard {
         guard.paste = true;
         execute!(guard.stdout, EnableMouseCapture)?;
         guard.mouse = true;
+        execute!(
+            guard.stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        )?;
+        guard.keyboard_enhancement = true;
         Ok(guard)
     }
     fn leave(&mut self) -> io::Result<()> {
