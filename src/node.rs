@@ -294,9 +294,13 @@ fn run_socket_loop(
         let mut detached = false;
         if !shutdown && let Some((reader, generation, screen_sequences)) = client.as_mut() {
             match read_message(reader) {
-                Ok(Some(ClientMessage::Input { bytes })) => node
-                    .input(bytes)
-                    .map_err(|error| io::Error::other(error.to_string()))?,
+                Ok(Some(ClientMessage::Input { bytes })) => {
+                    node.input(bytes)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    changed |= node
+                        .drain()
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
                 Ok(Some(ClientMessage::StructuralIntent { intent })) => {
                     node.intent(intent)
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -364,6 +368,7 @@ fn run_socket_loop(
                 Ok(None) => detached = true,
                 Err(_) => detached = true,
             }
+            did_work |= changed;
             if changed
                 && !detached
                 && let Err(error) =

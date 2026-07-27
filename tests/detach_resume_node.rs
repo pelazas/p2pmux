@@ -176,7 +176,7 @@ fn run_detach_resume_round_trip(
             bytes: b"printf p2pmux-detach-roundtrip\\r".to_vec(),
         },
     );
-    let updated = receive_until_snapshot(&mut reader, "snapshot after input");
+    let updated = receive_until_screen_update(&mut reader, 1, "snapshot after input");
     let NodeMessage::Snapshot { screens, .. } = updated else {
         unreachable!()
     };
@@ -255,6 +255,34 @@ fn receive_until_snapshot(reader: &mut BufReader<UnixStream>, phase: &str) -> No
             return message;
         }
         assert!(Instant::now() < deadline, "timed out waiting for snapshot");
+    }
+}
+
+fn receive_until_screen_update(
+    reader: &mut BufReader<UnixStream>,
+    pane_id: u64,
+    phase: &str,
+) -> NodeMessage {
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    loop {
+        let message = receive_until_deadline(reader, deadline, phase);
+        if matches!(
+            &message,
+            NodeMessage::Snapshot { screens, .. }
+                if screens.iter().any(|frame|
+                    frame.pane_id == pane_id
+                        && matches!(
+                            frame.state,
+                            ScreenUpdate::Snapshot { .. } | ScreenUpdate::Delta { .. }
+                        )
+                )
+        ) {
+            return message;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for screen update"
+        );
     }
 }
 
