@@ -22,9 +22,9 @@ use crossterm::{
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 
 use crate::{
-    local_ipc::{ClientMessage, NodeMessage},
+    local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
     protocol::AgentRosterState,
-    screen::GuestScreen,
+    screen::{ApplyDelta, GuestScreen},
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
@@ -94,7 +94,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         ..
                     } = *message
                     {
-                        apply_snapshot(
+                        let resync = apply_snapshot(
                             &mut tui,
                             theme,
                             &mut screens,
@@ -107,6 +107,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             pane_id,
                             &mut pending_focus,
                         )?;
+                        for pane_id in resync {
+                            write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
+                        }
                         local_peer_id = next_local_peer_id;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
@@ -295,7 +298,7 @@ fn apply_snapshot(
     tab_id: u64,
     pane_id: u64,
     pending_focus: &mut Option<(u64, u64)>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let view = match tui {
         Some(view) => {
             view.apply_snapshot(layout)
@@ -309,10 +312,32 @@ fn apply_snapshot(
     };
     view.set_title(format!("p2pmux ({room_name})"));
     screens.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
+    let mut resync = Vec::new();
     for frame in next_screens {
         let screen = screens.entry(frame.pane_id).or_default();
-        screen.apply_snapshot(frame.sequence, &frame.snapshot)?;
-        screen.set_kitty_keyboard_active(frame.kitty_keyboard_active);
+        match frame.state {
+            ScreenUpdate::Snapshot {
+                sequence,
+                snapshot,
+                kitty_keyboard_active,
+            } => {
+                screen.apply_snapshot(sequence, &snapshot)?;
+                screen.set_kitty_keyboard_active(kitty_keyboard_active);
+            }
+            ScreenUpdate::Delta {
+                base_sequence,
+                sequence,
+                delta,
+                kitty_keyboard_active,
+            } => match screen.apply_delta(base_sequence, sequence, &delta) {
+                Ok(ApplyDelta::Applied) => screen.set_kitty_keyboard_active(kitty_keyboard_active),
+                Ok(ApplyDelta::NeedsSnapshot) | Err(_) => resync.push(frame.pane_id),
+            },
+            ScreenUpdate::Unchanged {
+                sequence: _,
+                kitty_keyboard_active,
+            } => screen.set_kitty_keyboard_active(kitty_keyboard_active),
+        }
     }
     for lease in leases {
         view.set_pane_view(
@@ -345,7 +370,7 @@ fn apply_snapshot(
             .collect(),
     );
     reconcile_snapshot_focus(view, pending_focus, tab_id, pane_id)?;
-    Ok(())
+    Ok(resync)
 }
 
 fn reconcile_snapshot_focus(

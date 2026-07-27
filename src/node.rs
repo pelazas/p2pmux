@@ -5,6 +5,7 @@
 //! only component allowed to render a terminal.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fs,
     io::{self, BufRead, BufReader, Write},
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
-        PaneScreenSnapshot, SessionSummary,
+        PaneScreenSnapshot, ScreenUpdate, SessionSummary,
     },
     rendezvous::LocalRendezvous,
     session::{
@@ -191,7 +192,7 @@ fn run_socket_loop(
     descriptor: &SessionDescriptor,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
-    let mut client: Option<(BufReader<UnixStream>, u64)> = None;
+    let mut client: Option<(BufReader<UnixStream>, u64, BTreeMap<u64, u64>)> = None;
     loop {
         let mut shutdown = false;
         loop {
@@ -220,18 +221,24 @@ fn run_socket_loop(
                             if let Ok(generation) = gate.attach() {
                                 node.resize(cols, rows)
                                     .map_err(|error| io::Error::other(error.to_string()))?;
+                                let mut screen_sequences = BTreeMap::new();
                                 match write_message(
                                     reader.get_mut(),
                                     &NodeMessage::AttachAccepted { generation },
                                 )
                                 .and_then(|()| {
-                                    write_snapshot(reader.get_mut(), descriptor, node, generation)
+                                    write_snapshot(
+                                        reader.get_mut(),
+                                        descriptor,
+                                        node,
+                                        &mut screen_sequences,
+                                    )
                                 }) {
                                     Ok(()) => {
                                         reader
                                             .get_mut()
                                             .set_read_timeout(Some(Duration::from_millis(1)))?;
-                                        client = Some((reader, generation));
+                                        client = Some((reader, generation, screen_sequences));
                                     }
                                     Err(error) => {
                                         eprintln!(
@@ -277,7 +284,7 @@ fn run_socket_loop(
             .drain()
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut detached = false;
-        if !shutdown && let Some((reader, generation)) = client.as_mut() {
+        if !shutdown && let Some((reader, generation, screen_sequences)) = client.as_mut() {
             match read_message(reader) {
                 Ok(Some(ClientMessage::Input { bytes })) => node
                     .input(bytes)
@@ -290,6 +297,10 @@ fn run_socket_loop(
                 Ok(Some(ClientMessage::Resize { cols, rows })) => {
                     node.resize(cols, rows)
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    changed = true;
+                }
+                Ok(Some(ClientMessage::ResyncScreen { pane_id })) => {
+                    screen_sequences.remove(&pane_id);
                     changed = true;
                 }
                 Ok(Some(ClientMessage::Focus { tab_id, pane_id })) => {
@@ -347,14 +358,15 @@ fn run_socket_loop(
             }
             if changed
                 && !detached
-                && let Err(error) = write_snapshot(reader.get_mut(), descriptor, node, *generation)
+                && let Err(error) =
+                    write_snapshot(reader.get_mut(), descriptor, node, screen_sequences)
             {
                 eprintln!("p2pmux node: failed to write local snapshot: {error}");
                 detached = true;
             }
         }
         if (detached || shutdown)
-            && let Some((mut reader, generation)) = client.take()
+            && let Some((mut reader, generation, _)) = client.take()
         {
             let _ = reader.get_mut().shutdown(Shutdown::Both);
             let _ = gate.detach(generation);
@@ -388,7 +400,7 @@ fn write_snapshot(
     stream: &mut UnixStream,
     descriptor: &SessionDescriptor,
     node: &SharedLayoutNode,
-    _generation: u64,
+    screen_sequences: &mut BTreeMap<u64, u64>,
 ) -> io::Result<()> {
     let (tab_id, pane_id) = node.local_focus();
     let local_peer_id = node.local_peer_id();
@@ -420,17 +432,7 @@ fn write_snapshot(
                 coordinator_name,
             },
             layout: Box::new(layout),
-            screens: screens
-                .into_iter()
-                .map(
-                    |(pane_id, (sequence, snapshot, kitty_keyboard_active))| PaneScreenSnapshot {
-                        pane_id,
-                        sequence,
-                        snapshot,
-                        kitty_keyboard_active,
-                    },
-                )
-                .collect(),
+            screens: pane_screen_updates(screens, screen_sequences),
             leases: leases
                 .into_iter()
                 .map(
@@ -448,6 +450,63 @@ fn write_snapshot(
             pane_id,
         },
     )
+}
+
+fn pane_screen_updates(
+    screens: crate::tui::NodeScreenSnapshots,
+    sequences: &mut BTreeMap<u64, u64>,
+) -> Vec<PaneScreenSnapshot> {
+    sequences.retain(|pane_id, _| screens.contains_key(pane_id));
+    screens
+        .into_iter()
+        .map(|(pane_id, screen)| {
+            let (sequence, state) = match screen {
+                crate::tui::NodeScreenSnapshot::Local(frame) => {
+                    let state = if sequences.get(&pane_id) == Some(&frame.sequence) {
+                        ScreenUpdate::Unchanged {
+                            sequence: frame.sequence,
+                            kitty_keyboard_active: frame.kitty_keyboard_active,
+                        }
+                    } else if sequences.get(&pane_id) == Some(&frame.base_sequence) {
+                        ScreenUpdate::Delta {
+                            base_sequence: frame.base_sequence,
+                            sequence: frame.sequence,
+                            delta: frame.delta.as_ref().to_vec(),
+                            kitty_keyboard_active: frame.kitty_keyboard_active,
+                        }
+                    } else {
+                        ScreenUpdate::Snapshot {
+                            sequence: frame.sequence,
+                            snapshot: frame.snapshot.as_ref().to_vec(),
+                            kitty_keyboard_active: frame.kitty_keyboard_active,
+                        }
+                    };
+                    (frame.sequence, state)
+                }
+                crate::tui::NodeScreenSnapshot::Remote {
+                    sequence,
+                    snapshot,
+                    kitty_keyboard_active,
+                } => {
+                    let state = if sequences.get(&pane_id) == Some(&sequence) {
+                        ScreenUpdate::Unchanged {
+                            sequence,
+                            kitty_keyboard_active,
+                        }
+                    } else {
+                        ScreenUpdate::Snapshot {
+                            sequence,
+                            snapshot,
+                            kitty_keyboard_active,
+                        }
+                    };
+                    (sequence, state)
+                }
+            };
+            sequences.insert(pane_id, sequence);
+            PaneScreenSnapshot { pane_id, state }
+        })
+        .collect()
 }
 
 impl SharedLayoutNode {
@@ -473,7 +532,7 @@ impl SharedLayoutNode {
     pub fn local_focus(&self) -> (u64, u64) {
         self.runtime.local_focus()
     }
-    pub fn snapshot(
+    pub(crate) fn snapshot(
         &self,
     ) -> (
         crate::layout::LayoutSnapshot,
@@ -502,6 +561,7 @@ mod tests {
     use super::*;
     use crate::{
         layout::{Axis, Node, Pane},
+        screen::HostScreen,
         session::{HostSession, SharedLayoutHost, layout_snapshot_from_state},
         tui::SharedLocalPane,
     };
@@ -537,6 +597,41 @@ mod tests {
             read_message(&mut reader).unwrap(),
             Some(ClientMessage::Detach { generation: 7 })
         ));
+    }
+
+    #[test]
+    fn local_screen_updates_use_snapshot_delta_and_unchanged() {
+        let mut screen = HostScreen::new(1, 3).unwrap();
+        let mut sequences = BTreeMap::new();
+        let initial = BTreeMap::from([(
+            1,
+            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+        )]);
+        let updates = pane_screen_updates(initial, &mut sequences);
+        assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
+
+        screen.process_pty(b"a").unwrap();
+        let changed = BTreeMap::from([(
+            1,
+            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+        )]);
+        let updates = pane_screen_updates(changed, &mut sequences);
+        assert!(matches!(updates[0].state, ScreenUpdate::Delta { .. }));
+
+        let unchanged = BTreeMap::from([(
+            1,
+            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+        )]);
+        let updates = pane_screen_updates(unchanged, &mut sequences);
+        assert!(matches!(updates[0].state, ScreenUpdate::Unchanged { .. }));
+
+        screen.resize(2, 3).unwrap();
+        let resized = BTreeMap::from([(
+            1,
+            crate::tui::NodeScreenSnapshot::Local(screen.current_frame().clone()),
+        )]);
+        let updates = pane_screen_updates(resized, &mut sequences);
+        assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -642,9 +737,11 @@ mod tests {
                 }),
                 screens: vec![PaneScreenSnapshot {
                     pane_id: 1,
-                    sequence: 1,
-                    snapshot: vec![b'x'; 256 * 1024],
-                    kitty_keyboard_active: false,
+                    state: ScreenUpdate::Snapshot {
+                        sequence: 1,
+                        snapshot: vec![b'x'; 256 * 1024],
+                        kitty_keyboard_active: false,
+                    },
                 }],
                 leases: vec![],
                 rosters: vec![],
@@ -658,7 +755,10 @@ mod tests {
         let NodeMessage::Snapshot { screens, .. } = client.join().unwrap() else {
             panic!("expected snapshot");
         };
-        assert_eq!(screens[0].snapshot, vec![b'x'; 256 * 1024]);
+        assert!(matches!(
+            &screens[0].state,
+            ScreenUpdate::Snapshot { snapshot, .. } if snapshot == &vec![b'x'; 256 * 1024]
+        ));
         let _ = fs::remove_file(path);
     }
 

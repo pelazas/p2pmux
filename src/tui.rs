@@ -75,7 +75,15 @@ use crate::{
     transport::Transport,
 };
 
-pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, (u64, Vec<u8>, bool)>;
+pub(crate) enum NodeScreenSnapshot {
+    Local(ScreenFrame),
+    Remote {
+        sequence: u64,
+        snapshot: Vec<u8>,
+        kitty_keyboard_active: bool,
+    },
+}
+pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, NodeScreenSnapshot>;
 pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
 
 /// Kept as the module's public marker from the scaffold.
@@ -3727,9 +3735,8 @@ impl SharedLayoutRuntime {
             .is_none_or(|pane| !pane.locked || pane.host_peer_id == peer_id)
     }
 
-    /// A complete node-owned view for a newly attached local renderer. Frames are deliberately
-    /// snapshots: the client can always rebuild a `GuestScreen` without owning a PTY.
-    pub fn node_snapshot(
+    /// A complete node-owned view for a newly attached local renderer.
+    pub(crate) fn node_snapshot(
         &self,
     ) -> (
         LayoutSnapshot,
@@ -3740,14 +3747,9 @@ impl SharedLayoutRuntime {
         let mut screens = BTreeMap::new();
         let mut chrome = BTreeMap::new();
         for (pane_id, pane) in &self.local {
-            let frame = pane.screen.current_frame();
             screens.insert(
                 *pane_id,
-                (
-                    frame.sequence,
-                    frame.snapshot.as_ref().to_vec(),
-                    frame.kitty_keyboard_active,
-                ),
+                NodeScreenSnapshot::Local(pane.screen.current_frame().clone()),
             );
             let view = pane.view_state();
             chrome.insert(
@@ -3761,11 +3763,11 @@ impl SharedLayoutRuntime {
             {
                 screens.insert(
                     *pane_id,
-                    (
-                        pane.screen.sequence().unwrap_or(1),
-                        snapshot.as_ref().to_vec(),
-                        pane.screen.kitty_keyboard_active(),
-                    ),
+                    NodeScreenSnapshot::Remote {
+                        sequence: pane.screen.sequence().unwrap_or(1),
+                        snapshot: snapshot.as_ref().to_vec(),
+                        kitty_keyboard_active: pane.screen.kitty_keyboard_active(),
+                    },
                 );
             }
             let view = pane.view_state();

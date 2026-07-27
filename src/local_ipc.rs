@@ -25,6 +25,7 @@ pub enum ClientMessage {
     Input { bytes: Vec<u8> },
     StructuralIntent { intent: UiIntent },
     Resize { cols: u16, rows: u16 },
+    ResyncScreen { pane_id: u64 },
     Focus { tab_id: u64, pane_id: u64 },
     Detach { generation: u64 },
     Rename { name: String },
@@ -93,14 +94,31 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
     }
 }
 
-/// Complete screen state for one pane. Attachments replace their local `GuestScreen` from this
-/// payload, so reconnects do not depend on a delta history.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PaneScreenSnapshot {
     pub pane_id: u64,
-    pub sequence: u64,
-    pub snapshot: Vec<u8>,
-    pub kitty_keyboard_active: bool,
+    pub state: ScreenUpdate,
+}
+
+/// The screen state carried inside every local attachment snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreenUpdate {
+    Snapshot {
+        sequence: u64,
+        snapshot: Vec<u8>,
+        kitty_keyboard_active: bool,
+    },
+    Delta {
+        base_sequence: u64,
+        sequence: u64,
+        delta: Vec<u8>,
+        kitty_keyboard_active: bool,
+    },
+    Unchanged {
+        sequence: u64,
+        kitty_keyboard_active: bool,
+    },
 }
 
 /// The subset of a pane lease needed by render chrome; lease authority stays in the node.
