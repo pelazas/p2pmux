@@ -99,6 +99,7 @@ const TAB_BAR_SEPARATOR: &str = " · ";
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const PANE_SCROLL_WHEEL_STEP: usize = 3;
 
 fn unix_ms_now() -> u64 {
     SystemTime::now()
@@ -894,9 +895,11 @@ impl MultiPaneTui {
             return false;
         };
         let scrollback = if up {
-            view.scrollback.saturating_add(1).min(scrollback_len)
+            view.scrollback
+                .saturating_add(PANE_SCROLL_WHEEL_STEP)
+                .min(scrollback_len)
         } else {
-            view.scrollback.saturating_sub(1)
+            view.scrollback.saturating_sub(PANE_SCROLL_WHEEL_STEP)
         };
         if view.scrollback == scrollback {
             return false;
@@ -7792,13 +7795,15 @@ mod tests {
         let pane_id = tui.pane_at_or_focused(60, 17, area);
         assert_eq!(pane_id, 3);
 
-        assert!(tui.scroll_pane(pane_id, 2, true));
-        assert!(tui.scroll_pane(pane_id, 2, true));
-        assert!(!tui.scroll_pane(pane_id, 2, true));
-        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 2);
-        assert!(tui.scroll_pane(pane_id, 2, false));
-        assert!(tui.scroll_pane(pane_id, 2, false));
-        assert!(!tui.scroll_pane(pane_id, 2, false));
+        assert!(tui.scroll_pane(pane_id, 10, true));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 3);
+        assert!(tui.scroll_pane(pane_id, 4, true));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 4);
+        assert!(!tui.scroll_pane(pane_id, 4, true));
+        assert!(tui.scroll_pane(pane_id, 4, false));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 1);
+        assert!(tui.scroll_pane(pane_id, 4, false));
+        assert!(!tui.scroll_pane(pane_id, 4, false));
         assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 0);
     }
 
@@ -7817,7 +7822,7 @@ mod tests {
         assert!(tui.scroll_pane(1, 10, true));
         assert!(tui.scroll_pane(1, 10, true));
         assert!(tui.pin_scrollback_after_output(1, 3, 10));
-        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 5);
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 9);
         tui.reset_scrollback(1);
         assert!(!tui.pin_scrollback_after_output(1, 3, 10));
     }

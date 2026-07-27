@@ -38,6 +38,10 @@ use crate::{
 
 use crate::tui::SharedLayoutRuntime;
 
+const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
+const ATTACHED_IDLE_BACKOFF: Duration = Duration::from_millis(1);
+const DETACHED_IDLE_BACKOFF: Duration = Duration::from_millis(16);
+
 pub struct SharedLayoutNode {
     runtime: SharedLayoutRuntime,
 }
@@ -196,11 +200,12 @@ fn run_socket_loop(
     let mut client: Option<(BufReader<UnixStream>, u64, BTreeMap<u64, u64>)> = None;
     loop {
         let mut shutdown = false;
+        let mut did_work = false;
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                    stream.set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT))?;
                     // Prevent stalled clients from wedging the node on large Snapshot writes.
                     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                     let mut reader = BufReader::new(stream);
@@ -240,6 +245,7 @@ fn run_socket_loop(
                                             .get_mut()
                                             .set_read_timeout(Some(Duration::from_millis(1)))?;
                                         client = Some((reader, generation, screen_sequences));
+                                        did_work = true;
                                     }
                                     Err(error) => {
                                         eprintln!(
@@ -284,12 +290,17 @@ fn run_socket_loop(
         let mut changed = node
             .drain()
             .map_err(|error| io::Error::other(error.to_string()))?;
+        did_work |= changed;
         let mut detached = false;
         if !shutdown && let Some((reader, generation, screen_sequences)) = client.as_mut() {
             match read_message(reader) {
-                Ok(Some(ClientMessage::Input { bytes })) => node
-                    .input(bytes)
-                    .map_err(|error| io::Error::other(error.to_string()))?,
+                Ok(Some(ClientMessage::Input { bytes })) => {
+                    node.input(bytes)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    changed |= node
+                        .drain()
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
                 Ok(Some(ClientMessage::StructuralIntent { intent })) => {
                     node.intent(intent)
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -357,6 +368,7 @@ fn run_socket_loop(
                 Ok(None) => detached = true,
                 Err(_) => detached = true,
             }
+            did_work |= changed;
             if changed
                 && !detached
                 && let Err(error) =
@@ -377,7 +389,18 @@ fn run_socket_loop(
         if shutdown {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(16));
+        match socket_loop_backoff(client.is_some(), did_work) {
+            Some(backoff) => std::thread::sleep(backoff),
+            None => std::thread::yield_now(),
+        }
+    }
+}
+
+fn socket_loop_backoff(client_attached: bool, did_work: bool) -> Option<Duration> {
+    match (client_attached, did_work) {
+        (true, true) => None,
+        (true, false) => Some(ATTACHED_IDLE_BACKOFF),
+        (false, _) => Some(DETACHED_IDLE_BACKOFF),
     }
 }
 
@@ -616,6 +639,20 @@ mod tests {
             read_message(&mut reader).unwrap(),
             Some(ClientMessage::Detach { generation: 7 })
         ));
+    }
+
+    #[test]
+    fn socket_loop_uses_short_attached_backoff() {
+        assert_eq!(socket_loop_backoff(true, true), None);
+        assert_eq!(
+            socket_loop_backoff(true, false),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            socket_loop_backoff(false, false),
+            Some(Duration::from_millis(16))
+        );
+        assert!(FIRST_MESSAGE_TIMEOUT <= Duration::from_millis(5));
     }
 
     #[test]
