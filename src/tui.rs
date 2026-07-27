@@ -5739,11 +5739,12 @@ mod tests {
         HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
         MultiPaneTui, PaneTextSelection, PaneViewState, PendingEscape, RemoteSubscriptionState,
         ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
-        allocate_node_with_preview, area_from_terminal_size, contextual_footer, copied_line_count,
-        encode_key, encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command,
-        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
-        render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
+        allocate_node_with_preview, area_from_terminal_size, chord_footer_badge, contextual_footer,
+        copied_line_count, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
+        is_chord_command, lease_allows_held_input, member_label, mouse_to_screen_cell,
+        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
+        render_guest_screen, render_multi_pane, render_shared_multi_pane, selection_text,
+        text_width, viewed_screen, visible_leaf_panes,
     };
 
     #[test]
@@ -7291,6 +7292,14 @@ mod tests {
             ),
             Color::Rgb(1, 2, 3)
         );
+        assert_eq!(
+            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::Pane,),
+            theme.pane_border_chord_focused
+        );
+        assert_eq!(
+            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::Tab,),
+            theme.pane_border_remote_control
+        );
     }
 
     #[test]
@@ -8019,11 +8028,11 @@ mod tests {
             ),
             (
                 ChordMode::Pane,
-                "Pane  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
+                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
-                "Tab  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
+                "TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
             ),
         ] {
             tui.chord_mode = mode;
@@ -8067,6 +8076,15 @@ mod tests {
             assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
             let (_, segments) = contextual_footer(mode);
             let mut x = 0;
+            if let Some(badge) = chord_footer_badge(mode, 120) {
+                for character in badge.chars() {
+                    assert_eq!(footer[(x, 3)].fg, theme.footer_orange);
+                    assert_eq!(footer[(x, 3)].bg, theme.footer_background);
+                    assert!(footer[(x, 3)].modifier.contains(Modifier::BOLD));
+                    assert_eq!(footer[(x, 3)].symbol(), character.to_string());
+                    x += 1;
+                }
+            }
             for segment in segments {
                 let (text, fg, bg, bold) = match segment {
                     FooterSegment::Text(text) => {
@@ -8091,6 +8109,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chord_footer_badges_fall_back_atomically_on_narrow_terminals() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+
+        for (mode, width, expected) in [
+            (ChordMode::Pane, 9, "PANE MODE"),
+            (ChordMode::Pane, 8, "PANE"),
+            (ChordMode::Pane, 4, "PANE"),
+            (ChordMode::Pane, 3, ""),
+            (ChordMode::Tab, 8, "TAB MODE"),
+            (ChordMode::Tab, 7, "TAB"),
+        ] {
+            let mut tui = tui.clone();
+            tui.chord_mode = mode;
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).expect("test terminal");
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+                .expect("render");
+            let footer = (0..width)
+                .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+                .collect::<String>();
+
+            assert!(
+                footer.starts_with(expected),
+                "mode: {mode:?}, footer: {footer}"
+            );
+            assert!(
+                !footer.starts_with("PANE MO") || footer.starts_with("PANE MODE"),
+                "footer: {footer}"
+            );
+            assert!(
+                !footer.starts_with("TAB MOD") || footer.starts_with("TAB MODE"),
+                "footer: {footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn chord_mode_chrome_switches_and_restores_remote_focused_pane_colors() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState::from_chrome(true, Some(b"guest".to_vec()), true),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("test terminal");
+
+        tui.chord_mode = ChordMode::Pane;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].fg, tui.theme.pane_border_chord_focused);
+        assert_eq!(
+            (0..9).map(|x| buffer[(x, 7)].symbol()).collect::<String>(),
+            "PANE MODE"
+        );
+
+        tui.chord_mode = ChordMode::Tab;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].fg, tui.theme.pane_border_remote_control);
+        assert_eq!(
+            (0..8).map(|x| buffer[(x, 7)].symbol()).collect::<String>(),
+            "TAB MODE"
+        );
+
+        tui.chord_mode = ChordMode::None;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].fg, tui.theme.pane_border_remote_control);
+        assert!(
+            (0..4)
+                .map(|x| buffer[(x, 7)].symbol())
+                .collect::<String>()
+                .starts_with("Ctrl")
+        );
     }
 
     #[test]
@@ -8124,7 +8232,7 @@ mod tests {
 
     #[test]
     fn tab_bar_uses_a_branded_footer_like_strip_and_highlights_the_active_tab() {
-        let tui = MultiPaneTui::new(layout(
+        let mut tui = MultiPaneTui::new(layout(
             vec![
                 Tab {
                     tab_id: 10,
@@ -8159,6 +8267,22 @@ mod tests {
         assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
         assert_eq!(buffer[(20, 0)].fg, Color::White);
         assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
+
+        tui.chord_mode = ChordMode::Tab;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(9, 0)].fg, Color::White);
+        assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(20, 0)].fg, Color::DarkGray);
+        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
+
+        tui.chord_mode = ChordMode::None;
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        assert_eq!(terminal.backend().buffer()[(20, 0)].fg, Color::White);
     }
 
     #[test]
