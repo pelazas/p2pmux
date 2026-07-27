@@ -2540,7 +2540,11 @@ fn render_shared_multi_pane(
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(theme.tab_foreground)
+                    .fg(if tui.chord_mode == ChordMode::Tab {
+                        theme.tab_separator
+                    } else {
+                        theme.tab_foreground
+                    })
                     .bg(theme.footer_background)
             };
             let label = truncate_trailing(
