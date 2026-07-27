@@ -979,7 +979,8 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         | LayoutError::InvalidGrid
         | LayoutError::InvalidSplitRatio
         | LayoutError::AlreadyMember
-        | LayoutError::InvalidSnapshot => LayoutRejectReason::Malformed,
+        | LayoutError::InvalidSnapshot
+        | LayoutError::ConflictingSnapshotRevision { .. } => LayoutRejectReason::Malformed,
     }
 }
 
