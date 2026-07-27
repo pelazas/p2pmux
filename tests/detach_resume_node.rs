@@ -10,7 +10,7 @@ use std::{
 
 use p2pmux::{
     client,
-    local_ipc::{ClientMessage, NodeMessage},
+    local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
     node::{NodeBootstrap, NodeBootstrapKind, write_bootstrap},
     session_store::{SessionDescriptor, SessionRole, SessionStore, generate_id},
 };
@@ -152,7 +152,7 @@ fn run_detach_resume_round_trip(
         screens
             .iter()
             .find(|frame| frame.pane_id == 1)
-            .is_some_and(|frame| !frame.snapshot.is_empty())
+            .is_some_and(|frame| matches!(&frame.state, ScreenUpdate::Snapshot { snapshot, .. } if !snapshot.is_empty()))
     );
     assert!(
         leases
@@ -184,7 +184,10 @@ fn run_detach_resume_round_trip(
         screens
             .iter()
             .find(|frame| frame.pane_id == 1)
-            .is_some_and(|frame| !frame.snapshot.is_empty())
+            .is_some_and(|frame| matches!(
+                frame.state,
+                ScreenUpdate::Snapshot { .. } | ScreenUpdate::Delta { .. }
+            ))
     );
 
     send(&mut stream, &ClientMessage::Detach { generation });

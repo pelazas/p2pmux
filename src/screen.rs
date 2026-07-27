@@ -56,6 +56,7 @@ pub struct HostScreen {
     previous: vt100::Screen,
     current: ScreenFrame,
     kitty_keyboard: KittyKeyboardTracker,
+    history_floor: usize,
 }
 
 impl HostScreen {
@@ -75,6 +76,7 @@ impl HostScreen {
                 kitty_keyboard_active: false,
             },
             kitty_keyboard: KittyKeyboardTracker::default(),
+            history_floor: 0,
         })
     }
 
@@ -113,6 +115,7 @@ impl HostScreen {
             .ok_or(ScreenError::SequenceExhausted)?;
         self.parser.screen_mut().set_size(rows, cols);
         self.previous = self.parser.screen().clone();
+        self.history_floor = screen_scrollback_len(self.parser.screen());
         let frame = ScreenFrame {
             sequence,
             base_sequence: 0,
@@ -136,9 +139,41 @@ impl HostScreen {
         self.kitty_keyboard.active()
     }
 
+    /// Returns the authoritative visual scrollback rows accumulated since the last resize.
+    pub fn visual_scrollback(&self, max_rows: usize, max_bytes: usize) -> (usize, Vec<Vec<u8>>) {
+        if self.parser.screen().alternate_screen() {
+            return (0, Vec::new());
+        }
+        let total_rows =
+            screen_scrollback_len(self.parser.screen()).saturating_sub(self.history_floor);
+        let first_row = total_rows.saturating_sub(max_rows);
+        let mut rows = Vec::new();
+        let mut bytes = 0_usize;
+        for row in first_row..total_rows {
+            let offset = total_rows.saturating_sub(row);
+            let mut screen = self.parser.screen().clone();
+            screen.set_scrollback(offset);
+            let Some(formatted) = screen.rows_formatted(0, screen.size().1).next() else {
+                continue;
+            };
+            if bytes.saturating_add(formatted.len()) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(formatted.len());
+            rows.push(formatted);
+        }
+        (total_rows, rows)
+    }
+
     pub fn take_kitty_keyboard_query_reply(&mut self) -> Option<Vec<u8>> {
         self.kitty_keyboard.take_query_reply()
     }
+}
+
+fn screen_scrollback_len(screen: &vt100::Screen) -> usize {
+    let mut screen = screen.clone();
+    screen.set_scrollback(SCROLLBACK_LINES);
+    screen.scrollback()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -258,4 +293,24 @@ fn validate_dimensions(rows: u16, cols: u16) -> Result<(), ScreenError> {
         return Err(ScreenError::InvalidDimensions);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostScreen;
+
+    #[test]
+    fn visual_scrollback_is_bounded_and_resets_on_resize_or_alternate_screen() {
+        let mut screen = HostScreen::new(1, 3).unwrap();
+        screen.process_pty(b"a\r\nb\r\nc").unwrap();
+        let (total, rows) = screen.visual_scrollback(1, 1024);
+        assert!(total >= 1);
+        assert_eq!(rows.len(), 1);
+
+        screen.resize(2, 3).unwrap();
+        assert_eq!(screen.visual_scrollback(10, 1024), (0, vec![]));
+
+        screen.process_pty(b"\x1b[?1049h").unwrap();
+        assert_eq!(screen.visual_scrollback(10, 1024), (0, vec![]));
+    }
 }

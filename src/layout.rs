@@ -165,6 +165,7 @@ pub struct SessionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayoutError {
     StaleRevision { expected: u64, got: u64 },
+    ConflictingSnapshotRevision { revision: u64 },
     RevisionExhausted,
     MemberLimit,
     AlreadyMember,

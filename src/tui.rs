@@ -75,7 +75,19 @@ use crate::{
     transport::Transport,
 };
 
-pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, (u64, Vec<u8>, bool)>;
+pub(crate) enum NodeScreenSnapshot {
+    Local {
+        frame: ScreenFrame,
+        history_total_rows: usize,
+        history_rows: Vec<Vec<u8>>,
+    },
+    Remote {
+        sequence: u64,
+        snapshot: Vec<u8>,
+        kitty_keyboard_active: bool,
+    },
+}
+pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, NodeScreenSnapshot>;
 pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
 
 /// Kept as the module's public marker from the scaffold.
@@ -287,6 +299,12 @@ pub enum KeyHandling {
     Forward,
     Consumed(Vec<UiIntent>),
     Quit,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MouseHandling {
+    pub intents: Vec<UiIntent>,
+    pub copy_selection_requested: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -802,6 +820,15 @@ impl MultiPaneTui {
         self.selection.filter(|selection| !selection.is_empty())
     }
 
+    pub(crate) fn selection_pane(&self) -> Option<PaneId> {
+        self.selection().map(|selection| selection.pane_id)
+    }
+
+    pub(crate) fn selected_text(&self, screen: &vt100::Screen) -> Option<String> {
+        self.selection()
+            .and_then(|selection| selection_text(screen, selection))
+    }
+
     fn screen_cell_at(&self, column: u16, row: u16, area: Rect) -> Option<(PaneId, ScreenCell)> {
         let geometry = self.geometry(area);
         let (pane_id, pane_rect) = geometry.panes.iter().find_map(|(pane_id, rect)| {
@@ -821,6 +848,10 @@ impl MultiPaneTui {
         self.pane_views
             .get(&pane_id)
             .map_or(0, |view| view.scrollback)
+    }
+
+    pub(crate) fn pane_scrollback_offset(&self, pane_id: PaneId) -> usize {
+        self.scrollback_offset(pane_id)
     }
 
     fn pane_at_or_focused(&self, column: u16, row: u16, area: Rect) -> PaneId {
@@ -870,6 +901,30 @@ impl MultiPaneTui {
         true
     }
 
+    /// Keeps a scrolled-back local viewport pinned while the host appends visual rows.
+    pub fn pin_scrollback_after_output(
+        &mut self,
+        pane_id: PaneId,
+        appended_rows: usize,
+        scrollback_len: usize,
+    ) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        if view.scrollback == 0 {
+            return false;
+        }
+        let scrollback = view
+            .scrollback
+            .saturating_add(appended_rows)
+            .min(scrollback_len);
+        if view.scrollback == scrollback {
+            return false;
+        }
+        view.scrollback = scrollback;
+        true
+    }
+
     pub fn set_pane_view(&mut self, pane_id: PaneId, mut state: PaneViewState) -> bool {
         if self.snapshot.panes.contains_key(&pane_id) {
             state.scrollback = self.scrollback_offset(pane_id);
@@ -895,6 +950,21 @@ impl MultiPaneTui {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: LayoutSnapshot) -> Result<(), LayoutError> {
+        if snapshot.revision < self.snapshot.revision {
+            return Err(LayoutError::StaleRevision {
+                expected: self.snapshot.revision,
+                got: snapshot.revision,
+            });
+        }
+        if snapshot.revision == self.snapshot.revision {
+            return if snapshot == self.snapshot {
+                Ok(())
+            } else {
+                Err(LayoutError::ConflictingSnapshotRevision {
+                    revision: snapshot.revision,
+                })
+            };
+        }
         crate::layout::SessionState::validate_snapshot(&snapshot)?;
         let old_views = std::mem::take(&mut self.pane_views);
         self.pane_views = snapshot
@@ -907,6 +977,7 @@ impl MultiPaneTui {
             .collect();
         self.snapshot = snapshot;
         self.cancel_resize_drag();
+        self.clear_selection();
         self.repair_selection();
         Ok(())
     }
@@ -1135,48 +1206,59 @@ impl MultiPaneTui {
         &mut self,
         mouse: crossterm::event::MouseEvent,
         area: Rect,
-    ) -> Vec<UiIntent> {
+    ) -> MouseHandling {
         if matches!(self.modal, ModalState::Rename(_)) {
-            return Vec::new();
+            return MouseHandling::default();
         }
         match mouse.kind {
             MouseEventKind::Moved if !self.overlay_open() => {
                 self.hover_pane_at(mouse.column, mouse.row, area);
-                Vec::new()
+                MouseHandling::default()
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.overlay_open() {
-                    return self.handle_agent_overlay_click(mouse.column, mouse.row, area);
+                    return MouseHandling {
+                        intents: self.handle_agent_overlay_click(mouse.column, mouse.row, area),
+                        copy_selection_requested: false,
+                    };
                 }
                 self.clear_selection();
                 if self.begin_resize_drag(mouse.column, mouse.row, area) {
-                    return Vec::new();
+                    return MouseHandling::default();
                 }
                 if let Some(intent) = self.switch_tab_at(mouse.column, mouse.row, area) {
-                    return vec![intent];
+                    return MouseHandling {
+                        intents: vec![intent],
+                        copy_selection_requested: false,
+                    };
                 }
                 let changed = self.focus_pane_at(mouse.column, mouse.row, area);
                 self.begin_selection_at(mouse.column, mouse.row, area);
-                changed
-                    .then_some(UiIntent::FocusPane {
-                        pane_id: self.focused_pane,
-                    })
-                    .into_iter()
-                    .collect()
+                MouseHandling {
+                    intents: changed
+                        .then_some(UiIntent::FocusPane {
+                            pane_id: self.focused_pane,
+                        })
+                        .into_iter()
+                        .collect(),
+                    copy_selection_requested: false,
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if !self.extend_resize_drag(mouse.column, mouse.row) {
                     self.extend_selection_at(mouse.column, mouse.row, area);
                 }
-                Vec::new()
+                MouseHandling::default()
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.end_selection_drag();
-                self.end_resize_drag(mouse.column, mouse.row)
-                    .into_iter()
-                    .collect()
+                let resize_intent = self.end_resize_drag(mouse.column, mouse.row);
+                MouseHandling {
+                    copy_selection_requested: resize_intent.is_none() && self.selection().is_some(),
+                    intents: resize_intent.into_iter().collect(),
+                }
             }
-            _ => Vec::new(),
+            _ => MouseHandling::default(),
         }
     }
 
@@ -2125,6 +2207,11 @@ fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Optio
     Some(lines.join("\n"))
 }
 
+pub(crate) fn copy_selection_to_clipboard(text: &str) -> io::Result<usize> {
+    copy_to_macos_clipboard(text)?;
+    Ok(copied_line_count(text))
+}
+
 fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
     let mut stdin = child
@@ -2151,6 +2238,16 @@ pub fn render_multi_pane(
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
     render_shared_multi_pane(frame, tui, screens, "", None, None, None);
+}
+
+/// Renders the local attachment footer with its own copy feedback.
+pub fn render_multi_pane_with_copy_feedback(
+    frame: &mut Frame<'_>,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
+    copied_lines: Option<usize>,
+) {
+    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, None);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -3836,9 +3933,8 @@ impl SharedLayoutRuntime {
             .is_none_or(|pane| !pane.locked || pane.host_peer_id == peer_id)
     }
 
-    /// A complete node-owned view for a newly attached local renderer. Frames are deliberately
-    /// snapshots: the client can always rebuild a `GuestScreen` without owning a PTY.
-    pub fn node_snapshot(
+    /// A complete node-owned view for a newly attached local renderer.
+    pub(crate) fn node_snapshot(
         &self,
     ) -> (
         LayoutSnapshot,
@@ -3849,14 +3945,15 @@ impl SharedLayoutRuntime {
         let mut screens = BTreeMap::new();
         let mut chrome = BTreeMap::new();
         for (pane_id, pane) in &self.local {
-            let frame = pane.screen.current_frame();
+            let (history_total_rows, history_rows) =
+                pane.screen.visual_scrollback(1_000, 256 * 1024);
             screens.insert(
                 *pane_id,
-                (
-                    frame.sequence,
-                    frame.snapshot.as_ref().to_vec(),
-                    frame.kitty_keyboard_active,
-                ),
+                NodeScreenSnapshot::Local {
+                    frame: pane.screen.current_frame().clone(),
+                    history_total_rows,
+                    history_rows,
+                },
             );
             let view = pane.view_state();
             chrome.insert(
@@ -3870,11 +3967,11 @@ impl SharedLayoutRuntime {
             {
                 screens.insert(
                     *pane_id,
-                    (
-                        pane.screen.sequence().unwrap_or(1),
-                        snapshot.as_ref().to_vec(),
-                        pane.screen.kitty_keyboard_active(),
-                    ),
+                    NodeScreenSnapshot::Remote {
+                        sequence: pane.screen.sequence().unwrap_or(1),
+                        snapshot: snapshot.as_ref().to_vec(),
+                        kitty_keyboard_active: pane.screen.kitty_keyboard_active(),
+                    },
                 );
             }
             let view = pane.view_state();
@@ -4120,9 +4217,11 @@ impl SharedLayoutRuntime {
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
                 {
-                    if let Some(intent) = self.tui.end_resize_drag(mouse.column, mouse.row) {
+                    let handling = self.tui.handle_mouse(mouse, Rect::new(0, 0, cols, rows));
+                    for intent in handling.intents {
                         self.handle_intent(intent)?;
-                    } else if self.tui.end_selection_drag() {
+                    }
+                    if handling.copy_selection_requested {
                         self.copy_selection_to_clipboard();
                     }
                     dirty = true;
@@ -4197,10 +4296,10 @@ impl SharedLayoutRuntime {
         let Some(text) = text else {
             return;
         };
-        match copy_to_macos_clipboard(&text) {
-            Ok(()) => {
+        match copy_selection_to_clipboard(&text) {
+            Ok(lines) => {
                 self.status.clear();
-                self.copied_lines = Some(copied_line_count(&text));
+                self.copied_lines = Some(lines);
             }
             Err(error) => {
                 self.copied_lines = None;
@@ -4456,7 +4555,6 @@ impl SharedLayoutRuntime {
         self.tui
             .apply_snapshot(snapshot.clone())
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
-        self.tui.cancel_resize_drag();
         self.release_blurred_pane(previously_focused)?;
         let me = self.control.peer_id();
         self.remote_descriptors.clear();
@@ -5714,7 +5812,9 @@ mod tests {
     };
     use tokio::sync::{mpsc, watch};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    };
     use portable_pty::PtySize;
     use ratatui::{
         Terminal,
@@ -5724,7 +5824,7 @@ mod tests {
     };
 
     use crate::config::UiTheme;
-    use crate::layout::{Axis, LayoutSnapshot, NewPanePosition, Node, Pane, Tab};
+    use crate::layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, Pane, Tab};
     use crate::lease::{IDLE_AFTER, LeaseManager, LeaseState};
     use crate::screen::{GuestScreen, HostScreen};
     use crate::{
@@ -6967,6 +7067,63 @@ mod tests {
     }
 
     #[test]
+    fn mouse_up_requests_copy_only_for_a_nonempty_selection_without_resize_commit() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(tui.handle_mouse(down, area).intents.is_empty());
+        tui.handle_mouse(drag, area);
+        let handling = tui.handle_mouse(up, area);
+        assert!(handling.intents.is_empty());
+        assert!(handling.copy_selection_requested);
+
+        let resize_down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let resize_drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 49,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let resize_up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 49,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        tui.handle_mouse(resize_down, area);
+        tui.handle_mouse(resize_drag, area);
+        let handling = tui.handle_mouse(resize_up, area);
+        assert!(matches!(
+            handling.intents.as_slice(),
+            [UiIntent::SetSplitRatio { .. }]
+        ));
+        assert!(!handling.copy_selection_requested);
+    }
+
+    #[test]
     fn dragging_a_shared_vertical_border_resizes_its_split() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -7024,19 +7181,50 @@ mod tests {
     }
 
     #[test]
-    fn applying_a_new_snapshot_cancels_the_resize_preview() {
+    fn same_revision_snapshot_preserves_resize_preview_and_selection() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
         let initial = tui.geometry(area);
 
         assert!(tui.begin_resize_drag(39, 5, area));
         assert!(tui.extend_resize_drag(49, 5));
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
         assert_ne!(tui.geometry(area), initial);
 
         tui.apply_snapshot(tui.snapshot().clone())
             .expect("valid snapshot");
+        assert!(tui.resize_drag.is_some());
+        assert!(tui.selection().is_some());
+        assert_ne!(tui.geometry(area), initial);
+    }
+
+    #[test]
+    fn same_revision_different_snapshot_is_rejected() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let mut conflicting = tui.snapshot().clone();
+        conflicting.tabs[0].title = Some("conflict".into());
+
+        assert_eq!(
+            tui.apply_snapshot(conflicting),
+            Err(LayoutError::ConflictingSnapshotRevision { revision: 1 })
+        );
+    }
+
+    #[test]
+    fn higher_revision_snapshot_cancels_resize_preview_and_selection() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        let mut newer = tui.snapshot().clone();
+        newer.revision += 1;
+
+        tui.apply_snapshot(newer).expect("valid snapshot");
         assert!(tui.resize_drag.is_none());
-        assert_eq!(tui.geometry(area), initial);
+        assert!(tui.selection().is_none());
     }
 
     #[test]
@@ -7404,6 +7592,17 @@ mod tests {
     }
 
     #[test]
+    fn appended_local_history_pins_a_scrolled_back_viewport() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 10, true));
+        assert!(tui.scroll_pane(1, 10, true));
+        assert!(tui.pin_scrollback_after_output(1, 3, 10));
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 5);
+        tui.reset_scrollback(1);
+        assert!(!tui.pin_scrollback_after_output(1, 3, 10));
+    }
+
+    #[test]
     fn selection_text_uses_stream_semantics_in_document_order() {
         let mut parser = vt100::Parser::new(3, 4, 0);
         parser.process(b"abcd\r\nefgh\r\nijkl");
@@ -7528,7 +7727,7 @@ mod tests {
         let mut tui = MultiPaneTui::new(initial).expect("valid layout");
         tui.select_tab(2).expect("select second tab");
 
-        tui.apply_snapshot(layout(
+        let mut committed = layout(
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
@@ -7536,8 +7735,9 @@ mod tests {
                 title: None,
             }],
             &[(1, 2, 2)],
-        ))
-        .expect("valid commit");
+        );
+        committed.revision = 2;
+        tui.apply_snapshot(committed).expect("valid commit");
 
         assert_eq!(tui.current_tab(), 1);
         assert_eq!(tui.focused_pane(), 1);
@@ -8526,7 +8726,7 @@ mod tests {
         .expect("valid layout");
 
         tui.select_created_tab(2);
-        tui.apply_snapshot(layout(
+        let mut unrelated = layout(
             vec![
                 Tab {
                     tab_id: 1,
@@ -8542,11 +8742,12 @@ mod tests {
                 },
             ],
             &[(1, 2, 2), (3, 2, 2)],
-        ))
-        .expect("unrelated commit");
+        );
+        unrelated.revision = 2;
+        tui.apply_snapshot(unrelated).expect("unrelated commit");
         assert_eq!(tui.current_tab(), 1);
 
-        tui.apply_snapshot(layout(
+        let mut targeted = layout(
             vec![
                 Tab {
                     tab_id: 1,
@@ -8568,8 +8769,9 @@ mod tests {
                 },
             ],
             &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
-        ))
-        .expect("targeted tab commit");
+        );
+        targeted.revision = 3;
+        tui.apply_snapshot(targeted).expect("targeted tab commit");
 
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);

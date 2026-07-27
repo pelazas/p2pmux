@@ -381,6 +381,7 @@ pub fn init_to(path: &Path) -> Result<(), ConfigError> {
 mod tests {
     use std::{
         fs,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -389,12 +390,14 @@ mod tests {
     use super::*;
 
     fn temp_config_path() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("p2pmux-config-{unique}"))
+            .join(format!("p2pmux-config-{unique}-{seq}"))
             .join("config.toml")
     }
 
