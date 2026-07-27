@@ -1,7 +1,7 @@
 //! Terminal-facing half of a local session attachment.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -138,13 +138,14 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut detach_sent = false;
     let mut last_agent_overlay_animation = Instant::now();
     let mut pending_focus = None;
+    let mut pending_resync = BTreeSet::new();
     let mut local_peer_id = Vec::new();
 
     'attached: loop {
         loop {
             match messages.try_recv() {
-                Ok(ReaderEvent::Message(message)) => {
-                    if let NodeMessage::Snapshot {
+                Ok(ReaderEvent::Message(message)) => match *message {
+                    NodeMessage::Snapshot {
                         room_name,
                         layout,
                         screens: next_screens,
@@ -154,23 +155,26 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         tab_id,
                         pane_id,
                         ..
-                    } = *message
-                    {
+                    } => {
                         let apply_started = Instant::now();
-                        let resync = apply_snapshot(
+                        let view = apply_layout(
                             &mut tui,
                             theme,
                             &mut screens,
                             &mut local_history,
                             room_name,
                             *layout,
-                            next_screens,
-                            leases,
-                            rosters,
-                            tab_id,
-                            pane_id,
-                            &mut pending_focus,
                         )?;
+                        let resync = apply_screens(
+                            view,
+                            &mut screens,
+                            &mut local_history,
+                            next_screens,
+                            &mut pending_resync,
+                        )?;
+                        apply_leases(view, leases);
+                        apply_rosters(view, rosters);
+                        apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
                         let apply_elapsed = apply_started.elapsed();
                         if crate::perf::enabled() && apply_elapsed >= Duration::from_millis(5) {
                             crate::perf::log(&format!(
@@ -179,7 +183,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 screens.len(),
                             ));
                         }
-                        for pane_id in resync {
+                        for pane_id in new_resync_requests(&mut pending_resync, resync) {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
                         }
                         local_peer_id = next_local_peer_id;
@@ -188,7 +192,55 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         }
                         dirty = true;
                     }
-                }
+                    NodeMessage::Layout { layout } => {
+                        apply_layout(
+                            &mut tui,
+                            theme,
+                            &mut screens,
+                            &mut local_history,
+                            String::new(),
+                            *layout,
+                        )?;
+                        dirty = true;
+                    }
+                    NodeMessage::Screens {
+                        screens: next_screens,
+                    } => {
+                        let view = tui.as_mut().ok_or_else(|| {
+                            io::Error::other("screens received before attachment snapshot")
+                        })?;
+                        let resync = apply_screens(
+                            view,
+                            &mut screens,
+                            &mut local_history,
+                            next_screens,
+                            &mut pending_resync,
+                        )?;
+                        for pane_id in new_resync_requests(&mut pending_resync, resync) {
+                            write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
+                        }
+                        dirty = true;
+                    }
+                    NodeMessage::Leases { leases } => {
+                        if let Some(view) = tui.as_mut() {
+                            apply_leases(view, leases);
+                            dirty = true;
+                        }
+                    }
+                    NodeMessage::Rosters { rosters } => {
+                        if let Some(view) = tui.as_mut() {
+                            apply_rosters(view, rosters);
+                            dirty = true;
+                        }
+                    }
+                    NodeMessage::Focus { tab_id, pane_id } => {
+                        if let Some(view) = tui.as_mut() {
+                            apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
+                            dirty = true;
+                        }
+                    }
+                    _ => {}
+                },
                 Ok(ReaderEvent::Ended) | Err(TryRecvError::Disconnected) => {
                     node_ended = true;
                     break 'attached;
@@ -214,26 +266,28 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                 terminal.draw(|frame| {
                     let viewport_screens = screens
                         .iter()
+                        .filter(|(pane_id, _)| tui.pane_scrollback_offset(**pane_id) != 0)
                         .filter_map(|(pane_id, screen)| {
                             screen.screen().map(|screen| {
-                                let screen = if tui.pane_scrollback_offset(*pane_id) == 0 {
-                                    screen.clone()
-                                } else {
-                                    local_history
-                                        .get(pane_id)
-                                        .filter(|history| !history.rows.is_empty())
-                                        .map_or_else(
-                                            || screen.clone(),
-                                            |history| history.viewport(screen),
-                                        )
-                                };
-                                (*pane_id, screen)
+                                let viewport = local_history
+                                    .get(pane_id)
+                                    .filter(|history| !history.rows.is_empty())
+                                    .map_or_else(
+                                        || screen.clone(),
+                                        |history| history.viewport(screen),
+                                    );
+                                (*pane_id, viewport)
                             })
                         })
                         .collect::<BTreeMap<_, _>>();
-                    let visible = viewport_screens
+                    let visible = screens
                         .iter()
-                        .map(|(pane_id, screen)| (*pane_id, screen))
+                        .filter_map(|(pane_id, guest)| {
+                            viewport_screens
+                                .get(pane_id)
+                                .or_else(|| guest.screen())
+                                .map(|screen| (*pane_id, screen))
+                        })
                         .collect();
                     render_multi_pane_with_copy_feedback(frame, tui, &visible, copied_lines);
                 })?;
@@ -356,6 +410,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         let _ = write_message(&mut stream, &ClientMessage::Detach { generation });
     }
     let _ = stream.shutdown(Shutdown::Both);
+    drop(messages);
     let _ = reader_thread.join();
     guard.leave()?;
     if let Some(error) = attach_error {
@@ -398,6 +453,7 @@ fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
     !tui.overlay_open() && !tui.modal_open() && input_allowed(tui, local_peer_id)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn apply_snapshot(
     tui: &mut Option<MultiPaneTui>,
@@ -413,6 +469,28 @@ fn apply_snapshot(
     pane_id: u64,
     pending_focus: &mut Option<(u64, u64)>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let view = apply_layout(tui, theme, screens, local_history, room_name, layout)?;
+    let resync = apply_screens(
+        view,
+        screens,
+        local_history,
+        next_screens,
+        &mut BTreeSet::new(),
+    )?;
+    apply_leases(view, leases);
+    apply_rosters(view, rosters);
+    apply_focus(view, pending_focus, tab_id, pane_id)?;
+    Ok(resync)
+}
+
+fn apply_layout<'a>(
+    tui: &'a mut Option<MultiPaneTui>,
+    theme: crate::config::UiTheme,
+    screens: &mut BTreeMap<u64, GuestScreen>,
+    local_history: &mut BTreeMap<u64, LocalHistory>,
+    room_name: String,
+    layout: crate::layout::LayoutSnapshot,
+) -> Result<&'a mut MultiPaneTui, Box<dyn std::error::Error>> {
     let view = match tui {
         Some(view) => {
             view.apply_snapshot(layout)
@@ -424,9 +502,21 @@ fn apply_snapshot(
                 io::Error::other(format!("invalid layout snapshot: {error:?}"))
             })?),
     };
-    view.set_title(format!("p2pmux ({room_name})"));
+    if !room_name.is_empty() {
+        view.set_title(format!("p2pmux ({room_name})"));
+    }
     screens.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
     local_history.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
+    Ok(view)
+}
+
+fn apply_screens(
+    view: &mut MultiPaneTui,
+    screens: &mut BTreeMap<u64, GuestScreen>,
+    local_history: &mut BTreeMap<u64, LocalHistory>,
+    next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
+    pending_resync: &mut BTreeSet<u64>,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let mut resync = Vec::new();
     for frame in next_screens {
         let pane_id = frame.pane_id;
@@ -439,6 +529,7 @@ fn apply_snapshot(
             } => {
                 screen.apply_snapshot(sequence, &snapshot)?;
                 screen.set_kitty_keyboard_active(kitty_keyboard_active);
+                pending_resync.remove(&pane_id);
             }
             ScreenUpdate::Delta {
                 base_sequence,
@@ -464,6 +555,10 @@ fn apply_snapshot(
             }
         }
     }
+    Ok(resync)
+}
+
+fn apply_leases(view: &mut MultiPaneTui, leases: Vec<crate::local_ipc::PaneLeaseSnapshot>) {
     for lease in leases {
         view.set_pane_view(
             lease.pane_id,
@@ -474,6 +569,9 @@ fn apply_snapshot(
             ),
         );
     }
+}
+
+fn apply_rosters(view: &mut MultiPaneTui, rosters: Vec<crate::local_ipc::AgentOverlaySnapshotRow>) {
     view.set_agent_rows(
         rosters
             .into_iter()
@@ -494,11 +592,9 @@ fn apply_snapshot(
             })
             .collect(),
     );
-    reconcile_snapshot_focus(view, pending_focus, tab_id, pane_id)?;
-    Ok(resync)
 }
 
-fn reconcile_snapshot_focus(
+fn apply_focus(
     view: &mut MultiPaneTui,
     pending_focus: &mut Option<(u64, u64)>,
     tab_id: u64,
@@ -515,6 +611,13 @@ fn reconcile_snapshot_focus(
     }
     view.set_focus(tab_id, pane_id)
         .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))
+}
+
+fn new_resync_requests(pending: &mut BTreeSet<u64>, resync: Vec<u64>) -> Vec<u64> {
+    resync
+        .into_iter()
+        .filter(|pane_id| pending.insert(*pane_id))
+        .collect()
 }
 
 fn send_intents(
@@ -594,7 +697,7 @@ enum ReaderEvent {
 fn spawn_message_reader(
     mut reader: BufReader<UnixStream>,
 ) -> (Receiver<ReaderEvent>, thread::JoinHandle<()>) {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(16);
     let thread = thread::spawn(move || {
         loop {
             match read_message(&mut reader) {
@@ -966,6 +1069,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(local_history[&1].available_rows(), 1);
+    }
+
+    #[test]
+    fn screens_apply_without_replacing_layout() {
+        let host = HostScreen::new(2, 8).unwrap();
+        let mut tui = Some(MultiPaneTui::new(layout(&[1])).unwrap());
+        let mut screens = BTreeMap::new();
+        let mut history = BTreeMap::new();
+        let mut pending_resync = BTreeSet::new();
+
+        apply_screens(
+            tui.as_mut().unwrap(),
+            &mut screens,
+            &mut history,
+            vec![PaneScreenSnapshot {
+                pane_id: 1,
+                state: ScreenUpdate::Snapshot {
+                    sequence: 1,
+                    snapshot: host.current_frame().snapshot.as_ref().to_vec(),
+                    kitty_keyboard_active: false,
+                },
+                local_history: None,
+            }],
+            &mut pending_resync,
+        )
+        .unwrap();
+
+        assert_eq!(tui.unwrap().snapshot().revision, 1);
+        assert_eq!(
+            screens[&1].screen().unwrap().contents(),
+            host.screen().contents()
+        );
+    }
+
+    #[test]
+    fn resync_requests_are_deduplicated_until_a_snapshot_arrives() {
+        let mut pending = BTreeSet::new();
+        assert_eq!(new_resync_requests(&mut pending, vec![1, 1]), vec![1]);
+        assert!(new_resync_requests(&mut pending, vec![1]).is_empty());
+        pending.remove(&1);
+        assert_eq!(new_resync_requests(&mut pending, vec![1]), vec![1]);
     }
 
     #[test]
