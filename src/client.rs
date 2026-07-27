@@ -172,12 +172,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut pending_focus,
                         )?;
                         let apply_elapsed = apply_started.elapsed();
-                        if perf_enabled() && apply_elapsed >= Duration::from_millis(5) {
-                            eprintln!(
+                        if crate::perf::enabled() && apply_elapsed >= Duration::from_millis(5) {
+                            crate::perf::log(&format!(
                                 "P2PMUX_PERF client apply_ms={} panes={}",
                                 apply_elapsed.as_millis(),
                                 screens.len(),
-                            );
+                            ));
                         }
                         for pane_id in resync {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
@@ -238,12 +238,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     render_multi_pane_with_copy_feedback(frame, tui, &visible, copied_lines);
                 })?;
                 let draw_elapsed = draw_started.elapsed();
-                if perf_enabled() && draw_elapsed >= Duration::from_millis(5) {
-                    eprintln!(
+                if crate::perf::enabled() && draw_elapsed >= Duration::from_millis(5) {
+                    crate::perf::log(&format!(
                         "P2PMUX_PERF client draw_ms={} panes={}",
                         draw_elapsed.as_millis(),
                         screens.len(),
-                    );
+                    ));
                 }
             }
             dirty = false;
@@ -385,10 +385,6 @@ fn refresh_tui_timers(
         dirty = true;
     }
     dirty
-}
-
-fn perf_enabled() -> bool {
-    std::env::var_os("P2PMUX_PERF").is_some_and(|value| value == "1")
 }
 
 fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {

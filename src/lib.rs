@@ -9,6 +9,7 @@ pub mod layout;
 pub mod lease;
 pub mod local_ipc;
 pub mod node;
+mod perf;
 pub mod protocol;
 pub mod pty_host;
 pub mod rendezvous;

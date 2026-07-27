@@ -518,7 +518,7 @@ fn write_snapshot(
     stream.write_all(&frame)?;
     stream.flush()?;
     let json_write = write_started.elapsed();
-    if perf_enabled()
+    if crate::perf::enabled()
         && [
             drain_elapsed,
             snapshot_build,
@@ -529,7 +529,7 @@ fn write_snapshot(
         .into_iter()
         .any(|elapsed| elapsed >= Duration::from_millis(5))
     {
-        eprintln!(
+        crate::perf::log(&format!(
             "P2PMUX_PERF node drain_ms={} snapshot_build_ms={} history_extract_ms={} history_panes={} json_serialize_ms={} json_write_ms={} write_bytes={} panes_local={} panes_remote={} updates_snapshot={}({}B) updates_delta={}({}B) updates_unchanged={}",
             drain_elapsed.as_millis(),
             snapshot_build.as_millis(),
@@ -545,7 +545,7 @@ fn write_snapshot(
             updates.deltas,
             updates.delta_bytes,
             updates.unchanged,
-        );
+        ));
     }
     Ok(())
 }
@@ -650,13 +650,12 @@ impl ScreenUpdateStats {
     }
 }
 
-fn perf_enabled() -> bool {
-    std::env::var_os("P2PMUX_PERF").is_some_and(|value| value == "1")
-}
-
 fn log_slow_drain(elapsed: Duration) {
-    if perf_enabled() && elapsed >= Duration::from_millis(5) {
-        eprintln!("P2PMUX_PERF node drain_ms={}", elapsed.as_millis());
+    if crate::perf::enabled() && elapsed >= Duration::from_millis(5) {
+        crate::perf::log(&format!(
+            "P2PMUX_PERF node drain_ms={}",
+            elapsed.as_millis()
+        ));
     }
 }
 
