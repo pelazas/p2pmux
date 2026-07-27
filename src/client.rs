@@ -166,8 +166,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         dirty = true;
                     }
                     KeyHandling::Forward => {
+                        let kitty_keyboard_active = screens
+                            .get(&tui.focused_pane())
+                            .is_some_and(GuestScreen::kitty_keyboard_active);
                         if input_allowed(tui, &local_peer_id)
-                            && let Some(bytes) = client_key_bytes(key.code, key.modifiers)
+                            && let Some(bytes) = client_key_bytes(
+                                key.code,
+                                key.modifiers,
+                                kitty_keyboard_active,
+                            )
                         {
                             write_message(&mut stream, &ClientMessage::Input { bytes })?;
                         }
@@ -474,7 +481,11 @@ fn spawn_message_reader(
     (receiver, thread)
 }
 
-fn client_key_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+fn client_key_bytes(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kitty_keyboard_active: bool,
+) -> Option<Vec<u8>> {
     match code {
         KeyCode::Char(character)
             if modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii_alphabetic() =>
@@ -482,6 +493,13 @@ fn client_key_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
             Some(vec![character.to_ascii_lowercase() as u8 - b'a' + 1])
         }
         KeyCode::Char(character) => Some(character.to_string().into_bytes()),
+        KeyCode::Enter if modifiers == KeyModifiers::SHIFT => {
+            if kitty_keyboard_active {
+                Some(b"\x1b[13;2u".to_vec())
+            } else {
+                Some(b"\n".to_vec())
+            }
+        }
         KeyCode::Enter => Some(b"\r".to_vec()),
         KeyCode::Backspace => Some(b"\x7f".to_vec()),
         KeyCode::Tab => Some(b"\t".to_vec()),
@@ -679,11 +697,11 @@ mod tests {
     #[test]
     fn ctrl_q_is_reserved_for_detach() {
         assert_eq!(
-            client_key_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            client_key_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL, false),
             Some(vec![3])
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL, false),
             Some(vec![17])
         );
     }
