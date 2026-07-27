@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-pub const IDLE_AFTER: Duration = Duration::from_secs(8);
+pub const IDLE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseState {

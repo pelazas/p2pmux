@@ -100,7 +100,7 @@ If coordinator disconnects:
 ### Input control
 
 - `controller` exists only during active typing; focus ≠ control.
-- After ~8 seconds idle, the host publishes an empty controller and a new lease epoch: the pane is
+- After ~30 seconds idle, the host publishes an empty controller and a new lease epoch: the pane is
   free. The next ordinary input claims it and carries its first key.
 - Active typing rejects other ordinary input; no forced takeover exists.
 - Claims are serialized so two streams never hit one PTY.

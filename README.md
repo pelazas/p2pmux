@@ -97,7 +97,7 @@ Short join codes resolve through a restrictive local cache on the same Mac, so t
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
 
-Only one peer controls a pane while they are actively typing. After about eight seconds without
+Only one peer controls a pane while they are actively typing. After about thirty seconds without
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key
 claims the free pane and is delivered as its first input; active typing is protected, so there is
 no forced takeover. A pane's host owns its PTY, not its control lease: newly created split and tab
