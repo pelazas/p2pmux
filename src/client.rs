@@ -23,7 +23,7 @@ use crossterm::{
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 
 use crate::{
-    local_ipc::{ClientMessage, LocalHistorySnapshot, NodeMessage, ScreenUpdate},
+    local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
     protocol::AgentRosterState,
     screen::{ApplyDelta, GuestScreen},
     session_store::SessionDescriptor,
@@ -34,34 +34,36 @@ use crate::{
 };
 
 #[derive(Default)]
-struct LocalHistory {
+struct HistoryCache {
     grid: Option<(u16, u16)>,
-    total_rows: usize,
+    total_rows: u64,
+    history_end: u64,
     rows: Vec<Vec<u8>>,
 }
 
-impl LocalHistory {
-    fn replace(&mut self, snapshot: LocalHistorySnapshot, grid: (u16, u16)) -> usize {
-        let grid_changed = self
-            .grid
-            .replace(grid)
-            .is_some_and(|previous| previous != grid);
-        let previous_total = if grid_changed { 0 } else { self.total_rows };
-        self.rows = snapshot
-            .rows
+impl HistoryCache {
+    fn install_window(
+        &mut self,
+        total_rows: u64,
+        history_end: u64,
+        grid: (u16, u16),
+        rows: Vec<String>,
+    ) {
+        self.grid = Some(grid);
+        self.total_rows = total_rows;
+        self.history_end = history_end;
+        self.rows = rows
             .into_iter()
             .filter_map(|row| STANDARD.decode(row).ok())
             .collect();
-        self.total_rows = snapshot.total_rows;
-        if grid_changed || snapshot.total_rows < previous_total {
-            0
-        } else {
-            snapshot.total_rows.saturating_sub(previous_total)
-        }
     }
 
     fn available_rows(&self) -> usize {
         self.rows.len()
+    }
+
+    fn reaches_live(&self) -> bool {
+        self.total_rows <= self.rows.len() as u64
     }
 
     fn viewport(&self, live: &vt100::Screen) -> vt100::Screen {
@@ -79,17 +81,23 @@ impl LocalHistory {
 fn copy_attach_selection(
     tui: &MultiPaneTui,
     screens: &BTreeMap<u64, GuestScreen>,
-    local_history: &BTreeMap<u64, LocalHistory>,
+    history: &BTreeMap<u64, HistoryCache>,
 ) -> Option<usize> {
     let pane_id = tui.selection_pane()?;
     let live = screens.get(&pane_id)?.screen()?;
-    let mut viewport = local_history
+    let mut viewport = history
         .get(&pane_id)
         .filter(|history| !history.rows.is_empty())
         .map_or_else(|| live.clone(), |history| history.viewport(live));
     viewport.set_scrollback(tui.pane_scrollback_offset(pane_id));
     let text = tui.selected_text(&viewport)?;
     copy_selection_to_clipboard(&text).ok()
+}
+
+#[derive(Clone, Copy)]
+struct PendingScroll {
+    request_id: u64,
+    target: usize,
 }
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
@@ -130,7 +138,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     )?;
     let mut tui = None;
     let mut screens = BTreeMap::new();
-    let mut local_history = BTreeMap::new();
+    let mut history = BTreeMap::new();
+    let mut pending_scroll: BTreeMap<u64, PendingScroll> = BTreeMap::new();
+    let mut next_scrollback_request_id = 1_u64;
     let mut copied_lines = None;
     let mut dirty = false;
     let mut node_ended = false;
@@ -139,6 +149,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut last_agent_overlay_animation = Instant::now();
     let mut pending_focus = None;
     let mut pending_resync = BTreeSet::new();
+    let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
     let mut join_code = None;
 
@@ -163,16 +174,17 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut tui,
                             theme,
                             &mut screens,
-                            &mut local_history,
+                            &mut history,
                             room_name,
                             *layout,
                         )?;
                         let resync = apply_screens(
                             view,
                             &mut screens,
-                            &mut local_history,
+                            &mut history,
                             next_screens,
                             &mut pending_resync,
+                            &mut history_refresh,
                         )?;
                         apply_leases(view, leases);
                         apply_rosters(view, rosters);
@@ -188,6 +200,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         for pane_id in new_resync_requests(&mut pending_resync, resync) {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
                         }
+                        for pane_id in std::mem::take(&mut history_refresh) {
+                            request_scrollback(
+                                &mut stream,
+                                pane_id,
+                                view.pane_scrollback_offset(pane_id),
+                                &mut pending_scroll,
+                                &mut next_scrollback_request_id,
+                            )?;
+                        }
                         local_peer_id = next_local_peer_id;
                         join_code = next_join_code;
                         if let Some(tui) = tui.as_mut() {
@@ -200,7 +221,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut tui,
                             theme,
                             &mut screens,
-                            &mut local_history,
+                            &mut history,
                             String::new(),
                             *layout,
                         )?;
@@ -215,12 +236,59 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         let resync = apply_screens(
                             view,
                             &mut screens,
-                            &mut local_history,
+                            &mut history,
                             next_screens,
                             &mut pending_resync,
+                            &mut history_refresh,
                         )?;
                         for pane_id in new_resync_requests(&mut pending_resync, resync) {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
+                        }
+                        for pane_id in std::mem::take(&mut history_refresh) {
+                            request_scrollback(
+                                &mut stream,
+                                pane_id,
+                                view.pane_scrollback_offset(pane_id),
+                                &mut pending_scroll,
+                                &mut next_scrollback_request_id,
+                            )?;
+                        }
+                        dirty = true;
+                    }
+                    NodeMessage::ScrollbackWindow {
+                        pane_id,
+                        request_id,
+                        sequence,
+                        grid_rows,
+                        grid_cols,
+                        total_rows,
+                        offset,
+                        rows,
+                    } => {
+                        let Some(pending) = pending_scroll.remove(&pane_id) else {
+                            continue;
+                        };
+                        let Some(guest) = screens.get(&pane_id) else {
+                            continue;
+                        };
+                        let Some(screen) = guest.screen() else {
+                            continue;
+                        };
+                        if pending.request_id != request_id
+                            || offset != 0
+                            || screen.size() != (grid_rows, grid_cols)
+                            || guest.sequence().is_some_and(|current| sequence < current)
+                        {
+                            continue;
+                        }
+                        let cache = history.entry(pane_id).or_default();
+                        let history_end = cache.history_end.max(total_rows);
+                        cache.install_window(total_rows, history_end, screen.size(), rows);
+                        if let Some(view) = tui.as_mut() {
+                            view.set_pane_scrollback_offset(
+                                pane_id,
+                                pending.target.min(cache.available_rows()),
+                            );
                         }
                         dirty = true;
                     }
@@ -272,7 +340,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         .filter(|(pane_id, _)| tui.pane_scrollback_offset(**pane_id) != 0)
                         .filter_map(|(pane_id, screen)| {
                             screen.screen().map(|screen| {
-                                let viewport = local_history
+                                let viewport = history
                                     .get(pane_id)
                                     .filter(|history| !history.rows.is_empty())
                                     .map_or_else(
@@ -338,6 +406,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 client_key_bytes(key.code, key.modifiers, kitty_keyboard_active)
                         {
                             write_message(&mut stream, &ClientMessage::Input { bytes })?;
+                            history.remove(&tui.focused_pane());
+                            pending_scroll.remove(&tui.focused_pane());
+                            tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
                         }
                     }
                 }
@@ -350,6 +421,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             bytes: text.into_bytes(),
                         },
                     )?;
+                    history.remove(&tui.focused_pane());
+                    pending_scroll.remove(&tui.focused_pane());
+                    tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
                 }
                 dirty = true;
             }
@@ -375,23 +449,28 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
                     let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
-                    let scrollback_len = local_history.get(&pane_id).map_or_else(
-                        || {
-                            screens
-                                .get(&pane_id)
-                                .and_then(GuestScreen::screen)
-                                .map(available_scrollback)
-                                .unwrap_or_default()
-                        },
-                        LocalHistory::available_rows,
-                    );
-                    tui.scroll_mouse_pane(
-                        mouse.column,
-                        mouse.row,
-                        area,
-                        scrollback_len,
-                        matches!(mouse.kind, MouseEventKind::ScrollUp),
-                    );
+                    let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                    let scrollback_len = history
+                        .get(&pane_id)
+                        .map(HistoryCache::available_rows)
+                        .unwrap_or_default();
+                    if up && scrollback_len == 0 {
+                        let target = pending_scroll
+                            .get(&pane_id)
+                            .map_or(3, |pending| pending.target.saturating_add(3));
+                        request_scrollback(
+                            &mut stream,
+                            pane_id,
+                            target,
+                            &mut pending_scroll,
+                            &mut next_scrollback_request_id,
+                        )?;
+                    } else {
+                        tui.scroll_mouse_pane(mouse.column, mouse.row, area, scrollback_len, up);
+                        if !up && tui.pane_scrollback_offset(pane_id) == 0 {
+                            history.remove(&pane_id);
+                        }
+                    }
                 } else {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         copied_lines = None;
@@ -399,7 +478,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     let handling = tui.handle_mouse(mouse, area);
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
-                        copied_lines = copy_attach_selection(tui, &screens, &local_history);
+                        copied_lines = copy_attach_selection(tui, &screens, &history);
                     }
                 }
                 dirty = true;
@@ -408,6 +487,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                 terminal.resize(Rect::new(0, 0, cols, rows))?;
                 if !tui.modal_open() {
                     tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
+                    history.clear();
+                    pending_scroll.clear();
                     write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
                 }
                 dirty = true;
@@ -468,7 +549,7 @@ fn apply_snapshot(
     tui: &mut Option<MultiPaneTui>,
     theme: crate::config::UiTheme,
     screens: &mut BTreeMap<u64, GuestScreen>,
-    local_history: &mut BTreeMap<u64, LocalHistory>,
+    history: &mut BTreeMap<u64, HistoryCache>,
     room_name: String,
     layout: crate::layout::LayoutSnapshot,
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
@@ -478,12 +559,13 @@ fn apply_snapshot(
     pane_id: u64,
     pending_focus: &mut Option<(u64, u64)>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-    let view = apply_layout(tui, theme, screens, local_history, room_name, layout)?;
+    let view = apply_layout(tui, theme, screens, history, room_name, layout)?;
     let resync = apply_screens(
         view,
         screens,
-        local_history,
+        history,
         next_screens,
+        &mut BTreeSet::new(),
         &mut BTreeSet::new(),
     )?;
     apply_leases(view, leases);
@@ -496,7 +578,7 @@ fn apply_layout<'a>(
     tui: &'a mut Option<MultiPaneTui>,
     theme: crate::config::UiTheme,
     screens: &mut BTreeMap<u64, GuestScreen>,
-    local_history: &mut BTreeMap<u64, LocalHistory>,
+    history: &mut BTreeMap<u64, HistoryCache>,
     room_name: String,
     layout: crate::layout::LayoutSnapshot,
 ) -> Result<&'a mut MultiPaneTui, Box<dyn std::error::Error>> {
@@ -515,20 +597,23 @@ fn apply_layout<'a>(
         view.set_title(format!("p2pmux ({room_name})"));
     }
     screens.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
-    local_history.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
+    history.retain(|pane_id, _| view.snapshot().panes.contains_key(pane_id));
     Ok(view)
 }
 
 fn apply_screens(
     view: &mut MultiPaneTui,
     screens: &mut BTreeMap<u64, GuestScreen>,
-    local_history: &mut BTreeMap<u64, LocalHistory>,
+    history: &mut BTreeMap<u64, HistoryCache>,
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
     pending_resync: &mut BTreeSet<u64>,
+    history_refresh: &mut BTreeSet<u64>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let mut resync = Vec::new();
     for frame in next_screens {
         let pane_id = frame.pane_id;
+        let history_len = frame.history_len;
+        let history_end = frame.history_end;
         let screen = screens.entry(frame.pane_id).or_default();
         match frame.state {
             ScreenUpdate::Snapshot {
@@ -554,13 +639,26 @@ fn apply_screens(
                 kitty_keyboard_active,
             } => screen.set_kitty_keyboard_active(kitty_keyboard_active),
         }
-        if let Some(snapshot) = frame.local_history
-            && let Some(screen) = screen.screen()
-        {
-            let local = local_history.entry(pane_id).or_default();
-            let appended = local.replace(snapshot, screen.size());
-            if appended > 0 {
-                view.pin_scrollback_after_output(pane_id, appended, local.available_rows());
+        if let Some(screen) = screen.screen() {
+            let cache = history.entry(pane_id).or_default();
+            let previous_end = cache.history_end;
+            let cache_reached_live = cache.reaches_live();
+            if cache.grid.is_some_and(|grid| grid != screen.size())
+                || history_end < cache.history_end
+                || history_len < cache.total_rows
+            {
+                *cache = HistoryCache::default();
+                view.set_pane_scrollback_offset(pane_id, 0);
+            }
+            let appended = history_end.saturating_sub(previous_end) as usize;
+            cache.grid = Some(screen.size());
+            cache.total_rows = history_len;
+            cache.history_end = history_end;
+            if appended > 0 && view.pane_scrollback_offset(pane_id) > 0 {
+                view.pin_scrollback_after_output(pane_id, appended, history_len as usize);
+                if cache_reached_live {
+                    history_refresh.insert(pane_id);
+                }
             }
         }
     }
@@ -650,6 +748,33 @@ fn send_intents(
             }
             intent => write_message(stream, &ClientMessage::StructuralIntent { intent })?,
         }
+    }
+    Ok(())
+}
+
+fn request_scrollback(
+    stream: &mut UnixStream,
+    pane_id: u64,
+    target: usize,
+    pending: &mut BTreeMap<u64, PendingScroll>,
+    next_request_id: &mut u64,
+) -> io::Result<()> {
+    let request_id = *next_request_id;
+    let entry = pending.entry(pane_id).or_insert_with(|| {
+        *next_request_id = (*next_request_id).wrapping_add(1);
+        PendingScroll { request_id, target }
+    });
+    entry.target = entry.target.max(target);
+    if entry.request_id == request_id {
+        write_message(
+            stream,
+            &ClientMessage::ScrollbackQuery {
+                pane_id,
+                offset: 0,
+                max_rows: 1_000,
+                request_id,
+            },
+        )?;
     }
     Ok(())
 }
@@ -771,12 +896,6 @@ fn client_key_bytes(
     }
 }
 
-fn available_scrollback(screen: &vt100::Screen) -> usize {
-    let mut screen = screen.clone();
-    screen.set_scrollback(crate::screen::SCROLLBACK_LINES);
-    screen.scrollback()
-}
-
 struct ClientTerminalGuard {
     stdout: io::Stdout,
     raw: bool,
@@ -851,7 +970,7 @@ mod tests {
 
     use crate::{
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
-        local_ipc::{AgentOverlaySnapshotRow, LocalHistorySnapshot, PaneScreenSnapshot},
+        local_ipc::{AgentOverlaySnapshotRow, PaneScreenSnapshot},
         screen::HostScreen,
         tui::{AGENT_TOGGLE_WINDOW, UiIntent},
     };
@@ -1000,19 +1119,16 @@ mod tests {
     }
 
     #[test]
-    fn local_history_rebuilds_a_scrollback_viewport() {
+    fn history_cache_rebuilds_a_scrollback_viewport() {
         let mut host = HostScreen::new(1, 3).unwrap();
         host.process_pty(b"one\r\ntwo").unwrap();
         let (total_rows, rows) = host.visual_scrollback(1_000, 256 * 1024);
-        let mut history = LocalHistory::default();
-        assert!(
-            history.replace(
-                LocalHistorySnapshot {
-                    total_rows,
-                    rows: rows.into_iter().map(|row| STANDARD.encode(row)).collect(),
-                },
-                host.screen().size(),
-            ) > 0
+        let mut history = HistoryCache::default();
+        history.install_window(
+            total_rows as u64,
+            total_rows as u64,
+            host.screen().size(),
+            rows.into_iter().map(|row| STANDARD.encode(row)).collect(),
         );
 
         let mut viewport = history.viewport(host.screen());
@@ -1021,17 +1137,17 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_screen_update_preserves_local_history() {
+    fn screen_updates_do_not_fill_the_history_cache() {
         let host = HostScreen::new(2, 8).unwrap();
         let mut tui = None;
         let mut screens = BTreeMap::new();
-        let mut local_history = BTreeMap::new();
+        let mut history = BTreeMap::new();
         let mut pending_focus = None;
         apply_snapshot(
             &mut tui,
             crate::config::UiTheme::default(),
             &mut screens,
-            &mut local_history,
+            &mut history,
             String::from("room"),
             layout(&[1]),
             vec![PaneScreenSnapshot {
@@ -1041,10 +1157,8 @@ mod tests {
                     snapshot: host.current_frame().snapshot.as_ref().to_vec(),
                     kitty_keyboard_active: false,
                 },
-                local_history: Some(LocalHistorySnapshot {
-                    total_rows: 1,
-                    rows: vec![STANDARD.encode(b"history")],
-                }),
+                history_len: 1,
+                history_end: 1,
             }],
             vec![],
             vec![],
@@ -1053,13 +1167,13 @@ mod tests {
             &mut pending_focus,
         )
         .unwrap();
-        assert_eq!(local_history[&1].available_rows(), 1);
+        assert_eq!(history[&1].available_rows(), 0);
 
         apply_snapshot(
             &mut tui,
             crate::config::UiTheme::default(),
             &mut screens,
-            &mut local_history,
+            &mut history,
             String::from("room"),
             layout(&[1]),
             vec![PaneScreenSnapshot {
@@ -1068,7 +1182,8 @@ mod tests {
                     sequence: 1,
                     kitty_keyboard_active: false,
                 },
-                local_history: None,
+                history_len: 1,
+                history_end: 1,
             }],
             vec![],
             vec![],
@@ -1077,7 +1192,7 @@ mod tests {
             &mut pending_focus,
         )
         .unwrap();
-        assert_eq!(local_history[&1].available_rows(), 1);
+        assert_eq!(history[&1].available_rows(), 0);
     }
 
     #[test]
@@ -1099,9 +1214,11 @@ mod tests {
                     snapshot: host.current_frame().snapshot.as_ref().to_vec(),
                     kitty_keyboard_active: false,
                 },
-                local_history: None,
+                history_len: 0,
+                history_end: 0,
             }],
             &mut pending_resync,
+            &mut BTreeSet::new(),
         )
         .unwrap();
 

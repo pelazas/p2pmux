@@ -158,6 +158,13 @@ claiming control or sending input. Mouse wheel scrolls pane history locally. The
 `PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK`; tab mode is
 `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
+For locally hosted panes, mouse-wheel scrollback is loaded from the host on demand when you first
+scroll up, then cached while you browse it. Alternate-screen applications have no attach
+scrollback, and a resize establishes the existing history floor (so pre-attach history can be
+empty after the attach-triggered resize). Remote-hosted panes return an empty scrollback window in
+this v1 implementation. This release changes the local IPC screen payload: restart any running
+p2pmux sessions after upgrading before attaching a new client.
+
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any
 changed host-owned grids. Guests only receive the resulting commit and screen snapshot.

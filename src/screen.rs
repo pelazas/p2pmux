@@ -56,7 +56,8 @@ pub struct HostScreen {
     previous: vt100::Screen,
     current: ScreenFrame,
     kitty_keyboard: KittyKeyboardTracker,
-    history_floor: usize,
+    history_floor: u64,
+    history_end: u64,
 }
 
 impl HostScreen {
@@ -77,12 +78,20 @@ impl HostScreen {
             },
             kitty_keyboard: KittyKeyboardTracker::default(),
             history_floor: 0,
+            history_end: 0,
         })
     }
 
     pub fn process_pty(&mut self, bytes: &[u8]) -> Result<ScreenFrame, ScreenError> {
+        let before_history = screen_scrollback_len(self.parser.screen());
         self.kitty_keyboard.observe(bytes);
         self.parser.process(bytes);
+        let after_history = screen_scrollback_len(self.parser.screen());
+        let appended = after_history.saturating_sub(before_history).max(
+            usize::from(before_history == SCROLLBACK_LINES && after_history == SCROLLBACK_LINES)
+                * bytes.iter().filter(|byte| **byte == b'\n').count(),
+        );
+        self.history_end = self.history_end.saturating_add(appended as u64);
         let sequence = self
             .current
             .sequence
@@ -115,7 +124,7 @@ impl HostScreen {
             .ok_or(ScreenError::SequenceExhausted)?;
         self.parser.screen_mut().set_size(rows, cols);
         self.previous = self.parser.screen().clone();
-        self.history_floor = screen_scrollback_len(self.parser.screen());
+        self.history_floor = self.history_end;
         let frame = ScreenFrame {
             sequence,
             base_sequence: 0,
@@ -139,20 +148,46 @@ impl HostScreen {
         self.kitty_keyboard.active()
     }
 
-    /// Returns the authoritative visual scrollback rows accumulated since the last resize.
-    pub fn visual_scrollback(&self, max_rows: usize, max_bytes: usize) -> (usize, Vec<Vec<u8>>) {
+    /// Returns available rows and the monotonic end position without formatting rows.
+    pub fn history_metadata(&self) -> (u64, u64) {
         if self.parser.screen().alternate_screen() {
-            return (0, Vec::new());
+            return (0, 0);
         }
         let mut screen = self.parser.screen().clone();
         screen.set_scrollback(SCROLLBACK_LINES);
-        let total_rows = screen.scrollback().saturating_sub(self.history_floor);
-        let first_row = total_rows.saturating_sub(max_rows);
+        let retained = screen.scrollback() as u64;
+        let first = self
+            .history_end
+            .saturating_sub(retained)
+            .max(self.history_floor);
+        (self.history_end.saturating_sub(first), self.history_end)
+    }
+
+    /// Returns a bounded history window. `offset` skips newest rows; returned rows are oldest to
+    /// newest.
+    pub fn visual_scrollback_window(
+        &self,
+        offset: u64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> (u64, Vec<Vec<u8>>) {
+        let (total_rows, history_end) = self.history_metadata();
+        if total_rows == 0 {
+            return (0, Vec::new());
+        }
+        let offset = offset.min(total_rows);
+        let last = total_rows.saturating_sub(offset);
+        let first = last.saturating_sub(max_rows as u64);
         let mut rows = Vec::new();
         let mut bytes = 0_usize;
-        for row in first_row..total_rows {
-            let offset = total_rows.saturating_sub(row);
-            screen.set_scrollback(offset);
+        let retained = screen_scrollback_len(self.parser.screen()) as u64;
+        let retained_start = history_end.saturating_sub(retained);
+        let available_start = history_end.saturating_sub(total_rows);
+        let mut screen = self.parser.screen().clone();
+        for row in first..last {
+            let absolute = available_start.saturating_add(row);
+            let physical = absolute.saturating_sub(retained_start);
+            screen.set_scrollback(retained.saturating_sub(physical) as usize);
             let Some(formatted) = screen.rows_formatted(0, screen.size().1).next() else {
                 continue;
             };
@@ -163,6 +198,12 @@ impl HostScreen {
             rows.push(formatted);
         }
         (total_rows, rows)
+    }
+
+    /// Compatibility helper for callers that need the newest window.
+    pub fn visual_scrollback(&self, max_rows: usize, max_bytes: usize) -> (usize, Vec<Vec<u8>>) {
+        let (total, rows) = self.visual_scrollback_window(0, max_rows, max_bytes);
+        (total as usize, rows)
     }
 
     pub fn take_kitty_keyboard_query_reply(&mut self) -> Option<Vec<u8>> {
@@ -312,5 +353,18 @@ mod tests {
 
         screen.process_pty(b"\x1b[?1049h").unwrap();
         assert_eq!(screen.visual_scrollback(10, 1024), (0, vec![]));
+    }
+
+    #[test]
+    fn visual_scrollback_window_skips_newest_rows() {
+        let mut screen = HostScreen::new(1, 8).unwrap();
+        screen.process_pty(b"one\r\ntwo\r\nthree").unwrap();
+
+        let (total, newest) = screen.visual_scrollback_window(0, 1, 1024);
+        let (_, older) = screen.visual_scrollback_window(1, 1, 1024);
+        assert!(total >= 2);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(older.len(), 1);
+        assert_ne!(newest, older);
     }
 }

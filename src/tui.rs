@@ -78,6 +78,8 @@ use crate::{
 pub(crate) enum NodeScreenSnapshot {
     Local {
         frame: ScreenFrame,
+        history_len: u64,
+        history_end: u64,
     },
     Remote {
         sequence: u64,
@@ -86,6 +88,15 @@ pub(crate) enum NodeScreenSnapshot {
 }
 pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, NodeScreenSnapshot>;
 pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalScrollbackWindow {
+    pub total_rows: u64,
+    pub sequence: u64,
+    pub grid_rows: u16,
+    pub grid_cols: u16,
+    pub rows: Vec<Vec<u8>>,
+}
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
@@ -862,6 +873,17 @@ impl MultiPaneTui {
 
     pub(crate) fn pane_scrollback_offset(&self, pane_id: PaneId) -> usize {
         self.scrollback_offset(pane_id)
+    }
+
+    pub(crate) fn set_pane_scrollback_offset(&mut self, pane_id: PaneId, offset: usize) -> bool {
+        let Some(view) = self.pane_views.get_mut(&pane_id) else {
+            return false;
+        };
+        if view.scrollback == offset {
+            return false;
+        }
+        view.scrollback = offset;
+        true
     }
 
     fn pane_at_or_focused(&self, column: u16, row: u16, area: Rect) -> PaneId {
@@ -4077,6 +4099,8 @@ impl SharedLayoutRuntime {
                 *pane_id,
                 NodeScreenSnapshot::Local {
                     frame: pane.screen.current_frame().clone(),
+                    history_len: pane.screen.history_metadata().0,
+                    history_end: pane.screen.history_metadata().1,
                 },
             );
             let view = pane.view_state();
@@ -4112,9 +4136,25 @@ impl SharedLayoutRuntime {
         )
     }
 
-    pub(crate) fn node_local_history(&self, pane_id: PaneId) -> Option<(usize, Vec<Vec<u8>>)> {
+    pub(crate) fn node_local_scrollback(
+        &self,
+        pane_id: PaneId,
+        offset: u64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<LocalScrollbackWindow> {
         let pane = self.local.get(&pane_id)?;
-        Some(pane.screen.visual_scrollback(1_000, 256 * 1024))
+        let (total_rows, rows) = pane
+            .screen
+            .visual_scrollback_window(offset, max_rows, max_bytes);
+        let (grid_rows, grid_cols) = pane.screen.screen().size();
+        Some(LocalScrollbackWindow {
+            total_rows,
+            sequence: pane.screen.current_frame().sequence,
+            grid_rows,
+            grid_cols,
+            rows,
+        })
     }
 
     pub(crate) fn node_remote_snapshot(&self, pane_id: PaneId) -> Option<Vec<u8>> {
