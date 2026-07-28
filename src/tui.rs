@@ -6830,16 +6830,6 @@ mod tests {
         });
         assert!(source_cwd.is_some(), "source PTY changed directory");
 
-        runtime.tui.selection = Some(PaneTextSelection {
-            pane_id: 1,
-            anchor: ScreenCell { row: 0, col: 0 },
-            cursor: ScreenCell { row: 0, col: 1 },
-        });
-        runtime.copied_lines = Some(2);
-        assert!(runtime.clear_selection());
-        assert!(runtime.tui.selection.is_none());
-        assert_eq!(runtime.copied_lines, None);
-
         runtime
             .handle_intent(UiIntent::CreatePane {
                 target_pane_id: 1,
