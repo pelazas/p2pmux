@@ -99,12 +99,17 @@ impl HostScreen {
             .ok_or(ScreenError::SequenceExhausted)?;
         let snapshot = snapshot_payload(self.parser.screen())?;
         let delta = self.parser.screen().state_diff(&self.previous);
-        if delta.len() > MAX_DELTA_BYTES {
-            return Err(ScreenError::DeltaTooLarge(delta.len()));
-        }
+        // A large batch can outgrow the wire delta cap; fall back to the
+        // snapshot-only frame shape (as resize does) so consumers replace
+        // their screen instead of patching it.
+        let (base_sequence, delta) = if delta.len() > MAX_DELTA_BYTES {
+            (0, Vec::new())
+        } else {
+            (self.current.sequence, delta)
+        };
         let frame = ScreenFrame {
             sequence,
-            base_sequence: self.current.sequence,
+            base_sequence,
             snapshot,
             delta: Arc::from(delta),
             kitty_keyboard_active: self.kitty_keyboard.active(),

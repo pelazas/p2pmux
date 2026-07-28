@@ -1844,6 +1844,26 @@ impl PendingEscape {
 /// starve PTY draining forever.
 const MAX_EVENTS_PER_CYCLE: usize = 256;
 
+/// Frames are presented at most once per interval (~60 fps) so parse and input
+/// work is never crowded out by redraws faster than anyone can perceive.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+fn frame_due(last_draw: Option<Instant>) -> bool {
+    last_draw.is_none_or(|drawn| drawn.elapsed() >= FRAME_INTERVAL)
+}
+
+/// Poll timeout for the run loops: until the next frame deadline while a dirty
+/// frame is waiting, one full interval when idle.
+fn event_poll_timeout(dirty: bool, last_draw: Option<Instant>) -> Duration {
+    if !dirty {
+        return FRAME_INTERVAL;
+    }
+    last_draw
+        .map(|drawn| FRAME_INTERVAL.saturating_sub(drawn.elapsed()))
+        .unwrap_or(Duration::ZERO)
+        .max(Duration::from_millis(1))
+}
+
 fn is_mouse_moved(event: &Event) -> bool {
     matches!(
         event,
@@ -3636,6 +3656,7 @@ impl SharedLocalPane {
             }
         }
         let started = Instant::now();
+        let mut pending = Vec::new();
         for _ in 0..64 {
             if started.elapsed() >= Duration::from_millis(4) {
                 break;
@@ -3643,17 +3664,22 @@ impl SharedLocalPane {
             let Some(bytes) = self.host.try_read_output()? else {
                 break;
             };
+            pending.extend_from_slice(&bytes);
+        }
+        if !pending.is_empty() {
             self.agent_tracker
                 .record_output(Instant::now(), unix_ms_now());
-            let frame = self.screen.process_pty(&bytes)?;
+            // One parse/snapshot/diff for the whole batch: process_pty clones the
+            // screen per call, so per-chunk calls dominated CPU under output floods.
+            let frame = self.screen.process_pty(&pending)?;
             if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
                 && self.host.write_input(&reply).is_err()
             {
                 changed |= self.transition_exited()?;
-                break;
+            } else {
+                self.screen_tx.send_replace(frame);
+                changed = true;
             }
-            self.screen_tx.send_replace(frame);
-            changed = true;
         }
         if !self.exited && self.host.output_closed() {
             changed |= self.transition_exited()?;
@@ -4567,6 +4593,7 @@ impl SharedLayoutRuntime {
         self.tui
             .set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
         let mut dirty = true;
+        let mut last_draw: Option<Instant> = None;
         let mut pending_escape = PendingEscape::default();
         loop {
             dirty |= self.drain()?;
@@ -4593,7 +4620,7 @@ impl SharedLayoutRuntime {
                 }
                 dirty = true;
             }
-            if dirty {
+            if dirty && frame_due(last_draw) {
                 let mut screens = BTreeMap::new();
                 for (pane_id, pane) in &self.local {
                     screens.insert(*pane_id, pane.screen.screen());
@@ -4617,8 +4644,9 @@ impl SharedLayoutRuntime {
                     );
                 })?;
                 dirty = false;
+                last_draw = Some(Instant::now());
             }
-            if !event::poll(Duration::from_millis(16))? {
+            if !event::poll(event_poll_timeout(dirty, last_draw))? {
                 continue;
             }
             let mut quit = false;
@@ -6000,9 +6028,11 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
         },
     )?;
     let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
 
     loop {
         let drain_started = Instant::now();
+        let mut pending = Vec::new();
         for _ in 0..64 {
             if drain_started.elapsed() >= Duration::from_millis(4) {
                 break;
@@ -6010,8 +6040,11 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             let Some(bytes) = host.try_read_output()? else {
                 break;
             };
-            kitty_keyboard.observe(&bytes);
-            parser.process(&bytes);
+            pending.extend_from_slice(&bytes);
+        }
+        if !pending.is_empty() {
+            kitty_keyboard.observe(&pending);
+            parser.process(&pending);
             if let Some(reply) = kitty_keyboard.take_query_reply() {
                 host.write_input(&reply)?;
             }
@@ -6021,7 +6054,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        if dirty {
+        if dirty && frame_due(last_draw) {
             terminal.draw(|frame| {
                 let screen = parser.screen();
                 let area = frame.area();
@@ -6032,9 +6065,10 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
                 }
             })?;
             dirty = false;
+            last_draw = Some(Instant::now());
         }
 
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(event_poll_timeout(dirty, last_draw))? {
             continue;
         }
         let mut quit = false;
@@ -6087,6 +6121,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     )?;
     let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
     let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
     loop {
         if let Some(state) = runtime.lease.clear_if_idle(Instant::now())? {
             runtime.lease_tx.send_replace(state);
@@ -6136,6 +6171,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             }
         }
         let drain_started = Instant::now();
+        let mut pending = Vec::new();
         for _ in 0..64 {
             if drain_started.elapsed() >= Duration::from_millis(4) {
                 break;
@@ -6143,7 +6179,10 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             let Some(bytes) = runtime.host.try_read_output()? else {
                 break;
             };
-            if let Ok(frame) = runtime.screen.process_pty(&bytes) {
+            pending.extend_from_slice(&bytes);
+        }
+        if !pending.is_empty() {
+            if let Ok(frame) = runtime.screen.process_pty(&pending) {
                 if let Some(reply) = runtime.screen.take_kitty_keyboard_query_reply() {
                     runtime.host.write_input(&reply)?;
                 }
@@ -6154,7 +6193,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         if runtime.host.output_closed() {
             break;
         }
-        if dirty {
+        if dirty && frame_due(last_draw) {
             terminal.draw(|frame| {
                 let screen = runtime.screen.screen();
                 render_host_screen(frame, screen, &footer);
@@ -6165,8 +6204,9 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                 }
             })?;
             dirty = false;
+            last_draw = Some(Instant::now());
         }
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(event_poll_timeout(dirty, last_draw))? {
             continue;
         }
         let mut quit = false;
@@ -6257,6 +6297,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
 
     loop {
         let mut received_lease = false;
@@ -6328,16 +6369,17 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        if dirty {
+        if dirty && frame_due(last_draw) {
             terminal.draw(|frame| {
                 if let Some(screen) = remote.screen() {
                     render_guest_screen(frame, screen, &footer);
                 }
             })?;
             dirty = false;
+            last_draw = Some(Instant::now());
         }
 
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(event_poll_timeout(dirty, last_draw))? {
             continue;
         }
         let mut quit = false;
