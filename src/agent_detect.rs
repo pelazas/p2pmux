@@ -1,11 +1,33 @@
 //! Pure helpers for detecting supported coding agents in a hosted PTY tree.
 
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const DONE_GRACE: Duration = Duration::from_secs(15);
 const WORKING_WINDOW: Duration = Duration::from_secs(2);
+
+/// Return a process's current working directory when it is an existing absolute directory.
+pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    system
+        .process(pid)
+        .and_then(|process| process.cwd())
+        .and_then(existing_absolute_directory)
+}
+
+fn existing_absolute_directory(path: &Path) -> Option<PathBuf> {
+    (path.is_absolute() && path.is_dir()).then(|| path.to_path_buf())
+}
 
 /// A supported coding agent kind.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -353,6 +375,80 @@ impl PaneAgentTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        process::{Command, Stdio},
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn cwd_for_pid_reads_a_live_childs_working_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2pmux-cwd-for-pid-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("create temporary directory");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .current_dir(&directory)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+
+        let cwd = (0..20).find_map(|_| {
+            let cwd = cwd_for_pid(child.id());
+            if cwd.is_some() {
+                cwd
+            } else {
+                thread::sleep(Duration::from_millis(25));
+                None
+            }
+        });
+
+        assert_eq!(
+            cwd.as_deref()
+                .map(|cwd| fs::canonicalize(cwd).expect("canonicalize detected cwd")),
+            Some(fs::canonicalize(&directory).expect("canonicalize temporary directory"))
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir(&directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn cwd_validation_rejects_missing_paths_and_non_directories() {
+        let temporary_root = std::env::temp_dir().join(format!(
+            "p2pmux-cwd-validation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&temporary_root).expect("create temporary directory");
+        let file = temporary_root.join("file");
+        fs::write(&file, "not a directory").expect("write temporary file");
+
+        assert_eq!(
+            existing_absolute_directory(&temporary_root),
+            Some(temporary_root.clone())
+        );
+        assert_eq!(existing_absolute_directory(&file), None);
+        assert_eq!(
+            existing_absolute_directory(&temporary_root.join("missing")),
+            None
+        );
+        assert_eq!(existing_absolute_directory(Path::new("relative")), None);
+
+        fs::remove_dir_all(&temporary_root).expect("remove temporary directory");
+    }
 
     fn process(
         pid: u32,
