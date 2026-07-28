@@ -247,6 +247,49 @@ Two things worth knowing:
   cost is *per pane* rather than shared, a busy 8-member session with several flooded panes
   could get expensive. Worth a deliberate multi-pane measurement.
 
+### Iteration 6 — E×D: mouse forwarding and fidelity across mismatched sizes (2026-07-29)
+
+Script: `scripts/e2e/scenario_f_mouse.py`. Host at **120x40**, guest at **64x20** — the
+pane grid is host-owned, so a much smaller guest must track the stream without corrupting
+it. Mouse input is sent as real SGR (1006) reports, the encoding the client enables.
+
+The interesting part is that p2pmux must choose between two incompatible wheel behaviours
+*per pane state*: scroll its own scrollback, or forward the wheel to a child that scrolls
+itself. Get it backwards and either the user cannot scroll back, or a full-screen app never
+sees the wheel. Both are exercised on the **same pane, same peer**, so the decision cannot
+be made once at startup.
+
+Repro:
+1. Host creates at 120x40, guest joins at 64x20.
+2. Host runs `echo '日本語 ABC 🙂🎉 café ĄŻ'`.
+3. Host runs `seq 1 200`, then wheel-up ×5 at (20,10), then wheel-down ×8.
+4. Host runs `printf '\033[?1000h\033[?1006h'` so the child now reports mouse.
+5. Wheel-up ×3 again on that same pane.
+
+| Check | Result |
+|---|---|
+| Unicode/wide/emoji reaches a much smaller guest | PASS |
+| Wide characters are not mangled on the host | PASS |
+| Wheel scrolls p2pmux's own scrollback when the child does not report mouse | PASS |
+| Wheel-up moves backwards through history, not forwards | PASS |
+| **Wheel-down returns exactly to the live bottom** (byte-identical screen) | PASS |
+| **Wheel is forwarded once the child reports mouse** | PASS |
+| **p2pmux scrollback does NOT move while the child owns the wheel** | PASS |
+| No panic, both peers alive | PASS |
+
+**No p2pmux bug found.** 4/4 runs clean, zero orphans. Wheel-up moves back exactly 3 lines
+per notch and wheel-down clamps to a byte-identical live bottom.
+
+Two harness defects found and fixed (mine, not p2pmux's):
+- **pyte crashes on emoji.** `Screen.display` does `char[0]` on every cell and raises
+  `IndexError` on the empty continuation cell a wide character leaves behind
+  (`pyte/screens.py:241`). Since these scenarios stream CJK and emoji on purpose, the
+  harness now renders rows itself, wide-char aware, via `Peer._render_row`.
+- **Wrong mouse oracle.** The check looked for `[<64;` in the pane. The pane's own vt100
+  parser consumes the leading `ESC [ <` as an escape sequence, so a forwarded report lands
+  on screen as `64;19;6M`. Confirmed forwarding was working all along by reading the raw
+  PTY bytes before changing anything.
+
 ## Coverage caveat on the loop's stop rule
 
 Iterations 1-3 each found no bug, which technically fires the "three consecutive clean

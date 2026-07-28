@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 import pyte
+from wcwidth import wcwidth
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BINARY = REPO_ROOT / "target" / "release" / "p2pmux"
@@ -269,6 +270,27 @@ class Peer:
         time.sleep(0.05)
         self.send(KEYS["enter"])
 
+    # SGR (1006) mouse reports, which is what the client enables via EnableMouseCapture.
+    # Coordinates are 1-based, matching what a real terminal emits.
+    def _sgr_mouse(self, code: int, col: int, row: int, release: bool = False) -> None:
+        self.send(f"\x1b[<{code};{col};{row}{'m' if release else 'M'}".encode())
+
+    def wheel_up(self, col: int, row: int, times: int = 1, delay: float = 0.12) -> None:
+        for _ in range(times):
+            self._sgr_mouse(64, col, row)
+            time.sleep(delay)
+
+    def wheel_down(self, col: int, row: int, times: int = 1, delay: float = 0.12) -> None:
+        for _ in range(times):
+            self._sgr_mouse(65, col, row)
+            time.sleep(delay)
+
+    def click(self, col: int, row: int, delay: float = 0.15) -> None:
+        self._sgr_mouse(0, col, row)
+        time.sleep(delay)
+        self._sgr_mouse(0, col, row, release=True)
+        time.sleep(delay)
+
     def resize(self, cols: int, rows: int) -> None:
         """Resize this peer's terminal, delivering a real SIGWINCH."""
         self.cols, self.rows = cols, rows
@@ -281,10 +303,32 @@ class Peer:
 
     # ------------------------------------------------------------------ output
 
+    def _render_row(self, y: int) -> str:
+        """One rendered row, wide-char aware.
+
+        Deliberately not pyte's own `Screen.display`: that does `char[0]` on every cell
+        and raises IndexError when it meets the empty continuation cell that wide
+        characters and emoji leave behind (pyte/screens.py:241). Since these scenarios
+        stream CJK and emoji through panes on purpose, the harness has to render them
+        itself rather than crash on the exact content it is meant to be checking.
+        """
+        row = self._screen.buffer[y]
+        out: list[str] = []
+        x = 0
+        while x < self._screen.columns:
+            data = row[x].data
+            if not data:
+                out.append(" ")
+                x += 1
+                continue
+            out.append(data)
+            x += 2 if wcwidth(data[0]) == 2 else 1
+        return "".join(out)
+
     def snapshot(self) -> str:
         """The currently rendered screen as text, trailing blanks stripped."""
         with self._lock:
-            lines = [line.rstrip() for line in self._screen.display]
+            lines = [self._render_row(y).rstrip() for y in range(self._screen.lines)]
         return "\n".join(lines)
 
     def cursor(self) -> tuple[int, int]:
