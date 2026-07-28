@@ -67,6 +67,28 @@ KEYS = {
 }
 
 
+class AltScreen(pyte.Screen):
+    """pyte.Screen plus alternate-screen support.
+
+    p2pmux enters the alt screen (`ESC [ ? 1049 h`) before drawing its TUI. Stock
+    pyte ignores 1049, so anything printed to the terminal beforehand -- notably the
+    multi-line TRUST WARNING that `create`/`join` print -- stays on the grid and
+    bleeds through wherever the TUI does not repaint. That looks exactly like a
+    garbled render, which is precisely the bug class these scenarios hunt for, so
+    the harness has to model it correctly or it will manufacture false positives.
+    """
+
+    def set_mode(self, *modes: int, **kwargs: object) -> None:
+        super().set_mode(*modes, **kwargs)
+        if kwargs.get("private") and 1049 in modes:
+            self.reset()
+
+    def reset_mode(self, *modes: int, **kwargs: object) -> None:
+        super().reset_mode(*modes, **kwargs)
+        if kwargs.get("private") and 1049 in modes:
+            self.reset()
+
+
 class DeadlineExceeded(AssertionError):
     """A screen never reached the expected state before its deadline."""
 
@@ -107,7 +129,7 @@ class Peer:
         if not BINARY.exists():
             raise FileNotFoundError(f"{BINARY} missing -- run: cargo build --release")
 
-        self._screen = pyte.Screen(self.cols, self.rows)
+        self._screen = AltScreen(self.cols, self.rows)
         self._stream = pyte.ByteStream(self._screen)
 
         master_fd, slave_fd = pty.openpty()
@@ -465,6 +487,33 @@ class Harness:
         self.peers.append(peer)
         peer.start()
         return peer
+
+    def create_room(
+        self,
+        name: str = "host",
+        cols: int = DEFAULT_COLS,
+        rows: int = DEFAULT_ROWS,
+        timeout: float = 25.0,
+    ) -> tuple[Peer, str]:
+        """Start a host peer and return it with its live join code."""
+        host = self.spawn(name, ["create", "--name", name], cols=cols, rows=rows)
+        host.wait_ready(timeout=timeout)
+        screen = host.wait_for(r"p2pmux join [A-Za-z0-9]{6,}", timeout=timeout)
+        return host, join_code_from(screen)
+
+    def join_room(
+        self,
+        name: str,
+        code: str,
+        cols: int = DEFAULT_COLS,
+        rows: int = DEFAULT_ROWS,
+        timeout: float = 30.0,
+    ) -> Peer:
+        """Join an existing room and wait until the shared layout has rendered."""
+        guest = self.spawn(name, ["join", code, "--name", name], cols=cols, rows=rows)
+        guest.wait_ready(timeout=timeout)
+        guest.wait_for(r"Pane #\d+", timeout=timeout)
+        return guest
 
     def peer(self, name: str) -> Peer:
         for peer in self.peers:

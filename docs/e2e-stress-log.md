@@ -66,9 +66,46 @@ takes `require_content=True` by default and `wait_ready()` waits for the first n
 frame. Confirmed the underlying render was always correct by dumping the raw PTY bytes
 (`\x1b[?1049h` alt-screen enter, then the prompt).
 
+### Iteration 1 — A×A: child exits under a watching guest, then guest types into it (2026-07-28)
+
+Script: `scripts/e2e/scenario_a_exit.py`. Two real peers, 100x30 each.
+
+Repro:
+1. `p2pmux create --name host` → read the join code off the host status bar.
+2. `p2pmux join <code> --name guest`, wait for `Pane #1` to render.
+3. Host types `echo WATCHING-<n>` + Enter.
+4. Host types `exit` + Enter — the pane's child shell dies while the guest watches.
+5. Guest types `GHOSTKEY<n>` + Enter into the now-exited pane.
+
+| Check | Result |
+|---|---|
+| Guest sees the host child's output | PASS |
+| Host and guest render byte-identical pane bodies | PASS |
+| Host footer shows `exited — close with Ctrl+P, X` | PASS |
+| Guest footer shows `exited — input disabled; pane host can close with Ctrl+P, X` | PASS |
+| Both peers survive the child exit | PASS |
+| Guest keystrokes never appear in the exited pane (guest view) | PASS |
+| Guest keystrokes never reach the host's exited pane | PASS |
+| Exited pane content unchanged by the rejected input, both views | PASS |
+| No panic text on either PTY | PASS |
+| RSS across the scenario | PASS — 76.6 MB → 76.1 MB, no growth |
+
+**No bug found.** 5/5 runs fully clean (1 + 4 repeats), zero orphans. Input rejection is
+real, not cosmetic: `input_allowed()` (`src/tui.rs:4521`) gates on `!pane.exited`, and the
+guest's bytes changed nothing on the *host's* copy of the pane either — so they were
+dropped before the wire, not swallowed at the render layer.
+
+Escalating: next scenario targets severity-2 ownership outcomes rather than happy path.
+
+**Second harness fidelity fix (harness only):** pyte does not implement the alternate
+screen buffer, so the multi-line TRUST WARNING that `create`/`join` print before the TUI
+starts stayed on the grid and bled through wherever the TUI did not repaint — indis-
+tinguishable from a garbled render, i.e. a false-positive generator for exactly the bug
+class this loop hunts. `driver.AltScreen` now clears on `ESC [ ? 1049 h/l`.
+
 ## Open bugs
 
-_None yet — no product scenario has been run._
+_None yet._
 
 ## Fixed
 
