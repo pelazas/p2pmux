@@ -4031,6 +4031,10 @@ impl SharedLayoutRuntime {
         self.control.peer_id()
     }
 
+    pub(crate) fn join_code(&self) -> Option<&str> {
+        self.join_code.as_deref()
+    }
+
     fn input_allowed(&self, pane_id: PaneId) -> bool {
         let peer_id = self.control.peer_id();
         self.tui

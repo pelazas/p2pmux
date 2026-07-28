@@ -522,6 +522,7 @@ fn write_snapshot(
         local_peer_id,
         tab_id,
         pane_id,
+        join_code: node.runtime.join_code().map(str::to_owned),
     };
     let json_started = Instant::now();
     let mut frame = serde_json::to_vec(&message).map_err(io::Error::other)?;
@@ -1164,6 +1165,7 @@ mod tests {
                 local_peer_id: vec![],
                 tab_id: 1,
                 pane_id: 1,
+                join_code: None,
             },
         )
         .unwrap();
