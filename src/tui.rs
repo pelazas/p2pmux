@@ -2454,26 +2454,6 @@ fn render_copy_feedback(
     );
 }
 
-fn render_footer_notice(
-    buffer: &mut Buffer,
-    theme: &UiTheme,
-    x: u16,
-    y: u16,
-    end_x: u16,
-    notice: &str,
-) {
-    buffer.set_stringn(
-        x,
-        y,
-        format!("  {notice}"),
-        usize::from(end_x.saturating_sub(x)),
-        Style::default()
-            .fg(theme.footer_orange)
-            .bg(theme.footer_background)
-            .add_modifier(Modifier::BOLD),
-    );
-}
-
 fn footer_suffix(text: &str, width: usize) -> &str {
     if width == 0 {
         return "";
@@ -2502,78 +2482,222 @@ fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&st
     0
 }
 
+struct FooterText {
+    text: String,
+    rect: Rect,
+}
+
+enum FooterFlash {
+    Notice(FooterText),
+    CopyFeedback { lines: usize, rect: Rect },
+}
+
+/// The shared placement authority for footer content, including the join command.
+struct FooterLayout {
+    badge: Option<&'static str>,
+    help_start: u16,
+    help_end: u16,
+    status: Option<FooterText>,
+    flash: Option<FooterFlash>,
+    join_x: u16,
+    join_text: Option<String>,
+    join_rect: Option<Rect>,
+}
+
+fn footer_layout(
+    area: Rect,
+    chord_mode: ChordMode,
+    status: &str,
+    footer_notice: Option<&str>,
+    copied_lines: Option<usize>,
+    join_code: Option<&str>,
+) -> FooterLayout {
+    let end_x = area.right();
+    let join = join_code.map(|code| format!("join: p2pmux join {code}"));
+
+    if chord_mode != ChordMode::None {
+        let badge = chord_footer_badge(chord_mode, area.width);
+        let mut x = area.x.saturating_add(badge.map_or(0, text_width));
+        let (_, segments) = contextual_footer(chord_mode);
+        if badge.is_none() || end_x.saturating_sub(x) < footer_segments_width(segments) {
+            return FooterLayout {
+                badge,
+                help_start: x,
+                help_end: end_x,
+                status: None,
+                flash: None,
+                join_x: end_x,
+                join_text: None,
+                join_rect: None,
+            };
+        }
+
+        x = x.saturating_add(footer_segments_width(segments));
+        let help_end = x;
+        let status = (!status.is_empty()).then(|| {
+            let text = format!("{status}  ");
+            let width = text_width(&text);
+            (text, width)
+        });
+        let status = status.and_then(|(text, width)| {
+            (end_x.saturating_sub(x) >= width).then(|| {
+                let rect = Rect::new(x, area.y, width, 1);
+                x = x.saturating_add(width);
+                FooterText { text, rect }
+            })
+        });
+        let flash = footer_notice.and_then(|notice| {
+            let text = format!("  {notice}");
+            let width = text_width(&text);
+            (end_x.saturating_sub(x) >= width).then(|| {
+                let rect = Rect::new(x, area.y, width, 1);
+                x = x.saturating_add(width);
+                FooterFlash::Notice(FooterText { text, rect })
+            })
+        });
+        let join_text = join.filter(|text| end_x.saturating_sub(x) >= text_width(text));
+        let join_rect = join_text
+            .as_ref()
+            .map(|text| Rect::new(x, area.y, text_width(text), 1));
+
+        return FooterLayout {
+            badge,
+            help_start: area.x.saturating_add(badge.map_or(0, text_width)),
+            help_end,
+            status,
+            flash,
+            join_x: join_rect.map_or(end_x, |rect| rect.x),
+            join_text,
+            join_rect,
+        };
+    }
+
+    let mut x = area.x;
+    let status = (!status.is_empty()).then(|| {
+        let text = format!("{status}  ");
+        let width = text_width(&text).min(end_x.saturating_sub(x));
+        let rect = Rect::new(x, area.y, width, 1);
+        x = x.saturating_add(width);
+        FooterText { text, rect }
+    });
+    let join_text = join.as_deref().and_then(|text| {
+        let text = footer_suffix(text, usize::from(end_x.saturating_sub(x)));
+        (!text.is_empty()).then(|| text.to_owned())
+    });
+    let join_x = join_text.as_ref().map_or(end_x, |text| {
+        end_x.saturating_sub(u16::try_from(text.chars().count()).unwrap_or(u16::MAX))
+    });
+    let join_rect = join_text.as_ref().map(|text| {
+        Rect::new(
+            join_x,
+            area.y,
+            u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            1,
+        )
+    });
+    let flash_width = if footer_notice.is_some() {
+        mid_footer_flash_width(None, footer_notice)
+    } else if status.is_none() {
+        mid_footer_flash_width(copied_lines, None)
+    } else {
+        0
+    };
+    let help_end = join_x.saturating_sub(flash_width);
+    let flash_start = x.max(help_end);
+    let flash_rect = Rect::new(flash_start, area.y, join_x.saturating_sub(flash_start), 1);
+    let flash = footer_notice
+        .map(|notice| {
+            FooterFlash::Notice(FooterText {
+                text: format!("  {notice}"),
+                rect: flash_rect,
+            })
+        })
+        .or_else(|| {
+            status
+                .is_none()
+                .then_some(copied_lines)
+                .flatten()
+                .map(|lines| FooterFlash::CopyFeedback {
+                    lines,
+                    rect: flash_rect,
+                })
+        });
+
+    FooterLayout {
+        badge: None,
+        help_start: x,
+        help_end,
+        status,
+        flash,
+        join_x,
+        join_text,
+        join_rect,
+    }
+}
+
 fn render_chord_footer(
     buffer: &mut Buffer,
     theme: &UiTheme,
     area: Rect,
-    status: &str,
-    footer_notice: Option<&str>,
-    join_code: Option<&str>,
     chord_mode: ChordMode,
+    layout: &FooterLayout,
 ) {
-    let Some(badge) = chord_footer_badge(chord_mode, area.width) else {
+    let Some(badge) = layout.badge else {
         return;
     };
-    let end_x = area.right();
-    let mut x = buffer
-        .set_stringn(
-            area.x,
-            area.y,
-            badge,
-            usize::from(end_x.saturating_sub(area.x)),
-            Style::default()
-                .fg(theme.footer_orange)
-                .bg(theme.footer_background)
-                .add_modifier(Modifier::BOLD),
-        )
-        .0;
+    buffer.set_stringn(
+        area.x,
+        area.y,
+        badge,
+        usize::from(area.right().saturating_sub(area.x)),
+        Style::default()
+            .fg(theme.footer_orange)
+            .bg(theme.footer_background)
+            .add_modifier(Modifier::BOLD),
+    );
     let (_, segments) = contextual_footer(chord_mode);
-    if end_x.saturating_sub(x) < footer_segments_width(segments) {
-        render_footer_segments(buffer, theme, x, area.y, end_x, segments);
-        return;
-    }
-    x = render_footer_segments(buffer, theme, x, area.y, end_x, segments);
+    render_footer_segments(
+        buffer,
+        theme,
+        layout.help_start,
+        area.y,
+        layout.help_end,
+        segments,
+    );
 
-    let status = (!status.is_empty()).then(|| format!("{status}  "));
-    let notice = footer_notice.map(|notice| format!("  {notice}"));
-    for (text, style) in [
-        (
-            status.as_deref(),
+    if let Some(status) = &layout.status {
+        buffer.set_stringn(
+            status.rect.x,
+            area.y,
+            &status.text,
+            usize::from(status.rect.width),
             Style::default()
                 .fg(theme.footer_muted)
                 .bg(theme.footer_background),
-        ),
-        (
-            notice.as_deref(),
+        );
+    }
+    if let Some(FooterFlash::Notice(notice)) = &layout.flash {
+        buffer.set_stringn(
+            notice.rect.x,
+            area.y,
+            &notice.text,
+            usize::from(notice.rect.width),
             Style::default()
                 .fg(theme.footer_orange)
                 .bg(theme.footer_background)
                 .add_modifier(Modifier::BOLD),
-        ),
-    ] {
-        if let Some(text) = text
-            && end_x.saturating_sub(x) >= text_width(text)
-        {
-            x = buffer
-                .set_stringn(x, area.y, text, usize::from(text_width(text)), style)
-                .0;
-        }
+        );
     }
-
-    if let Some(join_code) = join_code {
-        let join = format!("join: p2pmux join {join_code}");
-        let join_width = text_width(&join);
-        if end_x.saturating_sub(x) >= join_width {
-            buffer.set_stringn(
-                x,
-                area.y,
-                join,
-                usize::from(join_width),
-                Style::default()
-                    .fg(theme.footer_muted)
-                    .bg(theme.footer_background),
-            );
-        }
+    if let (Some(join), Some(join_rect)) = (&layout.join_text, layout.join_rect) {
+        buffer.set_stringn(
+            layout.join_x,
+            area.y,
+            join,
+            usize::from(join_rect.width),
+            Style::default()
+                .fg(theme.footer_muted)
+                .bg(theme.footer_background),
+        );
     }
 }
 
@@ -2588,6 +2712,14 @@ fn render_contextual_footer(
     join_code: Option<&str>,
     chord_mode: ChordMode,
 ) {
+    let layout = footer_layout(
+        area,
+        chord_mode,
+        status,
+        footer_notice,
+        copied_lines,
+        join_code,
+    );
     buffer.set_stringn(
         area.x,
         area.y,
@@ -2597,70 +2729,55 @@ fn render_contextual_footer(
     );
 
     if chord_mode != ChordMode::None {
-        render_chord_footer(
-            buffer,
-            theme,
-            area,
-            status,
-            footer_notice,
-            join_code,
-            chord_mode,
-        );
+        render_chord_footer(buffer, theme, area, chord_mode, &layout);
         return;
     }
 
-    let end_x = area.right();
-    let mut x = area.x;
-    if !status.is_empty() {
-        x = buffer
-            .set_stringn(
-                x,
-                area.y,
-                format!("{status}  "),
-                usize::from(end_x.saturating_sub(x)),
-                Style::default()
-                    .fg(theme.footer_muted)
-                    .bg(theme.footer_background),
-            )
-            .0;
-    }
-
-    let join = join_code.map(|code| format!("join: p2pmux join {code}"));
-    let (join_x, join_text) = join
-        .as_deref()
-        .map(|text| {
-            let text = footer_suffix(text, usize::from(end_x.saturating_sub(x)));
-            (
-                end_x.saturating_sub(text.chars().count() as u16),
-                Some(text),
-            )
-        })
-        .unwrap_or((end_x, None));
-    let flash_width = if footer_notice.is_some() {
-        mid_footer_flash_width(None, footer_notice)
-    } else if status.is_empty() && chord_mode == ChordMode::None {
-        mid_footer_flash_width(copied_lines, None)
-    } else {
-        0
-    };
-    let help_end = join_x.saturating_sub(flash_width);
-    let (_, segments) = contextual_footer(chord_mode);
-    let x = render_footer_segments(buffer, theme, x, area.y, help_end, segments);
-    // Mid-bar flash messages sit after chord help and before the join code.
-    if let Some(notice) = footer_notice {
-        render_footer_notice(buffer, theme, x, area.y, join_x, notice);
-    } else if status.is_empty()
-        && chord_mode == ChordMode::None
-        && let Some(lines) = copied_lines
-    {
-        render_copy_feedback(buffer, theme, x, area.y, join_x, lines);
-    }
-    if let Some(text) = join_text {
+    if let Some(status) = &layout.status {
         buffer.set_stringn(
-            join_x,
+            status.rect.x,
+            area.y,
+            &status.text,
+            usize::from(status.rect.width),
+            Style::default()
+                .fg(theme.footer_muted)
+                .bg(theme.footer_background),
+        );
+    }
+    let (_, segments) = contextual_footer(chord_mode);
+    render_footer_segments(
+        buffer,
+        theme,
+        layout.help_start,
+        area.y,
+        layout.help_end,
+        segments,
+    );
+    // Mid-bar flash messages sit after chord help and before the join code.
+    match &layout.flash {
+        Some(FooterFlash::Notice(notice)) => {
+            buffer.set_stringn(
+                notice.rect.x,
+                area.y,
+                &notice.text,
+                usize::from(notice.rect.width),
+                Style::default()
+                    .fg(theme.footer_orange)
+                    .bg(theme.footer_background)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        Some(FooterFlash::CopyFeedback { lines, rect }) => {
+            render_copy_feedback(buffer, theme, rect.x, area.y, rect.right(), *lines);
+        }
+        None => {}
+    }
+    if let (Some(text), Some(join_rect)) = (&layout.join_text, layout.join_rect) {
+        buffer.set_stringn(
+            layout.join_x,
             area.y,
             text,
-            usize::from(end_x.saturating_sub(join_x)),
+            usize::from(join_rect.width),
             Style::default()
                 .fg(theme.footer_muted)
                 .bg(theme.footer_background),
