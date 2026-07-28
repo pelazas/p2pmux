@@ -202,6 +202,51 @@ visible reaction to the refused keystrokes and saw **none** (`visible reaction? 
 Filed under Cosmetic below rather than Open bugs — the refusal itself is correct per
 design, only the feedback is missing.
 
+### Iteration 4 — F×D: typing fast into a 10k-line flood with a guest watching (2026-07-29)
+
+Script: `scripts/e2e/scenario_d_load.py`. Two real peers, guest watching throughout.
+
+Repro:
+1. Host creates, guest joins.
+2. Host runs `seq 1 10000`.
+3. **150 ms later, while the flood is still streaming**, host types
+   `echo TYPED-DURING-STREAM-Q1W2E3R4T5` at ~1ms/key. The shell cannot read it until the
+   burst ends, so the keystrokes sit in the PTY input queue across the entire flood.
+4. Let both peers settle, then run a second identical `seq 1 10000`.
+
+| Check | Result |
+|---|---|
+| Input typed during the flood still executes | PASS |
+| The queued command is not mangled by the flood | PASS |
+| The queued command is not duplicated | PASS |
+| The flood reached its last line (10000) | PASS |
+| Host and guest render identical pane bodies after the flood | PASS |
+| A second identical flood does not grow memory again | PASS |
+| No panic, both peers alive | PASS |
+
+**No bug found.** 3/3 runs clean, zero orphans.
+
+**Memory characterisation** (measured over four consecutive floods, not a bug):
+
+| stage | host | guest | total |
+|---|---|---|---|
+| baseline | 39.8 MB | 37.9 MB | 77.6 MB |
+| after flood 1 | 162.7 MB | 38.4 MB | 201.1 MB |
+| after flood 2 | 163.3 MB | 38.4 MB | 201.7 MB |
+| after flood 3 | 163.4 MB | 38.4 MB | 201.8 MB |
+| after flood 4 | 163.4 MB | 38.4 MB | 201.8 MB |
+
+Two things worth knowing:
+- Scrollback memory is **bounded, not leaking**. The first flood costs ~123 MB on the pane
+  host as the scrollback buffer reaches capacity; every later flood is free (+0.6 MB total
+  across three more). The scenario now asserts this boundedness invariant instead of an
+  arbitrary absolute ceiling.
+- **Only the pane host retains scrollback.** The watching guest grew 0.5 MB for the same
+  10k lines, consistent with the on-demand-scrollback design.
+- Open question for a human, not pursued here: ~123 MB per flooded pane is chunky. If that
+  cost is *per pane* rather than shared, a busy 8-member session with several flooded panes
+  could get expensive. Worth a deliberate multi-pane measurement.
+
 ## Coverage caveat on the loop's stop rule
 
 Iterations 1-3 each found no bug, which technically fires the "three consecutive clean
