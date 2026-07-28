@@ -70,8 +70,13 @@ fn report_failure(path: &Path, reported_failures: &Mutex<BTreeSet<PathBuf>>, mes
     let Ok(mut failures) = reported_failures.lock() else {
         return;
     };
+    // The TUI owns the terminal (raw mode + alternate screen), so stderr would
+    // scribble over it; route through the opt-in UI debug log instead.
     if failures.insert(path.to_owned()) {
-        eprintln!("p2pmux notification sound {}: {message}", path.display());
+        crate::tui::ui_debug_log(
+            "notify_sound_failure",
+            format_args!("path={} message={message}", path.display()),
+        );
     }
 }
 

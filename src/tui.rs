@@ -126,7 +126,7 @@ struct UiDebugLog {
     write_lock: Mutex<()>,
 }
 
-fn ui_debug_log(event: &str, fields: fmt::Arguments<'_>) {
+pub(crate) fn ui_debug_log(event: &str, fields: fmt::Arguments<'_>) {
     static UI_DEBUG_LOG: OnceLock<UiDebugLog> = OnceLock::new();
     let debug_log = UI_DEBUG_LOG.get_or_init(|| {
         let path = env::var("P2PMUX_DEBUG_UI").ok().and_then(|value| {
