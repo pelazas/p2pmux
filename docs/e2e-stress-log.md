@@ -165,9 +165,64 @@ Refusing is per design (`lease.rs`, `IDLE_AFTER = 30s`; the bank calls for "expl
 handoff required"). The open question is the missing feedback, and — more interesting —
 whether `held_input` replay after the handoff is lossless. That is iteration 3.
 
+### Iteration 3 — B: control-lease handoff and input integrity (2026-07-29)
+
+Script: `scripts/e2e/scenario_c_lease.py`. Two real peers. Severity-3 target: the
+`held_input` buffer-and-replay path in `src/tui.rs:6717-6725`, which is where a handoff
+would drop, duplicate, or reorder keystrokes. ~85s per run (two 30s idle waits).
+
+Repro:
+1. Host creates, guest joins, guest makes its own pane (`Ctrl+P, n`).
+2. Guest focuses the host's pane (`Ctrl+P, ←`) and types `HOPIN<n>` — control is free,
+   so this is the no-approval idle hop-in.
+3. Host immediately types `BLOCKED<n>` into its *own* pane while the guest holds the lease.
+4. Wait 35s for the lease to go idle. Host types `echo Q1W2E3R4T5Y6U7I8O9P0` at ~2ms/key,
+   fast enough that the bytes straddle the take-control round trip and land in `held_input`.
+5. Wait 35s again, then host and guest type `AAAAAAAAAA` / `BBBBBBBBBB` simultaneously.
+
+| Check | Result |
+|---|---|
+| Idle hop-in: guest input reaches the host's pane with no approval | PASS |
+| Both peers agree the guest is now controller | PASS |
+| Host's own input is refused while the guest holds the lease | PASS |
+| Host reclaims control once the lease goes idle | PASS |
+| **Handoff input is not duplicated** (exactly 2 occurrences: typed + echoed) | PASS |
+| **Handoff input is not reordered or partially dropped** | PASS |
+| Guest renders the same reclaimed-pane content as the host | PASS |
+| **Racing peers do not interleave into one command line** | PASS |
+| **Exactly one peer wins the control race** | PASS |
+| No panic, both peers alive | PASS |
+
+**No bug found.** 4/4 runs clean, zero orphans. `held_input` replay is lossless: the
+20-character non-repeating handoff string arrived intact, in order, exactly once, and the
+simultaneous race produced no interleaving.
+
+Confirms the iteration-2 discovery by measurement: the harness explicitly checked for any
+visible reaction to the refused keystrokes and saw **none** (`visible reaction? False`).
+Filed under Cosmetic below rather than Open bugs — the refusal itself is correct per
+design, only the feedback is missing.
+
+## Coverage caveat on the loop's stop rule
+
+Iterations 1-3 each found no bug, which technically fires the "three consecutive clean
+iterations → stop" rule. Noting explicitly that this is **not** saturation of p2pmux:
+those three iterations were all inside categories A and B (which the loop asked to be
+prioritised, being the newest code). Categories C (room lifecycle), D (terminal fidelity),
+E (mouse forwarding) and F (load and failure) have **not been touched at all**. The right
+reading is "A and B look solid", so the loop continues into the untouched categories.
+
 ## Open bugs
 
-_None yet._
+_None._
+
+## Cosmetic / by-design gaps (not bugs)
+
+- **Silent input discard while another peer holds a pane's lease.** `src/tui.rs:6715-6726`
+  has no `else` branch, so keystrokes typed into a pane someone else actively controls are
+  dropped with no bell, no footer notice, and no other reaction (measured, iteration 3).
+  The only indication is the `control: <peer>` badge in the pane header. Refusing is
+  correct per `lease.rs` (`IDLE_AFTER = 30s`); the gap is purely the missing feedback, and
+  it is inconsistent with the exited-pane path which does explain itself. Severity 5.
 
 ## Fixed
 
