@@ -17,6 +17,7 @@ pub const MAX_AGENT_ROSTER_ENTRIES: usize = 32;
 pub const MAX_AGENT_KIND_BYTES: usize = 32;
 pub const MAX_AGENT_CWD_BYTES: usize = 512;
 pub const MAX_LAYOUT_TITLE_BYTES: usize = 128;
+pub const MAX_SESSION_NAME_BYTES: usize = 48;
 
 #[derive(Debug)]
 pub enum ProtocolError {
@@ -177,6 +178,8 @@ pub struct Welcome {
     pub admitted_peer_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "3")]
     pub coordinator_peer_id: Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub session_name: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -694,6 +697,11 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
                 "welcome.coordinator_peer_id",
                 &welcome.coordinator_peer_id,
                 MAX_PEER_ID_BYTES,
+            )?;
+            validate_field_size(
+                "welcome.session_name",
+                welcome.session_name.len(),
+                MAX_SESSION_NAME_BYTES,
             )?;
         }
         envelope::Body::Input(input) => {

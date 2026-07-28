@@ -100,7 +100,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
         } => {
             let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
             let host = SharedLayoutHost::with_display_name(
-                HostSession::create().await?,
+                HostSession::create_with_session_name(descriptor.name.clone()).await?,
                 display_name,
                 shell_rows,
                 shell_cols,

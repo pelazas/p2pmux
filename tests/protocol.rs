@@ -149,6 +149,7 @@ fn envelope_exposes_each_v1_body() {
             session_id: b"session-a".to_vec(),
             admitted_peer_id: b"peer-a".to_vec(),
             coordinator_peer_id: b"peer-host".to_vec(),
+            session_name: String::new(),
         })),
         envelope(envelope::Body::Input(Input {
             pane_id: b"pane-a".to_vec(),
@@ -276,6 +277,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             session_id: b"session-a".to_vec(),
             admitted_peer_id: b"peer-a".to_vec(),
             coordinator_peer_id: b"peer-host".to_vec(),
+            session_name: String::new(),
         })),
         envelope(envelope::Body::Input(Input {
             pane_id: b"pane-a".to_vec(),
