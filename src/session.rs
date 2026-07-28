@@ -1483,6 +1483,7 @@ pub struct HostSession {
     transport: Transport,
     ticket: JoinTicket,
     address_ready: bool,
+    session_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1492,6 +1493,7 @@ pub struct JoinReceipt {
     pub coordinator_peer_id: Vec<u8>,
     pub endpoint_addr: EndpointAddr,
     pub display_name: String,
+    pub session_name: String,
 }
 
 #[derive(Debug)]
@@ -1563,6 +1565,10 @@ impl From<CoordinatorError> for SessionError {
 
 impl HostSession {
     pub async fn create() -> Result<Self, SessionError> {
+        Self::create_with_session_name(String::new()).await
+    }
+
+    pub async fn create_with_session_name(session_name: String) -> Result<Self, SessionError> {
         let transport = Transport::bind().await?;
         let address_ready = transport.wait_until_online().await;
         let ticket = JoinTicket::mint(transport.endpoint_addr()).map_err(SessionError::Ticket)?;
@@ -1570,15 +1576,24 @@ impl HostSession {
             transport,
             ticket,
             address_ready,
+            session_name,
         })
     }
 
     pub fn from_transport(transport: Transport) -> Result<Self, SessionError> {
+        Self::from_transport_with_session_name(transport, String::new())
+    }
+
+    pub fn from_transport_with_session_name(
+        transport: Transport,
+        session_name: String,
+    ) -> Result<Self, SessionError> {
         let ticket = JoinTicket::mint(transport.endpoint_addr()).map_err(SessionError::Ticket)?;
         Ok(Self {
             transport,
             ticket,
             address_ready: true,
+            session_name,
         })
     }
 
@@ -1732,6 +1747,7 @@ impl HostSession {
             coordinator_peer_id: coordinator.as_bytes().to_vec(),
             endpoint_addr,
             display_name: join.display_name,
+            session_name: self.session_name.clone(),
         };
         self.transport
             .write_frame(
@@ -1743,6 +1759,7 @@ impl HostSession {
                         session_id: receipt.session_id.clone(),
                         admitted_peer_id: receipt.admitted_peer_id.clone(),
                         coordinator_peer_id: receipt.coordinator_peer_id.clone(),
+                        session_name: receipt.session_name.clone(),
                     })),
                 },
             )
@@ -1945,6 +1962,7 @@ impl ControlFrameSink for crate::transport::FrameWriter {
 pub struct SharedLayoutMember {
     pub peer_id: Vec<u8>,
     pub coordinator_peer_id: Vec<u8>,
+    pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
     outbound: mpsc::Sender<LayoutClientMessage>,
     transport: Transport,
@@ -2602,6 +2620,7 @@ pub async fn join_layout_with_display_name(
         let (outbound, outbound_rx) = mpsc::channel(64);
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let coordinator_peer_id = receipt.coordinator_peer_id;
+        let session_name = receipt.session_name;
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
@@ -2617,6 +2636,7 @@ pub async fn join_layout_with_display_name(
         Ok(SharedLayoutMember {
             peer_id,
             coordinator_peer_id,
+            session_name,
             events,
             outbound,
             transport: transport.clone(),
@@ -3349,6 +3369,7 @@ async fn join_handshake_with_display_name(
         coordinator_peer_id: welcome.coordinator_peer_id,
         endpoint_addr: ticket.endpoint_addr().clone(),
         display_name: String::new(),
+        session_name: welcome.session_name,
     })
 }
 

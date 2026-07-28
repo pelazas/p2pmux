@@ -100,7 +100,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
         } => {
             let (shell_rows, shell_cols) = crate::tui::initial_root_pane_grid(cols, rows);
             let host = SharedLayoutHost::with_display_name(
-                HostSession::create().await?,
+                HostSession::create_with_session_name(descriptor.name.clone()).await?,
                 display_name,
                 shell_rows,
                 shell_cols,
@@ -161,6 +161,16 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     );
                 }
             };
+            let live_names = SessionStore::for_current_user()?
+                .list_live()?
+                .into_iter()
+                .map(|session| session.name)
+                .collect();
+            if let Some(name) =
+                crate::session_store::unique_local_name(&member.session_name, &live_names)
+            {
+                descriptor.name = name;
+            }
             let panes = member.pane_server(ticket.session_id().to_vec())?;
             panes.replace_roster_from_layout(&state)?;
             let acceptor = panes.clone();

@@ -64,6 +64,30 @@ async fn control_snapshot_converts_to_a_renderable_local_layout() {
     coordinator.close().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_carries_host_session_name_from_welcome() {
+    let host = HostSession::from_transport_with_session_name(
+        loopback_transport().await,
+        "lisbon".to_owned(),
+    )
+    .expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let member = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("member joins");
+    let receipt = accept.await.expect("accept task").expect("accept member");
+
+    assert_eq!(receipt.session_name, "lisbon");
+    assert_eq!(member.session_name, "lisbon");
+
+    member.shutdown().await;
+    coordinator.close().await;
+}
+
 async fn next_event(member: &mut p2pmux::session::SharedLayoutMember) -> LayoutControlEvent {
     timeout(TEST_TIMEOUT, member.events.recv())
         .await

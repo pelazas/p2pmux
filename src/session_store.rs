@@ -343,6 +343,28 @@ fn available_city_name(live_names: &HashSet<String>, start: usize) -> String {
     unreachable!("an unbounded suffix range always yields a name")
 }
 
+/// Returns a locally available version of `preferred`, or `None` when the caller should use a
+/// generated fallback name instead.
+pub fn unique_local_name(preferred: &str, live_names: &HashSet<String>) -> Option<String> {
+    if !valid_name(preferred) {
+        return None;
+    }
+    if !live_names.contains(preferred) {
+        return Some(preferred.to_owned());
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{preferred}-{suffix}");
+        if !valid_name(&candidate) {
+            return None;
+        }
+        if !live_names.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    unreachable!("a valid suffix is found before the name length limit")
+}
+
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 48
@@ -529,6 +551,34 @@ mod tests {
         assert_eq!(
             available_city_name(&live_names, 0),
             format!("{}-3", CITY_NAMES[0])
+        );
+    }
+
+    #[test]
+    fn unique_local_name_uses_preferred_or_available_suffix() {
+        let mut live_names = HashSet::from(["lisbon".to_owned(), "lisbon-2".to_owned()]);
+
+        assert_eq!(
+            unique_local_name("lisbon", &live_names),
+            Some("lisbon-3".to_owned())
+        );
+        assert_eq!(
+            unique_local_name("tokyo", &live_names),
+            Some("tokyo".to_owned())
+        );
+        live_names.insert("lisbon-3".to_owned());
+        assert_eq!(
+            unique_local_name("lisbon", &live_names),
+            Some("lisbon-4".to_owned())
+        );
+    }
+
+    #[test]
+    fn unique_local_name_requires_a_valid_preferred_and_suffix() {
+        assert_eq!(unique_local_name("", &HashSet::new()), None);
+        assert_eq!(
+            unique_local_name(&"a".repeat(48), &HashSet::from(["a".repeat(48)])),
+            None
         );
     }
 }

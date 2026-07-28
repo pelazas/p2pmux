@@ -32,6 +32,29 @@ fn protocol_version_is_v7() {
 }
 
 #[test]
+fn welcome_session_name_round_trips_and_defaults_empty() {
+    let named = envelope(envelope::Body::Welcome(Welcome {
+        session_id: b"session-a".to_vec(),
+        admitted_peer_id: b"peer-a".to_vec(),
+        coordinator_peer_id: b"peer-host".to_vec(),
+        session_name: "lisbon".to_owned(),
+    }));
+    assert_eq!(decode_frame(&encode_frame(&named).unwrap()).unwrap(), named);
+
+    let legacy = envelope(envelope::Body::Welcome(Welcome {
+        session_id: b"session-a".to_vec(),
+        admitted_peer_id: b"peer-a".to_vec(),
+        coordinator_peer_id: b"peer-host".to_vec(),
+        session_name: String::new(),
+    }));
+    let decoded = decode_frame(&encode_frame(&legacy).unwrap()).unwrap();
+    let Some(envelope::Body::Welcome(welcome)) = decoded.body else {
+        panic!("expected Welcome");
+    };
+    assert!(welcome.session_name.is_empty());
+}
+
+#[test]
 fn ratio_and_grid_actions_validate_strictly() {
     let request = LayoutRequest {
         request_id: 1,
@@ -149,6 +172,7 @@ fn envelope_exposes_each_v1_body() {
             session_id: b"session-a".to_vec(),
             admitted_peer_id: b"peer-a".to_vec(),
             coordinator_peer_id: b"peer-host".to_vec(),
+            session_name: String::new(),
         })),
         envelope(envelope::Body::Input(Input {
             pane_id: b"pane-a".to_vec(),
@@ -276,6 +300,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             session_id: b"session-a".to_vec(),
             admitted_peer_id: b"peer-a".to_vec(),
             coordinator_peer_id: b"peer-host".to_vec(),
+            session_name: String::new(),
         })),
         envelope(envelope::Body::Input(Input {
             pane_id: b"pane-a".to_vec(),
