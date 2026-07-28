@@ -65,7 +65,7 @@ use crate::{
         PaneDescriptor, PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
-    screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
+    screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame, SyncGate},
     session::{
         CoordinatorResponse, GuestEvent, GuestPane, HostControlEvent, HostPaneChannels,
         LayoutControlEvent, LayoutControlQueueError, PaneLayoutReconciler, PaneServer,
@@ -1852,6 +1852,18 @@ fn frame_due(last_draw: Option<Instant>) -> bool {
     last_draw.is_none_or(|drawn| drawn.elapsed() >= FRAME_INTERVAL)
 }
 
+/// Asks the outer terminal to present the writes up to the matching end marker
+/// atomically (DEC 2026). Terminals without support ignore both markers.
+fn begin_synchronized_output() -> io::Result<()> {
+    io::stdout().write_all(b"\x1b[?2026h")
+}
+
+fn end_synchronized_output() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(b"\x1b[?2026l")?;
+    stdout.flush()
+}
+
 /// Poll timeout for the run loops: until the next frame deadline while a dirty
 /// frame is waiting, one full interval when idle.
 fn event_poll_timeout(dirty: bool, last_draw: Option<Instant>) -> Duration {
@@ -3517,6 +3529,7 @@ pub struct SharedLocalPane {
     control_tx: mpsc::Sender<HostControlEvent>,
     control_rx: mpsc::Receiver<HostControlEvent>,
     agent_tracker: PaneAgentTracker,
+    sync_gate: SyncGate,
 }
 
 impl SharedLocalPane {
@@ -3567,6 +3580,7 @@ impl SharedLocalPane {
             control_tx,
             control_rx,
             agent_tracker: PaneAgentTracker::default(),
+            sync_gate: SyncGate::default(),
         })
     }
 
@@ -3669,9 +3683,16 @@ impl SharedLocalPane {
         if !pending.is_empty() {
             self.agent_tracker
                 .record_output(Instant::now(), unix_ms_now());
+        }
+        let ready = if pending.is_empty() {
+            self.sync_gate.flush_stale(Instant::now())
+        } else {
+            self.sync_gate.feed(&pending, Instant::now())
+        };
+        if !ready.is_empty() {
             // One parse/snapshot/diff for the whole batch: process_pty clones the
             // screen per call, so per-chunk calls dominated CPU under output floods.
-            let frame = self.screen.process_pty(&pending)?;
+            let frame = self.screen.process_pty(&ready)?;
             if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
                 && self.host.write_input(&reply).is_err()
             {
@@ -4630,6 +4651,7 @@ impl SharedLayoutRuntime {
                         screens.insert(*pane_id, screen);
                     }
                 }
+                begin_synchronized_output()?;
                 terminal.draw(|frame| {
                     render_shared_multi_pane(
                         frame,
@@ -4643,6 +4665,7 @@ impl SharedLayoutRuntime {
                         self.join_code.as_deref(),
                     );
                 })?;
+                end_synchronized_output()?;
                 dirty = false;
                 last_draw = Some(Instant::now());
             }
@@ -6029,6 +6052,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     )?;
     let mut dirty = true;
     let mut last_draw: Option<Instant> = None;
+    let mut sync_gate = SyncGate::default();
 
     loop {
         let drain_started = Instant::now();
@@ -6042,9 +6066,14 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             };
             pending.extend_from_slice(&bytes);
         }
-        if !pending.is_empty() {
-            kitty_keyboard.observe(&pending);
-            parser.process(&pending);
+        let ready = if pending.is_empty() {
+            sync_gate.flush_stale(Instant::now())
+        } else {
+            sync_gate.feed(&pending, Instant::now())
+        };
+        if !ready.is_empty() {
+            kitty_keyboard.observe(&ready);
+            parser.process(&ready);
             if let Some(reply) = kitty_keyboard.take_query_reply() {
                 host.write_input(&reply)?;
             }
@@ -6055,6 +6084,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
         }
 
         if dirty && frame_due(last_draw) {
+            begin_synchronized_output()?;
             terminal.draw(|frame| {
                 let screen = parser.screen();
                 let area = frame.area();
@@ -6064,6 +6094,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
                     frame.set_cursor_position((area.x + col, area.y + row));
                 }
             })?;
+            end_synchronized_output()?;
             dirty = false;
             last_draw = Some(Instant::now());
         }
@@ -6122,6 +6153,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
     let mut dirty = true;
     let mut last_draw: Option<Instant> = None;
+    let mut sync_gate = SyncGate::default();
     loop {
         if let Some(state) = runtime.lease.clear_if_idle(Instant::now())? {
             runtime.lease_tx.send_replace(state);
@@ -6181,8 +6213,13 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             };
             pending.extend_from_slice(&bytes);
         }
-        if !pending.is_empty() {
-            if let Ok(frame) = runtime.screen.process_pty(&pending) {
+        let ready = if pending.is_empty() {
+            sync_gate.flush_stale(Instant::now())
+        } else {
+            sync_gate.feed(&pending, Instant::now())
+        };
+        if !ready.is_empty() {
+            if let Ok(frame) = runtime.screen.process_pty(&ready) {
                 if let Some(reply) = runtime.screen.take_kitty_keyboard_query_reply() {
                     runtime.host.write_input(&reply)?;
                 }
@@ -6194,6 +6231,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             break;
         }
         if dirty && frame_due(last_draw) {
+            begin_synchronized_output()?;
             terminal.draw(|frame| {
                 let screen = runtime.screen.screen();
                 render_host_screen(frame, screen, &footer);
@@ -6203,6 +6241,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                     frame.set_cursor_position((frame.area().x + col, frame.area().y + row));
                 }
             })?;
+            end_synchronized_output()?;
             dirty = false;
             last_draw = Some(Instant::now());
         }
@@ -6370,11 +6409,13 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
         }
 
         if dirty && frame_due(last_draw) {
+            begin_synchronized_output()?;
             terminal.draw(|frame| {
                 if let Some(screen) = remote.screen() {
                     render_guest_screen(frame, screen, &footer);
                 }
             })?;
+            end_synchronized_output()?;
             dirty = false;
             last_draw = Some(Instant::now());
         }

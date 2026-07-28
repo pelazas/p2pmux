@@ -1,6 +1,10 @@
 //! Fixed-grid vt100 state codec used only by the host and guest renderers.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     kitty_keyboard::KittyKeyboardTracker,
@@ -50,6 +54,127 @@ impl fmt::Display for ScreenError {
 }
 
 impl std::error::Error for ScreenError {}
+
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+/// Give up on a synchronized update after this long and show what arrived.
+const MAX_SYNC_HOLD: Duration = Duration::from_millis(150);
+/// Cap held bytes so a stuck application cannot buffer without bound.
+const MAX_SYNC_BYTES: usize = 4 * 1024 * 1024;
+/// Flush a held partial marker whose continuation never arrives.
+const MAX_CARRY_HOLD: Duration = Duration::from_millis(25);
+
+/// Applications wrap atomic redraws in DEC private mode 2026 (synchronized
+/// output). This gate holds a pane's PTY bytes from the begin marker until the
+/// end marker so the screen is never parsed — and thus never rendered or
+/// broadcast — mid-redraw. The markers themselves are stripped; time and size
+/// caps bound how long a misbehaving application can freeze the pane.
+#[derive(Default)]
+pub struct SyncGate {
+    /// Bytes held while a synchronized update is open.
+    held: Vec<u8>,
+    /// How much of `held` was already scanned for the end marker.
+    scanned: usize,
+    /// Trailing bytes that may be a split begin marker, kept until the next chunk.
+    carry: Vec<u8>,
+    carry_since: Option<Instant>,
+    active_since: Option<Instant>,
+}
+
+impl SyncGate {
+    /// Feeds raw PTY bytes and returns the prefix that is safe to parse now.
+    pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<u8> {
+        let mut input = std::mem::take(&mut self.carry);
+        self.carry_since = None;
+        input.extend_from_slice(bytes);
+        let mut ready = Vec::new();
+        let mut cursor = 0;
+        loop {
+            if self.active_since.is_some() {
+                self.held.extend_from_slice(&input[cursor..]);
+                let scan_from = self.scanned.saturating_sub(SYNC_END.len() - 1);
+                let found = find_subsequence(&self.held[scan_from..], SYNC_END)
+                    .map(|offset| scan_from + offset);
+                self.scanned = self.held.len();
+                if let Some(end) = found {
+                    let remainder = self.held.split_off(end + SYNC_END.len());
+                    ready.extend_from_slice(&self.held[..end]);
+                    self.held.clear();
+                    self.reset_hold();
+                    input = remainder;
+                    cursor = 0;
+                    continue;
+                }
+                if self.hold_expired(now) {
+                    ready.append(&mut self.held);
+                    self.reset_hold();
+                }
+                break;
+            }
+            match find_subsequence(&input[cursor..], SYNC_BEGIN) {
+                Some(offset) => {
+                    ready.extend_from_slice(&input[cursor..cursor + offset]);
+                    cursor += offset + SYNC_BEGIN.len();
+                    self.active_since = Some(now);
+                }
+                None => {
+                    let tail = &input[cursor..];
+                    let keep = partial_marker_suffix(tail, SYNC_BEGIN);
+                    ready.extend_from_slice(&tail[..tail.len() - keep]);
+                    if keep > 0 {
+                        self.carry.extend_from_slice(&tail[tail.len() - keep..]);
+                        self.carry_since = Some(now);
+                    }
+                    break;
+                }
+            }
+        }
+        ready
+    }
+
+    /// Returns bytes whose hold deadline passed. Call when no new output arrived.
+    pub fn flush_stale(&mut self, now: Instant) -> Vec<u8> {
+        if self.active_since.is_some() && self.hold_expired(now) {
+            self.reset_hold();
+            return std::mem::take(&mut self.held);
+        }
+        if self
+            .carry_since
+            .is_some_and(|since| now.duration_since(since) >= MAX_CARRY_HOLD)
+        {
+            self.carry_since = None;
+            return std::mem::take(&mut self.carry);
+        }
+        Vec::new()
+    }
+
+    fn hold_expired(&self, now: Instant) -> bool {
+        self.held.len() > MAX_SYNC_BYTES
+            || self
+                .active_since
+                .is_some_and(|since| now.duration_since(since) >= MAX_SYNC_HOLD)
+    }
+
+    fn reset_hold(&mut self) {
+        self.active_since = None;
+        self.scanned = 0;
+    }
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Length of the longest strict marker prefix that the slice ends with.
+fn partial_marker_suffix(tail: &[u8], marker: &[u8]) -> usize {
+    let max = tail.len().min(marker.len() - 1);
+    (1..=max)
+        .rev()
+        .find(|&len| tail[tail.len() - len..] == marker[..len])
+        .unwrap_or(0)
+}
 
 pub struct HostScreen {
     parser: vt100::Parser,
@@ -343,7 +468,91 @@ fn validate_dimensions(rows: u16, cols: u16) -> Result<(), ScreenError> {
 
 #[cfg(test)]
 mod tests {
-    use super::HostScreen;
+    use std::time::{Duration, Instant};
+
+    use super::{HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+
+    #[test]
+    fn sync_gate_passes_unmarked_output_through() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"plain output", now), b"plain output");
+    }
+
+    #[test]
+    fn sync_gate_holds_between_markers_and_strips_them() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"pre\x1b[?2026hheld", now), b"pre");
+        assert_eq!(gate.feed(b" more", now), b"");
+        assert_eq!(gate.feed(b"\x1b[?2026lpost", now), b"held morepost");
+    }
+
+    #[test]
+    fn sync_gate_handles_complete_update_in_one_chunk() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(
+            gate.feed(b"a\x1b[?2026hb\x1b[?2026lc", now),
+            b"abc".to_vec()
+        );
+    }
+
+    #[test]
+    fn sync_gate_reassembles_marker_split_across_chunks() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"pre\x1b[?20", now), b"pre");
+        assert_eq!(gate.feed(b"26hheld\x1b[?2026lpost", now), b"heldpost");
+    }
+
+    #[test]
+    fn sync_gate_flushes_stale_carry() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"tail\x1b[?2", now), b"tail");
+        assert_eq!(gate.flush_stale(now), b"");
+        let later = now + Duration::from_millis(30);
+        assert_eq!(gate.flush_stale(later), b"\x1b[?2");
+    }
+
+    #[test]
+    fn sync_gate_gives_up_after_hold_deadline() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"\x1b[?2026hstuck", now), b"");
+        assert_eq!(gate.flush_stale(now), b"");
+        let later = now + MAX_SYNC_HOLD;
+        assert_eq!(gate.flush_stale(later), b"stuck");
+        assert_eq!(gate.feed(b"after", later), b"after");
+    }
+
+    #[test]
+    fn sync_gate_gives_up_past_size_cap() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"\x1b[?2026h", now), b"");
+        let big = vec![b'x'; MAX_SYNC_BYTES + 1];
+        assert_eq!(gate.feed(&big, now), big);
+        assert_eq!(gate.feed(b"after", now), b"after");
+    }
+
+    #[test]
+    fn sync_gate_handles_back_to_back_updates() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(
+            gate.feed(b"\x1b[?2026ha\x1b[?2026l\x1b[?2026hb\x1b[?2026lc", now),
+            b"abc".to_vec()
+        );
+    }
+
+    #[test]
+    fn sync_gate_passes_end_marker_without_begin_through() {
+        let mut gate = SyncGate::default();
+        let now = Instant::now();
+        assert_eq!(gate.feed(b"a\x1b[?2026lb", now), b"a\x1b[?2026lb");
+    }
 
     #[test]
     fn visual_scrollback_is_bounded_and_resets_on_resize_or_alternate_screen() {
