@@ -77,10 +77,12 @@ its default. Colors accept lowercase named values (`white`, `yellow`, `gray`, `d
 case-insensitive `#RRGGBB` values. The theme is client-local and is never synchronized over P2P;
 detach and reattach after editing the file to reload it.
 
-Every `create` and `join` automatically receives a memorable world-city session name such as
-`tokyo` or `cape-town`; no session name is required. `create --session-name <name>` remains
-available when you want to choose a name explicitly. Automatically chosen names avoid live local
-session names, adding `-2`, `-3`, and so on if every city name is already in use.
+Every `create` automatically receives a memorable world-city session name such as `tokyo` or
+`cape-town`; no session name is required. `create --session-name <name>` remains available when
+you want to choose a name explicitly. A joining peer uses the coordinator's session name for its
+local chrome and finder record when that name is free locally; on the same Mac it adds `-2`, `-3`,
+and so on to avoid a collision. Automatically chosen create names avoid live local session names
+the same way.
 
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
 Ctrl+Q detaches that client without stopping shells, Iroh, rendezvous, or hosted panes. It prints
