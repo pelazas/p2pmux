@@ -314,6 +314,17 @@ pub enum KeyHandling {
 pub struct MouseHandling {
     pub intents: Vec<UiIntent>,
     pub copy_selection_requested: bool,
+    /// A runnable join command requested by a completed footer click.
+    pub join_copy_command: Option<String>,
+}
+
+/// Footer content that determines the visible join command hit target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FooterMouseInput<'a> {
+    pub status: &'a str,
+    pub footer_notice: Option<&'a str>,
+    pub copied_lines: Option<usize>,
+    pub join_code: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,6 +464,7 @@ pub struct MultiPaneTui {
     agent_overlay_viewport_lines: u16,
     pending_agent_toggle: Option<Instant>,
     resize_drag: Option<ResizeDrag>,
+    pending_join_click: bool,
 }
 
 impl MultiPaneTui {
@@ -490,6 +502,7 @@ impl MultiPaneTui {
             agent_overlay_viewport_lines: 0,
             pending_agent_toggle: None,
             resize_drag: None,
+            pending_join_click: false,
         })
     }
 
@@ -1250,8 +1263,10 @@ impl MultiPaneTui {
         &mut self,
         mouse: crossterm::event::MouseEvent,
         area: Rect,
+        footer: FooterMouseInput<'_>,
     ) -> MouseHandling {
         if self.modal_open() {
+            self.pending_join_click = false;
             return MouseHandling::default();
         }
         match mouse.kind {
@@ -1263,8 +1278,14 @@ impl MultiPaneTui {
                 if self.overlay_open() {
                     return MouseHandling {
                         intents: self.handle_agent_overlay_click(mouse.column, mouse.row, area),
-                        copy_selection_requested: false,
+                        ..MouseHandling::default()
                     };
+                }
+                self.pending_join_click = self
+                    .footer_join_rect(area, footer)
+                    .is_some_and(|rect| rect_contains_mouse(rect, mouse.column, mouse.row));
+                if self.pending_join_click {
+                    return MouseHandling::default();
                 }
                 self.clear_selection();
                 if self.begin_resize_drag(mouse.column, mouse.row, area) {
@@ -1273,7 +1294,7 @@ impl MultiPaneTui {
                 if let Some(intent) = self.switch_tab_at(mouse.column, mouse.row, area) {
                     return MouseHandling {
                         intents: vec![intent],
-                        copy_selection_requested: false,
+                        ..MouseHandling::default()
                     };
                 }
                 let changed = self.focus_pane_at(mouse.column, mouse.row, area);
@@ -1285,25 +1306,53 @@ impl MultiPaneTui {
                         })
                         .into_iter()
                         .collect(),
-                    copy_selection_requested: false,
+                    ..MouseHandling::default()
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self.pending_join_click {
+                    self.pending_join_click = false;
+                    return MouseHandling::default();
+                }
                 if !self.extend_resize_drag(mouse.column, mouse.row) {
                     self.extend_selection_at(mouse.column, mouse.row, area);
                 }
                 MouseHandling::default()
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if std::mem::take(&mut self.pending_join_click) {
+                    let join_copy_command = self
+                        .footer_join_rect(area, footer)
+                        .filter(|rect| rect_contains_mouse(*rect, mouse.column, mouse.row))
+                        .zip(footer.join_code)
+                        .map(|(_, code)| format!("p2pmux join {code}"));
+                    return MouseHandling {
+                        join_copy_command,
+                        ..MouseHandling::default()
+                    };
+                }
                 self.end_selection_drag();
                 let resize_intent = self.end_resize_drag(mouse.column, mouse.row);
                 MouseHandling {
                     copy_selection_requested: resize_intent.is_none() && self.selection().is_some(),
                     intents: resize_intent.into_iter().collect(),
+                    ..MouseHandling::default()
                 }
             }
             _ => MouseHandling::default(),
         }
+    }
+
+    fn footer_join_rect(&self, area: Rect, footer: FooterMouseInput<'_>) -> Option<Rect> {
+        footer_layout(
+            self.geometry(area).footer,
+            self.chord_mode,
+            footer.status,
+            footer.footer_notice,
+            footer.copied_lines,
+            footer.join_code,
+        )
+        .join_rect
     }
 
     /// Aligns a reattached client's local selection with the node-owned focus.
@@ -2633,6 +2682,10 @@ fn footer_layout(
         join_text,
         join_rect,
     }
+}
+
+fn rect_contains_mouse(rect: Rect, column: u16, row: u16) -> bool {
+    (rect.x..rect.right()).contains(&column) && (rect.y..rect.bottom()).contains(&row)
 }
 
 fn render_chord_footer(
@@ -4516,7 +4569,16 @@ impl SharedLayoutRuntime {
                     if self.tui.modal_open() {
                         continue;
                     }
-                    let handling = self.tui.handle_mouse(mouse, Rect::new(0, 0, cols, rows));
+                    let handling = self.tui.handle_mouse(
+                        mouse,
+                        Rect::new(0, 0, cols, rows),
+                        FooterMouseInput {
+                            status: &self.status,
+                            footer_notice: self.footer_notice.as_deref(),
+                            copied_lines: self.copied_lines,
+                            join_code: self.join_code.as_deref(),
+                        },
+                    );
                     for intent in handling.intents {
                         self.handle_intent(intent)?;
                     }
@@ -6154,14 +6216,14 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterSegment,
-        HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
-        MultiPaneTui, PaneTextSelection, PaneViewState, PendingEscape, RemoteSubscriptionState,
-        ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen,
-        allocate_node_with_preview, area_from_terminal_size, chord_footer_badge, contextual_footer,
-        copied_line_count, encode_key, encode_paste, grid_for_pane, initial_root_pane_grid,
-        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
-        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterMouseInput,
+        FooterSegment, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
+        LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState, PendingEscape,
+        RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
+        VtScreen, allocate_node_with_preview, area_from_terminal_size, chord_footer_badge,
+        contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
+        initial_root_pane_grid, is_chord_command, is_chord_navigation, lease_allows_held_input,
+        member_label, mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
         reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_multi_pane_with_copy_feedback, render_shared_multi_pane, selection_text, text_width,
         viewed_screen, visible_leaf_panes,
@@ -7471,6 +7533,217 @@ mod tests {
         assert!(tui.selection().is_some());
     }
 
+    fn join_footer_input() -> FooterMouseInput<'static> {
+        FooterMouseInput {
+            join_code: Some("TESTCODE"),
+            ..FooterMouseInput::default()
+        }
+    }
+
+    fn left_mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_down_on_visible_join_command_arms_join_copy() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let footer = join_footer_input();
+        let join_rect = tui
+            .footer_join_rect(area, footer)
+            .expect("visible join command");
+
+        let handling = tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+
+        assert_eq!(handling, super::MouseHandling::default());
+        assert!(tui.pending_join_click);
+        assert_eq!(tui.focused_pane(), 1);
+        assert!(tui.resize_drag.is_none());
+    }
+
+    #[test]
+    fn join_click_cancels_on_drag_away_or_release_outside() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let footer = join_footer_input();
+        let join_rect = tui
+            .footer_join_rect(area, footer)
+            .expect("visible join command");
+        let outside_x = join_rect.x.saturating_sub(1);
+
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        let handling = tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        assert!(!tui.pending_join_click);
+        assert!(handling.join_copy_command.is_none());
+
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        let handling = tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                outside_x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        assert!(!tui.pending_join_click);
+        assert!(handling.join_copy_command.is_none());
+    }
+
+    #[test]
+    fn join_click_requests_runnable_join_command() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let footer = join_footer_input();
+        let join_rect = tui
+            .footer_join_rect(area, footer)
+            .expect("visible join command");
+
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        let handling = tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+
+        assert_eq!(
+            handling.join_copy_command.as_deref(),
+            Some("p2pmux join TESTCODE")
+        );
+        assert!(!handling.copy_selection_requested);
+    }
+
+    #[test]
+    fn mouse_down_on_footer_help_does_not_arm_join_copy() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let footer = join_footer_input();
+        let layout = super::footer_layout(
+            tui.geometry(area).footer,
+            tui.chord_mode(),
+            footer.status,
+            footer.footer_notice,
+            footer.copied_lines,
+            footer.join_code,
+        );
+        assert!(layout.help_start < layout.help_end);
+
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.help_start,
+                tui.geometry(area).footer.y,
+            ),
+            area,
+            footer,
+        );
+        let handling = tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.help_start,
+                tui.geometry(area).footer.y,
+            ),
+            area,
+            footer,
+        );
+
+        assert!(!tui.pending_join_click);
+        assert!(handling.join_copy_command.is_none());
+    }
+
+    #[test]
+    fn join_click_preserves_existing_pane_selection() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let footer = join_footer_input();
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        assert!(tui.end_selection_drag());
+        let selection = tui.selection();
+        let join_rect = tui
+            .footer_join_rect(area, footer)
+            .expect("visible join command");
+
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                join_rect.x,
+                join_rect.y,
+            ),
+            area,
+            footer,
+        );
+
+        assert_eq!(tui.selection(), selection);
+    }
+
     #[test]
     fn mouse_up_requests_copy_only_for_a_nonempty_selection_without_resize_commit() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
@@ -7494,9 +7767,13 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        assert!(tui.handle_mouse(down, area).intents.is_empty());
-        tui.handle_mouse(drag, area);
-        let handling = tui.handle_mouse(up, area);
+        assert!(
+            tui.handle_mouse(down, area, FooterMouseInput::default())
+                .intents
+                .is_empty()
+        );
+        tui.handle_mouse(drag, area, FooterMouseInput::default());
+        let handling = tui.handle_mouse(up, area, FooterMouseInput::default());
         assert!(handling.intents.is_empty());
         assert!(handling.copy_selection_requested);
 
@@ -7518,9 +7795,9 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        tui.handle_mouse(resize_down, area);
-        tui.handle_mouse(resize_drag, area);
-        let handling = tui.handle_mouse(resize_up, area);
+        tui.handle_mouse(resize_down, area, FooterMouseInput::default());
+        tui.handle_mouse(resize_drag, area, FooterMouseInput::default());
+        let handling = tui.handle_mouse(resize_up, area, FooterMouseInput::default());
         assert!(matches!(
             handling.intents.as_slice(),
             [UiIntent::SetSplitRatio { .. }]
@@ -7877,7 +8154,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(
-            tui.handle_mouse(mouse, area),
+            tui.handle_mouse(mouse, area, FooterMouseInput::default()),
             super::MouseHandling::default()
         );
         assert_eq!(tui.focused_pane(), 1);

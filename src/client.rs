@@ -28,8 +28,9 @@ use crate::{
     screen::{ApplyDelta, GuestScreen},
     session_store::SessionDescriptor,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneViewState, copy_selection_to_clipboard, render_multi_pane_with_copy_feedback,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, FooterMouseInput, KeyHandling,
+        MultiPaneTui, PaneViewState, copy_selection_to_clipboard,
+        render_multi_pane_with_copy_feedback,
     },
 };
 
@@ -441,7 +442,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             matches!(mouse.kind, MouseEventKind::ScrollUp),
                         );
                     } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                        let handling = tui.handle_mouse(mouse, area);
+                        let handling = tui.handle_mouse(
+                            mouse,
+                            area,
+                            FooterMouseInput {
+                                copied_lines,
+                                join_code: join_code.as_deref(),
+                                ..FooterMouseInput::default()
+                            },
+                        );
                         send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     }
                 } else if matches!(
@@ -475,7 +484,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         copied_lines = None;
                     }
-                    let handling = tui.handle_mouse(mouse, area);
+                    let handling = tui.handle_mouse(
+                        mouse,
+                        area,
+                        FooterMouseInput {
+                            copied_lines,
+                            join_code: join_code.as_deref(),
+                            ..FooterMouseInput::default()
+                        },
+                    );
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
                         copied_lines = copy_attach_selection(tui, &screens, &history);
