@@ -285,4 +285,38 @@ mod tests {
         assert!(gate.attach().is_ok());
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn snapshot_join_code_serde_is_optional_and_backwards_compatible() {
+        let snapshot = |join_code| NodeMessage::Snapshot {
+            room_name: "test".into(),
+            role: "coordinator".into(),
+            summary: SessionSummary::default(),
+            layout: Box::new(crate::layout::LayoutSnapshot {
+                revision: 0,
+                members: vec![],
+                tabs: vec![],
+                panes: Default::default(),
+            }),
+            screens: vec![],
+            leases: vec![],
+            rosters: vec![],
+            local_peer_id: vec![],
+            tab_id: 1,
+            pane_id: 1,
+            join_code,
+        };
+
+        let with_join_code = serde_json::to_value(snapshot(Some("TESTCODE".into()))).unwrap();
+        assert_eq!(with_join_code["join_code"], "TESTCODE");
+
+        let without_join_code = serde_json::to_value(snapshot(None)).unwrap();
+        assert!(without_join_code.get("join_code").is_none());
+
+        let parsed: NodeMessage = serde_json::from_value(without_join_code).unwrap();
+        let NodeMessage::Snapshot { join_code, .. } = parsed else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(join_code, None);
+    }
 }
