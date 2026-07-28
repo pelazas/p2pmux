@@ -2318,8 +2318,9 @@ pub fn render_multi_pane_with_copy_feedback(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     copied_lines: Option<usize>,
+    join_code: Option<&str>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, None);
+    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, join_code);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
