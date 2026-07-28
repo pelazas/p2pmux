@@ -4887,6 +4887,19 @@ impl SharedLayoutRuntime {
                         .scroll_agent_overlay(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
                     return Ok(false);
                 }
+                // A child that reports mouse scrolls its own buffer; local scrollback
+                // would otherwise hide the wheel from it.
+                let protocol = self.focused_pane_mouse_protocol();
+                if protocol.reports_mouse()
+                    && let Some(bytes) = self
+                        .tui
+                        .handle_mouse(mouse, area, FooterMouseInput::default(), protocol)
+                        .forward_bytes
+                {
+                    self.forward_mouse(bytes)?;
+                    *dirty = true;
+                    return Ok(false);
+                }
                 let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
                 let scrollback_len = self
                     .local
@@ -8837,6 +8850,52 @@ mod tests {
 
         assert_eq!(handling.forward_bytes, None);
         assert!(tui.selection_dragging);
+    }
+
+    #[test]
+    fn the_wheel_reaches_a_reporting_child_over_its_own_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::ScrollUp, 2, 3),
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, Some(b"\x1b[<64;2;2M".to_vec()));
+    }
+
+    #[test]
+    fn the_wheel_stays_local_over_a_pane_the_reporting_child_does_not_own() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::ScrollDown, 45, 3),
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+    }
+
+    #[test]
+    fn the_wheel_stays_local_while_a_reporting_pane_shows_history() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.set_pane_scrollback_offset(1, 3));
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::ScrollDown, 2, 3),
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
     }
 
     #[test]

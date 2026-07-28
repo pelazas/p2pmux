@@ -514,34 +514,55 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
-                    let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
-                    let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-                    let scrollback_len = history
-                        .get(&pane_id)
-                        .map(HistoryCache::available_rows)
-                        .unwrap_or(1_000);
-                    let current = tui.pane_scrollback_offset(pane_id);
-                    let target = if up {
-                        current.saturating_add(3)
+                    // A child that reports mouse scrolls its own buffer; local
+                    // scrollback would otherwise hide the wheel from it.
+                    let protocol = focused_pane_mouse_protocol(tui, &screens, &local_peer_id);
+                    let forwarded = protocol
+                        .reports_mouse()
+                        .then(|| {
+                            tui.handle_mouse(mouse, area, FooterMouseInput::default(), protocol)
+                        })
+                        .and_then(|handling| handling.forward_bytes);
+                    if let Some(bytes) = forwarded {
+                        let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
+                        write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
                     } else {
-                        current.saturating_sub(3)
-                    };
-                    let cached = history
-                        .get(&pane_id)
-                        .is_some_and(|history| history.viewports.contains_key(&target));
-                    if target > 0 && !cached {
-                        request_scrollback(
-                            &mut stream,
-                            pane_id,
-                            target,
-                            &history,
-                            &mut pending_scroll,
-                            &mut next_scrollback_request_id,
-                        )?;
-                    } else {
-                        tui.scroll_mouse_pane(mouse.column, mouse.row, area, scrollback_len, up);
-                        if !up && tui.pane_scrollback_offset(pane_id) == 0 {
-                            history.remove(&pane_id);
+                        let pane_id =
+                            tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
+                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        let scrollback_len = history
+                            .get(&pane_id)
+                            .map(HistoryCache::available_rows)
+                            .unwrap_or(1_000);
+                        let current = tui.pane_scrollback_offset(pane_id);
+                        let target = if up {
+                            current.saturating_add(3)
+                        } else {
+                            current.saturating_sub(3)
+                        };
+                        let cached = history
+                            .get(&pane_id)
+                            .is_some_and(|history| history.viewports.contains_key(&target));
+                        if target > 0 && !cached {
+                            request_scrollback(
+                                &mut stream,
+                                pane_id,
+                                target,
+                                &history,
+                                &mut pending_scroll,
+                                &mut next_scrollback_request_id,
+                            )?;
+                        } else {
+                            tui.scroll_mouse_pane(
+                                mouse.column,
+                                mouse.row,
+                                area,
+                                scrollback_len,
+                                up,
+                            );
+                            if !up && tui.pane_scrollback_offset(pane_id) == 0 {
+                                history.remove(&pane_id);
+                            }
                         }
                     }
                 } else {
