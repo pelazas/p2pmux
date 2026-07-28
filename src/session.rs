@@ -1962,6 +1962,7 @@ impl ControlFrameSink for crate::transport::FrameWriter {
 pub struct SharedLayoutMember {
     pub peer_id: Vec<u8>,
     pub coordinator_peer_id: Vec<u8>,
+    pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
     outbound: mpsc::Sender<LayoutClientMessage>,
     transport: Transport,
@@ -2619,6 +2620,7 @@ pub async fn join_layout_with_display_name(
         let (outbound, outbound_rx) = mpsc::channel(64);
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let coordinator_peer_id = receipt.coordinator_peer_id;
+        let session_name = receipt.session_name;
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
@@ -2634,6 +2636,7 @@ pub async fn join_layout_with_display_name(
         Ok(SharedLayoutMember {
             peer_id,
             coordinator_peer_id,
+            session_name,
             events,
             outbound,
             transport: transport.clone(),
