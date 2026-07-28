@@ -26,6 +26,12 @@ pub enum ClientMessage {
     StructuralIntent { intent: UiIntent },
     Resize { cols: u16, rows: u16 },
     ResyncScreen { pane_id: u64 },
+    ScrollbackQuery {
+        pane_id: u64,
+        offset: u64,
+        max_rows: u32,
+        request_id: u64,
+    },
     Focus { tab_id: u64, pane_id: u64 },
     Detach { generation: u64 },
     Rename { name: String },
@@ -58,6 +64,17 @@ pub enum NodeMessage {
     },
     Screens {
         screens: Vec<PaneScreenSnapshot>,
+    },
+    /// Bounded host visual rows, encoded so terminal control bytes remain JSON-safe.
+    ScrollbackWindow {
+        pane_id: u64,
+        request_id: u64,
+        sequence: u64,
+        grid_rows: u16,
+        grid_cols: u16,
+        total_rows: u64,
+        offset: u64,
+        rows: Vec<String>,
     },
     Layout {
         layout: Box<LayoutSnapshot>,
@@ -116,14 +133,9 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
 pub struct PaneScreenSnapshot {
     pub pane_id: u64,
     pub state: ScreenUpdate,
-    pub local_history: Option<LocalHistorySnapshot>,
-}
-
-/// Bounded local-host visual rows, encoded so terminal control bytes remain JSON-safe.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct LocalHistorySnapshot {
-    pub total_rows: usize,
-    pub rows: Vec<String>,
+    /// Local-host history metadata. Remote panes publish zeroes.
+    pub history_len: u64,
+    pub history_end: u64,
 }
 
 /// The screen state carried inside every local attachment snapshot.

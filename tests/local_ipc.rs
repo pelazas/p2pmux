@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use p2pmux::{
     layout::LayoutSnapshot,
     local_ipc::{
@@ -57,7 +58,8 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                         snapshot: vec![1],
                         kitty_keyboard_active: false,
                     },
-                    local_history: None,
+                    history_len: 4,
+                    history_end: 12,
                 },
                 PaneScreenSnapshot {
                     pane_id: 2,
@@ -67,7 +69,8 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                         delta: vec![2],
                         kitty_keyboard_active: true,
                     },
-                    local_history: None,
+                    history_len: 0,
+                    history_end: 0,
                 },
             ],
         },
@@ -92,6 +95,16 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
             tab_id: 2,
             pane_id: 3,
         },
+        NodeMessage::ScrollbackWindow {
+            pane_id: 1,
+            request_id: 9,
+            sequence: 3,
+            grid_rows: 24,
+            grid_cols: 80,
+            total_rows: 12,
+            offset: 0,
+            rows: vec![base64::engine::general_purpose::STANDARD.encode(b"row")],
+        },
     ];
     for message in messages {
         let encoded = serde_json::to_vec(&message).unwrap();
@@ -105,4 +118,30 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
             );
         }
     }
+}
+
+#[test]
+fn scrollback_query_round_trips_and_screen_updates_carry_no_rows() {
+    let query = ClientMessage::ScrollbackQuery {
+        pane_id: 7,
+        offset: 3,
+        max_rows: 64,
+        request_id: 11,
+    };
+    let encoded = serde_json::to_value(&query).unwrap();
+    assert_eq!(encoded["type"], "scrollback_query");
+    assert_eq!(serde_json::from_value::<ClientMessage>(encoded).unwrap(), query);
+
+    let screen = PaneScreenSnapshot {
+        pane_id: 7,
+        state: ScreenUpdate::Unchanged {
+            sequence: 4,
+            kitty_keyboard_active: false,
+        },
+        history_len: 2,
+        history_end: 9,
+    };
+    let encoded = serde_json::to_value(screen).unwrap();
+    assert!(encoded.get("local_history").is_none());
+    assert!(encoded.get("rows").is_none());
 }
