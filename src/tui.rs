@@ -4368,12 +4368,6 @@ impl SharedLayoutRuntime {
         self.shutdown();
     }
 
-    fn clear_selection(&mut self) -> bool {
-        let selection_cleared = self.tui.clear_selection();
-        let copy_feedback_cleared = self.copied_lines.take().is_some();
-        selection_cleared || copy_feedback_cleared
-    }
-
     fn handle_key(&mut self, key: KeyEvent, area: Rect) -> Result<bool, Box<dyn Error>> {
         let previously_focused = self.tui.focused_pane();
         let quit = match self.tui.handle_key(key, area) {
