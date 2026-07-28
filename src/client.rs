@@ -103,15 +103,16 @@ struct PendingScroll {
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::config::config_path()?;
-    let theme = crate::config::load_config_from(&config_path)
-        .map_err(|error| {
-            io::Error::other(format!(
-                "could not load config {}: {error}",
-                config_path.display()
-            ))
-        })?
-        .ui
-        .theme;
+    let config = crate::config::load_config_from(&config_path).map_err(|error| {
+        io::Error::other(format!(
+            "could not load config {}: {error}",
+            config_path.display()
+        ))
+    })?;
+    let theme = config.ui.theme;
+    let sound_enabled = config.ui.notifications.sound_enabled;
+    let notification_sound =
+        crate::notify_sound::NotificationSound::new(config.ui.notifications.sound_path);
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
@@ -189,8 +190,14 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut history_refresh,
                         )?;
                         apply_leases(view, leases);
-                        apply_rosters(view, rosters);
                         apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
+                        if sound_enabled {
+                            for _ in apply_rosters(view, rosters) {
+                                notification_sound.play();
+                            }
+                        } else {
+                            let _ = apply_rosters(view, rosters);
+                        }
                         let apply_elapsed = apply_started.elapsed();
                         if crate::perf::enabled() && apply_elapsed >= Duration::from_millis(5) {
                             crate::perf::log(&format!(
@@ -302,7 +309,13 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     NodeMessage::Rosters { rosters } => {
                         if let Some(view) = tui.as_mut() {
-                            apply_rosters(view, rosters);
+                            if sound_enabled {
+                                for _ in apply_rosters(view, rosters) {
+                                    notification_sound.play();
+                                }
+                            } else {
+                                let _ = apply_rosters(view, rosters);
+                            }
                             dirty = true;
                         }
                     }
@@ -598,8 +611,8 @@ fn apply_snapshot(
         &mut BTreeSet::new(),
     )?;
     apply_leases(view, leases);
-    apply_rosters(view, rosters);
     apply_focus(view, pending_focus, tab_id, pane_id)?;
+    let _ = apply_rosters(view, rosters);
     Ok(resync)
 }
 
@@ -707,8 +720,11 @@ fn apply_leases(view: &mut MultiPaneTui, leases: Vec<crate::local_ipc::PaneLease
     }
 }
 
-fn apply_rosters(view: &mut MultiPaneTui, rosters: Vec<crate::local_ipc::AgentOverlaySnapshotRow>) {
-    view.set_agent_rows(
+fn apply_rosters(
+    view: &mut MultiPaneTui,
+    rosters: Vec<crate::local_ipc::AgentOverlaySnapshotRow>,
+) -> Vec<u64> {
+    view.update_attached_agent_rows(
         rosters
             .into_iter()
             .filter_map(|row| {
@@ -727,7 +743,7 @@ fn apply_rosters(view: &mut MultiPaneTui, rosters: Vec<crate::local_ipc::AgentOv
                 })
             })
             .collect(),
-    );
+    )
 }
 
 fn apply_focus(
