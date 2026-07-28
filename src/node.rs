@@ -332,25 +332,29 @@ fn run_socket_loop(
                     max_rows,
                     request_id,
                 })) => {
-                    let (total_rows, sequence, grid_rows, grid_cols, rows) = node
+                    let window = node
                         .node_local_scrollback(
                             pane_id,
                             offset,
                             (max_rows as usize).min(MAX_SCROLLBACK_ROWS),
                             MAX_SCROLLBACK_BYTES,
                         )
-                        .unwrap_or((0, 0, 0, 0, Vec::new()));
+                        .unwrap_or_default();
                     write_message(
                         reader.get_mut(),
                         &NodeMessage::ScrollbackWindow {
                             pane_id,
                             request_id,
-                            sequence,
-                            grid_rows,
-                            grid_cols,
-                            total_rows,
-                            offset: offset.min(total_rows),
-                            rows: rows.into_iter().map(|row| STANDARD.encode(row)).collect(),
+                            sequence: window.sequence,
+                            grid_rows: window.grid_rows,
+                            grid_cols: window.grid_cols,
+                            total_rows: window.total_rows,
+                            offset: offset.min(window.total_rows),
+                            rows: window
+                                .rows
+                                .into_iter()
+                                .map(|row| STANDARD.encode(row))
+                                .collect(),
                         },
                     )?;
                     did_work = true;
@@ -846,7 +850,7 @@ impl SharedLayoutNode {
         offset: u64,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Option<(u64, u64, u16, u16, Vec<Vec<u8>>)> {
+    ) -> Option<crate::tui::LocalScrollbackWindow> {
         self.runtime
             .node_local_scrollback(pane_id, offset, max_rows, max_bytes)
     }
