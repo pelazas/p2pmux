@@ -149,6 +149,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut last_agent_overlay_animation = Instant::now();
     let mut pending_focus = None;
     let mut pending_resync = BTreeSet::new();
+    let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
     let mut join_code = None;
 
@@ -183,6 +184,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut history,
                             next_screens,
                             &mut pending_resync,
+                            &mut history_refresh,
                         )?;
                         apply_leases(view, leases);
                         apply_rosters(view, rosters);
@@ -197,6 +199,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         }
                         for pane_id in new_resync_requests(&mut pending_resync, resync) {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
+                        }
+                        for pane_id in std::mem::take(&mut history_refresh) {
+                            request_scrollback(
+                                &mut stream,
+                                pane_id,
+                                view.pane_scrollback_offset(pane_id),
+                                &mut pending_scroll,
+                                &mut next_scrollback_request_id,
+                            )?;
                         }
                         local_peer_id = next_local_peer_id;
                         join_code = next_join_code;
@@ -228,9 +239,19 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut history,
                             next_screens,
                             &mut pending_resync,
+                            &mut history_refresh,
                         )?;
                         for pane_id in new_resync_requests(&mut pending_resync, resync) {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
+                        }
+                        for pane_id in std::mem::take(&mut history_refresh) {
+                            request_scrollback(
+                                &mut stream,
+                                pane_id,
+                                view.pane_scrollback_offset(pane_id),
+                                &mut pending_scroll,
+                                &mut next_scrollback_request_id,
+                            )?;
                         }
                         dirty = true;
                     }
@@ -434,26 +455,16 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         .map(HistoryCache::available_rows)
                         .unwrap_or_default();
                     if up && scrollback_len == 0 {
-                        let pending = pending_scroll.entry(pane_id).or_insert_with(|| {
-                            let request_id = next_scrollback_request_id;
-                            next_scrollback_request_id = next_scrollback_request_id.wrapping_add(1);
-                            PendingScroll {
-                                request_id,
-                                target: 0,
-                            }
-                        });
-                        pending.target = pending.target.saturating_add(3);
-                        if pending.target == 3 {
-                            write_message(
-                                &mut stream,
-                                &ClientMessage::ScrollbackQuery {
-                                    pane_id,
-                                    offset: 0,
-                                    max_rows: 1_000,
-                                    request_id: pending.request_id,
-                                },
-                            )?;
-                        }
+                        let target = pending_scroll
+                            .get(&pane_id)
+                            .map_or(3, |pending| pending.target.saturating_add(3));
+                        request_scrollback(
+                            &mut stream,
+                            pane_id,
+                            target,
+                            &mut pending_scroll,
+                            &mut next_scrollback_request_id,
+                        )?;
                     } else {
                         tui.scroll_mouse_pane(mouse.column, mouse.row, area, scrollback_len, up);
                         if !up && tui.pane_scrollback_offset(pane_id) == 0 {
@@ -555,6 +566,7 @@ fn apply_snapshot(
         history,
         next_screens,
         &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
     )?;
     apply_leases(view, leases);
     apply_rosters(view, rosters);
@@ -590,11 +602,12 @@ fn apply_layout<'a>(
 }
 
 fn apply_screens(
-    _view: &mut MultiPaneTui,
+    view: &mut MultiPaneTui,
     screens: &mut BTreeMap<u64, GuestScreen>,
     history: &mut BTreeMap<u64, HistoryCache>,
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
     pending_resync: &mut BTreeSet<u64>,
+    history_refresh: &mut BTreeSet<u64>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let mut resync = Vec::new();
     for frame in next_screens {
@@ -628,15 +641,25 @@ fn apply_screens(
         }
         if let Some(screen) = screen.screen() {
             let cache = history.entry(pane_id).or_default();
+            let previous_end = cache.history_end;
+            let cache_reached_live = cache.reaches_live();
             if cache.grid.is_some_and(|grid| grid != screen.size())
                 || history_end < cache.history_end
                 || history_len < cache.total_rows
             {
                 *cache = HistoryCache::default();
+                view.set_pane_scrollback_offset(pane_id, 0);
             }
+            let appended = history_end.saturating_sub(previous_end) as usize;
             cache.grid = Some(screen.size());
             cache.total_rows = history_len;
             cache.history_end = history_end;
+            if appended > 0 && view.pane_scrollback_offset(pane_id) > 0 {
+                view.pin_scrollback_after_output(pane_id, appended, history_len as usize);
+                if cache_reached_live {
+                    history_refresh.insert(pane_id);
+                }
+            }
         }
     }
     Ok(resync)
@@ -725,6 +748,36 @@ fn send_intents(
             }
             intent => write_message(stream, &ClientMessage::StructuralIntent { intent })?,
         }
+    }
+    Ok(())
+}
+
+fn request_scrollback(
+    stream: &mut UnixStream,
+    pane_id: u64,
+    target: usize,
+    pending: &mut BTreeMap<u64, PendingScroll>,
+    next_request_id: &mut u64,
+) -> io::Result<()> {
+    let request_id = *next_request_id;
+    let entry = pending.entry(pane_id).or_insert_with(|| {
+        *next_request_id = (*next_request_id).wrapping_add(1);
+        PendingScroll {
+            request_id,
+            target,
+        }
+    });
+    entry.target = entry.target.max(target);
+    if entry.request_id == request_id {
+        write_message(
+            stream,
+            &ClientMessage::ScrollbackQuery {
+                pane_id,
+                offset: 0,
+                max_rows: 1_000,
+                request_id,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1168,6 +1221,7 @@ mod tests {
                 history_end: 0,
             }],
             &mut pending_resync,
+            &mut BTreeSet::new(),
         )
         .unwrap();
 
