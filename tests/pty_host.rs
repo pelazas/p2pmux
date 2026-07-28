@@ -82,6 +82,31 @@ fn pty_host_resizes_without_disrupting_io() {
 }
 
 #[test]
+fn pty_host_reaps_an_exited_child_without_shutdown() {
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.args(["-c", "printf final; exit 0"]);
+    let mut host = PtyHost::spawn(
+        command,
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )
+    .expect("PTY should spawn");
+
+    assert!(read_until(&mut host, "final").contains("final"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !host.try_wait().expect("nonblocking reap") {
+        assert!(Instant::now() < deadline, "child should exit promptly");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(host.process_id().is_none());
+    host.shutdown().expect("explicit shutdown remains clean");
+}
+
+#[test]
 fn pty_host_default_shell_uses_explicit_working_directory() {
     let directory = std::env::temp_dir().join(format!(
         "p2pmux-pty-host-cwd-{}-{}",

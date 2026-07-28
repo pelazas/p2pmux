@@ -564,7 +564,7 @@ fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
     tui.snapshot()
         .panes
         .get(&tui.focused_pane())
-        .is_none_or(|pane| !pane.locked || pane.host_peer_id == local_peer_id)
+        .is_none_or(|pane| !pane.exited && (!pane.locked || pane.host_peer_id == local_peer_id))
 }
 
 fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
@@ -1444,5 +1444,17 @@ mod tests {
         assert!(!should_forward_paste(&tui, b"guest"));
         assert!(input_allowed(&tui, b"host"));
         assert!(should_forward_paste(&tui, b"host"));
+    }
+
+    #[test]
+    fn exited_pane_suppresses_key_and_paste_for_every_peer() {
+        let mut layout = layout(&[1]);
+        layout.panes.get_mut(&1).expect("pane").exited = true;
+        let tui = MultiPaneTui::new(layout).expect("layout");
+
+        assert!(!input_allowed(&tui, b"guest"));
+        assert!(!should_forward_paste(&tui, b"guest"));
+        assert!(!input_allowed(&tui, b"host"));
+        assert!(!should_forward_paste(&tui, b"host"));
     }
 }

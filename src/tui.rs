@@ -61,8 +61,8 @@ use crate::{
     local_ipc::AgentOverlaySnapshotRow,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, LayoutRequest, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor,
-        PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
+        DeleteTab, LayoutRequest, MarkPaneExited, NewPanePosition as ProtocolNewPanePosition,
+        PaneDescriptor, PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
@@ -3432,6 +3432,8 @@ pub struct SharedLocalPane {
     lease: LeaseManager,
     host_peer_id: Vec<u8>,
     locked: bool,
+    exited: bool,
+    exit_report_pending: bool,
     screen_tx: watch::Sender<ScreenFrame>,
     lease_tx: watch::Sender<LeaseState>,
     control_tx: mpsc::Sender<HostControlEvent>,
@@ -3480,6 +3482,8 @@ impl SharedLocalPane {
             lease,
             host_peer_id,
             locked: false,
+            exited: false,
+            exit_report_pending: false,
             screen_tx,
             lease_tx,
             control_tx,
@@ -3507,13 +3511,19 @@ impl SharedLocalPane {
         }
     }
 
-    fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
+    fn drain(&mut self) -> Result<LocalPaneDrain, Box<dyn Error>> {
         let mut changed = false;
+        if !self.exited && self.host.try_wait()? {
+            changed |= self.transition_exited()?;
+        }
         if let Some(state) = self.lease.clear_if_idle(Instant::now())? {
             self.lease_tx.send_replace(state);
             changed = true;
         }
         while let Ok(event) = self.control_rx.try_recv() {
+            if self.exited {
+                continue;
+            }
             match event {
                 HostControlEvent::Input { peer_id, input } => {
                     if self.locked && peer_id != self.host_peer_id {
@@ -3523,7 +3533,10 @@ impl SharedLocalPane {
                         self.lease
                             .input(&peer_id, input.lease_epoch, input.data, Instant::now())
                     {
-                        self.host.write_input(&bytes)?;
+                        if self.host.write_input(&bytes).is_err() {
+                            changed |= self.transition_exited()?;
+                            continue;
+                        }
                         self.lease_tx.send_replace(self.lease.state().clone());
                         changed = true;
                     }
@@ -3575,13 +3588,22 @@ impl SharedLocalPane {
             self.agent_tracker
                 .record_output(Instant::now(), unix_ms_now());
             let frame = self.screen.process_pty(&bytes)?;
-            if let Some(reply) = self.screen.take_kitty_keyboard_query_reply() {
-                self.host.write_input(&reply)?;
+            if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
+                && self.host.write_input(&reply).is_err()
+            {
+                changed |= self.transition_exited()?;
+                break;
             }
             self.screen_tx.send_replace(frame);
             changed = true;
         }
-        Ok(changed)
+        if !self.exited && self.host.output_closed() {
+            changed |= self.transition_exited()?;
+        }
+        Ok(LocalPaneDrain {
+            changed,
+            newly_exited: std::mem::take(&mut self.exit_report_pending),
+        })
     }
 
     fn apply_agent_snapshot(&mut self, processes: &[ProcessSnapshot], now: Instant) -> bool {
@@ -3615,13 +3637,18 @@ impl SharedLocalPane {
     }
 
     fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        if self.exited {
+            return Ok(());
+        }
         let epoch = self.lease.state().epoch;
         let decision = self
             .lease
             .input(&self.host_peer_id, epoch, bytes, Instant::now());
         match decision {
             LeaseDecision::AcceptInput(bytes) => {
-                self.host.write_input(&bytes)?;
+                if self.host.write_input(&bytes).is_err() {
+                    let _ = self.transition_exited()?;
+                }
                 self.lease_tx.send_replace(self.lease.state().clone());
             }
             LeaseDecision::Publish(_) => {}
@@ -3658,6 +3685,9 @@ impl SharedLocalPane {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Box<dyn Error>> {
+        if self.exited {
+            return Ok(());
+        }
         if self.screen.screen().size() == (rows, cols) {
             return Ok(());
         }
@@ -3675,6 +3705,31 @@ impl SharedLocalPane {
     fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         self.host.shutdown()
     }
+
+    fn transition_exited(&mut self) -> Result<bool, Box<dyn Error>> {
+        if self.exited {
+            return Ok(false);
+        }
+        self.exited = true;
+        self.exit_report_pending = true;
+        while self.control_rx.try_recv().is_ok() {}
+        if let Some(state) = self.lease.clear_controller(Instant::now())? {
+            self.lease_tx.send_replace(state);
+        }
+        Ok(true)
+    }
+
+    fn mark_exited(&mut self) -> Result<(), Box<dyn Error>> {
+        self.transition_exited()?;
+        self.exit_report_pending = false;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LocalPaneDrain {
+    changed: bool,
+    newly_exited: bool,
 }
 
 struct AgentSamplingWorker {
@@ -3730,6 +3785,7 @@ struct SharedRemotePane {
     last_lease: Instant,
     pending_control: bool,
     held_input: Vec<u8>,
+    exited: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3764,6 +3820,7 @@ impl SharedRemotePane {
             last_lease: Instant::now(),
             pending_control: false,
             held_input: Vec::new(),
+            exited: false,
         }
     }
 
@@ -3783,6 +3840,10 @@ impl SharedRemotePane {
     }
 
     fn drain(&mut self) -> RemotePaneDrain {
+        if self.exited {
+            while self.pane.events.try_recv().is_ok() {}
+            return RemotePaneDrain::Unchanged;
+        }
         let mut changed = false;
         let mut received_lease = false;
         loop {
@@ -3863,6 +3924,9 @@ impl SharedRemotePane {
     }
 
     fn input(&mut self, bytes: Vec<u8>) {
+        if self.exited {
+            return;
+        }
         let Some(lease) = self.lease.as_ref() else {
             return;
         };
@@ -3896,6 +3960,12 @@ impl SharedRemotePane {
         self.pending_control = false;
         self.held_input.clear();
         true
+    }
+
+    fn mark_exited(&mut self) {
+        self.exited = true;
+        self.pending_control = false;
+        self.held_input.clear();
     }
 }
 
@@ -4084,6 +4154,7 @@ pub struct SharedLayoutRuntime {
     pending_create: Option<PendingCreate>,
     provisional: BTreeMap<u64, PaneId>,
     pending_locks: BTreeMap<u64, (PaneId, bool)>,
+    pending_exits: BTreeMap<PaneId, u64>,
     next_request_id: u64,
     status: String,
     copied_lines: Option<usize>,
@@ -4191,6 +4262,7 @@ impl SharedLayoutRuntime {
             pending_create: None,
             provisional: BTreeMap::new(),
             pending_locks: BTreeMap::new(),
+            pending_exits: BTreeMap::new(),
             next_request_id: 1,
             status: String::new(),
             copied_lines: None,
@@ -4261,7 +4333,7 @@ impl SharedLayoutRuntime {
             .snapshot()
             .panes
             .get(&pane_id)
-            .is_none_or(|pane| !pane.locked || pane.host_peer_id == peer_id)
+            .is_none_or(|pane| !pane.exited && (!pane.locked || pane.host_peer_id == peer_id))
     }
 
     /// A complete node-owned view for a newly attached local renderer.
@@ -4681,12 +4753,19 @@ impl SharedLayoutRuntime {
         }
         self.start_eligible_subscriptions();
         for pane in self.local.values_mut() {
-            changed |= pane.drain()?;
+            let drained = pane.drain()?;
+            changed |= drained.changed;
+            if drained.newly_exited {
+                self.pending_exits.entry(pane.pane_id).or_insert(0);
+            }
         }
+        self.send_pending_exit_marks()?;
         if let Some(snapshot) = self.agent_sampler.latest_snapshot() {
             let now = Instant::now();
             for pane in self.local.values_mut() {
-                changed |= pane.apply_agent_snapshot(&snapshot, now);
+                if !pane.exited {
+                    changed |= pane.apply_agent_snapshot(&snapshot, now);
+                }
             }
         }
         changed |= self.publish_local_agent_roster();
@@ -4737,6 +4816,7 @@ impl SharedLayoutRuntime {
         let entries = self
             .local
             .values_mut()
+            .filter(|pane| !pane.exited)
             .filter_map(|pane| pane.agent_roster_entry(now))
             .collect::<Vec<_>>();
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
@@ -4780,6 +4860,9 @@ impl SharedLayoutRuntime {
             .flat_map(|roster| {
                 roster.entries.iter().filter_map(|entry| {
                     let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
+                    if pane.exited {
+                        return None;
+                    }
                     let view = self.tui.pane_view(entry.pane_id)?;
                     let &(tab_ordinal, pane_ordinal) = pane_locations.get(&entry.pane_id)?;
                     let tab = self
@@ -4853,6 +4936,7 @@ impl SharedLayoutRuntime {
         let snapshot = layout_snapshot_from_state(state)
             .map_err(|error| io::Error::other(format!("invalid layout state: {error:?}")))?;
         let current_ids = snapshot.panes.keys().copied().collect::<BTreeSet<_>>();
+        let prior_revision = self.tui.snapshot().revision;
         self.agent_rosters.retain(|host, roster| {
             roster.entries.retain(|entry| {
                 snapshot
@@ -4882,6 +4966,14 @@ impl SharedLayoutRuntime {
         for (pane_id, pane) in &snapshot.panes {
             if let Some(local) = self.local.get_mut(pane_id) {
                 local.set_locked(pane.locked)?;
+                if pane.exited {
+                    local.mark_exited()?;
+                }
+            }
+            if pane.exited {
+                if let Some(remote) = self.remote.get_mut(pane_id) {
+                    remote.mark_exited();
+                }
             }
         }
         self.pending_locks.retain(|_, (pane_id, locked)| {
@@ -4890,6 +4982,8 @@ impl SharedLayoutRuntime {
                 .get(pane_id)
                 .is_some_and(|pane| pane.locked != *locked)
         });
+        self.pending_exits
+            .retain(|pane_id, _| snapshot.panes.get(pane_id).is_some_and(|pane| !pane.exited));
         let remote_ids = self.remote.keys().copied().collect::<Vec<_>>();
         for pane_id in remote_ids {
             if !current_ids.contains(&pane_id)
@@ -4905,7 +4999,11 @@ impl SharedLayoutRuntime {
         self.release_blurred_pane(previously_focused)?;
         let me = self.control.peer_id();
         self.remote_descriptors.clear();
-        for pane in state.panes.iter().filter(|pane| pane.host_peer_id != me) {
+        for pane in state
+            .panes
+            .iter()
+            .filter(|pane| pane.host_peer_id != me && !pane.exited)
+        {
             let endpoint = state
                 .members
                 .iter()
@@ -4930,6 +5028,9 @@ impl SharedLayoutRuntime {
         if let Some(area) = area_from_terminal_size(terminal::size()) {
             self.reflow_local_panes(area)?;
         }
+        if snapshot.revision > prior_revision {
+            self.send_pending_exit_marks()?;
+        }
         Ok(())
     }
 
@@ -4940,6 +5041,16 @@ impl SharedLayoutRuntime {
             let Some(pane) = self.local.get_mut(&pane_id) else {
                 continue;
             };
+            if pane.exited
+                || self
+                    .tui
+                    .snapshot()
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|descriptor| descriptor.exited)
+            {
+                continue;
+            }
             let (rows, cols) = grid_for_pane(rect);
             if pane.screen.screen().size() == (rows, cols) {
                 continue;
@@ -4999,6 +5110,36 @@ impl SharedLayoutRuntime {
                 let _ = tx.send((pane_id, result));
             });
         }
+    }
+
+    fn send_pending_exit_marks(&mut self) -> Result<(), Box<dyn Error>> {
+        let revision = self.tui.snapshot().revision;
+        let pane_ids = self
+            .pending_exits
+            .iter()
+            .filter_map(|(pane_id, attempted_revision)| {
+                (*attempted_revision < revision).then_some(*pane_id)
+            })
+            .collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            let request_id = self.next_id();
+            self.pending_exits.insert(pane_id, revision);
+            self.send_request(LayoutRequest {
+                request_id,
+                base_revision: revision,
+                create_pane: None,
+                delete_pane: None,
+                create_tab: None,
+                delete_tab: None,
+                set_split_ratio: None,
+                update_pane_grids: None,
+                rename_pane: None,
+                rename_tab: None,
+                set_pane_lock: None,
+                mark_pane_exited: Some(MarkPaneExited { pane_id }),
+            })?;
+        }
+        Ok(())
     }
 
     fn handle_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
@@ -7265,6 +7406,33 @@ mod tests {
         let lease = lease_rx.borrow_and_update().clone();
         assert!(lease.controller_peer_id.is_empty());
         assert_eq!(lease.epoch, 2);
+    }
+
+    #[test]
+    fn exited_local_pane_clears_lease_and_rejects_all_controls() {
+        let host_id = b"host".to_vec();
+        let mut pane = SharedLocalPane::spawn(99, 1, 1, host_id.clone()).expect("local pane");
+        let lease_rx = pane.lease_tx.subscribe();
+        pane.lease = LeaseManager::new(host_id.clone(), Instant::now());
+        assert!(pane.transition_exited().expect("exit transition"));
+        assert!(pane.exited);
+        assert!(pane.lease.state().controller_peer_id.is_empty());
+        assert!(lease_rx.has_changed().expect("lease publication"));
+
+        pane.control_tx
+            .try_send(HostControlEvent::TakeControl {
+                peer_id: host_id,
+                request: crate::protocol::TakeControl {
+                    pane_id: pane_wire_id(99),
+                    requester_peer_id: b"host".to_vec(),
+                    known_lease_epoch: pane.lease.state().epoch,
+                },
+            })
+            .expect("queued control");
+        let drained = pane.drain().expect("drain exited pane");
+        assert!(drained.newly_exited);
+        assert!(pane.lease.state().controller_peer_id.is_empty());
+        pane.shutdown().expect("shutdown exited pane");
     }
 
     #[test]

@@ -102,6 +102,18 @@ impl PtyHost {
         self.child.as_ref().and_then(|child| child.process_id())
     }
 
+    /// Reap an exited child without releasing its PTY handles or joining the reader.
+    pub fn try_wait(&mut self) -> Result<bool, Box<dyn Error>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(true);
+        };
+        if child.try_wait()?.is_some() {
+            self.child.take();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Write terminal input to the child PTY immediately.
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let writer = self.writer.as_mut().ok_or("PTY writer is shut down")?;
