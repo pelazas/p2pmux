@@ -53,6 +53,8 @@ pub enum NodeMessage {
         local_peer_id: Vec<u8>,
         tab_id: u64,
         pane_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        join_code: Option<String>,
     },
     Screens {
         screens: Vec<PaneScreenSnapshot>,
