@@ -27,6 +27,8 @@ pub enum ClientMessage {
     },
     Input {
         bytes: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf_id: Option<u64>,
     },
     StructuralIntent {
         intent: UiIntent,
@@ -40,8 +42,9 @@ pub enum ClientMessage {
     },
     ScrollbackQuery {
         pane_id: u64,
+        /// Omitted when starting a new frozen local-history browsing session.
+        history_id: Option<u64>,
         offset: u64,
-        max_rows: u32,
         request_id: u64,
     },
     Focus {
@@ -85,17 +88,21 @@ pub enum NodeMessage {
     },
     Screens {
         screens: Vec<PaneScreenSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf_id: Option<u64>,
     },
-    /// Bounded host visual rows, encoded so terminal control bytes remain JSON-safe.
+    /// A frozen, render-ready host viewport.  This deliberately uses the normal screen codec:
+    /// history is never replayed through a second client-side VT parser.
     ScrollbackWindow {
         pane_id: u64,
         request_id: u64,
-        sequence: u64,
-        grid_rows: u16,
-        grid_cols: u16,
+        history_id: u64,
         total_rows: u64,
         offset: u64,
-        rows: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot: Option<Vec<u8>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unavailable: Option<String>,
     },
     Layout {
         layout: Box<LayoutSnapshot>,

@@ -5,7 +5,7 @@
 //! only component allowed to render a terminal.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     error::Error,
     fs,
     io::{self, BufRead, BufReader, Write},
@@ -14,10 +14,11 @@ use std::{
         fs::OpenOptionsExt,
         net::{UnixListener, UnixStream},
     },
+    sync::{Arc, Condvar, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -42,8 +43,10 @@ const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
 const ATTACHED_IDLE_BACKOFF: Duration = Duration::from_millis(1);
 const DETACHED_IDLE_BACKOFF: Duration = Duration::from_millis(16);
 const SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
-const MAX_SCROLLBACK_ROWS: usize = 1_000;
-const MAX_SCROLLBACK_BYTES: usize = 256 * 1024;
+const TARGET_SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(8);
+const TARGET_SCREEN_URGENCY_TTL: Duration = Duration::from_millis(64);
+const MAX_FROZEN_SCROLLBACK_SESSIONS: usize = 8;
+const OUTBOUND_QUEUE: usize = 64;
 
 pub struct SharedLayoutNode {
     runtime: SharedLayoutRuntime,
@@ -211,7 +214,9 @@ fn run_socket_loop(
     descriptor: &SessionDescriptor,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
-    let mut client: Option<(BufReader<UnixStream>, u64, AttachmentPublishState)> = None;
+    let mut client: Option<AttachedClient> = None;
+    let mut frozen_scrollback = BTreeMap::<u64, FrozenScrollback>::new();
+    let mut next_history_id = 1_u64;
     loop {
         let mut shutdown = false;
         let mut did_work = false;
@@ -259,7 +264,16 @@ fn run_socket_loop(
                                         reader
                                             .get_mut()
                                             .set_read_timeout(Some(Duration::from_millis(1)))?;
-                                        client = Some((reader, generation, publish));
+                                        let writer =
+                                            AttachmentWriter::start(reader.get_mut().try_clone()?)?;
+                                        client = Some(AttachedClient {
+                                            reader,
+                                            generation,
+                                            publish,
+                                            writer,
+                                            close_after_ack: false,
+                                            shutdown_after_ack: false,
+                                        });
                                         did_work = true;
                                     }
                                     Err(error) => {
@@ -310,11 +324,19 @@ fn run_socket_loop(
         did_work |= changed;
         let mut detached = false;
         let mut full_snapshot = false;
-        if !shutdown && let Some((reader, generation, publish)) = client.as_mut() {
-            match read_message(reader) {
-                Ok(Some(ClientMessage::Input { bytes })) => {
+        if !shutdown && let Some(client) = client.as_mut() {
+            match read_message(&mut client.reader) {
+                Ok(Some(ClientMessage::Input { bytes, perf_id })) => {
+                    let focused_pane = node.local_focus().1;
                     node.input(bytes)
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    client
+                        .publish
+                        .arm_target_urgency(focused_pane, Instant::now());
+                    client.publish.perf_id = perf_id;
+                    if let Some(perf_id) = perf_id {
+                        crate::perf::log(&format!("P2PMUX_PERF id={perf_id} node_input"));
+                    }
                     let drain_started = Instant::now();
                     changed |= node
                         .drain()
@@ -329,45 +351,67 @@ fn run_socket_loop(
                 Ok(Some(ClientMessage::Resize { cols, rows })) => {
                     node.resize(cols, rows)
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    frozen_scrollback.clear();
                     changed = true;
                 }
                 Ok(Some(ClientMessage::ResyncScreen { pane_id })) => {
-                    publish.screen_sequences.remove(&pane_id);
-                    publish.force_screens = true;
+                    client.publish.screen_sequences.remove(&pane_id);
+                    client.publish.force_screens = true;
                     changed = true;
                     full_snapshot = true;
                 }
                 Ok(Some(ClientMessage::ScrollbackQuery {
                     pane_id,
+                    history_id,
                     offset,
-                    max_rows,
                     request_id,
                 })) => {
-                    let window = node
-                        .node_local_scrollback(
-                            pane_id,
-                            offset,
-                            (max_rows as usize).min(MAX_SCROLLBACK_ROWS),
-                            MAX_SCROLLBACK_BYTES,
-                        )
-                        .unwrap_or_default();
-                    write_message(
-                        reader.get_mut(),
-                        &NodeMessage::ScrollbackWindow {
-                            pane_id,
-                            request_id,
-                            sequence: window.sequence,
-                            grid_rows: window.grid_rows,
-                            grid_cols: window.grid_cols,
-                            total_rows: window.total_rows,
-                            offset: offset.min(window.total_rows),
-                            rows: window
-                                .rows
-                                .into_iter()
-                                .map(|row| STANDARD.encode(row))
-                                .collect(),
-                        },
-                    )?;
+                    let (history_id, result) = if let Some(history_id) = history_id {
+                        let result = frozen_scrollback
+                            .get(&history_id)
+                            .filter(|frozen| frozen.pane_id == pane_id)
+                            .map(|frozen| frozen.viewport(offset));
+                        (history_id, result)
+                    } else {
+                        if frozen_scrollback.len() >= MAX_FROZEN_SCROLLBACK_SESSIONS {
+                            // History browsing is local UI state; evicting old sessions is safe
+                            // because a stale id receives an explicit unavailable response.
+                            frozen_scrollback.clear();
+                        }
+                        frozen_scrollback.retain(|_, frozen| frozen.pane_id != pane_id);
+                        let history_id = next_history_id;
+                        next_history_id = next_history_id.wrapping_add(1).max(1);
+                        let result = node.node_local_scrollback(pane_id).map(|window| {
+                            let frozen = FrozenScrollback {
+                                pane_id,
+                                total_rows: window.total_rows,
+                                screen: window.screen,
+                            };
+                            let viewport = frozen.viewport(offset);
+                            frozen_scrollback.insert(history_id, frozen);
+                            viewport
+                        });
+                        (history_id, result)
+                    };
+                    let (total_rows, snapshot, unavailable) = match result {
+                        Some((total_rows, snapshot)) => (total_rows, Some(snapshot), None),
+                        None => (
+                            0,
+                            None,
+                            Some(String::from(
+                                "local scrollback is unavailable for this pane (remote, alternate screen, or stale history)",
+                            )),
+                        ),
+                    };
+                    let _ = client.writer.enqueue(NodeMessage::ScrollbackWindow {
+                        pane_id,
+                        request_id,
+                        history_id,
+                        total_rows,
+                        offset: offset.min(total_rows),
+                        snapshot,
+                        unavailable,
+                    });
                     did_work = true;
                 }
                 Ok(Some(ClientMessage::Focus { tab_id, pane_id })) => {
@@ -377,43 +421,31 @@ fn run_socket_loop(
                 }
                 Ok(Some(ClientMessage::Detach {
                     generation: requested,
-                })) if requested == *generation => {
+                })) if requested == client.generation => {
                     node.release_all_local_control()
                         .map_err(|error| io::Error::other(error.to_string()))?;
-                    let _ = write_message(
-                        reader.get_mut(),
-                        &NodeMessage::DetachAck {
-                            generation: *generation,
-                        },
-                    );
-                    detached = true;
+                    let _ = client.writer.enqueue_control(NodeMessage::DetachAck {
+                        generation: client.generation,
+                    });
+                    client.close_after_ack = true;
                 }
                 Ok(Some(ClientMessage::Shutdown {
                     generation: requested,
-                })) if requested == *generation => {
-                    write_message(
-                        reader.get_mut(),
-                        &NodeMessage::ShutdownAck {
-                            generation: *generation,
-                        },
-                    )?;
-                    shutdown = true;
+                })) if requested == client.generation => {
+                    let _ = client.writer.enqueue_control(NodeMessage::ShutdownAck {
+                        generation: client.generation,
+                    });
+                    client.shutdown_after_ack = true;
                 }
                 Ok(Some(ClientMessage::Rename { name })) => {
                     if crate::session_store::valid_name(&name) {
-                        write_message(
-                            reader.get_mut(),
-                            &NodeMessage::Update {
-                                state: serde_json::json!({"name": name}),
-                            },
-                        )?;
+                        let _ = client.writer.enqueue_control(NodeMessage::Update {
+                            state: serde_json::json!({"name": name}),
+                        });
                     } else {
-                        write_message(
-                            reader.get_mut(),
-                            &NodeMessage::Error {
-                                message: "invalid session name".into(),
-                            },
-                        )?;
+                        let _ = client.writer.enqueue_control(NodeMessage::Error {
+                            message: "invalid session name".into(),
+                        });
                     }
                 }
                 Ok(Some(_)) => {}
@@ -424,17 +456,23 @@ fn run_socket_loop(
                 Err(_) => detached = true,
             }
             did_work |= changed;
-            if !detached {
+            if !detached && !client.close_after_ack && !client.shutdown_after_ack {
                 let result = if full_snapshot {
-                    write_snapshot(reader.get_mut(), descriptor, node, publish, drain_elapsed)
-                        .map(|()| true)
-                } else {
-                    write_updates(
-                        reader.get_mut(),
+                    queue_snapshot(
+                        descriptor,
                         node,
-                        publish,
+                        &mut client.publish,
+                        drain_elapsed,
+                        &client.writer,
+                    )
+                    .map(|()| true)
+                } else {
+                    queue_updates(
+                        node,
+                        &mut client.publish,
                         drain_elapsed,
                         Instant::now(),
+                        &client.writer,
                     )
                 };
                 match result {
@@ -445,15 +483,22 @@ fn run_socket_loop(
                     }
                 }
             }
+            if client.close_after_ack && client.writer.is_idle() {
+                detached = true;
+            }
+            if client.shutdown_after_ack && client.writer.is_idle() {
+                shutdown = true;
+            }
         }
         if !changed {
             log_slow_drain(drain_elapsed);
         }
         if (detached || shutdown)
-            && let Some((mut reader, generation, _)) = client.take()
+            && let Some(client) = client.take()
         {
-            let _ = reader.get_mut().shutdown(Shutdown::Both);
-            let _ = gate.detach(generation);
+            let _ = client.reader.get_ref().shutdown(Shutdown::Both);
+            client.writer.close();
+            let _ = gate.detach(client.generation);
             node.release_all_local_control()
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
@@ -464,6 +509,24 @@ fn run_socket_loop(
             Some(backoff) => std::thread::sleep(backoff),
             None => std::thread::yield_now(),
         }
+    }
+}
+
+struct FrozenScrollback {
+    pane_id: u64,
+    total_rows: u64,
+    screen: vt100::Screen,
+}
+
+impl FrozenScrollback {
+    fn viewport(&self, offset: u64) -> (u64, Vec<u8>) {
+        let mut screen = self.screen.clone();
+        screen.set_scrollback(offset.min(self.total_rows) as usize);
+        let snapshot = crate::screen::snapshot_payload(&screen)
+            .expect("host scrollback viewport must fit the screen codec")
+            .as_ref()
+            .to_vec();
+        (self.total_rows, snapshot)
     }
 }
 
@@ -491,6 +554,142 @@ fn write_message(stream: &mut UnixStream, message: &NodeMessage) -> io::Result<(
     stream.write_all(&frame)?;
     stream.flush()
 }
+
+struct AttachedClient {
+    reader: BufReader<UnixStream>,
+    generation: u64,
+    publish: AttachmentPublishState,
+    writer: AttachmentWriter,
+    close_after_ack: bool,
+    shutdown_after_ack: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueResult {
+    Queued,
+    Dropped,
+    CoalesceScreens,
+    Disconnected,
+}
+
+struct OutboundState {
+    messages: VecDeque<NodeMessage>,
+    writing: bool,
+    closed: bool,
+}
+
+struct AttachmentWriter {
+    state: Arc<(Mutex<OutboundState>, Condvar)>,
+    shutdown: UnixStream,
+    worker: thread::JoinHandle<()>,
+}
+
+impl AttachmentWriter {
+    fn start(mut stream: UnixStream) -> io::Result<Self> {
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let shutdown = stream.try_clone()?;
+        let state = Arc::new((
+            Mutex::new(OutboundState {
+                messages: VecDeque::with_capacity(OUTBOUND_QUEUE),
+                writing: false,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let worker = thread::spawn(move || {
+            loop {
+                let message = {
+                    let (lock, ready) = &*worker_state;
+                    let mut state = lock.lock().expect("outbound queue poisoned");
+                    while state.messages.is_empty() && !state.closed {
+                        state = ready.wait(state).expect("outbound queue poisoned");
+                    }
+                    let message = state.messages.pop_front();
+                    state.writing = message.is_some();
+                    ready.notify_all();
+                    match message {
+                        Some(message) => message,
+                        None => return,
+                    }
+                };
+                if write_message(&mut stream, &message).is_err() {
+                    let (lock, ready) = &*worker_state;
+                    lock.lock().expect("outbound queue poisoned").closed = true;
+                    ready.notify_all();
+                    return;
+                }
+                let (lock, ready) = &*worker_state;
+                lock.lock().expect("outbound queue poisoned").writing = false;
+                ready.notify_all();
+            }
+        });
+        Ok(Self {
+            state,
+            shutdown,
+            worker,
+        })
+    }
+
+    fn enqueue(&self, message: NodeMessage) -> QueueResult {
+        self.push(message, false)
+    }
+
+    fn enqueue_control(&self, message: NodeMessage) -> QueueResult {
+        self.push(message, true)
+    }
+
+    fn push(&self, message: NodeMessage, control: bool) -> QueueResult {
+        let (lock, ready) = &*self.state;
+        let mut state = lock.lock().expect("outbound queue poisoned");
+        let result = push_outbound(&mut state, message, control);
+        if result == QueueResult::Queued {
+            ready.notify_one();
+        }
+        result
+    }
+
+    fn is_idle(&self) -> bool {
+        let (lock, _) = &*self.state;
+        let state = lock.lock().expect("outbound queue poisoned");
+        (state.messages.is_empty() && !state.writing) || state.closed
+    }
+
+    fn close(self) {
+        let (lock, ready) = &*self.state;
+        lock.lock().expect("outbound queue poisoned").closed = true;
+        ready.notify_all();
+        let _ = self.shutdown.shutdown(Shutdown::Both);
+        let _ = self.worker.join();
+    }
+}
+
+fn push_outbound(state: &mut OutboundState, message: NodeMessage, control: bool) -> QueueResult {
+    if state.closed {
+        return QueueResult::Disconnected;
+    }
+    if state.messages.len() == OUTBOUND_QUEUE {
+        if matches!(message, NodeMessage::Screens { .. }) {
+            return QueueResult::CoalesceScreens;
+        }
+        if matches!(message, NodeMessage::ScrollbackWindow { .. }) {
+            return QueueResult::Dropped;
+        }
+        state
+            .messages
+            .retain(|queued| !matches!(queued, NodeMessage::ScrollbackWindow { .. }));
+        if control && state.messages.len() == OUTBOUND_QUEUE {
+            state
+                .messages
+                .retain(|queued| !matches!(queued, NodeMessage::Screens { .. }));
+        }
+        if state.messages.len() == OUTBOUND_QUEUE {
+            return QueueResult::Dropped;
+        }
+    }
+    state.messages.push_back(message);
+    QueueResult::Queued
+}
 fn write_snapshot(
     stream: &mut UnixStream,
     descriptor: &SessionDescriptor,
@@ -498,16 +697,63 @@ fn write_snapshot(
     publish: &mut AttachmentPublishState,
     drain_elapsed: Duration,
 ) -> io::Result<()> {
+    let (message, layout, leases, rosters, screens, stats) =
+        snapshot_message(descriptor, node, publish)?;
+    let json_started = Instant::now();
+    let mut frame = serde_json::to_vec(&message).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    let json_serialize = json_started.elapsed();
+    let write_started = Instant::now();
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    let json_write = write_started.elapsed();
+    publish.layout = Some(layout);
+    publish.leases = Some(leases);
+    publish.rosters = Some(rosters);
+    publish.focus = Some(node.local_focus());
+    update_screen_sequences(&mut publish.screen_sequences, &screens);
+    publish.last_screen_publish = Some(Instant::now());
+    publish.force_screens = false;
+    if crate::perf::enabled()
+        && [drain_elapsed, json_serialize, json_write]
+            .into_iter()
+            .any(|elapsed| elapsed >= Duration::from_millis(5))
+    {
+        crate::perf::log(&format!(
+            "P2PMUX_PERF node drain_ms={} snapshot_json_ms={} snapshot_write_ms={} write_bytes={} updates_snapshot={}({}B) updates_delta={}({}B) updates_unchanged={}",
+            drain_elapsed.as_millis(),
+            json_serialize.as_millis(),
+            json_write.as_millis(),
+            frame.len(),
+            stats.snapshots,
+            stats.snapshot_bytes,
+            stats.deltas,
+            stats.delta_bytes,
+            stats.unchanged,
+        ));
+    }
+    Ok(())
+}
+
+type SnapshotMessage = (
+    NodeMessage,
+    crate::layout::LayoutSnapshot,
+    Vec<PaneLeaseSnapshot>,
+    Vec<AgentOverlaySnapshotRow>,
+    Vec<PaneScreenSnapshot>,
+    ScreenUpdateStats,
+);
+
+fn snapshot_message(
+    descriptor: &SessionDescriptor,
+    node: &SharedLayoutNode,
+    publish: &AttachmentPublishState,
+) -> io::Result<SnapshotMessage> {
     let snapshot_started = Instant::now();
     let (tab_id, pane_id) = node.local_focus();
     let local_peer_id = node.local_peer_id();
     let (layout, screens, leases, rosters) = node.snapshot();
-    let snapshot_build = snapshot_started.elapsed();
-    let local_panes = screens
-        .values()
-        .filter(|screen| matches!(screen, crate::tui::NodeScreenSnapshot::Local { .. }))
-        .count();
-    let remote_panes = screens.len().saturating_sub(local_panes);
+    let _snapshot_build = snapshot_started.elapsed();
     let hosts = layout
         .panes
         .values()
@@ -556,41 +802,37 @@ fn write_snapshot(
         pane_id,
         join_code: node.runtime.join_code().map(str::to_owned),
     };
-    let json_started = Instant::now();
-    let mut frame = serde_json::to_vec(&message).map_err(io::Error::other)?;
-    frame.push(b'\n');
-    let json_serialize = json_started.elapsed();
-    let write_started = Instant::now();
-    stream.write_all(&frame)?;
-    stream.flush()?;
-    let json_write = write_started.elapsed();
-    publish.layout = Some(layout.clone());
-    publish.leases = Some(leases);
-    publish.rosters = Some(rosters);
-    publish.focus = Some((tab_id, pane_id));
-    update_screen_sequences(&mut publish.screen_sequences, &screens);
-    publish.last_screen_publish = Some(Instant::now());
-    publish.force_screens = false;
-    if crate::perf::enabled()
-        && [drain_elapsed, snapshot_build, json_serialize, json_write]
-            .into_iter()
-            .any(|elapsed| elapsed >= Duration::from_millis(5))
-    {
-        crate::perf::log(&format!(
-            "P2PMUX_PERF node drain_ms={} snapshot_build_ms={} json_serialize_ms={} json_write_ms={} write_bytes={} panes_local={} panes_remote={} updates_snapshot={}({}B) updates_delta={}({}B) updates_unchanged={}",
-            drain_elapsed.as_millis(),
-            snapshot_build.as_millis(),
-            json_serialize.as_millis(),
-            json_write.as_millis(),
-            frame.len(),
-            local_panes,
-            remote_panes,
-            updates.snapshots,
-            updates.snapshot_bytes,
-            updates.deltas,
-            updates.delta_bytes,
-            updates.unchanged,
-        ));
+    Ok((message, layout, leases, rosters, screens, updates))
+}
+
+fn queue_snapshot(
+    descriptor: &SessionDescriptor,
+    node: &SharedLayoutNode,
+    publish: &mut AttachmentPublishState,
+    _drain_elapsed: Duration,
+    writer: &AttachmentWriter,
+) -> io::Result<()> {
+    let (message, layout, leases, rosters, screens, _) =
+        snapshot_message(descriptor, node, publish)?;
+    match writer.enqueue(message) {
+        QueueResult::Queued => {
+            publish.layout = Some(layout);
+            publish.leases = Some(leases);
+            publish.rosters = Some(rosters);
+            publish.focus = Some(node.local_focus());
+            update_screen_sequences(&mut publish.screen_sequences, &screens);
+            publish.last_screen_publish = Some(Instant::now());
+            publish.force_screens = false;
+        }
+        QueueResult::Dropped | QueueResult::CoalesceScreens => {
+            publish.reset_for_snapshot();
+        }
+        QueueResult::Disconnected => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "local attachment disconnected",
+            ));
+        }
     }
     Ok(())
 }
@@ -605,14 +847,32 @@ struct AttachmentPublishState {
     last_screen_publish: Option<Instant>,
     pending_screens: bool,
     force_screens: bool,
+    target_urgency: Option<(u64, Instant)>,
+    perf_id: Option<u64>,
 }
 
-fn write_updates(
-    stream: &mut UnixStream,
+impl AttachmentPublishState {
+    fn arm_target_urgency(&mut self, pane_id: u64, now: Instant) {
+        self.target_urgency = Some((pane_id, now + TARGET_SCREEN_URGENCY_TTL));
+    }
+
+    fn reset_for_snapshot(&mut self) {
+        self.layout = None;
+        self.leases = None;
+        self.rosters = None;
+        self.focus = None;
+        self.screen_sequences.clear();
+        self.pending_screens = true;
+        self.force_screens = true;
+    }
+}
+
+fn queue_updates(
     node: &SharedLayoutNode,
     publish: &mut AttachmentPublishState,
     _drain_elapsed: Duration,
     now: Instant,
+    writer: &AttachmentWriter,
 ) -> io::Result<bool> {
     let (layout, screens, leases, rosters) = node.snapshot();
     let leases = leases
@@ -630,12 +890,15 @@ fn write_updates(
     let layout_changed = publish.layout.as_ref() != Some(&layout);
     let mut published = false;
     if layout_changed {
-        write_message(
-            stream,
-            &NodeMessage::Layout {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Layout {
                 layout: Box::new(layout.clone()),
             },
-        )?;
+        )? {
+            return Ok(published);
+        }
         publish.layout = Some(layout.clone());
         publish
             .screen_sequences
@@ -643,33 +906,42 @@ fn write_updates(
         published = true;
     }
     if publish.leases.as_ref() != Some(&leases) {
-        write_message(
-            stream,
-            &NodeMessage::Leases {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Leases {
                 leases: leases.clone(),
             },
-        )?;
+        )? {
+            return Ok(published);
+        }
         publish.leases = Some(leases);
         published = true;
     }
     if publish.rosters.as_ref() != Some(&rosters) {
-        write_message(
-            stream,
-            &NodeMessage::Rosters {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Rosters {
                 rosters: rosters.clone(),
             },
-        )?;
+        )? {
+            return Ok(published);
+        }
         publish.rosters = Some(rosters);
         published = true;
     }
     if publish.focus != Some(focus) {
-        write_message(
-            stream,
-            &NodeMessage::Focus {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Focus {
                 tab_id: focus.0,
                 pane_id: focus.1,
             },
-        )?;
+        )? {
+            return Ok(published);
+        }
         publish.focus = Some(focus);
         published = true;
     }
@@ -681,16 +953,25 @@ fn write_updates(
         publish.force_screens = false;
         return Ok(published);
     }
-    if !screens_due(publish, published, now) {
+    if !screens_due(publish, published, now, &frames) {
         publish.pending_screens = true;
         return Ok(published);
     }
-    write_message(
-        stream,
-        &NodeMessage::Screens {
+    let perf_id = publish.perf_id;
+    if !queue_update(
+        writer,
+        publish,
+        NodeMessage::Screens {
             screens: frames.clone(),
+            perf_id,
         },
-    )?;
+    )? {
+        return Ok(published);
+    }
+    if let Some(perf_id) = perf_id {
+        crate::perf::log(&format!("P2PMUX_PERF id={perf_id} node_publish"));
+        publish.perf_id = None;
+    }
     update_screen_sequences(&mut publish.screen_sequences, &frames);
     publish.last_screen_publish = Some(now);
     publish.pending_screens = false;
@@ -698,9 +979,40 @@ fn write_updates(
     Ok(true)
 }
 
-fn screens_due(publish: &AttachmentPublishState, structural: bool, now: Instant) -> bool {
+fn queue_update(
+    writer: &AttachmentWriter,
+    publish: &mut AttachmentPublishState,
+    message: NodeMessage,
+) -> io::Result<bool> {
+    match writer.enqueue(message) {
+        QueueResult::Queued => Ok(true),
+        QueueResult::Dropped | QueueResult::CoalesceScreens => {
+            publish.reset_for_snapshot();
+            Ok(false)
+        }
+        QueueResult::Disconnected => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "local attachment disconnected",
+        )),
+    }
+}
+
+fn screens_due(
+    publish: &AttachmentPublishState,
+    structural: bool,
+    now: Instant,
+    frames: &[PaneScreenSnapshot],
+) -> bool {
+    let target_due = publish.target_urgency.is_some_and(|(pane_id, expires)| {
+        now <= expires
+            && frames.iter().any(|frame| frame.pane_id == pane_id)
+            && publish
+                .last_screen_publish
+                .is_none_or(|last| now.duration_since(last) >= TARGET_SCREEN_PUBLISH_INTERVAL)
+    });
     structural
         || publish.force_screens
+        || target_due
         || publish
             .last_screen_publish
             .is_none_or(|last| now.duration_since(last) >= SCREEN_PUBLISH_INTERVAL)
@@ -858,12 +1170,8 @@ impl SharedLayoutNode {
     pub(crate) fn node_local_scrollback(
         &self,
         pane_id: u64,
-        offset: u64,
-        max_rows: usize,
-        max_bytes: usize,
     ) -> Option<crate::tui::LocalScrollbackWindow> {
-        self.runtime
-            .node_local_scrollback(pane_id, offset, max_rows, max_bytes)
+        self.runtime.node_local_scrollback(pane_id)
     }
     pub(crate) fn node_remote_snapshot(&self, pane_id: u64) -> Option<Vec<u8>> {
         self.runtime.node_remote_snapshot(pane_id)
@@ -906,6 +1214,7 @@ mod tests {
         let (mut writer, stream) = UnixStream::pair().unwrap();
         let mut frames = serde_json::to_vec(&ClientMessage::Input {
             bytes: b"first".to_vec(),
+            perf_id: None,
         })
         .unwrap();
         frames.push(b'\n');
@@ -918,7 +1227,7 @@ mod tests {
         let mut reader = BufReader::new(stream);
         assert!(matches!(
             read_message(&mut reader).unwrap(),
-            Some(ClientMessage::Input { bytes }) if bytes == b"first"
+            Some(ClientMessage::Input { bytes, .. }) if bytes == b"first"
         ));
         assert!(matches!(
             read_message(&mut reader).unwrap(),
@@ -950,12 +1259,99 @@ mod tests {
         assert!(!screens_due(
             &publish,
             false,
-            now + SCREEN_PUBLISH_INTERVAL - Duration::from_millis(1)
+            now + SCREEN_PUBLISH_INTERVAL - Duration::from_millis(1),
+            &[],
         ));
-        assert!(screens_due(&publish, false, now + SCREEN_PUBLISH_INTERVAL));
-        assert!(screens_due(&publish, true, now + Duration::from_millis(1)));
+        assert!(screens_due(
+            &publish,
+            false,
+            now + SCREEN_PUBLISH_INTERVAL,
+            &[],
+        ));
+        assert!(screens_due(
+            &publish,
+            true,
+            now + Duration::from_millis(1),
+            &[]
+        ));
         publish.force_screens = true;
-        assert!(screens_due(&publish, false, now + Duration::from_millis(1)));
+        assert!(screens_due(
+            &publish,
+            false,
+            now + Duration::from_millis(1),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn focused_input_urgency_beats_background_screen_throttle_only_for_target() {
+        let now = Instant::now();
+        let mut publish = AttachmentPublishState {
+            last_screen_publish: Some(now),
+            ..Default::default()
+        };
+        let target = vec![PaneScreenSnapshot {
+            pane_id: 7,
+            state: ScreenUpdate::Unchanged {
+                sequence: 1,
+                kitty_keyboard_active: false,
+            },
+            history_len: 0,
+            history_end: 0,
+        }];
+        publish.arm_target_urgency(7, now);
+        assert!(screens_due(
+            &publish,
+            false,
+            now + TARGET_SCREEN_PUBLISH_INTERVAL,
+            &target,
+        ));
+        assert!(!screens_due(
+            &publish,
+            false,
+            now + TARGET_SCREEN_PUBLISH_INTERVAL,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn full_outbound_queue_coalesces_screens_and_drops_scrollback() {
+        let mut state = OutboundState {
+            messages: VecDeque::with_capacity(OUTBOUND_QUEUE),
+            writing: false,
+            closed: false,
+        };
+        state
+            .messages
+            .extend(std::iter::repeat_n(NodeMessage::ProbeAck, OUTBOUND_QUEUE));
+        assert_eq!(
+            push_outbound(
+                &mut state,
+                NodeMessage::Screens {
+                    screens: vec![],
+                    perf_id: None,
+                },
+                false,
+            ),
+            QueueResult::CoalesceScreens,
+        );
+        assert_eq!(
+            push_outbound(
+                &mut state,
+                NodeMessage::ScrollbackWindow {
+                    pane_id: 1,
+                    request_id: 1,
+                    history_id: 1,
+                    total_rows: 0,
+                    offset: 0,
+                    snapshot: None,
+                    unavailable: None,
+                },
+                false,
+            ),
+            QueueResult::Dropped,
+        );
+        assert_eq!(state.messages.len(), OUTBOUND_QUEUE);
     }
 
     #[test]
@@ -1014,6 +1410,27 @@ mod tests {
         )]);
         let updates = pane_screen_updates(unchanged, &sequences, |_| None);
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn frozen_scrollback_viewport_uses_the_host_screen_codec() {
+        let mut host = HostScreen::new(2, 6).unwrap();
+        host.process_pty(b"one\r\ntwo\r\nthree\r\nfour").unwrap();
+        let (total_rows, _) = host.history_metadata();
+        let frozen = FrozenScrollback {
+            pane_id: 1,
+            total_rows,
+            screen: host.screen().clone(),
+        };
+        let (_, payload) = frozen.viewport(1);
+        let mut guest = crate::screen::GuestScreen::new();
+        guest.apply_snapshot(1, &payload).unwrap();
+        let mut expected = host.screen().clone();
+        expected.set_scrollback(1);
+        assert_eq!(
+            guest.screen().unwrap().state_formatted(),
+            expected.state_formatted()
+        );
     }
 
     #[test]

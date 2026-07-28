@@ -89,13 +89,10 @@ pub(crate) enum NodeScreenSnapshot {
 pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, NodeScreenSnapshot>;
 pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct LocalScrollbackWindow {
     pub total_rows: u64,
-    pub sequence: u64,
-    pub grid_rows: u16,
-    pub grid_cols: u16,
-    pub rows: Vec<Vec<u8>>,
+    pub screen: vt100::Screen,
 }
 
 /// Kept as the module's public marker from the scaffold.
@@ -4506,24 +4503,15 @@ impl SharedLayoutRuntime {
         )
     }
 
-    pub(crate) fn node_local_scrollback(
-        &self,
-        pane_id: PaneId,
-        offset: u64,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<LocalScrollbackWindow> {
+    pub(crate) fn node_local_scrollback(&self, pane_id: PaneId) -> Option<LocalScrollbackWindow> {
         let pane = self.local.get(&pane_id)?;
-        let (total_rows, rows) = pane
-            .screen
-            .visual_scrollback_window(offset, max_rows, max_bytes);
-        let (grid_rows, grid_cols) = pane.screen.screen().size();
+        let (total_rows, _) = pane.screen.history_metadata();
+        if total_rows == 0 || pane.screen.screen().alternate_screen() {
+            return None;
+        }
         Some(LocalScrollbackWindow {
             total_rows,
-            sequence: pane.screen.current_frame().sequence,
-            grid_rows,
-            grid_cols,
-            rows,
+            screen: pane.screen.screen().clone(),
         })
     }
 
