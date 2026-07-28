@@ -8,7 +8,7 @@ use std::{
     fs::OpenOptions,
     io,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
@@ -49,7 +49,7 @@ use ratatui::{
 
 use crate::{
     agent_detect::{
-        PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree,
+        PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree, cwd_for_pid,
         sample_global_snapshot,
     },
     config::UiTheme,
@@ -3243,11 +3243,27 @@ impl SharedLocalPane {
         grid_cols: u16,
         host_peer_id: Vec<u8>,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_cwd(pane_id, grid_rows, grid_cols, host_peer_id, None)
+    }
+
+    pub(crate) fn spawn_with_cwd(
+        pane_id: PaneId,
+        grid_rows: u16,
+        grid_cols: u16,
+        host_peer_id: Vec<u8>,
+        cwd: Option<&Path>,
+    ) -> Result<Self, Box<dyn Error>> {
         let size = PtySize {
             rows: grid_rows,
             cols: grid_cols,
             pixel_width: 0,
             pixel_height: 0,
+        };
+        let cwd = cwd.filter(|path| path.is_dir());
+        let host = match PtyHost::spawn_default_shell_with_cwd(size, cwd) {
+            Ok(host) => host,
+            Err(_) if cwd.is_some_and(|path| !path.is_dir()) => PtyHost::spawn_default_shell(size)?,
+            Err(error) => return Err(error),
         };
         let screen = HostScreen::new(grid_rows, grid_cols)?;
         let (screen_tx, _) = watch::channel(screen.current_frame().clone());
@@ -3256,7 +3272,7 @@ impl SharedLocalPane {
         let (control_tx, control_rx) = mpsc::channel(256);
         Ok(Self {
             pane_id,
-            host: PtyHost::spawn_default_shell(size)?,
+            host,
             screen,
             lease,
             host_peer_id,
@@ -3774,12 +3790,12 @@ fn layout_queue_message(error: LayoutControlQueueError) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
 struct PendingCreate {
     request_id: u64,
     base_revision: u64,
     grid_rows: u16,
     grid_cols: u16,
+    cwd: Option<PathBuf>,
 }
 
 /// Pure retry state for direct remote-pane subscriptions. Ticks are supplied by the UI drain
@@ -4794,13 +4810,23 @@ impl SharedLayoutRuntime {
                 grid_rows,
                 grid_cols,
             } => {
-                self.begin_create(Some((target_pane_id, axis, position)), grid_rows, grid_cols)?;
+                let cwd = self
+                    .local
+                    .get(&target_pane_id)
+                    .and_then(|pane| pane.host.process_id())
+                    .and_then(cwd_for_pid);
+                self.begin_create(
+                    Some((target_pane_id, axis, position)),
+                    grid_rows,
+                    grid_cols,
+                    cwd,
+                )?;
             }
             UiIntent::CreateTab {
                 grid_rows,
                 grid_cols,
             } => {
-                self.begin_create(None, grid_rows, grid_cols)?;
+                self.begin_create(None, grid_rows, grid_cols, None)?;
             }
             UiIntent::DeletePane { pane_id } => {
                 let request_id = self.next_id();
@@ -4909,6 +4935,7 @@ impl SharedLayoutRuntime {
         pane: Option<(PaneId, Axis, NewPanePosition)>,
         grid_rows: u16,
         grid_cols: u16,
+        cwd: Option<PathBuf>,
     ) -> Result<(), Box<dyn Error>> {
         if self.pending_create.is_some() {
             self.status = String::from("waiting for current pane reservation");
@@ -4921,6 +4948,7 @@ impl SharedLayoutRuntime {
             base_revision,
             grid_rows,
             grid_cols,
+            cwd,
         });
         self.send_request(LayoutRequest {
             request_id,
@@ -5019,11 +5047,12 @@ impl SharedLayoutRuntime {
             return Ok(());
         };
         let host_peer_id = self.control.peer_id();
-        let pane = match SharedLocalPane::spawn(
+        let pane = match SharedLocalPane::spawn_with_cwd(
             reservation.pane_id,
             pending.grid_rows,
             pending.grid_cols,
             host_peer_id.clone(),
+            pending.cwd.as_deref(),
         ) {
             Ok(pane) => pane,
             Err(error) => {
@@ -5079,6 +5108,7 @@ impl SharedLayoutRuntime {
         self.tui.cancel_resize_drag();
         self.pending_create = self
             .pending_create
+            .take()
             .filter(|pending| pending.request_id != request_id);
         if let Some(pane_id) = self.provisional.remove(&request_id) {
             let _ = self.panes.remove_local_pane(pane_id);
