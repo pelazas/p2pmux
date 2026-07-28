@@ -152,6 +152,9 @@ resize their own PTY and VT screen and publish their local grids.
 - `Ctrl+T`, then left/right — switch tabs.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted.
+When a pane shell exits, p2pmux preserves its final screen and marks the pane exited for everyone.
+Exited panes accept no input or control claims; only the pane host can close one with `Ctrl+P`, then
+`X`.
 Nested ratio-controlled splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Pane mode gives the locally focused pane a

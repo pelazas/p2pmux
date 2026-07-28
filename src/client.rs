@@ -369,6 +369,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         copied_lines,
                         footer_notice.as_deref(),
                         join_code.as_deref(),
+                        Some(&local_peer_id),
                     );
                 })?;
                 let draw_elapsed = draw_started.elapsed();

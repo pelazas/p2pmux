@@ -1992,12 +1992,14 @@ fn tab_label(title: Option<&str>, index: usize, active: bool) -> String {
     if active { format!(" {label} ") } else { label }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pane_title(
     custom_title: Option<&str>,
     index: usize,
     host_peer_id: &[u8],
     controller_peer_id: Option<&[u8]>,
     locked: bool,
+    exited: bool,
     members: &[crate::layout::Member],
     available_width: usize,
 ) -> Line<'static> {
@@ -2010,7 +2012,13 @@ fn pane_title(
         &custom_title.map_or_else(|| format!("Pane #{index}"), str::to_owned),
         available_width,
     );
-    let control = if locked { "host-only" } else { &control };
+    let control = if exited {
+        "exited"
+    } else if locked {
+        "host-only"
+    } else {
+        &control
+    };
     let metadata = format!(
         " host: {} control: {control}",
         member_label(host_peer_id, members)
@@ -2024,12 +2032,16 @@ fn pane_title(
 
 fn pane_border_color(
     theme: &UiTheme,
+    exited: bool,
     controller_peer_id: Option<&[u8]>,
     _controller_active: bool,
     focused: bool,
     hovered: bool,
     chord_mode: ChordMode,
 ) -> Color {
+    if exited {
+        return theme.pane_border_idle;
+    }
     if focused && chord_mode == ChordMode::Pane {
         return theme.pane_border_chord_focused;
     }
@@ -2391,14 +2403,27 @@ pub fn render_multi_pane_with_copy_feedback(
     copied_lines: Option<usize>,
     footer_notice: Option<&str>,
     join_code: Option<&str>,
+    local_peer_id: Option<&[u8]>,
 ) {
+    let exited_notice = tui
+        .snapshot()
+        .panes
+        .get(&tui.focused_pane())
+        .filter(|pane| pane.exited)
+        .map(|pane| {
+            if local_peer_id == Some(pane.host_peer_id.as_slice()) {
+                "exited — close with Ctrl+P, X"
+            } else {
+                "exited — input disabled; pane host can close with Ctrl+P, X"
+            }
+        });
     render_shared_multi_pane(
         frame,
         tui,
         screens,
         "",
         copied_lines,
-        footer_notice,
+        footer_notice.or(exited_notice),
         join_code,
     );
 }
@@ -2963,7 +2988,7 @@ fn render_shared_multi_pane(
         let view = tui.pane_views.get(&pane_id).cloned().unwrap_or_default();
         let focused = pane_id == tui.focused_pane;
         let title_width = usize::from(rect.width.saturating_sub(2));
-        let lock_badge = pane.locked.then(|| {
+        let lock_badge = (!pane.exited && pane.locked).then(|| {
             format!(
                 "(locked by {})",
                 member_label(&pane.host_peer_id, &tui.snapshot.members)
@@ -2978,6 +3003,7 @@ fn render_shared_multi_pane(
             &pane.host_peer_id,
             view.controller_peer_id.as_deref(),
             pane.locked,
+            pane.exited,
             &tui.snapshot.members,
             title_width.saturating_sub(badge_width).saturating_sub(2),
         );
@@ -2985,6 +3011,7 @@ fn render_shared_multi_pane(
         title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
             theme,
+            pane.exited,
             view.controller_peer_id.as_deref(),
             view.controller_active,
             focused,
@@ -3019,6 +3046,7 @@ fn render_shared_multi_pane(
                 && view.ready
                 && screen.scrollback() == 0
                 && !screen.hide_cursor()
+                && !pane.exited
                 && row < viewport.height
                 && col < viewport.width
             {
@@ -4327,6 +4355,18 @@ impl SharedLayoutRuntime {
         self.join_code.as_deref()
     }
 
+    fn exited_footer_notice(&self) -> Option<&'static str> {
+        let pane = self.tui.snapshot().panes.get(&self.tui.focused_pane())?;
+        if !pane.exited {
+            return None;
+        }
+        if pane.host_peer_id == self.control.peer_id() {
+            Some("exited — close with Ctrl+P, X")
+        } else {
+            Some("exited — input disabled; pane host can close with Ctrl+P, X")
+        }
+    }
+
     fn input_allowed(&self, pane_id: PaneId) -> bool {
         let peer_id = self.control.peer_id();
         self.tui
@@ -4540,7 +4580,9 @@ impl SharedLayoutRuntime {
                         &screens,
                         &self.status,
                         self.copied_lines,
-                        self.footer_notice.as_deref(),
+                        self.footer_notice
+                            .as_deref()
+                            .or_else(|| self.exited_footer_notice()),
                         self.join_code.as_deref(),
                     );
                 })?;
@@ -4970,10 +5012,8 @@ impl SharedLayoutRuntime {
                     local.mark_exited()?;
                 }
             }
-            if pane.exited {
-                if let Some(remote) = self.remote.get_mut(pane_id) {
-                    remote.mark_exited();
-                }
+            if pane.exited && let Some(remote) = self.remote.get_mut(pane_id) {
+                remote.mark_exited();
             }
         }
         self.pending_locks.retain(|_, (pane_id, locked)| {
@@ -7300,6 +7340,7 @@ mod tests {
                     None,
                     Some("copied join command"),
                     Some("TESTCODE"),
+                    None,
                 );
             })
             .expect("draw");
@@ -8114,20 +8155,24 @@ mod tests {
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
         assert_eq!(
-            pane_title(None, 1, b"host", Some(b""), false, &members, 80).to_string(),
+            pane_title(None, 1, b"host", Some(b""), false, false, &members, 80).to_string(),
             "Pane #1 host: Host control: free"
         );
         assert_eq!(
-            pane_title(None, 2, b"host", Some(b"guest"), false, &members, 80).to_string(),
+            pane_title(None, 2, b"host", Some(b"guest"), false, false, &members, 80).to_string(),
             "Pane #2 host: Host control: Guest"
         );
         assert_eq!(
-            pane_title(None, 2, b"host", None, false, &members, 80).to_string(),
+            pane_title(None, 2, b"host", None, false, false, &members, 80).to_string(),
             "Pane #2 host: Host control: …"
         );
         assert_eq!(
-            pane_title(None, 2, b"host", Some(b"guest"), true, &members, 80).to_string(),
+            pane_title(None, 2, b"host", Some(b"guest"), true, false, &members, 80).to_string(),
             "Pane #2 host: Host control: host-only"
+        );
+        assert_eq!(
+            pane_title(None, 2, b"host", Some(b"guest"), true, true, &members, 80).to_string(),
+            "Pane #2 host: Host control: exited"
         );
     }
 
@@ -8150,6 +8195,7 @@ mod tests {
                 1,
                 b"host",
                 Some(b""),
+                false,
                 false,
                 &members,
                 12
@@ -8371,35 +8417,75 @@ mod tests {
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         let theme = UiTheme::default();
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, true, false, ChordMode::None),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b""),
+                false,
+                true,
+                false,
+                ChordMode::None
+            ),
             Color::White
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, false, true, ChordMode::None),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b""),
+                false,
+                false,
+                true,
+                ChordMode::None
+            ),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b""), false, false, false, ChordMode::None),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b""),
+                false,
+                false,
+                false,
+                ChordMode::None
+            ),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, true, false, ChordMode::None),
+            pane_border_color(&theme, false, None, false, true, false, ChordMode::None),
             Color::Yellow
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, false, true, ChordMode::None),
+            pane_border_color(&theme, false, None, false, false, true, ChordMode::None),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, None, false, false, false, ChordMode::None),
+            pane_border_color(&theme, false, None, false, false, false, ChordMode::None),
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::None),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b"guest"),
+                true,
+                true,
+                true,
+                ChordMode::None
+            ),
             Color::Rgb(255, 69, 0)
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), false, false, true, ChordMode::None),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b"guest"),
+                false,
+                false,
+                true,
+                ChordMode::None
+            ),
             Color::Rgb(255, 69, 0)
         );
 
@@ -8410,6 +8496,7 @@ mod tests {
         assert_eq!(
             pane_border_color(
                 &themed,
+                false,
                 Some(b"guest"),
                 false,
                 false,
@@ -8419,11 +8506,27 @@ mod tests {
             Color::Rgb(1, 2, 3)
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::Pane,),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b"guest"),
+                true,
+                true,
+                true,
+                ChordMode::Pane,
+            ),
             theme.pane_border_chord_focused
         );
         assert_eq!(
-            pane_border_color(&theme, Some(b"guest"), true, true, true, ChordMode::Tab,),
+            pane_border_color(
+                &theme,
+                false,
+                Some(b"guest"),
+                true,
+                true,
+                true,
+                ChordMode::Tab,
+            ),
             theme.pane_border_remote_control
         );
     }

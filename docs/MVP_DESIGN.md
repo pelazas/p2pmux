@@ -121,6 +121,9 @@ renames the focused pane for all admitted members. `Ctrl+P` plus arrows moves fo
 tab for all admitted members; `Ctrl+T` plus left/right switches tabs. Rename uses Enter to save and
 Esc to cancel; a blank title restores the ordinal label. These mux chords are consumed locally. Ctrl+Q detaches
 the local view while the session node remains live; F9 and F10 reach the focused PTY. Pane grids never resize.
+When a hosted shell exits, its pane remains in the shared layout with its final output frozen and
+input disabled for every member. The pane host closes it through the existing pane-delete command;
+there is no automatic delete or respawn.
 
 ### Disconnect grace (any member)
 
