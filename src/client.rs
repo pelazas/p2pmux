@@ -143,6 +143,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut pending_scroll: BTreeMap<u64, PendingScroll> = BTreeMap::new();
     let mut next_scrollback_request_id = 1_u64;
     let mut copied_lines = None;
+    let mut footer_notice = None;
     let mut dirty = false;
     let mut node_ended = false;
     let mut attach_error = None;
@@ -366,6 +367,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         tui,
                         &visible,
                         copied_lines,
+                        footer_notice.as_deref(),
                         join_code.as_deref(),
                     );
                 })?;
@@ -447,6 +449,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             area,
                             FooterMouseInput {
                                 copied_lines,
+                                footer_notice: footer_notice.as_deref(),
                                 join_code: join_code.as_deref(),
                                 ..FooterMouseInput::default()
                             },
@@ -481,21 +484,29 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         }
                     }
                 } else {
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        copied_lines = None;
-                    }
                     let handling = tui.handle_mouse(
                         mouse,
                         area,
                         FooterMouseInput {
                             copied_lines,
+                            footer_notice: footer_notice.as_deref(),
                             join_code: join_code.as_deref(),
                             ..FooterMouseInput::default()
                         },
                     );
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        copied_lines = None;
+                        footer_notice = None;
+                    }
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
                         copied_lines = copy_attach_selection(tui, &screens, &history);
+                    }
+                    if let Some(command) = handling.join_copy_command
+                        && copy_selection_to_clipboard(&command).is_ok()
+                    {
+                        copied_lines = None;
+                        footer_notice = Some(String::from("copied join command"));
                     }
                 }
                 dirty = true;

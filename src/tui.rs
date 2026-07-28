@@ -2389,9 +2389,18 @@ pub fn render_multi_pane_with_copy_feedback(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     copied_lines: Option<usize>,
+    footer_notice: Option<&str>,
     join_code: Option<&str>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, join_code);
+    render_shared_multi_pane(
+        frame,
+        tui,
+        screens,
+        "",
+        copied_lines,
+        footer_notice,
+        join_code,
+    );
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -4513,65 +4522,21 @@ impl SharedLayoutRuntime {
                     }
                 }
                 Event::Mouse(mouse)
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    ) =>
                 {
                     if self.tui.modal_open() {
-                        continue;
-                    }
-                    if self.tui.overlay_open() {
-                        let previously_focused = self.tui.focused_pane();
-                        for intent in self.tui.handle_agent_overlay_click(
-                            mouse.column,
-                            mouse.row,
-                            Rect::new(0, 0, cols, rows),
-                        ) {
-                            self.handle_intent(intent)?;
-                        }
-                        self.release_blurred_pane(previously_focused)?;
-                        dirty = true;
                         continue;
                     }
                     let area = Rect::new(0, 0, cols, rows);
                     let previously_focused = self.tui.focused_pane();
-                    dirty |= self.clear_selection();
-                    if self.tui.begin_resize_drag(mouse.column, mouse.row, area) {
-                        dirty = true;
-                    } else if let Some(intent) =
-                        self.tui.switch_tab_at(mouse.column, mouse.row, area)
-                    {
-                        self.handle_intent(intent)?;
-                        dirty = true;
-                    } else {
-                        dirty |= self.tui.focus_pane_at(mouse.column, mouse.row, area);
-                        dirty |= self.tui.begin_selection_at(mouse.column, mouse.row, area);
-                    }
-                    self.release_blurred_pane(previously_focused)?;
-                }
-                Event::Mouse(mouse)
-                    if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) =>
-                {
-                    if self.tui.modal_open() {
-                        continue;
-                    }
-                    if self.tui.extend_resize_drag(mouse.column, mouse.row) {
-                        dirty = true;
-                    } else {
-                        dirty |= self.tui.extend_selection_at(
-                            mouse.column,
-                            mouse.row,
-                            Rect::new(0, 0, cols, rows),
-                        );
-                    }
-                }
-                Event::Mouse(mouse)
-                    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
-                {
-                    if self.tui.modal_open() {
-                        continue;
-                    }
                     let handling = self.tui.handle_mouse(
                         mouse,
-                        Rect::new(0, 0, cols, rows),
+                        area,
                         FooterMouseInput {
                             status: &self.status,
                             footer_notice: self.footer_notice.as_deref(),
@@ -4579,12 +4544,31 @@ impl SharedLayoutRuntime {
                             join_code: self.join_code.as_deref(),
                         },
                     );
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        self.copied_lines = None;
+                        if self.footer_notice.as_deref() == Some("copied join command") {
+                            self.footer_notice = None;
+                        }
+                    }
                     for intent in handling.intents {
                         self.handle_intent(intent)?;
                     }
                     if handling.copy_selection_requested {
                         self.copy_selection_to_clipboard();
                     }
+                    if let Some(command) = handling.join_copy_command {
+                        match copy_selection_to_clipboard(&command) {
+                            Ok(_) => {
+                                self.status.clear();
+                                self.copied_lines = None;
+                                self.footer_notice = Some(String::from("copied join command"));
+                            }
+                            Err(error) => {
+                                self.status = format!("clipboard copy failed: {error}");
+                            }
+                        }
+                    }
+                    self.release_blurred_pane(previously_focused)?;
                     dirty = true;
                 }
                 Event::Mouse(mouse)
@@ -7169,6 +7153,7 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     None,
+                    Some("copied join command"),
                     Some("TESTCODE"),
                 );
             })
@@ -7181,6 +7166,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("join: p2pmux join TESTCODE"));
+        assert!(rendered.contains("copied join command"));
     }
 
     #[test]
