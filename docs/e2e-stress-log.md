@@ -247,6 +247,45 @@ Two things worth knowing:
   cost is *per pane* rather than shared, a busy 8-member session with several flooded panes
   could get expensive. Worth a deliberate multi-pane measurement.
 
+### Iteration 5 — F×C×B: stalled-viewer resync, then the coordinator killed (2026-07-29)
+
+Script: `scripts/e2e/scenario_e_failure.py`. **Three** real peers (host + g1 + g2).
+
+Note on what "killing the host" means: `create`/`join` fork a detached `__node` that owns
+the PTYs; the foreground peer is only a renderer. Killing the peer is a *detach*; killing
+its node is the real disconnect. This scenario SIGKILLs the coordinator's **node**.
+
+Repro:
+1. Host creates, g1 and g2 join; all three confirm a shared baseline marker.
+2. `SIGSTOP` g2, then host runs `seq 1 3000`.
+3. Assert g1 keeps up to line 3000 while g2 is frozen (slow-viewer path).
+4. `SIGCONT` g2, assert it converges on the host's exact pane body.
+5. `SIGKILL` the coordinator's node with both guests attached.
+6. Probe each guest's liveness by resizing it and requiring a redraw at the new width.
+
+| Check | Result |
+|---|---|
+| All three peers share a baseline | PASS |
+| A healthy guest keeps up while another peer is stalled | PASS |
+| The stalled peer renders nothing while stopped | PASS |
+| **The stalled peer resyncs to identical content after SIGCONT** | PASS |
+| **The resumed peer did not replay a duplicated tail** | PASS |
+| Both guests survive the coordinator being killed | PASS |
+| **Both guests' render loops stay responsive** (resize → redraw) | PASS |
+| No panic on any peer | PASS |
+| **Guests are told the coordinator disconnected** | **FAIL — 3/3 runs** |
+
+The resync path is genuinely good: a peer stopped through 3000 lines of output converges
+byte-for-byte on resume with no duplicated tail, and killing the coordinator wedges
+nothing — both guests keep rendering and answer a resize.
+
+Deliberately *not* tested here: the B-category disconnect-grace items (placeholders, grace
+expiry, coordinator failover, old coordinator rejoining). Reading the source, **none of
+that is implemented yet** — there is no grace window, no placeholder pruning and no
+failover anywhere in `src/`, consistent with the README calling them "later work". So
+there is no hidden 5-minute timer to shrink for tests, and no configurable-grace flag was
+needed. Those bank entries are unimplemented features, not failing behaviour.
+
 ### Iteration 6 — E×D: mouse forwarding and fidelity across mismatched sizes (2026-07-29)
 
 Script: `scripts/e2e/scenario_f_mouse.py`. Host at **120x40**, guest at **64x20** — the
@@ -290,6 +329,44 @@ Two harness defects found and fixed (mine, not p2pmux's):
   on screen as `64;19;6M`. Confirmed forwarding was working all along by reading the raw
   PTY bytes before changing anything.
 
+### Iteration 7 — C: room lifecycle, bad codes, dead rooms, the 8-member cap (2026-07-29)
+
+Script: `scripts/e2e/scenario_g_lifecycle.py`. Up to **9 real peers** (18 processes, since
+each peer is a client plus its detached node). Each phase gets its own Harness, so join
+codes cannot leak between phases and cleanup is incremental.
+
+`MAX_MEMBERS` is 8 and the host counts as a member (`src/layout.rs:30,361`), so the cap is
+host + 7 guests and the 9th must be refused.
+
+Repro:
+1. `p2pmux join ZZZZZZZZZZ` — a code that was never valid.
+2. Create a room, SIGKILL its coordinator node, then join with the still-published code.
+3. Two peers spawned back to back against the same code.
+4. Host + 7 guests admitted, then an 8th guest attempts to join.
+
+| Check | Result |
+|---|---|
+| A bad join code exits instead of hanging | PASS |
+| A bad join code exits non-zero | PASS |
+| A bad join code explains itself | PASS |
+| **Joining a dead room terminates instead of hanging forever** | PASS |
+| Joining a dead room reports an error | PASS |
+| Both simultaneous joiners get in | PASS |
+| Both simultaneous joiners receive the host's output | PASS |
+| **All 7 guests fit under the 8-member cap** | PASS |
+| **The 9th member is refused, not admitted** | PASS (refused in 0.2s) |
+| The over-cap peer does not hang silently | PASS |
+| The refusal is not a raw internal debug error | PASS *(after the fix below)* |
+| **The over-cap peer explains why it was refused** | **FAIL — 3/3, see BUG-3** |
+| No panic across the full room | PASS |
+
+The cap itself is enforced correctly end to end, and nothing hangs: every doomed join
+exits rather than blocking, which was the severity-1 question behind this whole category.
+
+One harness false-pass caught and fixed: the "explains why" check originally searched the
+whole PTY output for `"full"`, which matches **"fully trusted"** in the TRUST WARNING that
+p2pmux prints on every join. It now scopes the search to the error line only.
+
 ## Coverage caveat on the loop's stop rule
 
 Iterations 1-3 each found no bug, which technically fires the "three consecutive clean
@@ -299,50 +376,70 @@ prioritised, being the newest code). Categories C (room lifecycle), D (terminal 
 E (mouse forwarding) and F (load and failure) have **not been touched at all**. The right
 reading is "A and B look solid", so the loop continues into the untouched categories.
 
-### Iteration 5 — F×C×B: stalled-viewer resync, then the coordinator killed (2026-07-29)
-
-Script: `scripts/e2e/scenario_e_failure.py`. **Three** real peers (host + g1 + g2).
-
-Note on what "killing the host" means: `create`/`join` fork a detached `__node` that owns
-the PTYs; the foreground peer is only a renderer. Killing the peer is a *detach*; killing
-its node is the real disconnect. This scenario SIGKILLs the coordinator's **node**.
-
-Repro:
-1. Host creates, g1 and g2 join; all three confirm a shared baseline marker.
-2. `SIGSTOP` g2, then host runs `seq 1 3000`.
-3. Assert g1 keeps up to line 3000 while g2 is frozen (slow-viewer path).
-4. `SIGCONT` g2, assert it converges on the host's exact pane body.
-5. `SIGKILL` the coordinator's node with both guests attached.
-6. Probe each guest's liveness by resizing it and requiring a redraw at the new width.
-
-| Check | Result |
-|---|---|
-| All three peers share a baseline | PASS |
-| A healthy guest keeps up while another peer is stalled | PASS |
-| The stalled peer renders nothing while stopped | PASS |
-| **The stalled peer resyncs to identical content after SIGCONT** | PASS |
-| **The resumed peer did not replay a duplicated tail** | PASS |
-| Both guests survive the coordinator being killed | PASS |
-| **Both guests' render loops stay responsive** (resize → redraw) | PASS |
-| No panic on any peer | PASS |
-| **Guests are told the coordinator disconnected** | **FAIL — 3/3 runs** |
-
-The resync path is genuinely good: a peer stopped through 3000 lines of output converges
-byte-for-byte on resume with no duplicated tail, and killing the coordinator wedges
-nothing — both guests keep rendering and answer a resize.
-
-Deliberately *not* tested here: the B-category disconnect-grace items (placeholders, grace
-expiry, coordinator failover, old coordinator rejoining). Reading the source, **none of
-that is implemented yet** — there is no grace window, no placeholder pruning and no
-failover anywhere in `src/`, consistent with the README calling them "later work". So
-there is no hidden 5-minute timer to shrink for tests, and no configurable-grace flag was
-needed. Those bank entries are unimplemented features, not failing behaviour.
-
 ## Open bugs
 
-_None._
+### BUG-3 (severity 5) — a refused joiner is not told the room is full
+
+**Symptom.** The 9th member is correctly refused, but is told
+`Error: transport error: Iroh stream read failed: read error: connection lost`. Truthful
+and no longer misleading, but it never says the room is full. Reproduced 3/3.
+
+**Root cause.** The coordinator computes the right reason — `LayoutError::MemberLimit`
+(`layout.rs:362`), which `reject_reason` maps to `LayoutRejectReason::Limit`
+(`session.rs:982`) — but that mapping serves *layout requests* made by admitted members.
+The join handshake has no such path: a peer refused at `add_member` simply has its
+connection dropped, so the joiner only observes a transport-level close.
+
+**Escape hatch taken — this needs a protocol change, so it is not fixed here.** Making it
+right means the coordinator sends a structured refusal on the control stream *before*
+closing, and the joiner surfaces it. That touches the join handshake and the wire format,
+which is more than one iteration should quietly change under a stress-test loop.
+
+**Plan for a human.**
+1. Add a terminal `LayoutControlEvent::Refused { reason }` (or reuse `LayoutReject` with a
+   handshake-scoped request id) emitted by the coordinator's join path on `MemberLimit`.
+2. Send it before `disconnect_or_remove` drops the connection.
+3. In `join_layout_with_display_name` (`session.rs:2634`), translate a received refusal
+   into a typed `SessionError::Refused(reason)` instead of surfacing the read failure.
+4. Map that to a plain sentence in `cli.rs`, e.g. `this session is full (8 members)`.
+
+Worth doing beyond the cap: the same channel would carry any future refusal reason
+(banned peer, version mismatch) rather than every one of them looking like a network fault.
 
 ## Fixed
+
+### BUG-2 (severity 5) — every CLI error printed as a Rust debug dump, hiding the real cause
+
+**Symptom.** A user joining a full room was told:
+
+```
+Error: Custom { kind: TimedOut, error: "background node did not become ready" }
+```
+
+Two failures in one line. It is a raw `Debug` dump of Rust internals, and it points at a
+*local startup problem* when the real cause was a remote refusal — actively misleading.
+
+**Root cause, two layers.**
+1. `main` returned `Result<(), Box<dyn Error>>`, and Rust prints that error with **Debug**,
+   not Display — so every CLI error surfaced as a struct dump.
+2. `create`/`join` fork a detached node whose stderr is `/dev/null` (`cli.rs:440`). When it
+   failed to start, its reason went nowhere, and `launch_background_node` could only report
+   that the socket never appeared — a timeout message standing in for the real error.
+
+**Fix.**
+- `src/main.rs` prints `Error: {error}` via Display and returns `ExitCode::FAILURE`, so
+  every error in the binary shows the message it actually carries.
+- The node writes its startup failure to `<session-id>.error` beside its bootstrap file;
+  `launch_background_node` polls for it and surfaces it verbatim as `NodeStartupError`,
+  falling back to the old timeout only when the node left no reason. Stale files are
+  removed before spawn.
+
+**Verified.** `p2pmux join ZZZZZZZZZZ` now prints `Error: join code was not found on this
+Mac`. The over-cap joiner reports a real transport error instead of a debug struct, 3/3
+runs. Regression: scenario A 2/2, full suite 385 tests, 0 failures.
+
+Same class of defect as BUG-1: the software computed the right information and had no wire
+to carry it to the user.
 
 ### BUG-1 (severity 4) — every status message is invisible in the default run mode
 

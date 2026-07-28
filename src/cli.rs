@@ -96,6 +96,18 @@ impl std::fmt::Display for CliError {
 
 impl Error for CliError {}
 
+/// Why the background node refused to start, forwarded verbatim from the node itself.
+#[derive(Debug)]
+struct NodeStartupError(String);
+
+impl std::fmt::Display for NodeStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for NodeStartupError {}
+
 /// Parse process arguments and run a command.
 pub async fn parse_and_run() -> Result<(), Box<dyn Error>> {
     run(Cli::parse()).await
@@ -108,7 +120,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         None => resume_picker(false),
         Some(Command::Node { bootstrap }) => {
-            crate::node::run_background(crate::node::read_bootstrap(&bootstrap)?).await
+            // This process has no terminal and its stderr is /dev/null, so a startup
+            // failure would otherwise be invisible and the launcher could only report
+            // that the socket never appeared. Leave the reason where it can find it.
+            let result = match crate::node::read_bootstrap(&bootstrap) {
+                Ok(parsed) => crate::node::run_background(parsed).await,
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = &result {
+                let _ = std::fs::write(bootstrap.with_extension("error"), error.to_string());
+            }
+            result
         }
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
@@ -443,15 +465,35 @@ pub(crate) fn launch_background_node(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    let error_path = descriptor.socket_path.with_extension("error");
+    let _ = std::fs::remove_file(&error_path);
     command.spawn()?;
     let deadline = Instant::now() + Duration::from_secs(5);
+    let take_node_error = || -> Option<String> {
+        let message = std::fs::read_to_string(&error_path).ok()?;
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            return None;
+        }
+        let _ = std::fs::remove_file(&error_path);
+        Some(message)
+    };
     while Instant::now() < deadline {
         if let Ok(found) = store.read(&id)
             && found.socket_path.exists()
         {
             return Ok(found);
         }
+        // The node reports why it could not start -- a full room, a dead coordinator, a
+        // bad ticket. Surfacing that beats telling the user it "did not become ready",
+        // which points at a local startup problem that is not the actual cause.
+        if let Some(message) = take_node_error() {
+            return Err(NodeStartupError(message).into());
+        }
         std::thread::sleep(Duration::from_millis(25));
+    }
+    if let Some(message) = take_node_error() {
+        return Err(NodeStartupError(message).into());
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
