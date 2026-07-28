@@ -103,6 +103,68 @@ starts stayed on the grid and bled through wherever the TUI did not repaint — 
 tinguishable from a garbled render, i.e. a false-positive generator for exactly the bug
 class this loop hunts. `driver.AltScreen` now clears on `ESC [ ? 1049 h/l`.
 
+### Iteration 2 — B×A: a guest tries to destroy what it does not own (2026-07-28)
+
+Script: `scripts/e2e/scenario_b_ownership.py`. Two real peers. All severity-2 territory.
+
+Repro:
+1. Host creates, guest joins.
+2. Guest presses `Ctrl+P, n` → guest-hosted pane; tab now holds one pane per owner.
+3. Guest presses `Ctrl+P, ←` to focus the host's pane.
+4. Guest presses `Ctrl+P, x` (delete a live foreign pane).
+5. Guest presses `Ctrl+T, x` + Enter (delete a tab containing a foreign pane).
+6. Host types `exit` — its pane is now an *exited* foreign pane.
+7. Guest presses `Ctrl+P, x` again on the exited foreign pane.
+8. **Positive control:** host presses `Ctrl+P, x` on its own exited pane.
+
+| Check | Result |
+|---|---|
+| Both peers see two panes with the right owners | PASS |
+| Guest cannot delete a live foreign pane | PASS |
+| Guest cannot delete a tab containing a foreign pane | PASS |
+| Tab survives the rejected tab delete | PASS |
+| Host's pane reports exited | PASS |
+| **Guest cannot delete an EXITED foreign pane** | PASS |
+| **Positive control: pane host CAN delete its own exited pane** | PASS |
+| No panic, both peers alive | PASS |
+
+**No bug found.** 4/4 runs clean, zero orphans. Enforcement is server-side in
+`layout.rs:747` (`LayoutError::NotPaneHost`), keyed on the *authenticated* peer id, so a
+guest cannot forge it client-side. The positive control matters: it proves the rejections
+are real authorization outcomes and not a chord that silently never fired.
+
+Two failures in the first run were **my oracles, not p2pmux**:
+- `Pane #N` is a display *ordinal* (`src/tui.rs:571`), not a stable id — deleting the first
+  pane renumbers the survivor to `#1`, which an id-keyed oracle reports as a phantom
+  failure. The oracle now keys on owner + count.
+- The scenario had the guest type into the host's pane before the host typed `exit`. That
+  grabs the pane's control lease, so the host's own `exit` was then correctly refused.
+  Reordered so ownership is tested without lease contamination.
+
+### Discovery — silent input discard when another peer holds the lease
+
+Found while diagnosing the above; **not yet classified as a bug**, recorded for iteration 3.
+
+`src/tui.rs:6715-6726` handles typing into a pane you do not control:
+
+```
+if you are the controller            -> send
+else if controller is empty (free)   -> send, implicitly grabbing control
+else if lease idle >= IDLE_AFTER     -> buffer into held_input, request take-control
+else                                 -> (no branch: bytes are silently discarded)
+```
+
+So while another peer actively holds control, your keystrokes vanish with **no feedback of
+any kind** — no bell, no footer notice. Compare the exited-pane path, which does explain
+itself (`exited — input disabled; pane host can close with Ctrl+P, X`). The pane header
+does show `control: <peer>`, which is the only indication. Confirmed by hand: after the
+guest typed once into the host's idle pane, the host typed `exit` into *its own* pane and
+nothing whatsoever happened.
+
+Refusing is per design (`lease.rs`, `IDLE_AFTER = 30s`; the bank calls for "explicit
+handoff required"). The open question is the missing feedback, and — more interesting —
+whether `held_input` replay after the handoff is lossless. That is iteration 3.
+
 ## Open bugs
 
 _None yet._
