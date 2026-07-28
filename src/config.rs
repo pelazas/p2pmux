@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn notification_settings_default_and_parse() {
-        assert_eq!(NotificationsConfig::default().sound_enabled, true);
+        assert!(NotificationsConfig::default().sound_enabled);
         assert_eq!(NotificationsConfig::default().sound_path, None);
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[ui.notifications]"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("sound_enabled = true"));
