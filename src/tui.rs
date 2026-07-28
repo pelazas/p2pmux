@@ -2758,7 +2758,8 @@ fn render_chord_footer(
             usize::from(join_rect.width),
             Style::default()
                 .fg(theme.footer_muted)
-                .bg(theme.footer_background),
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::UNDERLINED),
         );
     }
 }
@@ -2842,7 +2843,8 @@ fn render_contextual_footer(
             usize::from(join_rect.width),
             Style::default()
                 .fg(theme.footer_muted)
-                .bg(theme.footer_background),
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::UNDERLINED),
         );
     }
 }
@@ -7123,15 +7125,21 @@ mod tests {
                 );
             })
             .expect("draw");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
+        let footer = (0..160)
+            .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
             .collect::<String>();
-        assert!(rendered.contains("waiting for current pane reservation"));
-        assert!(rendered.contains("join: p2pmux join TESTCODE"));
+        assert!(footer.contains("waiting for current pane reservation"));
+        assert!(footer.contains("join: p2pmux join TESTCODE"));
+        let join = "join: p2pmux join TESTCODE";
+        let join_x = footer.find(join).expect("join code rendered") as u16;
+        for x in join_x..160 {
+            assert!(
+                terminal.backend().buffer()[(x, 4)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED),
+                "join cell at x={x} is underlined"
+            );
+        }
     }
 
     #[test]
