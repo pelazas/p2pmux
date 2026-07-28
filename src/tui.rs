@@ -126,7 +126,7 @@ struct UiDebugLog {
     write_lock: Mutex<()>,
 }
 
-fn ui_debug_log(event: &str, fields: fmt::Arguments<'_>) {
+pub(crate) fn ui_debug_log(event: &str, fields: fmt::Arguments<'_>) {
     static UI_DEBUG_LOG: OnceLock<UiDebugLog> = OnceLock::new();
     let debug_log = UI_DEBUG_LOG.get_or_init(|| {
         let path = env::var("P2PMUX_DEBUG_UI").ok().and_then(|value| {
@@ -457,6 +457,8 @@ pub struct MultiPaneTui {
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
+    prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
+    unread_agent_panes: BTreeSet<PaneId>,
     modal: ModalState,
     agent_selected_pane: Option<PaneId>,
     /// Terminal-line offset into the cards (two card lines plus one spacer each).
@@ -496,6 +498,8 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
+            prior_agent_states: BTreeMap::new(),
+            unread_agent_panes: BTreeSet::new(),
             modal: ModalState::None,
             agent_selected_pane: None,
             agent_overlay_scroll_line: 0,
@@ -582,6 +586,26 @@ impl MultiPaneTui {
         self.clamp_agent_overlay_scroll();
         self.ensure_agent_selection_visible();
         true
+    }
+
+    /// Updates attached-client agent rows and reports newly unread completions.
+    ///
+    /// The first observed roster only establishes the local baseline. Roster rows that disappear
+    /// intentionally retain their previous state and unread marker until their pane is deleted.
+    pub fn update_attached_agent_rows(&mut self, rows: Vec<AgentOverlayRow>) -> Vec<PaneId> {
+        self.set_agent_rows(rows);
+        let mut newly_unread = Vec::new();
+        for row in &self.agent_rows {
+            let previous = self.prior_agent_states.insert(row.pane_id, row.state);
+            if previous == Some(AgentRosterState::Working)
+                && row.state == AgentRosterState::Idle
+                && row.pane_id != self.focused_pane
+                && self.unread_agent_panes.insert(row.pane_id)
+            {
+                newly_unread.push(row.pane_id);
+            }
+        }
+        newly_unread
     }
 
     pub(crate) fn set_agent_overlay_viewport(&mut self, area: Rect) {
@@ -1026,6 +1050,10 @@ impl MultiPaneTui {
             })
             .collect();
         self.snapshot = snapshot;
+        self.prior_agent_states
+            .retain(|pane_id, _| self.snapshot.panes.contains_key(pane_id));
+        self.unread_agent_panes
+            .retain(|pane_id| self.snapshot.panes.contains_key(pane_id));
         self.cancel_resize_drag();
         self.clear_selection();
         self.repair_selection();
@@ -1039,17 +1067,8 @@ impl MultiPaneTui {
             .iter()
             .find(|tab| tab.tab_id == tab_id)
             .ok_or(LayoutError::UnknownTab { tab_id })?;
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.current_tab = tab_id;
-        self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
-        self.log_selection_change(
-            "tab_switch",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        let pane_id = first_leaf(&tab.root).expect("validated layout has a leaf");
+        self.select_pane(tab_id, pane_id, "tab_switch");
         Ok(())
     }
 
@@ -1057,20 +1076,7 @@ impl MultiPaneTui {
         let Some(pane_id) = pane_at(&self.geometry(area).panes, column, row) else {
             return false;
         };
-        if self.focused_pane == pane_id {
-            return false;
-        }
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.focused_pane = pane_id;
-        self.log_selection_change(
-            "mouse",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
-        true
+        self.select_pane(self.current_tab, pane_id, "mouse")
     }
 
     fn hover_pane_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
@@ -1155,6 +1161,7 @@ impl MultiPaneTui {
                     tab.title.as_deref(),
                     index + 1,
                     tab.tab_id == self.current_tab,
+                    self.tab_has_unread_agent_pane(tab),
                 ));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
@@ -1162,6 +1169,12 @@ impl MultiPaneTui {
                 (tab.tab_id, rect)
             })
             .collect()
+    }
+
+    fn tab_has_unread_agent_pane(&self, tab: &crate::layout::Tab) -> bool {
+        self.unread_agent_panes
+            .iter()
+            .any(|pane_id| contains_leaf(&tab.root, *pane_id))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
@@ -1366,17 +1379,7 @@ impl MultiPaneTui {
         if !contains_leaf(&tab.root, pane_id) {
             return Err(LayoutError::UnknownPane { pane_id });
         }
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.current_tab = tab_id;
-        self.focused_pane = pane_id;
-        self.log_selection_change(
-            "node_sync",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        self.select_pane(tab_id, pane_id, "node_sync");
         Ok(())
     }
 
@@ -1528,19 +1531,9 @@ impl MultiPaneTui {
         else {
             return Vec::new();
         };
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.current_tab = tab.tab_id;
-        self.focused_pane = pane_id;
+        self.select_pane(tab.tab_id, pane_id, "overlay_jump");
         self.modal = ModalState::None;
         self.pending_agent_toggle = None;
-        self.log_selection_change(
-            "overlay_jump",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
         ui_debug_log(
             "agents_overlay_close",
             format_args!("reason={close_reason} pane_id={pane_id}"),
@@ -1683,16 +1676,7 @@ impl MultiPaneTui {
                 direction_distance(source_center, rect_center(*rect), direction, *pane_id)
             })?
             .0;
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.focused_pane = pane_id;
-        self.log_selection_change(
-            "key",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        self.select_pane(self.current_tab, pane_id, "key");
         Some(UiIntent::FocusPane { pane_id })
     }
 
@@ -1722,53 +1706,42 @@ impl MultiPaneTui {
     }
 
     fn repair_selection(&mut self) {
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
         if let Some(tab_id) = self.pending_created_tab
             && let Some(tab) = self.snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)
         {
-            self.current_tab = tab_id;
-            self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
+            let pane_id = first_leaf(&tab.root).expect("validated layout has a leaf");
             self.pending_created_tab = None;
-            self.log_selection_change(
-                "snapshot_repair",
-                old_tab,
-                old_pane,
-                self.current_tab,
-                self.focused_pane,
-            );
+            self.select_pane(tab_id, pane_id, "snapshot_repair");
             return;
         }
-        let current_tab = self.current_tab_layout();
-        let current_tab = if let Some(tab) = current_tab {
+        let current_tab = if let Some(tab) = self.current_tab_layout() {
             tab
         } else {
-            self.current_tab = self.snapshot.tabs[0].tab_id;
             &self.snapshot.tabs[0]
         };
-        let (contains_focused_pane, first_pane, created_pane) = {
+        let (tab_id, pane_id) = {
             let root = &current_tab.root;
-            (
-                contains_leaf(root, self.focused_pane),
-                first_leaf(root).expect("validated layout has a leaf"),
-                self.pending_created_pane
-                    .filter(|pane_id| contains_leaf(root, *pane_id)),
-            )
+            let pane_id = self
+                .pending_created_pane
+                .filter(|pane_id| contains_leaf(root, *pane_id))
+                .or_else(|| contains_leaf(root, self.focused_pane).then_some(self.focused_pane))
+                .unwrap_or_else(|| first_leaf(root).expect("validated layout has a leaf"));
+            (current_tab.tab_id, pane_id)
         };
-        if !contains_focused_pane {
-            self.focused_pane = first_pane;
-        }
-        if let Some(pane_id) = created_pane {
-            self.focused_pane = pane_id;
+        if self.pending_created_pane == Some(pane_id) {
             self.pending_created_pane = None;
         }
-        self.log_selection_change(
-            "snapshot_repair",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        self.select_pane(tab_id, pane_id, "snapshot_repair");
+    }
+
+    fn select_pane(&mut self, tab_id: TabId, pane_id: PaneId, reason: &str) -> bool {
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
+        self.current_tab = tab_id;
+        self.focused_pane = pane_id;
+        let unread_cleared = self.unread_agent_panes.remove(&pane_id);
+        self.log_selection_change(reason, old_tab, old_pane, tab_id, pane_id);
+        old_tab != tab_id || old_pane != pane_id || unread_cleared
     }
 
     fn log_selection_change(
@@ -1987,8 +1960,9 @@ fn truncate_trailing(value: &str, width: usize) -> String {
     result
 }
 
-fn tab_label(title: Option<&str>, index: usize, active: bool) -> String {
+fn tab_label(title: Option<&str>, index: usize, active: bool, unread: bool) -> String {
     let label = title.map_or_else(|| format!("Tab #{index}"), str::to_owned);
+    let label = if unread { format!("* {label}") } else { label };
     if active { format!(" {label} ") } else { label }
 }
 
@@ -2946,7 +2920,12 @@ fn render_shared_multi_pane(
                     .bg(theme.footer_background)
             };
             let label = truncate_trailing(
-                &tab_label(tab.title.as_deref(), index + 1, active),
+                &tab_label(
+                    tab.title.as_deref(),
+                    index + 1,
+                    active,
+                    tui.tab_has_unread_agent_pane(tab),
+                ),
                 usize::from(geometry.tab_labels[&tab.tab_id].width),
             );
             let label_rect = geometry.tab_labels[&tab.tab_id];
@@ -3007,7 +2986,14 @@ fn render_shared_multi_pane(
             &tui.snapshot.members,
             title_width.saturating_sub(badge_width).saturating_sub(2),
         );
-        title.spans.insert(0, Span::raw(" "));
+        title.spans.insert(
+            0,
+            Span::raw(if tui.unread_agent_panes.contains(&pane_id) {
+                " * "
+            } else {
+                " "
+            }),
+        );
         title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
             theme,
@@ -6476,6 +6462,118 @@ mod tests {
     }
 
     #[test]
+    fn attached_agent_rows_mark_only_unfocused_working_to_idle_transitions_unread() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![working.clone()]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(tui.update_attached_agent_rows(vec![idle.clone()]), vec![2]);
+        assert!(tui.unread_agent_panes.contains(&2));
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![idle]),
+            Vec::<u64>::new()
+        );
+
+        let mut focused_working = working;
+        focused_working.pane_id = 1;
+        focused_working.pane_ordinal = 1;
+        let mut focused_idle = focused_working.clone();
+        focused_idle.state = crate::protocol::AgentRosterState::Idle;
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![focused_working]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![focused_idle]),
+            Vec::<u64>::new()
+        );
+        assert!(!tui.unread_agent_panes.contains(&1));
+    }
+
+    #[test]
+    fn attached_agent_rows_preserve_state_and_unread_when_rows_vanish() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+
+        tui.update_attached_agent_rows(vec![working]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle]), vec![2]);
+        tui.update_attached_agent_rows(Vec::new());
+        assert_eq!(
+            tui.prior_agent_states[&2],
+            crate::protocol::AgentRosterState::Idle
+        );
+        assert!(tui.unread_agent_panes.contains(&2));
+    }
+
+    #[test]
+    fn focus_routes_clear_unread_agent_markers() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+
+        tui.unread_agent_panes.insert(2);
+        tui.select_tab(2).expect("known tab");
+        assert!(!tui.unread_agent_panes.contains(&2));
+
+        tui.unread_agent_panes.insert(1);
+        tui.set_focus(1, 1).expect("known pane");
+        assert!(!tui.unread_agent_panes.contains(&1));
+
+        tui.unread_agent_panes.insert(2);
+        assert_eq!(
+            tui.jump_to_agent_pane(2, "test"),
+            vec![UiIntent::FocusPane { pane_id: 2 }]
+        );
+        assert!(!tui.unread_agent_panes.contains(&2));
+    }
+
+    #[test]
     fn agents_overlay_opens_immediately_and_double_tap_forwards_ctrl_a() {
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
@@ -8180,8 +8278,15 @@ mod tests {
 
     #[test]
     fn title_chrome_uses_custom_labels_and_cell_width_ellipsis() {
-        assert_eq!(super::tab_label(Some("build logs"), 1, false), "build logs");
-        assert_eq!(super::tab_label(None, 2, false), "Tab #2");
+        assert_eq!(
+            super::tab_label(Some("build logs"), 1, false, false),
+            "build logs"
+        );
+        assert_eq!(super::tab_label(None, 2, false, false), "Tab #2");
+        assert_eq!(
+            super::tab_label(Some("build logs"), 1, false, true),
+            "* build logs"
+        );
         assert_eq!(super::truncate_trailing("界界", 3), "界…");
         assert_eq!(super::truncate_trailing("界", 1), "…");
         assert_eq!(super::truncate_trailing("title", 0), "");
@@ -8205,6 +8310,44 @@ mod tests {
             .to_string(),
             "build logs …"
         );
+    }
+
+    #[test]
+    fn unread_agent_badges_use_the_same_starred_tab_label_for_hit_testing() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: Some(String::from("build")),
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        ))
+        .expect("valid layout");
+        tui.unread_agent_panes.insert(2);
+        let area = Rect::new(0, 0, 80, 8);
+        let geometry = tui.geometry(area);
+        assert_eq!(
+            geometry.tab_labels[&1].width,
+            text_width(&super::tab_label(Some("build"), 1, true, true))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("test terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let tab_bar = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        let pane_titles = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(tab_bar.contains("* build"));
+        assert!(pane_titles.contains("* Pane #2"));
     }
 
     #[test]

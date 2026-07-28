@@ -77,6 +77,11 @@ its default. Colors accept lowercase named values (`white`, `yellow`, `gray`, `d
 case-insensitive `#RRGGBB` values. The theme is client-local and is never synchronized over P2P;
 detach and reattach after editing the file to reload it.
 
+Agent-completion notifications live under `[ui.notifications]`. `sound_enabled = false` keeps
+the local unread stars while silencing sound. By default p2pmux plays
+`/System/Library/Sounds/Tink.aiff`; set the optional `sound_path` to any local sound file. These
+settings are client-local and load when the client attaches.
+
 Every `create` automatically receives a memorable world-city session name such as `tokyo` or
 `cape-town`; no session name is required. `create --session-name <name>` remains available when
 you want to choose a name explicitly. A joining peer uses the coordinator's session name for its

@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -49,6 +49,22 @@ pub struct Config {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiConfig {
     pub theme: UiTheme,
+    pub notifications: NotificationsConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotificationsConfig {
+    pub sound_enabled: bool,
+    pub sound_path: Option<PathBuf>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            sound_enabled: true,
+            sound_path: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,6 +129,14 @@ struct ConfigFile {
 struct UiConfigFile {
     #[serde(default)]
     theme: UiThemeFile,
+    #[serde(default)]
+    notifications: NotificationsConfigFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotificationsConfigFile {
+    sound_enabled: Option<bool>,
+    sound_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,9 +305,16 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         config.ui.theme.pane_border_remote_control,
         "pane_border_remote_control",
     )?;
+    let notifications = NotificationsConfig {
+        sound_enabled: config.ui.notifications.sound_enabled.unwrap_or(true),
+        sound_path: config.ui.notifications.sound_path,
+    };
     Ok(Config {
         display_name,
-        ui: UiConfig { theme },
+        ui: UiConfig {
+            theme,
+            notifications,
+        },
     })
 }
 
@@ -418,6 +449,31 @@ mod tests {
         assert_eq!(
             config.ui.theme.footer_accent,
             UiTheme::default().footer_accent
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn notification_settings_default_and_parse() {
+        assert!(NotificationsConfig::default().sound_enabled);
+        assert_eq!(NotificationsConfig::default().sound_path, None);
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[ui.notifications]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("sound_enabled = true"));
+
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[ui.notifications]\nsound_enabled = false\nsound_path = \"/tmp/complete.aiff\"\n",
+        )
+        .unwrap();
+
+        let notifications = load_config_from(&path).unwrap().ui.notifications;
+        assert!(!notifications.sound_enabled);
+        assert_eq!(
+            notifications.sound_path,
+            Some(PathBuf::from("/tmp/complete.aiff"))
         );
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
