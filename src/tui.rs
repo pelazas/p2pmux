@@ -457,6 +457,8 @@ pub struct MultiPaneTui {
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
+    prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
+    unread_agent_panes: BTreeSet<PaneId>,
     modal: ModalState,
     agent_selected_pane: Option<PaneId>,
     /// Terminal-line offset into the cards (two card lines plus one spacer each).
@@ -496,6 +498,8 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
+            prior_agent_states: BTreeMap::new(),
+            unread_agent_panes: BTreeSet::new(),
             modal: ModalState::None,
             agent_selected_pane: None,
             agent_overlay_scroll_line: 0,
@@ -582,6 +586,26 @@ impl MultiPaneTui {
         self.clamp_agent_overlay_scroll();
         self.ensure_agent_selection_visible();
         true
+    }
+
+    /// Updates attached-client agent rows and reports newly unread completions.
+    ///
+    /// The first observed roster only establishes the local baseline. Roster rows that disappear
+    /// intentionally retain their previous state and unread marker until their pane is deleted.
+    pub fn update_attached_agent_rows(&mut self, rows: Vec<AgentOverlayRow>) -> Vec<PaneId> {
+        self.set_agent_rows(rows);
+        let mut newly_unread = Vec::new();
+        for row in &self.agent_rows {
+            let previous = self.prior_agent_states.insert(row.pane_id, row.state);
+            if previous == Some(AgentRosterState::Working)
+                && row.state == AgentRosterState::Idle
+                && row.pane_id != self.focused_pane
+                && self.unread_agent_panes.insert(row.pane_id)
+            {
+                newly_unread.push(row.pane_id);
+            }
+        }
+        newly_unread
     }
 
     pub(crate) fn set_agent_overlay_viewport(&mut self, area: Rect) {
@@ -1026,6 +1050,10 @@ impl MultiPaneTui {
             })
             .collect();
         self.snapshot = snapshot;
+        self.prior_agent_states
+            .retain(|pane_id, _| self.snapshot.panes.contains_key(pane_id));
+        self.unread_agent_panes
+            .retain(|pane_id| self.snapshot.panes.contains_key(pane_id));
         self.cancel_resize_drag();
         self.clear_selection();
         self.repair_selection();
@@ -6473,6 +6501,83 @@ mod tests {
         );
         tui.modal = super::ModalState::Agents;
         tui
+    }
+
+    #[test]
+    fn attached_agent_rows_mark_only_unfocused_working_to_idle_transitions_unread() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![working.clone()]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(tui.update_attached_agent_rows(vec![idle.clone()]), vec![2]);
+        assert!(tui.unread_agent_panes.contains(&2));
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![idle]),
+            Vec::<u64>::new()
+        );
+
+        let mut focused_working = working;
+        focused_working.pane_id = 1;
+        focused_working.pane_ordinal = 1;
+        let mut focused_idle = focused_working.clone();
+        focused_idle.state = crate::protocol::AgentRosterState::Idle;
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![focused_working]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![focused_idle]),
+            Vec::<u64>::new()
+        );
+        assert!(!tui.unread_agent_panes.contains(&1));
+    }
+
+    #[test]
+    fn attached_agent_rows_preserve_state_and_unread_when_rows_vanish() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+
+        tui.update_attached_agent_rows(vec![working]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle]), vec![2]);
+        tui.update_attached_agent_rows(Vec::new());
+        assert_eq!(
+            tui.prior_agent_states[&2],
+            crate::protocol::AgentRosterState::Idle
+        );
+        assert!(tui.unread_agent_panes.contains(&2));
     }
 
     #[test]
