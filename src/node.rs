@@ -842,6 +842,7 @@ struct AttachmentPublishState {
     layout: Option<crate::layout::LayoutSnapshot>,
     leases: Option<Vec<PaneLeaseSnapshot>>,
     rosters: Option<Vec<AgentOverlaySnapshotRow>>,
+    status: Option<String>,
     focus: Option<(u64, u64)>,
     screen_sequences: BTreeMap<u64, u64>,
     last_screen_publish: Option<Instant>,
@@ -860,6 +861,7 @@ impl AttachmentPublishState {
         self.layout = None;
         self.leases = None;
         self.rosters = None;
+        self.status = None;
         self.focus = None;
         self.screen_sequences.clear();
         self.pending_screens = true;
@@ -916,6 +918,20 @@ fn queue_updates(
             return Ok(published);
         }
         publish.leases = Some(leases);
+        published = true;
+    }
+    let status = node.status();
+    if publish.status.as_deref() != Some(status.as_str()) {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Status {
+                message: status.clone(),
+            },
+        )? {
+            return Ok(published);
+        }
+        publish.status = Some(status);
         published = true;
     }
     if publish.rosters.as_ref() != Some(&rosters) {
@@ -1156,6 +1172,9 @@ impl SharedLayoutNode {
     }
     pub fn local_focus(&self) -> (u64, u64) {
         self.runtime.local_focus()
+    }
+    pub(crate) fn status(&self) -> String {
+        self.runtime.status().to_owned()
     }
     pub(crate) fn snapshot(
         &self,

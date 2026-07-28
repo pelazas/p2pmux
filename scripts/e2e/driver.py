@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import json
 import os
 import pty
 import re
@@ -514,6 +515,42 @@ class Harness:
         guest.wait_ready(timeout=timeout)
         guest.wait_for(r"Pane #\d+", timeout=timeout)
         return guest
+
+    def session_descriptors(self) -> list[dict]:
+        """The session records p2pmux wrote inside this sandbox HOME."""
+        store = self.home / "Library" / "Application Support" / "p2pmux" / "sessions"
+        found = []
+        for path in sorted(store.glob("*.json")):
+            try:
+                found.append(json.loads(path.read_text()))
+            except (OSError, json.JSONDecodeError):
+                continue
+        return found
+
+    def node_pids(self) -> dict[str, int]:
+        """{session_id: pid} for the detached `__node` workers owned by this sandbox.
+
+        The foreground peer is only a renderer; the node holds the PTYs and the session.
+        Killing a *peer* is a detach, killing its *node* is the real disconnect, so
+        failure scenarios need to address them separately.
+        """
+        ids = {descriptor["id"] for descriptor in self.session_descriptors()}
+        found: dict[str, int] = {}
+        for pid, _, command in _ps_table():
+            if "__node" not in command:
+                continue
+            for session_id in ids:
+                if session_id in command:
+                    found[session_id] = pid
+        return found
+
+    def node_pid_for_role(self, role: str) -> int | None:
+        """pid of the node whose descriptor has this role, e.g. 'Coordinator'."""
+        pids = self.node_pids()
+        for descriptor in self.session_descriptors():
+            if str(descriptor.get("role", "")).lower() == role.lower():
+                return pids.get(descriptor["id"])
+        return None
 
     def peer(self, name: str) -> Peer:
         for peer in self.peers:

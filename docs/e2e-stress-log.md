@@ -256,9 +256,107 @@ prioritised, being the newest code). Categories C (room lifecycle), D (terminal 
 E (mouse forwarding) and F (load and failure) have **not been touched at all**. The right
 reading is "A and B look solid", so the loop continues into the untouched categories.
 
+### Iteration 5 — F×C×B: stalled-viewer resync, then the coordinator killed (2026-07-29)
+
+Script: `scripts/e2e/scenario_e_failure.py`. **Three** real peers (host + g1 + g2).
+
+Note on what "killing the host" means: `create`/`join` fork a detached `__node` that owns
+the PTYs; the foreground peer is only a renderer. Killing the peer is a *detach*; killing
+its node is the real disconnect. This scenario SIGKILLs the coordinator's **node**.
+
+Repro:
+1. Host creates, g1 and g2 join; all three confirm a shared baseline marker.
+2. `SIGSTOP` g2, then host runs `seq 1 3000`.
+3. Assert g1 keeps up to line 3000 while g2 is frozen (slow-viewer path).
+4. `SIGCONT` g2, assert it converges on the host's exact pane body.
+5. `SIGKILL` the coordinator's node with both guests attached.
+6. Probe each guest's liveness by resizing it and requiring a redraw at the new width.
+
+| Check | Result |
+|---|---|
+| All three peers share a baseline | PASS |
+| A healthy guest keeps up while another peer is stalled | PASS |
+| The stalled peer renders nothing while stopped | PASS |
+| **The stalled peer resyncs to identical content after SIGCONT** | PASS |
+| **The resumed peer did not replay a duplicated tail** | PASS |
+| Both guests survive the coordinator being killed | PASS |
+| **Both guests' render loops stay responsive** (resize → redraw) | PASS |
+| No panic on any peer | PASS |
+| **Guests are told the coordinator disconnected** | **FAIL — 3/3 runs** |
+
+The resync path is genuinely good: a peer stopped through 3000 lines of output converges
+byte-for-byte on resume with no duplicated tail, and killing the coordinator wedges
+nothing — both guests keep rendering and answer a resize.
+
+Deliberately *not* tested here: the B-category disconnect-grace items (placeholders, grace
+expiry, coordinator failover, old coordinator rejoining). Reading the source, **none of
+that is implemented yet** — there is no grace window, no placeholder pruning and no
+failover anywhere in `src/`, consistent with the README calling them "later work". So
+there is no hidden 5-minute timer to shrink for tests, and no configurable-grace flag was
+needed. Those bank entries are unimplemented features, not failing behaviour.
+
 ## Open bugs
 
 _None._
+
+## Fixed
+
+### BUG-1 (severity 4) — every status message is invisible in the default run mode
+
+**Symptom.** Kill a session's coordinator and the guests are never told. 20+ seconds later
+each guest still renders `Pane #1 host: host control: host` over stale content, with the
+ordinary hint bar in the footer. A user cannot distinguish "the host is idle" from "the
+host's machine is gone". Reproduced **3/3 runs** — deterministic, not flaky.
+
+**Root cause — not a render bug, a missing wire.** `SharedLayoutRuntime` keeps a
+`status: String` (`src/tui.rs:4338`) and sets it correctly on exactly the events you would
+want: `layout coordinator disconnected` (`tui.rs:5168`), `pane {id} disconnected; retrying`
+(`tui.rs:5032`), `pane spawn failed` (`tui.rs:5654`), `pane registration failed`
+(`tui.rs:5673`), `pane {id} has no usable host address` (`tui.rs:5255`), and more.
+
+But `status` is only ever *read* at `tui.rs:4725/4807/4837`, inside `SharedLayoutRuntime`'s
+own drawing code — which is the **legacy foreground path**. Since `create`/`join` default
+to the node+client split (`cli.rs:150`, `cli.rs:249`), the runtime now executes headless
+inside the node and the client does the rendering. The string `status` does not appear
+anywhere in `src/node.rs`, `src/client.rs`, or `src/protocol.rs`, and `NodeMessage`
+(`local_ipc.rs:67`) has no status variant. `node_snapshot()` (`tui.rs:4531`) does not carry
+it either.
+
+So in the mode every real user runs, the entire status channel is dead code. This is wider
+than the disconnect case: *every* one of those operator-facing error messages is computed
+and then dropped on the floor.
+
+**Fixed** in commit below. One-line root cause: *the node computes `status` but no wire
+carried it to the client, so in the default node+client mode the whole status channel was
+dead code.* The fix adds the missing propagation rather than papering over it at the
+render layer:
+
+- `NodeMessage::Status { message }` added to `src/local_ipc.rs`.
+- `SharedLayoutRuntime::status()` exposed (`src/tui.rs`) and surfaced on the node wrapper.
+- Published from the node's existing change-detection loop in `queue_updates`
+  (`src/node.rs`), in the same shape as `Layout`/`Leases`/`Rosters`, so it is sent only
+  when it actually changes; `reset_for_snapshot` clears it so a reattaching client
+  re-receives it.
+- `src/client.rs` renders it through the `footer_notice` slot it already had. An empty
+  message retracts the notice instead of flashing a blank one.
+
+**Verified.** Same repro, 3/3 runs now pass. Measured latency to the user after the
+coordinator is SIGKILLed:
+
+| notice | appears at |
+|---|---|
+| `pane 1 disconnected; retrying` | ~34.6s |
+| `layout coordinator disconnected` | ~47.6s |
+
+Before the fix: never, at any elapsed time.
+
+Regression check: scenario A (2/2 clean) and the full `cargo test --release` suite
+(385 tests, 0 failures).
+
+**Follow-up, not fixed here (separate concern).** ~35s to first notice is the transport's
+dead-peer detection, not the propagation this fixed. Whether that idle timeout should be
+shorter — or whether the UI should show "no packets from host for Ns" sooner — is a design
+call worth a human's judgement.
 
 ## Cosmetic / by-design gaps (not bugs)
 
@@ -268,10 +366,6 @@ _None._
   The only indication is the `control: <peer>` badge in the pane header. Refusing is
   correct per `lease.rs` (`IDLE_AFTER = 30s`); the gap is purely the missing feedback, and
   it is inconsistent with the exited-pane path which does explain itself. Severity 5.
-
-## Fixed
-
-_None yet._
 
 ## Flaky
 

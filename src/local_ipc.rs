@@ -113,6 +113,12 @@ pub enum NodeMessage {
     Rosters {
         rosters: Vec<AgentOverlaySnapshotRow>,
     },
+    /// Operator-facing runtime status, e.g. a lost coordinator or a pane that is retrying.
+    /// The node owns the session, so this is the only way an attached client can learn
+    /// that something went wrong.
+    Status {
+        message: String,
+    },
     Focus {
         tab_id: u64,
         pane_id: u64,

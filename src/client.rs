@@ -319,6 +319,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             dirty = true;
                         }
                     }
+                    NodeMessage::Status { message } => {
+                        // The node clears its status by publishing an empty string, so an
+                        // empty message must retract the notice rather than blank-flash it.
+                        footer_notice = (!message.is_empty()).then_some(message);
+                        dirty = true;
+                    }
                     NodeMessage::Rosters { rosters } => {
                         if let Some(view) = tui.as_mut() {
                             if sound_enabled {

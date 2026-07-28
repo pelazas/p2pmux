@@ -4506,6 +4506,16 @@ impl SharedLayoutRuntime {
         self.join_code.as_deref()
     }
 
+    /// Current operator-facing status, empty when there is nothing to report.
+    ///
+    /// When the runtime drives its own terminal this is drawn directly, but under the
+    /// node+client split the runtime is headless, so the node has to forward this to the
+    /// attached client or the user never learns about a lost coordinator or a retrying
+    /// pane.
+    pub(crate) fn status(&self) -> &str {
+        &self.status
+    }
+
     fn exited_footer_notice(&self) -> Option<&'static str> {
         let pane = self.tui.snapshot().panes.get(&self.tui.focused_pane())?;
         if !pane.exited {
