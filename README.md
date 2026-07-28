@@ -95,6 +95,11 @@ There is one local client per session: a second attach is refused rather than ta
 finder descriptor is the only durable session data, under `~/Library/Application Support/p2pmux/`;
 the Unix socket is under `/tmp/p2pmux-$UID/`. Screens, PTYs, tickets, layout state, and focus are
 never restored from disk. The node survives terminal closure but is not managed by launchd.
+Local scrollback is available only for locally hosted, non-alternate-screen panes. Starting a
+scroll freezes a host-authored viewport for that browse session, so output can continue at the
+live edge without changing what is being read; resize, alternate-screen changes, and reconnects
+discard that frozen history. Local IPC is intentionally versioned as an implementation detail, so
+restart an existing session after upgrading when attach protocol changes are present.
 Short join codes resolve through a restrictive local cache on the same Mac, so they are for current
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
 it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
