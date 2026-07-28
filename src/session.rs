@@ -1540,6 +1540,7 @@ pub enum SessionError {
     InvalidPostWelcome,
     PeerTask,
     SessionFull,
+    JoinRefused,
     Coordinator(CoordinatorError),
 }
 
@@ -1563,6 +1564,7 @@ impl fmt::Display for SessionError {
             Self::SessionFull => {
                 write!(formatter, "this session is full ({MAX_MEMBERS} members)")
             }
+            Self::JoinRefused => formatter.write_str("the session coordinator refused the join"),
             Self::Coordinator(error) => write!(formatter, "layout coordinator error: {error}"),
         }
     }
@@ -1581,7 +1583,8 @@ impl Error for SessionError {
             | Self::UnauthenticatedPeer
             | Self::InvalidPostWelcome
             | Self::PeerTask
-            | Self::SessionFull => None,
+            | Self::SessionFull
+            | Self::JoinRefused => None,
             Self::Coordinator(error) => Some(error),
         }
     }
@@ -1801,6 +1804,38 @@ impl HostSession {
             )
             .await?;
         Ok(receipt)
+    }
+
+    /// Stands in for the request id a handshake refusal has no real request to name.
+    /// Any non-zero value works; the protocol validator rejects zero.
+    const JOIN_REFUSAL_REQUEST_ID: u64 = 1;
+
+    /// Tell a joiner why it is being turned away, before dropping its connection.
+    ///
+    /// Uses the existing `LayoutReject` body rather than a new message, so no wire format
+    /// changes. Without this the peer only observes a closed connection and can report
+    /// nothing more useful than "connection lost".
+    async fn refuse_join(
+        &self,
+        send: &mut SendStream,
+        reason: LayoutRejectReason,
+    ) -> Result<(), SessionError> {
+        self.transport
+            .write_frame(
+                send,
+                &Envelope {
+                    version: PROTOCOL_VERSION,
+                    sender_peer_id: self.transport.endpoint_id().as_bytes().to_vec(),
+                    body: Some(envelope::Body::LayoutReject(LayoutReject {
+                        // The handshake has no request to refer to, but the protocol
+                        // validator rejects a zero request_id, so use a fixed sentinel.
+                        request_id: Self::JOIN_REFUSAL_REQUEST_ID,
+                        reason: reason as i32,
+                    })),
+                },
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -2282,6 +2317,9 @@ impl SharedLayoutHost {
                 .map_err(|_| SessionError::PeerTask)?
                 .is_full()
             {
+                self.host
+                    .refuse_join(join_writer, LayoutRejectReason::Limit)
+                    .await?;
                 return Err(SessionError::SessionFull);
             }
             let receipt = self
@@ -2392,7 +2430,14 @@ impl SharedLayoutHost {
             // Close with the reason attached, so a refused peer can say why it was
             // turned away instead of only reporting that the connection went down.
             let reason = match &result {
-                Err(error @ SessionError::SessionFull) => error.to_string(),
+                Err(error @ SessionError::SessionFull) => {
+                    // We just wrote a refusal frame. Closing now would discard it --
+                    // QUIC drops stream data that has not been acknowledged -- and the
+                    // peer would be left reporting a bare "connection lost". The refused
+                    // peer closes as soon as it reads the refusal, so wait for that.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
+                    error.to_string()
+                }
                 _ => String::new(),
             };
             connection.close(0u8.into(), reason.as_bytes());
@@ -3414,6 +3459,13 @@ async fn join_handshake_with_display_name(
     let sender_peer_id = envelope.sender_peer_id;
     let welcome = match envelope.body {
         Some(envelope::Body::Welcome(welcome)) => welcome,
+        // A coordinator that will not admit us says so instead of welcoming us.
+        Some(envelope::Body::LayoutReject(reject)) => {
+            return Err(match LayoutRejectReason::try_from(reject.reason) {
+                Ok(LayoutRejectReason::Limit) => SessionError::SessionFull,
+                _ => SessionError::JoinRefused,
+            });
+        }
         _ => return Err(SessionError::InvalidWelcome),
     };
     validate_welcome(&sender_peer_id, &welcome, ticket, client_id)?;

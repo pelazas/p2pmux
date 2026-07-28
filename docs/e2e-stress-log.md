@@ -424,6 +424,48 @@ work and the explicit refusal *frame* in the original plan really is required.
 Regression: full suite 385 tests 0 failures; scenario G 2/2 apart from the known BUG-3
 check; the cap still admits exactly 7 guests and refuses the 9th.
 
+### Iteration 9 — A×B: a focused pane exits and is deleted under another peer (2026-07-29)
+
+Script: `scripts/e2e/scenario_i_focused_exit.py`. **Three** peers: `host` owns pane 1,
+`g1` owns pane 2 and is the one that exits and deletes it, `g2` holds pane 2 focused
+throughout. ~35s per run (one lease-idle wait).
+
+The nasty part is the deletion. A pane vanishing out from under a peer that has it
+*selected* is the classic way to strand focus on an id that no longer exists: the peer
+looks fine but every keystroke goes nowhere. So the decisive check is not "did it render"
+but "can that peer still type afterwards".
+
+Repro:
+1. `g1` presses `Ctrl+P, n` → pane 2 is g1-hosted.
+2. `g2` presses `Ctrl+P, →` and types `FOCUS<n>` — proves focus landed on pane 2.
+3. Wait out the 30s control lease (see the harness note below).
+4. `g1` types `exit` into its own pane 2, which dies while g2 still has it focused.
+5. `g2` types `GHOST<n>` into the exited pane.
+6. `g1` presses `Ctrl+P, x`, deleting the pane while g2 still has it focused.
+7. `g2` types `RECOVER<n>`.
+
+| Check | Result |
+|---|---|
+| All three peers see both panes with the right owners | PASS |
+| g2 has g1's pane focused (its typing landed there) | PASS |
+| **The peer holding the pane focused sees the exited notice** | PASS |
+| Input from the focusing peer into the exited pane is rejected | PASS |
+| The pane is gone on every peer | PASS |
+| **No peer died when the focused pane was deleted** | PASS |
+| **g2 can still type after its focused pane was deleted (focus not stranded)** | PASS |
+| g2's recovered typing is visible to the other peers too | PASS |
+| No panic on any peer | PASS |
+
+**No bug found.** 4/4 runs clean, zero orphans. Focus recovers cleanly when the selected
+pane is deleted by its owner — g2 keeps typing and the other peers see it.
+
+Harness note (my error, not p2pmux): the first run failed two checks because `GHOST<n>`
+came back as `command not found` — the shell was still alive, so the pane had never
+exited. g2's hop-in in step 2 had taken pane 2's **control lease**, so `g1`'s `exit` into
+its own pane was correctly refused. The scenario now waits out `lease.rs IDLE_AFTER` (30s)
+before the exit. Focus and control are separate: g2 keeps the pane *focused* across that
+wait without holding its lease.
+
 ## Coverage caveat on the loop's stop rule
 
 Iterations 1-3 each found no bug, which technically fires the "three consecutive clean
@@ -435,41 +477,48 @@ reading is "A and B look solid", so the loop continues into the untouched catego
 
 ## Open bugs
 
-### BUG-3 (severity 5) — a refused joiner is not told the room is full
-
-**Symptom.** The 9th member is correctly refused, but is told
-`Error: transport error: Iroh stream read failed: read error: connection lost`. Truthful
-and no longer misleading, but it never says the room is full. Reproduced 3/3.
-
-**Root cause.** The coordinator computes the right reason — `LayoutError::MemberLimit`
-(`layout.rs:362`), which `reject_reason` maps to `LayoutRejectReason::Limit`
-(`session.rs:982`) — but that mapping serves *layout requests* made by admitted members.
-The join handshake has no such path: a peer refused at `add_member` simply has its
-connection dropped, so the joiner only observes a transport-level close.
-
-**Status after iteration 8.** The cheaper, non-protocol fix was attempted and measured:
-the coordinator now refuses a full session *before* welcoming (previously it welcomed the
-peer and then dropped it) and closes carrying the reason. That did **not** surface to the
-user — the joiner's stream read fails with "connection lost" before the close reason is
-read — so the explicit refusal frame below is genuinely required. Still open.
-
-**Escape hatch taken — this needs a protocol change, so it is not fixed here.** Making it
-right means the coordinator sends a structured refusal on the control stream *before*
-closing, and the joiner surfaces it. That touches the join handshake and the wire format,
-which is more than one iteration should quietly change under a stress-test loop.
-
-**Plan for a human.**
-1. Add a terminal `LayoutControlEvent::Refused { reason }` (or reuse `LayoutReject` with a
-   handshake-scoped request id) emitted by the coordinator's join path on `MemberLimit`.
-2. Send it before `disconnect_or_remove` drops the connection.
-3. In `join_layout_with_display_name` (`session.rs:2634`), translate a received refusal
-   into a typed `SessionError::Refused(reason)` instead of surfacing the read failure.
-4. Map that to a plain sentence in `cli.rs`, e.g. `this session is full (8 members)`.
-
-Worth doing beyond the cap: the same channel would carry any future refusal reason
-(banned peer, version mismatch) rather than every one of them looking like a network fault.
+_None._
 
 ## Fixed
+
+### BUG-3 (severity 5) — a refused joiner was not told the room is full
+
+**Symptom.** The 9th member was correctly refused, but was told
+`Error: transport error: Iroh stream read failed: read error: connection lost`. Truthful,
+yet it never said the room was full and read like a network fault. Reproduced 3/3.
+
+**Root cause, three layers — each one hid the next.**
+1. The coordinator sent `Welcome` *first* (`session.rs:1774`) and only afterwards called
+   `admit_with_display_name` where `MemberLimit` fires. The over-cap peer was told it was
+   **admitted** and then dropped: the refusal was not merely unexplained, it was
+   contradicted. *(Fixed in iteration 8 via `LayoutCoordinator::is_full()`.)*
+2. Nothing was ever sent to explain the refusal, and closing the connection with a reason
+   did not help — measured in iteration 8, the joiner's stream read fails before a
+   connection-level close reason surfaces.
+3. Once a refusal frame *was* sent, it still never arrived. Instrumenting the send showed
+   p2pmux rejecting **its own outbound frame**:
+   `Err(Transport(Protocol(InvalidLayout("layout_reject.request_id"))))` —
+   `validate_nonzero` (`protocol.rs:824`) forbids a zero `request_id`, and a handshake
+   refusal has no request to name.
+
+**Fix.** The coordinator now sends an explicit refusal before dropping the connection,
+carried by the **existing** `LayoutReject` body (tag 22) with the existing
+`LayoutRejectReason::Limit` — so **no wire-format change**, only a new use of a message
+that was already there:
+- `HostSession::refuse_join` writes `LayoutReject` with a non-zero sentinel request id.
+- `join_handshake_with_display_name` translates a received `LayoutReject` into
+  `SessionError::SessionFull` (or `JoinRefused`) instead of `InvalidWelcome`.
+- The join path waits for the refused peer to close before closing itself, so QUIC cannot
+  discard the frame as unacknowledged stream data.
+- That error rides the BUG-2 plumbing (node error file → CLI Display) to the user.
+
+**Verified.** `Error: this session is full (8 members)`, 3/3 runs. Scenario G is fully
+green for the first time. Regression: scenario A 2/2, full suite 385 tests 0 failures; the
+cap still admits exactly 7 guests.
+
+**Worth noting:** two iterations of "this needs a protocol change" turned out to be wrong —
+the blocker was a self-inflicted validation failure on an existing message. Only
+instrumenting the actual send, rather than reasoning about the design, found it.
 
 ### BUG-2 (severity 5) — every CLI error printed as a Rust debug dump, hiding the real cause
 
