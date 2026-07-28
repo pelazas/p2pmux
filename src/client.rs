@@ -762,10 +762,7 @@ fn request_scrollback(
     let request_id = *next_request_id;
     let entry = pending.entry(pane_id).or_insert_with(|| {
         *next_request_id = (*next_request_id).wrapping_add(1);
-        PendingScroll {
-            request_id,
-            target,
-        }
+        PendingScroll { request_id, target }
     });
     entry.target = entry.target.max(target);
     if entry.request_id == request_id {

@@ -21,21 +21,42 @@ pub const OUTBOUND_QUEUE: usize = 64;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Probe,
-    Hello { cols: u16, rows: u16 },
-    Input { bytes: Vec<u8> },
-    StructuralIntent { intent: UiIntent },
-    Resize { cols: u16, rows: u16 },
-    ResyncScreen { pane_id: u64 },
+    Hello {
+        cols: u16,
+        rows: u16,
+    },
+    Input {
+        bytes: Vec<u8>,
+    },
+    StructuralIntent {
+        intent: UiIntent,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    ResyncScreen {
+        pane_id: u64,
+    },
     ScrollbackQuery {
         pane_id: u64,
         offset: u64,
         max_rows: u32,
         request_id: u64,
     },
-    Focus { tab_id: u64, pane_id: u64 },
-    Detach { generation: u64 },
-    Rename { name: String },
-    Shutdown { generation: u64 },
+    Focus {
+        tab_id: u64,
+        pane_id: u64,
+    },
+    Detach {
+        generation: u64,
+    },
+    Rename {
+        name: String,
+    },
+    Shutdown {
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

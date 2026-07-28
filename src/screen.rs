@@ -156,7 +156,10 @@ impl HostScreen {
         let mut screen = self.parser.screen().clone();
         screen.set_scrollback(SCROLLBACK_LINES);
         let retained = screen.scrollback() as u64;
-        let first = self.history_end.saturating_sub(retained).max(self.history_floor);
+        let first = self
+            .history_end
+            .saturating_sub(retained)
+            .max(self.history_floor);
         (self.history_end.saturating_sub(first), self.history_end)
     }
 

@@ -130,7 +130,10 @@ fn scrollback_query_round_trips_and_screen_updates_carry_no_rows() {
     };
     let encoded = serde_json::to_value(&query).unwrap();
     assert_eq!(encoded["type"], "scrollback_query");
-    assert_eq!(serde_json::from_value::<ClientMessage>(encoded).unwrap(), query);
+    assert_eq!(
+        serde_json::from_value::<ClientMessage>(encoded).unwrap(),
+        query
+    );
 
     let screen = PaneScreenSnapshot {
         pane_id: 7,

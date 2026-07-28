@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     local_ipc::{
-        AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage,
-        PaneLeaseSnapshot, PaneScreenSnapshot, ScreenUpdate, SessionSummary,
+        AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
+        PaneScreenSnapshot, ScreenUpdate, SessionSummary,
     },
     rendezvous::LocalRendezvous,
     session::{
@@ -557,14 +557,9 @@ fn write_snapshot(
     publish.last_screen_publish = Some(Instant::now());
     publish.force_screens = false;
     if crate::perf::enabled()
-        && [
-            drain_elapsed,
-            snapshot_build,
-            json_serialize,
-            json_write,
-        ]
-        .into_iter()
-        .any(|elapsed| elapsed >= Duration::from_millis(5))
+        && [drain_elapsed, snapshot_build, json_serialize, json_write]
+            .into_iter()
+            .any(|elapsed| elapsed >= Duration::from_millis(5))
     {
         crate::perf::log(&format!(
             "P2PMUX_PERF node drain_ms={} snapshot_build_ms={} json_serialize_ms={} json_write_ms={} write_bytes={} panes_local={} panes_remote={} updates_snapshot={}({}B) updates_delta={}({}B) updates_unchanged={}",
@@ -1016,9 +1011,9 @@ mod tests {
         };
         let initial = BTreeMap::from([(1, remote())]);
         let updates = pane_screen_updates(initial, &sequences, |_| {
-                calls.set(calls.get() + 1);
-                Some(vec![1])
-            });
+            calls.set(calls.get() + 1);
+            Some(vec![1])
+        });
         assert!(matches!(updates[0].state, ScreenUpdate::Snapshot { .. }));
         assert_eq!(calls.get(), 1);
         update_screen_sequences(&mut sequences, &updates);
