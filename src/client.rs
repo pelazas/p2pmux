@@ -5,12 +5,15 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError, TryRecvError},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -34,48 +37,36 @@ use crate::{
     },
 };
 
+const IPC_BATCH_PER_WAKE: usize = 32;
+
 #[derive(Default)]
 struct HistoryCache {
-    grid: Option<(u16, u16)>,
+    history_id: Option<u64>,
     total_rows: u64,
-    history_end: u64,
-    rows: Vec<Vec<u8>>,
+    grid: Option<(u16, u16)>,
+    viewports: BTreeMap<usize, GuestScreen>,
 }
 
 impl HistoryCache {
-    fn install_window(
+    fn install_viewport(
         &mut self,
+        history_id: u64,
         total_rows: u64,
-        history_end: u64,
-        grid: (u16, u16),
-        rows: Vec<String>,
-    ) {
+        offset: usize,
+        payload: &[u8],
+    ) -> Result<(), crate::screen::ScreenError> {
+        let mut viewport = GuestScreen::new();
+        viewport.apply_snapshot(1, payload)?;
+        let grid = viewport.screen().expect("decoded viewport").size();
+        self.history_id = Some(history_id);
         self.grid = Some(grid);
         self.total_rows = total_rows;
-        self.history_end = history_end;
-        self.rows = rows
-            .into_iter()
-            .filter_map(|row| STANDARD.decode(row).ok())
-            .collect();
+        self.viewports.insert(offset, viewport);
+        Ok(())
     }
 
     fn available_rows(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn reaches_live(&self) -> bool {
-        self.total_rows <= self.rows.len() as u64
-    }
-
-    fn viewport(&self, live: &vt100::Screen) -> vt100::Screen {
-        let (rows, cols) = live.size();
-        let mut parser = vt100::Parser::new(rows, cols, self.rows.len());
-        for row in &self.rows {
-            parser.process(row);
-            parser.process(b"\r\n");
-        }
-        parser.process(&live.contents_formatted());
-        parser.screen().clone()
+        self.total_rows as usize
     }
 }
 
@@ -85,13 +76,16 @@ fn copy_attach_selection(
     history: &BTreeMap<u64, HistoryCache>,
 ) -> Option<usize> {
     let pane_id = tui.selection_pane()?;
-    let live = screens.get(&pane_id)?.screen()?;
-    let mut viewport = history
-        .get(&pane_id)
-        .filter(|history| !history.rows.is_empty())
-        .map_or_else(|| live.clone(), |history| history.viewport(live));
-    viewport.set_scrollback(tui.pane_scrollback_offset(pane_id));
-    let text = tui.selected_text(&viewport)?;
+    let offset = tui.pane_scrollback_offset(pane_id);
+    let viewport = if offset == 0 {
+        screens.get(&pane_id)?.screen()?
+    } else {
+        history
+            .get(&pane_id)
+            .and_then(|history| history.viewports.get(&offset))
+            .and_then(GuestScreen::screen)?
+    };
+    let text = tui.selected_text(viewport)?;
     copy_selection_to_clipboard(&text).ok()
 }
 
@@ -129,7 +123,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         Some(NodeMessage::AttachRejected { reason }) => return Err(io::Error::other(reason).into()),
         _ => return Err(io::Error::other("node did not accept attachment").into()),
     };
-    let (messages, reader_thread) = spawn_message_reader(reader);
+    let (wake_tx, wakes) = mpsc::channel();
+    let reader_thread = spawn_message_reader(reader, wake_tx.clone());
+    let terminal_stop = Arc::new(AtomicBool::new(false));
     let mut guard = ClientTerminalGuard::enter(&descriptor.name)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
@@ -138,6 +134,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             viewport: Viewport::Fixed(Rect::new(0, 0, initial_cols, initial_rows)),
         },
     )?;
+    let terminal_thread = spawn_terminal_reader(wake_tx, Arc::clone(&terminal_stop));
     let mut tui = None;
     let mut screens = BTreeMap::new();
     let mut history = BTreeMap::new();
@@ -155,11 +152,18 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
     let mut join_code = None;
+    let mut pending_wake = None;
+    let mut next_perf_id = 1_u64;
+    let mut draw_perf_id = None;
 
     'attached: loop {
-        loop {
-            match messages.try_recv() {
-                Ok(ReaderEvent::Message(message)) => match *message {
+        for _ in 0..IPC_BATCH_PER_WAKE {
+            let wake = pending_wake
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| wakes.try_recv());
+            match wake {
+                Ok(WakeEvent::Ipc(ReaderEvent::Message(message))) => match *message {
                     NodeMessage::Snapshot {
                         room_name,
                         layout,
@@ -214,6 +218,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 &mut stream,
                                 pane_id,
                                 view.pane_scrollback_offset(pane_id),
+                                &history,
                                 &mut pending_scroll,
                                 &mut next_scrollback_request_id,
                             )?;
@@ -238,6 +243,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     NodeMessage::Screens {
                         screens: next_screens,
+                        perf_id,
                     } => {
                         let view = tui.as_mut().ok_or_else(|| {
                             io::Error::other("screens received before attachment snapshot")
@@ -258,45 +264,51 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 &mut stream,
                                 pane_id,
                                 view.pane_scrollback_offset(pane_id),
+                                &history,
                                 &mut pending_scroll,
                                 &mut next_scrollback_request_id,
                             )?;
                         }
                         dirty = true;
+                        if let Some(perf_id) = perf_id {
+                            crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_apply"));
+                            draw_perf_id = Some(perf_id);
+                        }
                     }
                     NodeMessage::ScrollbackWindow {
                         pane_id,
                         request_id,
-                        sequence,
-                        grid_rows,
-                        grid_cols,
+                        history_id,
                         total_rows,
                         offset,
-                        rows,
+                        snapshot,
+                        unavailable,
                     } => {
                         let Some(pending) = pending_scroll.remove(&pane_id) else {
                             continue;
                         };
-                        let Some(guest) = screens.get(&pane_id) else {
-                            continue;
-                        };
-                        let Some(screen) = guest.screen() else {
-                            continue;
-                        };
-                        if pending.request_id != request_id
-                            || offset != 0
-                            || screen.size() != (grid_rows, grid_cols)
-                            || guest.sequence().is_some_and(|current| sequence < current)
-                        {
+                        if pending.request_id != request_id {
                             continue;
                         }
+                        let Some(snapshot) = snapshot else {
+                            footer_notice = unavailable;
+                            dirty = true;
+                            continue;
+                        };
                         let cache = history.entry(pane_id).or_default();
-                        let history_end = cache.history_end.max(total_rows);
-                        cache.install_window(total_rows, history_end, screen.size(), rows);
+                        if cache.history_id.is_some_and(|id| id != history_id) {
+                            *cache = HistoryCache::default();
+                        }
+                        cache.install_viewport(
+                            history_id,
+                            total_rows,
+                            offset as usize,
+                            &snapshot,
+                        )?;
                         if let Some(view) = tui.as_mut() {
                             view.set_pane_scrollback_offset(
                                 pane_id,
-                                pending.target.min(cache.available_rows()),
+                                pending.target.min(total_rows as usize),
                             );
                         }
                         dirty = true;
@@ -327,18 +339,22 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     _ => {}
                 },
-                Ok(ReaderEvent::Ended) | Err(TryRecvError::Disconnected) => {
+                Ok(WakeEvent::Ipc(ReaderEvent::Ended)) | Err(TryRecvError::Disconnected) => {
                     node_ended = true;
                     break 'attached;
                 }
-                Ok(ReaderEvent::DecodeError(error)) => {
+                Ok(WakeEvent::Ipc(ReaderEvent::DecodeError(error))) => {
                     attach_error = Some(error);
                     break 'attached;
                 }
-                Ok(ReaderEvent::ReadError(error)) => {
+                Ok(WakeEvent::Ipc(ReaderEvent::ReadError(error))) => {
                     attach_error = Some(error);
                     node_ended = true;
                     break 'attached;
+                }
+                Ok(WakeEvent::Terminal(event)) => {
+                    pending_wake = Some(WakeEvent::Terminal(event));
+                    break;
                 }
                 Err(TryRecvError::Empty) => break,
             }
@@ -353,17 +369,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     let viewport_screens = screens
                         .iter()
                         .filter(|(pane_id, _)| tui.pane_scrollback_offset(**pane_id) != 0)
-                        .filter_map(|(pane_id, screen)| {
-                            screen.screen().map(|screen| {
-                                let viewport = history
-                                    .get(pane_id)
-                                    .filter(|history| !history.rows.is_empty())
-                                    .map_or_else(
-                                        || screen.clone(),
-                                        |history| history.viewport(screen),
-                                    );
-                                (*pane_id, viewport)
-                            })
+                        .filter_map(|(pane_id, _)| {
+                            history
+                                .get(pane_id)
+                                .and_then(|history| {
+                                    history.viewports.get(&tui.pane_scrollback_offset(*pane_id))
+                                })
+                                .and_then(GuestScreen::screen)
+                                .cloned()
+                                .map(|viewport| (*pane_id, viewport))
                         })
                         .collect::<BTreeMap<_, _>>();
                     let visible = screens
@@ -393,16 +407,32 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         screens.len(),
                     ));
                 }
+                if let Some(perf_id) = draw_perf_id.take() {
+                    crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_draw"));
+                }
             }
             dirty = false;
         }
-        if !event::poll(Duration::from_millis(16))? {
-            continue;
-        }
+        let event = match pending_wake.take() {
+            Some(WakeEvent::Terminal(event)) => event,
+            Some(wake) => {
+                pending_wake = Some(wake);
+                continue;
+            }
+            None => match wakes.recv_timeout(Duration::from_millis(16)) {
+                Ok(WakeEvent::Terminal(event)) => event,
+                Ok(wake) => {
+                    pending_wake = Some(wake);
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+        };
         let Some(tui) = tui.as_mut() else {
             continue;
         };
-        match event::read()? {
+        match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 match tui.handle_key(key, terminal.size()?.into()) {
                     KeyHandling::Quit => {
@@ -422,7 +452,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             && let Some(bytes) =
                                 client_key_bytes(key.code, key.modifiers, kitty_keyboard_active)
                         {
-                            write_message(&mut stream, &ClientMessage::Input { bytes })?;
+                            let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
+                            if let Some(perf_id) = perf_id {
+                                crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
+                            }
+                            write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
                             history.remove(&tui.focused_pane());
                             pending_scroll.remove(&tui.focused_pane());
                             tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
@@ -432,10 +466,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
             Event::Paste(text) => {
                 if should_forward_paste(tui, &local_peer_id) {
+                    let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
+                    if let Some(perf_id) = perf_id {
+                        crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
+                    }
                     write_message(
                         &mut stream,
                         &ClientMessage::Input {
                             bytes: text.into_bytes(),
+                            perf_id,
                         },
                     )?;
                     history.remove(&tui.focused_pane());
@@ -479,15 +518,22 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     let scrollback_len = history
                         .get(&pane_id)
                         .map(HistoryCache::available_rows)
-                        .unwrap_or_default();
-                    if up && scrollback_len == 0 {
-                        let target = pending_scroll
-                            .get(&pane_id)
-                            .map_or(3, |pending| pending.target.saturating_add(3));
+                        .unwrap_or(1_000);
+                    let current = tui.pane_scrollback_offset(pane_id);
+                    let target = if up {
+                        current.saturating_add(3)
+                    } else {
+                        current.saturating_sub(3)
+                    };
+                    let cached = history
+                        .get(&pane_id)
+                        .is_some_and(|history| history.viewports.contains_key(&target));
+                    if target > 0 && !cached {
                         request_scrollback(
                             &mut stream,
                             pane_id,
                             target,
+                            &history,
                             &mut pending_scroll,
                             &mut next_scrollback_request_id,
                         )?;
@@ -542,7 +588,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         let _ = write_message(&mut stream, &ClientMessage::Detach { generation });
     }
     let _ = stream.shutdown(Shutdown::Both);
-    drop(messages);
+    terminal_stop.store(true, Ordering::Release);
+    let _ = terminal_thread.join();
     let _ = reader_thread.join();
     guard.leave()?;
     if let Some(error) = attach_error {
@@ -579,6 +626,15 @@ fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
         .panes
         .get(&tui.focused_pane())
         .is_none_or(|pane| !pane.exited && (!pane.locked || pane.host_peer_id == local_peer_id))
+}
+
+fn next_perf_id_if_enabled(next: &mut u64) -> Option<u64> {
+    if !crate::perf::enabled() {
+        return None;
+    }
+    let id = *next;
+    *next = next.wrapping_add(1).max(1);
+    Some(id)
 }
 
 fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
@@ -649,13 +705,12 @@ fn apply_screens(
     history: &mut BTreeMap<u64, HistoryCache>,
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
     pending_resync: &mut BTreeSet<u64>,
-    history_refresh: &mut BTreeSet<u64>,
+    _history_refresh: &mut BTreeSet<u64>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let mut resync = Vec::new();
     for frame in next_screens {
         let pane_id = frame.pane_id;
         let history_len = frame.history_len;
-        let history_end = frame.history_end;
         let screen = screens.entry(frame.pane_id).or_default();
         match frame.state {
             ScreenUpdate::Snapshot {
@@ -683,24 +738,9 @@ fn apply_screens(
         }
         if let Some(screen) = screen.screen() {
             let cache = history.entry(pane_id).or_default();
-            let previous_end = cache.history_end;
-            let cache_reached_live = cache.reaches_live();
-            if cache.grid.is_some_and(|grid| grid != screen.size())
-                || history_end < cache.history_end
-                || history_len < cache.total_rows
-            {
+            if cache.grid.is_some_and(|grid| grid != screen.size()) || history_len == 0 {
                 *cache = HistoryCache::default();
                 view.set_pane_scrollback_offset(pane_id, 0);
-            }
-            let appended = history_end.saturating_sub(previous_end) as usize;
-            cache.grid = Some(screen.size());
-            cache.total_rows = history_len;
-            cache.history_end = history_end;
-            if appended > 0 && view.pane_scrollback_offset(pane_id) > 0 {
-                view.pin_scrollback_after_output(pane_id, appended, history_len as usize);
-                if cache_reached_live {
-                    history_refresh.insert(pane_id);
-                }
             }
         }
     }
@@ -801,26 +841,23 @@ fn request_scrollback(
     stream: &mut UnixStream,
     pane_id: u64,
     target: usize,
+    history: &BTreeMap<u64, HistoryCache>,
     pending: &mut BTreeMap<u64, PendingScroll>,
     next_request_id: &mut u64,
 ) -> io::Result<()> {
     let request_id = *next_request_id;
-    let entry = pending.entry(pane_id).or_insert_with(|| {
-        *next_request_id = (*next_request_id).wrapping_add(1);
-        PendingScroll { request_id, target }
-    });
-    entry.target = entry.target.max(target);
-    if entry.request_id == request_id {
-        write_message(
-            stream,
-            &ClientMessage::ScrollbackQuery {
-                pane_id,
-                offset: 0,
-                max_rows: 1_000,
-                request_id,
-            },
-        )?;
-    }
+    *next_request_id = (*next_request_id).wrapping_add(1).max(1);
+    let history_id = history.get(&pane_id).and_then(|history| history.history_id);
+    pending.insert(pane_id, PendingScroll { request_id, target });
+    write_message(
+        stream,
+        &ClientMessage::ScrollbackQuery {
+            pane_id,
+            history_id,
+            offset: target as u64,
+            request_id,
+        },
+    )?;
     Ok(())
 }
 
@@ -873,41 +910,67 @@ enum ReaderEvent {
     Ended,
 }
 
+enum WakeEvent {
+    Ipc(ReaderEvent),
+    Terminal(Event),
+}
+
 fn spawn_message_reader(
     mut reader: BufReader<UnixStream>,
-) -> (Receiver<ReaderEvent>, thread::JoinHandle<()>) {
-    let (sender, receiver) = mpsc::sync_channel(16);
-    let thread = thread::spawn(move || {
+    sender: mpsc::Sender<WakeEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         loop {
             match read_message(&mut reader) {
                 Ok(Some(message)) => {
                     if sender
-                        .send(ReaderEvent::Message(Box::new(message)))
+                        .send(WakeEvent::Ipc(ReaderEvent::Message(Box::new(message))))
                         .is_err()
                     {
                         return;
                     }
                 }
                 Ok(None) => {
-                    let _ = sender.send(ReaderEvent::Ended);
+                    let _ = sender.send(WakeEvent::Ipc(ReaderEvent::Ended));
                     return;
                 }
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                     if sender
-                        .send(ReaderEvent::DecodeError(error.to_string()))
+                        .send(WakeEvent::Ipc(ReaderEvent::DecodeError(error.to_string())))
                         .is_err()
                     {
                         return;
                     }
                 }
                 Err(error) => {
-                    let _ = sender.send(ReaderEvent::ReadError(error.to_string()));
+                    let _ = sender.send(WakeEvent::Ipc(ReaderEvent::ReadError(error.to_string())));
                     return;
                 }
             }
         }
-    });
-    (receiver, thread)
+    })
+}
+
+fn spawn_terminal_reader(
+    sender: mpsc::Sender<WakeEvent>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => match event::read() {
+                    Ok(event) => {
+                        if sender.send(WakeEvent::Terminal(event)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                },
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+    })
 }
 
 fn client_key_bytes(
@@ -1165,21 +1228,21 @@ mod tests {
     }
 
     #[test]
-    fn history_cache_rebuilds_a_scrollback_viewport() {
+    fn history_cache_keeps_a_render_ready_scrollback_viewport() {
         let mut host = HostScreen::new(1, 3).unwrap();
         host.process_pty(b"one\r\ntwo").unwrap();
-        let (total_rows, rows) = host.visual_scrollback(1_000, 256 * 1024);
+        let mut host_view = host.screen().clone();
+        host_view.set_scrollback(1);
         let mut history = HistoryCache::default();
-        history.install_window(
-            total_rows as u64,
-            total_rows as u64,
-            host.screen().size(),
-            rows.into_iter().map(|row| STANDARD.encode(row)).collect(),
+        let payload = crate::screen::snapshot_payload(&host_view).unwrap();
+        history.install_viewport(7, 1, 1, payload.as_ref()).unwrap();
+        assert!(
+            history.viewports[&1]
+                .screen()
+                .unwrap()
+                .contents()
+                .contains("one")
         );
-
-        let mut viewport = history.viewport(host.screen());
-        viewport.set_scrollback(history.available_rows());
-        assert!(viewport.contents().contains("one"));
     }
 
     #[test]

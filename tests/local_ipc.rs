@@ -1,4 +1,3 @@
-use base64::Engine as _;
 use p2pmux::{
     layout::LayoutSnapshot,
     local_ipc::{
@@ -73,6 +72,7 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                     history_end: 0,
                 },
             ],
+            perf_id: None,
         },
         NodeMessage::Layout {
             layout: Box::new(layout),
@@ -98,19 +98,18 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
         NodeMessage::ScrollbackWindow {
             pane_id: 1,
             request_id: 9,
-            sequence: 3,
-            grid_rows: 24,
-            grid_cols: 80,
+            history_id: 3,
             total_rows: 12,
             offset: 0,
-            rows: vec![base64::engine::general_purpose::STANDARD.encode(b"row")],
+            snapshot: Some(vec![1, 2, 3]),
+            unavailable: None,
         },
     ];
     for message in messages {
         let encoded = serde_json::to_vec(&message).unwrap();
         let decoded: NodeMessage = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, message);
-        if let NodeMessage::Screens { screens } = decoded {
+        if let NodeMessage::Screens { screens, .. } = decoded {
             assert!(
                 screens
                     .iter()
@@ -124,8 +123,8 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
 fn scrollback_query_round_trips_and_screen_updates_carry_no_rows() {
     let query = ClientMessage::ScrollbackQuery {
         pane_id: 7,
+        history_id: None,
         offset: 3,
-        max_rows: 64,
         request_id: 11,
     };
     let encoded = serde_json::to_value(&query).unwrap();

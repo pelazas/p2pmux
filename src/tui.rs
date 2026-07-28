@@ -65,7 +65,7 @@ use crate::{
         PaneDescriptor, PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
-    screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame},
+    screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame, SyncGate},
     session::{
         CoordinatorResponse, GuestEvent, GuestPane, HostControlEvent, HostPaneChannels,
         LayoutControlEvent, LayoutControlQueueError, PaneLayoutReconciler, PaneServer,
@@ -89,13 +89,10 @@ pub(crate) enum NodeScreenSnapshot {
 pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, NodeScreenSnapshot>;
 pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct LocalScrollbackWindow {
     pub total_rows: u64,
-    pub sequence: u64,
-    pub grid_rows: u16,
-    pub grid_cols: u16,
-    pub rows: Vec<Vec<u8>>,
+    pub screen: vt100::Screen,
 }
 
 /// Kept as the module's public marker from the scaffold.
@@ -1813,6 +1810,68 @@ impl PendingEscape {
     }
 }
 
+/// Upper bound on terminal events applied per loop cycle so one burst cannot
+/// starve PTY draining forever.
+const MAX_EVENTS_PER_CYCLE: usize = 256;
+
+/// Frames are presented at most once per interval (~60 fps) so parse and input
+/// work is never crowded out by redraws faster than anyone can perceive.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+fn frame_due(last_draw: Option<Instant>) -> bool {
+    last_draw.is_none_or(|drawn| drawn.elapsed() >= FRAME_INTERVAL)
+}
+
+/// Asks the outer terminal to present the writes up to the matching end marker
+/// atomically (DEC 2026). Terminals without support ignore both markers.
+fn begin_synchronized_output() -> io::Result<()> {
+    io::stdout().write_all(b"\x1b[?2026h")
+}
+
+fn end_synchronized_output() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(b"\x1b[?2026l")?;
+    stdout.flush()
+}
+
+/// Poll timeout for the run loops: until the next frame deadline while a dirty
+/// frame is waiting, one full interval when idle.
+fn event_poll_timeout(dirty: bool, last_draw: Option<Instant>) -> Duration {
+    if !dirty {
+        return FRAME_INTERVAL;
+    }
+    last_draw
+        .map(|drawn| FRAME_INTERVAL.saturating_sub(drawn.elapsed()))
+        .unwrap_or(Duration::ZERO)
+        .max(Duration::from_millis(1))
+}
+
+fn is_mouse_moved(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
+    )
+}
+
+/// Reads every queued terminal event without blocking. Hover only depends on the
+/// final pointer position, so all mouse-moves but the last are dropped; a burst
+/// of moves then costs one update instead of one redraw cycle each.
+fn collect_pending_events(max: usize) -> io::Result<Vec<Event>> {
+    let mut events = Vec::new();
+    while events.len() < max && event::poll(Duration::ZERO)? {
+        events.push(event::read()?);
+    }
+    if let Some(last_moved) = events.iter().rposition(is_mouse_moved) {
+        let mut index = 0;
+        events.retain(|event| {
+            let keep = index == last_moved || !is_mouse_moved(event);
+            index += 1;
+            keep
+        });
+    }
+    Ok(events)
+}
+
 fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
     if !key.modifiers.is_empty() {
         return false;
@@ -3453,6 +3512,7 @@ pub struct SharedLocalPane {
     control_tx: mpsc::Sender<HostControlEvent>,
     control_rx: mpsc::Receiver<HostControlEvent>,
     agent_tracker: PaneAgentTracker,
+    sync_gate: SyncGate,
 }
 
 impl SharedLocalPane {
@@ -3503,6 +3563,7 @@ impl SharedLocalPane {
             control_tx,
             control_rx,
             agent_tracker: PaneAgentTracker::default(),
+            sync_gate: SyncGate::default(),
         })
     }
 
@@ -3592,6 +3653,7 @@ impl SharedLocalPane {
             }
         }
         let started = Instant::now();
+        let mut pending = Vec::new();
         for _ in 0..64 {
             if started.elapsed() >= Duration::from_millis(4) {
                 break;
@@ -3599,17 +3661,29 @@ impl SharedLocalPane {
             let Some(bytes) = self.host.try_read_output()? else {
                 break;
             };
+            pending.extend_from_slice(&bytes);
+        }
+        if !pending.is_empty() {
             self.agent_tracker
                 .record_output(Instant::now(), unix_ms_now());
-            let frame = self.screen.process_pty(&bytes)?;
+        }
+        let ready = if pending.is_empty() {
+            self.sync_gate.flush_stale(Instant::now())
+        } else {
+            self.sync_gate.feed(&pending, Instant::now())
+        };
+        if !ready.is_empty() {
+            // One parse/snapshot/diff for the whole batch: process_pty clones the
+            // screen per call, so per-chunk calls dominated CPU under output floods.
+            let frame = self.screen.process_pty(&ready)?;
             if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
                 && self.host.write_input(&reply).is_err()
             {
                 changed |= self.transition_exited()?;
-                break;
+            } else {
+                self.screen_tx.send_replace(frame);
+                changed = true;
             }
-            self.screen_tx.send_replace(frame);
-            changed = true;
         }
         if !self.exited && self.host.output_closed() {
             changed |= self.transition_exited()?;
@@ -4415,24 +4489,15 @@ impl SharedLayoutRuntime {
         )
     }
 
-    pub(crate) fn node_local_scrollback(
-        &self,
-        pane_id: PaneId,
-        offset: u64,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<LocalScrollbackWindow> {
+    pub(crate) fn node_local_scrollback(&self, pane_id: PaneId) -> Option<LocalScrollbackWindow> {
         let pane = self.local.get(&pane_id)?;
-        let (total_rows, rows) = pane
-            .screen
-            .visual_scrollback_window(offset, max_rows, max_bytes);
-        let (grid_rows, grid_cols) = pane.screen.screen().size();
+        let (total_rows, _) = pane.screen.history_metadata();
+        if total_rows == 0 || pane.screen.screen().alternate_screen() {
+            return None;
+        }
         Some(LocalScrollbackWindow {
             total_rows,
-            sequence: pane.screen.current_frame().sequence,
-            grid_rows,
-            grid_cols,
-            rows,
+            screen: pane.screen.screen().clone(),
         })
     }
 
@@ -4523,6 +4588,7 @@ impl SharedLayoutRuntime {
         self.tui
             .set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
         let mut dirty = true;
+        let mut last_draw: Option<Instant> = None;
         let mut pending_escape = PendingEscape::default();
         loop {
             dirty |= self.drain()?;
@@ -4549,7 +4615,7 @@ impl SharedLayoutRuntime {
                 }
                 dirty = true;
             }
-            if dirty {
+            if dirty && frame_due(last_draw) {
                 let mut screens = BTreeMap::new();
                 for (pane_id, pane) in &self.local {
                     screens.insert(*pane_id, pane.screen.screen());
@@ -4559,6 +4625,7 @@ impl SharedLayoutRuntime {
                         screens.insert(*pane_id, screen);
                     }
                 }
+                begin_synchronized_output()?;
                 terminal.draw(|frame| {
                     render_shared_multi_pane(
                         frame,
@@ -4572,153 +4639,179 @@ impl SharedLayoutRuntime {
                         self.join_code.as_deref(),
                     );
                 })?;
+                end_synchronized_output()?;
                 dirty = false;
+                last_draw = Some(Instant::now());
             }
-            if !event::poll(Duration::from_millis(16))? {
+            if !event::poll(event_poll_timeout(dirty, last_draw))? {
                 continue;
             }
-            match event::read()? {
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    let area = Rect::new(0, 0, cols, rows);
-                    if let Some(option_arrow) = pending_escape.take_option_arrow(key) {
-                        if self.handle_key(option_arrow, area)? {
-                            break;
-                        }
-                    } else {
-                        if pending_escape.take()
-                            && self
-                                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area)?
-                        {
-                            break;
-                        }
-                        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-                            pending_escape.start(Instant::now());
-                        } else if self.handle_key(key, area)? {
-                            break;
-                        }
-                    }
-                    dirty = true;
+            let mut quit = false;
+            for event in collect_pending_events(MAX_EVENTS_PER_CYCLE)? {
+                if self.handle_terminal_event(
+                    event,
+                    &mut cols,
+                    &mut rows,
+                    &mut pending_escape,
+                    &mut dirty,
+                )? {
+                    quit = true;
+                    break;
                 }
-                Event::Paste(text) => {
-                    if !self.tui.overlay_open() && !self.tui.modal_open() {
-                        self.tui.exit_chord_mode();
-                        self.forward_paste(&text)?;
-                    }
-                    dirty = true;
-                }
-                Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
-                    if !self.tui.overlay_open() && !self.tui.modal_open() {
-                        dirty |= self.tui.hover_pane_at(
-                            mouse.column,
-                            mouse.row,
-                            Rect::new(0, 0, cols, rows),
-                        );
-                    }
-                }
-                Event::Mouse(mouse)
-                    if matches!(
-                        mouse.kind,
-                        MouseEventKind::Down(MouseButton::Left)
-                            | MouseEventKind::Drag(MouseButton::Left)
-                            | MouseEventKind::Up(MouseButton::Left)
-                    ) =>
-                {
-                    if self.tui.modal_open() {
-                        continue;
-                    }
-                    let area = Rect::new(0, 0, cols, rows);
-                    let previously_focused = self.tui.focused_pane();
-                    let handling = self.tui.handle_mouse(
-                        mouse,
-                        area,
-                        FooterMouseInput {
-                            status: &self.status,
-                            footer_notice: self.footer_notice.as_deref(),
-                            copied_lines: self.copied_lines,
-                            join_code: self.join_code.as_deref(),
-                        },
-                    );
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        self.copied_lines = None;
-                        if self.footer_notice.as_deref() == Some("copied join command") {
-                            self.footer_notice = None;
-                        }
-                    }
-                    for intent in handling.intents {
-                        self.handle_intent(intent)?;
-                    }
-                    if handling.copy_selection_requested {
-                        self.copy_selection_to_clipboard();
-                    }
-                    if let Some(command) = handling.join_copy_command {
-                        match copy_selection_to_clipboard(&command) {
-                            Ok(_) => {
-                                self.status.clear();
-                                self.copied_lines = None;
-                                self.footer_notice = Some(String::from("copied join command"));
-                            }
-                            Err(error) => {
-                                self.status = format!("clipboard copy failed: {error}");
-                            }
-                        }
-                    }
-                    self.release_blurred_pane(previously_focused)?;
-                    dirty = true;
-                }
-                Event::Mouse(mouse)
-                    if matches!(
-                        mouse.kind,
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                    ) =>
-                {
-                    let area = Rect::new(0, 0, cols, rows);
-                    if self.tui.modal_open() {
-                        continue;
-                    }
-                    if self.tui.overlay_open() {
-                        dirty |= self.tui.scroll_agent_overlay(
-                            area,
-                            matches!(mouse.kind, MouseEventKind::ScrollUp),
-                        );
-                        continue;
-                    }
-                    let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
-                    let scrollback_len = self
-                        .local
-                        .get(&pane_id)
-                        .map(|pane| available_scrollback(pane.screen.screen()))
-                        .or_else(|| {
-                            self.remote
-                                .get(&pane_id)
-                                .and_then(|pane| pane.screen.screen())
-                                .map(available_scrollback)
-                        })
-                        .unwrap_or(0);
-                    dirty |= self.tui.scroll_pane(
-                        pane_id,
-                        scrollback_len,
-                        matches!(mouse.kind, MouseEventKind::ScrollUp),
-                    );
-                }
-                Event::Resize(width, height) => {
-                    if self.tui.modal_open() {
-                        continue;
-                    }
-                    cols = width;
-                    rows = height;
-                    self.tui
-                        .set_agent_overlay_viewport(Rect::new(0, 0, width, height));
-                    self.tui.ensure_agent_selection_visible();
-                    self.reflow_local_panes(Rect::new(0, 0, width, height))?;
-                    dirty = true;
-                }
-                _ => {}
+            }
+            if quit {
+                break;
             }
         }
         self.shutdown();
         Ok(())
+    }
+
+    /// Applies one terminal event to the runtime. Returns true when the user quit.
+    fn handle_terminal_event(
+        &mut self,
+        event: Event,
+        cols: &mut u16,
+        rows: &mut u16,
+        pending_escape: &mut PendingEscape,
+        dirty: &mut bool,
+    ) -> Result<bool, Box<dyn Error>> {
+        match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let area = Rect::new(0, 0, *cols, *rows);
+                if let Some(option_arrow) = pending_escape.take_option_arrow(key) {
+                    if self.handle_key(option_arrow, area)? {
+                        return Ok(true);
+                    }
+                } else {
+                    if pending_escape.take()
+                        && self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area)?
+                    {
+                        return Ok(true);
+                    }
+                    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+                        pending_escape.start(Instant::now());
+                    } else if self.handle_key(key, area)? {
+                        return Ok(true);
+                    }
+                }
+                *dirty = true;
+            }
+            Event::Paste(text) => {
+                if !self.tui.overlay_open() && !self.tui.modal_open() {
+                    self.tui.exit_chord_mode();
+                    self.forward_paste(&text)?;
+                }
+                *dirty = true;
+            }
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if !self.tui.overlay_open() && !self.tui.modal_open() {
+                    *dirty |= self.tui.hover_pane_at(
+                        mouse.column,
+                        mouse.row,
+                        Rect::new(0, 0, *cols, *rows),
+                    );
+                }
+            }
+            Event::Mouse(mouse)
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left)
+                        | MouseEventKind::Up(MouseButton::Left)
+                ) =>
+            {
+                if self.tui.modal_open() {
+                    return Ok(false);
+                }
+                let area = Rect::new(0, 0, *cols, *rows);
+                let previously_focused = self.tui.focused_pane();
+                let handling = self.tui.handle_mouse(
+                    mouse,
+                    area,
+                    FooterMouseInput {
+                        status: &self.status,
+                        footer_notice: self.footer_notice.as_deref(),
+                        copied_lines: self.copied_lines,
+                        join_code: self.join_code.as_deref(),
+                    },
+                );
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.copied_lines = None;
+                    if self.footer_notice.as_deref() == Some("copied join command") {
+                        self.footer_notice = None;
+                    }
+                }
+                for intent in handling.intents {
+                    self.handle_intent(intent)?;
+                }
+                if handling.copy_selection_requested {
+                    self.copy_selection_to_clipboard();
+                }
+                if let Some(command) = handling.join_copy_command {
+                    match copy_selection_to_clipboard(&command) {
+                        Ok(_) => {
+                            self.status.clear();
+                            self.copied_lines = None;
+                            self.footer_notice = Some(String::from("copied join command"));
+                        }
+                        Err(error) => {
+                            self.status = format!("clipboard copy failed: {error}");
+                        }
+                    }
+                }
+                self.release_blurred_pane(previously_focused)?;
+                *dirty = true;
+            }
+            Event::Mouse(mouse)
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                let area = Rect::new(0, 0, *cols, *rows);
+                if self.tui.modal_open() {
+                    return Ok(false);
+                }
+                if self.tui.overlay_open() {
+                    *dirty |= self
+                        .tui
+                        .scroll_agent_overlay(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
+                    return Ok(false);
+                }
+                let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                let scrollback_len = self
+                    .local
+                    .get(&pane_id)
+                    .map(|pane| available_scrollback(pane.screen.screen()))
+                    .or_else(|| {
+                        self.remote
+                            .get(&pane_id)
+                            .and_then(|pane| pane.screen.screen())
+                            .map(available_scrollback)
+                    })
+                    .unwrap_or(0);
+                *dirty |= self.tui.scroll_pane(
+                    pane_id,
+                    scrollback_len,
+                    matches!(mouse.kind, MouseEventKind::ScrollUp),
+                );
+            }
+            Event::Resize(width, height) => {
+                if self.tui.modal_open() {
+                    return Ok(false);
+                }
+                *cols = width;
+                *rows = height;
+                self.tui
+                    .set_agent_overlay_viewport(Rect::new(0, 0, width, height));
+                self.tui.ensure_agent_selection_visible();
+                self.reflow_local_panes(Rect::new(0, 0, width, height))?;
+                *dirty = true;
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn copy_selection_to_clipboard(&mut self) {
@@ -5932,9 +6025,12 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
         },
     )?;
     let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
+    let mut sync_gate = SyncGate::default();
 
     loop {
         let drain_started = Instant::now();
+        let mut pending = Vec::new();
         for _ in 0..64 {
             if drain_started.elapsed() >= Duration::from_millis(4) {
                 break;
@@ -5942,8 +6038,16 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             let Some(bytes) = host.try_read_output()? else {
                 break;
             };
-            kitty_keyboard.observe(&bytes);
-            parser.process(&bytes);
+            pending.extend_from_slice(&bytes);
+        }
+        let ready = if pending.is_empty() {
+            sync_gate.flush_stale(Instant::now())
+        } else {
+            sync_gate.feed(&pending, Instant::now())
+        };
+        if !ready.is_empty() {
+            kitty_keyboard.observe(&ready);
+            parser.process(&ready);
             if let Some(reply) = kitty_keyboard.take_query_reply() {
                 host.write_input(&reply)?;
             }
@@ -5953,7 +6057,8 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        if dirty {
+        if dirty && frame_due(last_draw) {
+            begin_synchronized_output()?;
             terminal.draw(|frame| {
                 let screen = parser.screen();
                 let area = frame.area();
@@ -5963,27 +6068,38 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
                     frame.set_cursor_position((area.x + col, area.y + row));
                 }
             })?;
+            end_synchronized_output()?;
             dirty = false;
+            last_draw = Some(Instant::now());
         }
 
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(event_poll_timeout(dirty, last_draw))? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_quit(key) {
-                    break;
+        let mut quit = false;
+        for event in collect_pending_events(MAX_EVENTS_PER_CYCLE)? {
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if is_quit(key) {
+                        quit = true;
+                        break;
+                    }
+                    if let Some(bytes) = encode_key(key, parser.screen(), kitty_keyboard.active()) {
+                        host.write_input(&bytes)?;
+                    }
                 }
-                if let Some(bytes) = encode_key(key, parser.screen(), kitty_keyboard.active()) {
+                Event::Paste(text) => {
+                    let bytes = encode_paste(&text, parser.screen().bracketed_paste());
                     host.write_input(&bytes)?;
                 }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
-            Event::Paste(text) => {
-                let bytes = encode_paste(&text, parser.screen().bracketed_paste());
-                host.write_input(&bytes)?;
-            }
-            Event::Resize(_, _) => {}
-            _ => {}
+        }
+        if quit {
+            break;
         }
     }
 
@@ -6010,6 +6126,8 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     )?;
     let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
     let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
+    let mut sync_gate = SyncGate::default();
     loop {
         if let Some(state) = runtime.lease.clear_if_idle(Instant::now())? {
             runtime.lease_tx.send_replace(state);
@@ -6059,6 +6177,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             }
         }
         let drain_started = Instant::now();
+        let mut pending = Vec::new();
         for _ in 0..64 {
             if drain_started.elapsed() >= Duration::from_millis(4) {
                 break;
@@ -6066,7 +6185,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             let Some(bytes) = runtime.host.try_read_output()? else {
                 break;
             };
-            if let Ok(frame) = runtime.screen.process_pty(&bytes) {
+            pending.extend_from_slice(&bytes);
+        }
+        let ready = if pending.is_empty() {
+            sync_gate.flush_stale(Instant::now())
+        } else {
+            sync_gate.feed(&pending, Instant::now())
+        };
+        if !ready.is_empty() {
+            if let Ok(frame) = runtime.screen.process_pty(&ready) {
                 if let Some(reply) = runtime.screen.take_kitty_keyboard_query_reply() {
                     runtime.host.write_input(&reply)?;
                 }
@@ -6077,7 +6204,8 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         if runtime.host.output_closed() {
             break;
         }
-        if dirty {
+        if dirty && frame_due(last_draw) {
+            begin_synchronized_output()?;
             terminal.draw(|frame| {
                 let screen = runtime.screen.screen();
                 render_host_screen(frame, screen, &footer);
@@ -6087,21 +6215,48 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                     frame.set_cursor_position((frame.area().x + col, frame.area().y + row));
                 }
             })?;
+            end_synchronized_output()?;
             dirty = false;
+            last_draw = Some(Instant::now());
         }
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(event_poll_timeout(dirty, last_draw))? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if is_quit(key) {
-                    break;
+        let mut quit = false;
+        for event in collect_pending_events(MAX_EVENTS_PER_CYCLE)? {
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if is_quit(key) {
+                        quit = true;
+                        break;
+                    }
+                    if let Some(bytes) = encode_key(
+                        key,
+                        runtime.screen.screen(),
+                        runtime.screen.kitty_keyboard_active(),
+                    ) {
+                        let now = Instant::now();
+                        let epoch = runtime.lease.state().epoch;
+                        let decision =
+                            runtime
+                                .lease
+                                .input(&runtime.host_peer_id, epoch, bytes, now);
+                        match decision {
+                            LeaseDecision::AcceptInput(bytes) => {
+                                runtime.host.write_input(&bytes)?;
+                                runtime.lease_tx.send_replace(runtime.lease.state().clone());
+                            }
+                            LeaseDecision::Publish(_) => {}
+                            LeaseDecision::RejectStaleInput
+                            | LeaseDecision::RejectStaleRequest
+                            | LeaseDecision::RejectActiveController => {}
+                        }
+                    }
                 }
-                if let Some(bytes) = encode_key(
-                    key,
-                    runtime.screen.screen(),
-                    runtime.screen.kitty_keyboard_active(),
-                ) {
+                Event::Paste(text) => {
+                    let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
                     let now = Instant::now();
                     let epoch = runtime.lease.state().epoch;
                     let decision = runtime
@@ -6118,27 +6273,12 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                         | LeaseDecision::RejectActiveController => {}
                     }
                 }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
-            Event::Paste(text) => {
-                let bytes = encode_paste(&text, runtime.screen.screen().bracketed_paste());
-                let now = Instant::now();
-                let epoch = runtime.lease.state().epoch;
-                let decision = runtime
-                    .lease
-                    .input(&runtime.host_peer_id, epoch, bytes, now);
-                match decision {
-                    LeaseDecision::AcceptInput(bytes) => {
-                        runtime.host.write_input(&bytes)?;
-                        runtime.lease_tx.send_replace(runtime.lease.state().clone());
-                    }
-                    LeaseDecision::Publish(_) => {}
-                    LeaseDecision::RejectStaleInput
-                    | LeaseDecision::RejectStaleRequest
-                    | LeaseDecision::RejectActiveController => {}
-                }
-            }
-            Event::Resize(_, _) => {}
-            _ => {}
+        }
+        if quit {
+            break;
         }
     }
     Ok(())
@@ -6170,6 +6310,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
 
     loop {
         let mut received_lease = false;
@@ -6241,74 +6382,86 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        if dirty {
+        if dirty && frame_due(last_draw) {
+            begin_synchronized_output()?;
             terminal.draw(|frame| {
                 if let Some(screen) = remote.screen() {
                     render_guest_screen(frame, screen, &footer);
                 }
             })?;
+            end_synchronized_output()?;
             dirty = false;
+            last_draw = Some(Instant::now());
         }
 
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(event_poll_timeout(dirty, last_draw))? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && is_quit(key) =>
-            {
-                break;
-            }
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
-                    && let Some(bytes) = encode_key(key, screen, remote.kitty_keyboard_active())
+        let mut quit = false;
+        for event in collect_pending_events(MAX_EVENTS_PER_CYCLE)? {
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && is_quit(key) =>
                 {
-                    if state.controller_peer_id == pane.controls.peer_id() {
-                        if held_input.is_empty() {
+                    quit = true;
+                    break;
+                }
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
+                        && let Some(bytes) = encode_key(key, screen, remote.kitty_keyboard_active())
+                    {
+                        if state.controller_peer_id == pane.controls.peer_id() {
+                            if held_input.is_empty() {
+                                let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                            } else {
+                                held_input.extend_from_slice(&bytes);
+                            }
+                        } else if state.controller_peer_id.is_empty() {
                             let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                        } else {
+                        } else if last_lease.elapsed() >= IDLE_AFTER {
                             held_input.extend_from_slice(&bytes);
-                        }
-                    } else if state.controller_peer_id.is_empty() {
-                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                    } else if last_lease.elapsed() >= IDLE_AFTER {
-                        held_input.extend_from_slice(&bytes);
-                        if !pending_control {
-                            pending_control = true;
-                            if pane.controls.try_take_control(state.lease_epoch).is_err() {
-                                pending_control = false;
-                                held_input.clear();
+                            if !pending_control {
+                                pending_control = true;
+                                if pane.controls.try_take_control(state.lease_epoch).is_err() {
+                                    pending_control = false;
+                                    held_input.clear();
+                                }
                             }
                         }
                     }
                 }
-            }
-            Event::Paste(text) => {
-                if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen()) {
-                    let bytes = encode_paste(&text, screen.bracketed_paste());
-                    if state.controller_peer_id == pane.controls.peer_id() {
-                        if held_input.is_empty() {
+                Event::Paste(text) => {
+                    if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen()) {
+                        let bytes = encode_paste(&text, screen.bracketed_paste());
+                        if state.controller_peer_id == pane.controls.peer_id() {
+                            if held_input.is_empty() {
+                                let _ = pane.controls.try_input(state.lease_epoch, bytes);
+                            } else {
+                                held_input.extend_from_slice(&bytes);
+                            }
+                        } else if state.controller_peer_id.is_empty() {
                             let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                        } else {
+                        } else if last_lease.elapsed() >= IDLE_AFTER {
                             held_input.extend_from_slice(&bytes);
-                        }
-                    } else if state.controller_peer_id.is_empty() {
-                        let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                    } else if last_lease.elapsed() >= IDLE_AFTER {
-                        held_input.extend_from_slice(&bytes);
-                        if !pending_control {
-                            pending_control = true;
-                            if pane.controls.try_take_control(state.lease_epoch).is_err() {
-                                pending_control = false;
-                                held_input.clear();
+                            if !pending_control {
+                                pending_control = true;
+                                if pane.controls.try_take_control(state.lease_epoch).is_err() {
+                                    pending_control = false;
+                                    held_input.clear();
+                                }
                             }
                         }
                     }
                 }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
-            Event::Resize(_, _) => {}
-            _ => {}
+        }
+        if quit {
+            break;
         }
     }
     Ok(())
