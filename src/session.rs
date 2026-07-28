@@ -24,8 +24,8 @@ use tokio::{
 
 use crate::{
     layout::{
-        Axis, LayoutError, LayoutSnapshot, Member, NewPanePosition as LayoutNewPanePosition, Node,
-        Pane, SessionState, Tab,
+        Axis, LayoutError, LayoutSnapshot, MAX_MEMBERS, Member,
+        NewPanePosition as LayoutNewPanePosition, Node, Pane, SessionState, Tab,
     },
     lease::LeaseState,
     protocol::{
@@ -195,6 +195,15 @@ impl LayoutCoordinator {
             agent_rosters: BTreeMap::new(),
             reservation_timeout,
         })
+    }
+
+    /// Whether the session has no room for another member.
+    ///
+    /// Checked before the coordinator welcomes a joiner: `add_member` enforces the same
+    /// limit, but it only runs after `Welcome` has already been sent, which would tell a
+    /// peer it is admitted and then drop it.
+    pub fn is_full(&self) -> bool {
+        self.state.members().len() >= MAX_MEMBERS
     }
 
     pub fn session_snapshot(&self) -> Result<SessionSnapshot, CoordinatorError> {
@@ -1530,6 +1539,7 @@ pub enum SessionError {
     UnauthenticatedPeer,
     InvalidPostWelcome,
     PeerTask,
+    SessionFull,
     Coordinator(CoordinatorError),
 }
 
@@ -1550,6 +1560,9 @@ impl fmt::Display for SessionError {
             }
             Self::InvalidPostWelcome => formatter.write_str("invalid post-Welcome message"),
             Self::PeerTask => formatter.write_str("peer stream task stopped unexpectedly"),
+            Self::SessionFull => {
+                write!(formatter, "this session is full ({MAX_MEMBERS} members)")
+            }
             Self::Coordinator(error) => write!(formatter, "layout coordinator error: {error}"),
         }
     }
@@ -1567,7 +1580,8 @@ impl Error for SessionError {
             | Self::InvalidWelcome
             | Self::UnauthenticatedPeer
             | Self::InvalidPostWelcome
-            | Self::PeerTask => None,
+            | Self::PeerTask
+            | Self::SessionFull => None,
             Self::Coordinator(error) => Some(error),
         }
     }
@@ -2258,6 +2272,18 @@ impl SharedLayoutHost {
     ) -> Result<JoinReceipt, SessionError> {
         let mut admitted_peer_id = None;
         let result = async {
+            // Refuse a full session *before* welcoming it. `admit_with_display_name`
+            // below enforces the same limit, but only after `Welcome` has gone out --
+            // so an over-cap peer was being told it was admitted and then dropped, and
+            // all it could report was a lost connection.
+            if self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .is_full()
+            {
+                return Err(SessionError::SessionFull);
+            }
             let receipt = self
                 .host
                 .handshake_join(&connection, join_writer, envelope)
@@ -2363,7 +2389,13 @@ impl SharedLayoutHost {
                     &peer_id,
                 );
             }
-            connection.close(0u8.into(), b"");
+            // Close with the reason attached, so a refused peer can say why it was
+            // turned away instead of only reporting that the connection went down.
+            let reason = match &result {
+                Err(error @ SessionError::SessionFull) => error.to_string(),
+                _ => String::new(),
+            };
+            connection.close(0u8.into(), reason.as_bytes());
         }
         result
     }

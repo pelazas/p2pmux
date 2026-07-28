@@ -367,6 +367,63 @@ One harness false-pass caught and fixed: the "explains why" check originally sea
 whole PTY output for `"full"`, which matches **"fully trusted"** in the TRUST WARNING that
 p2pmux prints on every join. It now scopes the search to the error line only.
 
+### Iteration 8 — D×C: full-screen TUI, mid-stream resize, paste, reattach (2026-07-29)
+
+Script: `scripts/e2e/scenario_h_fidelity.py`. Two peers at 100x28.
+
+A full-screen TUI is the hardest thing to replicate — `less` drives the alternate screen,
+absolute cursor moves and full repaints — so any divergence shows immediately. The nasty
+part is resizing the *guest's* whole terminal while that TUI is live: the pane grid is
+host-owned, so the guest must crop without corrupting the stream or disturbing the host.
+
+Repro:
+1. Host runs `seq 1 500 | less`; compare host and guest pane bodies.
+2. Host presses space (page down); compare again.
+3. Resize the guest to 70x20, wait, resize back to 100x28.
+4. Host quits `less`, presses `Ctrl+P, n` to split.
+5. Bracketed paste of 6 `echo PASTE<n>-<k>` lines wrapped in `ESC[200~ … ESC[201~`.
+6. Guest presses `Ctrl+Q`, then a new peer runs `p2pmux attach <session-name>`.
+
+| Check | Result |
+|---|---|
+| **Host and guest render the full-screen TUI identically** | PASS |
+| Paging inside the TUI stays in sync on the guest | PASS |
+| Guest survives a mid-stream terminal resize | PASS |
+| **Host is undisturbed by the guest's resize** | PASS |
+| **Guest reconverges on the host's view after resizing back** | PASS |
+| A split is replicated to the guest | PASS |
+| **Every line of a multi-line paste arrives** | PASS |
+| **Pasted lines are not reordered** | PASS |
+| Guest client exits on Ctrl+Q | PASS |
+| **Guest can reattach after quitting** | PASS |
+| **The reattached guest sees the pasted history, not a blank pane** | PASS |
+| No panic on any peer | PASS |
+
+**No bug found.** 4/4 runs clean, zero orphans.
+
+#### BUG-3 revisited — cheaper fix attempted, measured, and rejected
+
+With no new bug to fix, this iteration went back at BUG-3 rather than deferring twice.
+
+**Sharper root cause than the original plan.** The coordinator sends `Welcome` *first*
+(`session.rs:1774`) and only afterwards calls `admit_with_display_name` (`session.rs:2270`),
+where `MemberLimit` fires. So an over-cap peer was being told it was **admitted** and then
+dropped — the refusal was not just unexplained, it was contradicted.
+
+**Landed (server-side, no wire change).** `LayoutCoordinator::is_full()` plus a capacity
+check *before* the handshake welcomes anyone, and `SessionError::SessionFull` ("this
+session is full (8 members)"). The join connection now closes carrying that reason instead
+of the empty `b""` it used before. A peer is no longer welcomed and then discarded.
+
+**Measured, and it was not enough.** The refused joiner still reports
+`transport error: Iroh stream read failed: read error: connection lost` — its stream read
+fails before the connection-level close reason is surfaced, so the reason never reaches
+the user. **BUG-3 stays open**, now with evidence that the close-reason shortcut does not
+work and the explicit refusal *frame* in the original plan really is required.
+
+Regression: full suite 385 tests 0 failures; scenario G 2/2 apart from the known BUG-3
+check; the cap still admits exactly 7 guests and refuses the 9th.
+
 ## Coverage caveat on the loop's stop rule
 
 Iterations 1-3 each found no bug, which technically fires the "three consecutive clean
@@ -389,6 +446,12 @@ and no longer misleading, but it never says the room is full. Reproduced 3/3.
 (`session.rs:982`) — but that mapping serves *layout requests* made by admitted members.
 The join handshake has no such path: a peer refused at `add_member` simply has its
 connection dropped, so the joiner only observes a transport-level close.
+
+**Status after iteration 8.** The cheaper, non-protocol fix was attempted and measured:
+the coordinator now refuses a full session *before* welcoming (previously it welcomed the
+peer and then dropped it) and closes carrying the reason. That did **not** surface to the
+user — the joiner's stream read fails with "connection lost" before the close reason is
+read — so the explicit refusal frame below is genuinely required. Still open.
 
 **Escape hatch taken — this needs a protocol change, so it is not fixed here.** Making it
 right means the coordinator sends a structured refusal on the control stream *before*
