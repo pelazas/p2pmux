@@ -140,6 +140,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut pending_focus = None;
     let mut pending_resync = BTreeSet::new();
     let mut local_peer_id = Vec::new();
+    let mut join_code = None;
 
     'attached: loop {
         loop {
@@ -154,6 +155,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         local_peer_id: next_local_peer_id,
                         tab_id,
                         pane_id,
+                        join_code: next_join_code,
                         ..
                     } => {
                         let apply_started = Instant::now();
@@ -187,6 +189,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
                         }
                         local_peer_id = next_local_peer_id;
+                        join_code = next_join_code;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
                         }
@@ -289,7 +292,13 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 .map(|screen| (*pane_id, screen))
                         })
                         .collect();
-                    render_multi_pane_with_copy_feedback(frame, tui, &visible, copied_lines);
+                    render_multi_pane_with_copy_feedback(
+                        frame,
+                        tui,
+                        &visible,
+                        copied_lines,
+                        join_code.as_deref(),
+                    );
                 })?;
                 let draw_elapsed = draw_started.elapsed();
                 if crate::perf::enabled() && draw_elapsed >= Duration::from_millis(5) {

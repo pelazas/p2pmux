@@ -2318,8 +2318,9 @@ pub fn render_multi_pane_with_copy_feedback(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     copied_lines: Option<usize>,
+    join_code: Option<&str>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, None);
+    render_shared_multi_pane(frame, tui, screens, "", copied_lines, None, join_code);
 }
 
 fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
@@ -4029,6 +4030,10 @@ impl SharedLayoutRuntime {
 
     pub fn local_peer_id(&self) -> Vec<u8> {
         self.control.peer_id()
+    }
+
+    pub(crate) fn join_code(&self) -> Option<&str> {
+        self.join_code.as_deref()
     }
 
     fn input_allowed(&self, pane_id: PaneId) -> bool {
@@ -5971,7 +5976,8 @@ mod tests {
         is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
         mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
         reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
-        render_shared_multi_pane, selection_text, text_width, viewed_screen, visible_leaf_panes,
+        render_multi_pane_with_copy_feedback, render_shared_multi_pane, selection_text, text_width,
+        viewed_screen, visible_leaf_panes,
     };
 
     #[test]
@@ -6840,6 +6846,39 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("waiting for current pane reservation"));
+        assert!(rendered.contains("join: p2pmux join TESTCODE"));
+    }
+
+    #[test]
+    fn attach_renderer_draws_join_code_in_the_footer() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        );
+        let tui = MultiPaneTui::new(snapshot).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(160, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_multi_pane_with_copy_feedback(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    None,
+                    Some("TESTCODE"),
+                );
+            })
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
         assert!(rendered.contains("join: p2pmux join TESTCODE"));
     }
 
