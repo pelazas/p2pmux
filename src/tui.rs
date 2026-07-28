@@ -5967,10 +5967,10 @@ fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
-        io,
+        fs, io,
         net::Ipv4Addr,
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::{mpsc, watch};
 
@@ -5985,10 +5985,10 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use crate::config::UiTheme;
     use crate::layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, Pane, Tab};
     use crate::lease::{IDLE_AFTER, LeaseManager, LeaseState};
     use crate::screen::{GuestScreen, HostScreen};
+    use crate::{agent_detect::cwd_for_pid, config::UiTheme};
     use crate::{
         protocol::PaneDescriptor,
         session::{HostSession, SharedLayoutHost, layout_snapshot_from_state},
@@ -6553,6 +6553,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_create_then_committed_delete_updates_its_local_pane_lifecycle() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2pmux-runtime-create-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("create temporary directory");
+        let expected_cwd = fs::canonicalize(&directory).expect("canonicalize temporary directory");
         let host = SharedLayoutHost::new(
             HostSession::from_transport(loopback_transport().await).expect("host session"),
             2,
@@ -6592,6 +6602,35 @@ mod tests {
         .expect("runtime");
         runtime.set_session_id(b"session".to_vec());
 
+        thread::sleep(Duration::from_secs(2));
+        let source_pid = runtime
+            .local
+            .get(&1)
+            .and_then(|pane| pane.host.process_id())
+            .expect("source PTY child PID");
+        runtime
+            .local
+            .get_mut(&1)
+            .expect("source local pane")
+            .host
+            .write_input(format!("cd -- {}\n", directory.display()).as_bytes())
+            .expect("change source PTY directory");
+        let source_cwd = (0..20).find_map(|_| {
+            let cwd = cwd_for_pid(source_pid);
+            if cwd
+                .as_ref()
+                .and_then(|cwd| fs::canonicalize(cwd).ok())
+                .as_ref()
+                == Some(&expected_cwd)
+            {
+                cwd
+            } else {
+                thread::sleep(Duration::from_millis(25));
+                None
+            }
+        });
+        assert!(source_cwd.is_some(), "source PTY changed directory");
+
         runtime.tui.selection = Some(PaneTextSelection {
             pane_id: 1,
             anchor: ScreenCell { row: 0, col: 0 },
@@ -6612,6 +6651,17 @@ mod tests {
             })
             .expect("create intent commits after registering a local pane");
         assert!(runtime.local.contains_key(&2));
+        let created_pid = runtime
+            .local
+            .get(&2)
+            .and_then(|pane| pane.host.process_id())
+            .expect("created PTY child PID");
+        assert_eq!(
+            cwd_for_pid(created_pid)
+                .as_ref()
+                .and_then(|cwd| fs::canonicalize(cwd).ok()),
+            Some(expected_cwd.clone())
+        );
         assert!(runtime.panes.has_registered_pane(2).expect("pane registry"));
         assert!(
             runtime.provisional.is_empty(),
@@ -6646,6 +6696,8 @@ mod tests {
             "committed removal revokes the direct-pane service before the PTY is shut down"
         );
         assert_eq!(runtime.tui.snapshot().panes.len(), 1);
+        drop(runtime);
+        fs::remove_dir(&directory).expect("remove temporary directory");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
