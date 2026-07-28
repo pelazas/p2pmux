@@ -143,6 +143,13 @@ shared pane border to resize its split. Corner drags lock to one axis after a sh
 threshold, preview locally, and commit one shared ratio on release. The affected pane hosts then
 resize their own PTY and VT screen and publish their local grids.
 
+When the focused pane's program turns on xterm mouse reporting — an editor, a pager, or a coding
+agent's input box — clicks, drags, and the wheel go to that program instead, so clicking moves its
+text cursor. Hold `Shift` to select and copy as usual. The mux keeps every event such a program
+should not see: presses on borders, tab labels, and the footer, presses on a pane that is not yet
+focused (which focus it instead), and anything over a pane scrolled into history. A plain shell
+prompt does not report mouse, so nothing changes there.
+
 - `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
   tab. Some terminals need Shift with Option for horizontal arrows.
 - `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new PTY
@@ -169,7 +176,8 @@ Nested ratio-controlled splits are part of Spike 3 (depth 4, at most 8 panes per
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Pane mode gives the locally focused pane a
 soft-green border; Tab mode dims inactive tab labels. Click tab labels to switch tabs without
-claiming control or sending input. Mouse wheel scrolls pane history locally. The dark contextual footer uses red key accents: normal mode is
+claiming control or sending input. Mouse wheel scrolls pane history locally unless the focused
+pane's program reports mouse, in which case the wheel reaches that program. The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`; pane mode is
 `PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK`; tab mode is
 `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
