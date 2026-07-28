@@ -32,7 +32,7 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, FooterMouseInput, KeyHandling,
-        MultiPaneTui, PaneViewState, copy_selection_to_clipboard,
+        MultiPaneTui, PaneMouseProtocol, PaneViewState, copy_selection_to_clipboard,
         render_multi_pane_with_copy_feedback,
     },
 };
@@ -506,6 +506,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 join_code: join_code.as_deref(),
                                 ..FooterMouseInput::default()
                             },
+                            PaneMouseProtocol::default(),
                         );
                         send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     }
@@ -553,10 +554,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             join_code: join_code.as_deref(),
                             ..FooterMouseInput::default()
                         },
+                        focused_pane_mouse_protocol(tui, &screens, &local_peer_id),
                     );
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         copied_lines = None;
                         footer_notice = None;
+                    }
+                    if let Some(bytes) = handling.forward_bytes {
+                        let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
+                        write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
                     }
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
@@ -619,6 +625,22 @@ fn refresh_tui_timers(
         dirty = true;
     }
     dirty
+}
+
+/// The mouse reporting the focused pane's child has turned on, if any.
+fn focused_pane_mouse_protocol(
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+    local_peer_id: &[u8],
+) -> PaneMouseProtocol {
+    if !input_allowed(tui, local_peer_id) {
+        return PaneMouseProtocol::default();
+    }
+    screens
+        .get(&tui.focused_pane())
+        .and_then(GuestScreen::screen)
+        .map(PaneMouseProtocol::from_screen)
+        .unwrap_or_default()
 }
 
 fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {

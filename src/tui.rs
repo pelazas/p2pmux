@@ -313,6 +313,8 @@ pub struct MouseHandling {
     pub copy_selection_requested: bool,
     /// A runnable join command requested by a completed footer click.
     pub join_copy_command: Option<String>,
+    /// An xterm mouse report the focused pane's child asked to receive.
+    pub forward_bytes: Option<Vec<u8>>,
 }
 
 /// Footer content that determines the visible join command hit target.
@@ -464,6 +466,8 @@ pub struct MultiPaneTui {
     pending_agent_toggle: Option<Instant>,
     resize_drag: Option<ResizeDrag>,
     pending_join_click: bool,
+    /// Set while a press forwarded to a child owns the drag and release that follow.
+    mouse_forwarding: bool,
 }
 
 impl MultiPaneTui {
@@ -504,6 +508,7 @@ impl MultiPaneTui {
             pending_agent_toggle: None,
             resize_drag: None,
             pending_join_click: false,
+            mouse_forwarding: false,
         })
     }
 
@@ -1274,10 +1279,15 @@ impl MultiPaneTui {
         mouse: crossterm::event::MouseEvent,
         area: Rect,
         footer: FooterMouseInput<'_>,
+        protocol: PaneMouseProtocol,
     ) -> MouseHandling {
         if self.modal_open() {
             self.pending_join_click = false;
+            self.mouse_forwarding = false;
             return MouseHandling::default();
+        }
+        if let Some(handling) = self.report_mouse_to_child(mouse, area, protocol) {
+            return handling;
         }
         match mouse.kind {
             MouseEventKind::Moved if !self.overlay_open() => {
@@ -1351,6 +1361,74 @@ impl MultiPaneTui {
             }
             _ => MouseHandling::default(),
         }
+    }
+
+    /// Hands a mouse event to the focused pane's child when that child asked for
+    /// mouse reports, so a click lands as a caret move instead of a mux selection.
+    ///
+    /// Returns `None` when the mux keeps the event for its own focus, selection,
+    /// resize, tab, and footer handling.
+    fn report_mouse_to_child(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        area: Rect,
+        protocol: PaneMouseProtocol,
+    ) -> Option<MouseHandling> {
+        // Shift is the standing escape hatch: it always selects, never forwards.
+        if self.overlay_open()
+            || !protocol.reports_mouse()
+            || mouse.modifiers.contains(KeyModifiers::SHIFT)
+            || self.scrollback_offset(self.focused_pane) != 0
+        {
+            self.mouse_forwarding = false;
+            return None;
+        }
+        let viewport = self.focused_pane_viewport(area)?;
+        let cell = match mouse.kind {
+            // A press outside the focused pane still belongs to the mux: it moves
+            // focus, drags a border, or switches a tab.
+            MouseEventKind::Down(_) => {
+                let cell = mouse_to_screen_cell(viewport, mouse.column, mouse.row)?;
+                self.clear_selection();
+                self.mouse_forwarding = true;
+                cell
+            }
+            // Once a press is forwarded the child owns the rest of the gesture, even
+            // if the pointer leaves the pane mid-drag.
+            MouseEventKind::Drag(_) => {
+                if !self.mouse_forwarding {
+                    return None;
+                }
+                clamp_to_viewport(viewport, mouse.column, mouse.row)?
+            }
+            MouseEventKind::Up(_) => {
+                if !std::mem::take(&mut self.mouse_forwarding) {
+                    return None;
+                }
+                clamp_to_viewport(viewport, mouse.column, mouse.row)?
+            }
+            MouseEventKind::Moved => {
+                // Hover chrome still tracks the pointer while motion is forwarded.
+                self.hover_pane_at(mouse.column, mouse.row, area);
+                mouse_to_screen_cell(viewport, mouse.column, mouse.row)?
+            }
+            _ => mouse_to_screen_cell(viewport, mouse.column, mouse.row)?,
+        };
+        Some(MouseHandling {
+            forward_bytes: encode_mouse(mouse.kind, mouse.modifiers, cell, protocol),
+            ..MouseHandling::default()
+        })
+    }
+
+    fn focused_pane_viewport(&self, area: Rect) -> Option<Rect> {
+        let geometry = self.geometry(area);
+        let pane_rect = geometry.panes.get(&self.focused_pane)?;
+        let pane = self.snapshot.panes.get(&self.focused_pane)?;
+        Some(fixed_grid_viewport(
+            pane_content_rect(*pane_rect),
+            pane.grid_rows,
+            pane.grid_cols,
+        ))
     }
 
     fn footer_join_rect(&self, area: Rect, footer: FooterMouseInput<'_>) -> Option<Rect> {
@@ -2348,6 +2426,19 @@ fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
 
 fn pane_content_rect(pane_rect: Rect) -> Rect {
     Block::bordered().inner(pane_rect)
+}
+
+/// Pins a pointer that wandered off the pane to the nearest cell inside it.
+fn clamp_to_viewport(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
+    if viewport.width == 0 || viewport.height == 0 {
+        return None;
+    }
+    let last_column = viewport.x + viewport.width - 1;
+    let last_row = viewport.y + viewport.height - 1;
+    Some(ScreenCell {
+        row: row.clamp(viewport.y, last_row) - viewport.y,
+        col: column.clamp(viewport.x, last_column) - viewport.x,
+    })
 }
 
 fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
@@ -4706,19 +4797,31 @@ impl SharedLayoutRuntime {
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
                 if !self.tui.overlay_open() && !self.tui.modal_open() {
-                    *dirty |= self.tui.hover_pane_at(
-                        mouse.column,
-                        mouse.row,
-                        Rect::new(0, 0, *cols, *rows),
-                    );
+                    let area = Rect::new(0, 0, *cols, *rows);
+                    let protocol = self.focused_pane_mouse_protocol();
+                    if protocol.reports_mouse() {
+                        let handling = self.tui.handle_mouse(
+                            mouse,
+                            area,
+                            FooterMouseInput {
+                                status: &self.status,
+                                footer_notice: self.footer_notice.as_deref(),
+                                copied_lines: self.copied_lines,
+                                join_code: self.join_code.as_deref(),
+                            },
+                            protocol,
+                        );
+                        if let Some(bytes) = handling.forward_bytes {
+                            self.forward_mouse(bytes)?;
+                        }
+                    }
+                    *dirty |= self.tui.hover_pane_at(mouse.column, mouse.row, area);
                 }
             }
             Event::Mouse(mouse)
                 if matches!(
                     mouse.kind,
-                    MouseEventKind::Down(MouseButton::Left)
-                        | MouseEventKind::Drag(MouseButton::Left)
-                        | MouseEventKind::Up(MouseButton::Left)
+                    MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Up(_)
                 ) =>
             {
                 if self.tui.modal_open() {
@@ -4726,6 +4829,7 @@ impl SharedLayoutRuntime {
                 }
                 let area = Rect::new(0, 0, *cols, *rows);
                 let previously_focused = self.tui.focused_pane();
+                let protocol = self.focused_pane_mouse_protocol();
                 let handling = self.tui.handle_mouse(
                     mouse,
                     area,
@@ -4735,7 +4839,11 @@ impl SharedLayoutRuntime {
                         copied_lines: self.copied_lines,
                         join_code: self.join_code.as_deref(),
                     },
+                    protocol,
                 );
+                if let Some(bytes) = handling.forward_bytes {
+                    self.forward_mouse(bytes)?;
+                }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.copied_lines = None;
                     if self.footer_notice.as_deref() == Some("copied join command") {
@@ -5600,6 +5708,38 @@ impl SharedLayoutRuntime {
         id
     }
 
+    /// The mouse reporting the focused pane's child has turned on, if any.
+    fn focused_pane_mouse_protocol(&self) -> PaneMouseProtocol {
+        let pane_id = self.tui.focused_pane();
+        if !self.input_allowed(pane_id) {
+            return PaneMouseProtocol::default();
+        }
+        self.local
+            .get(&pane_id)
+            .map(|pane| PaneMouseProtocol::from_screen(pane.screen.screen()))
+            .or_else(|| {
+                self.remote
+                    .get(&pane_id)
+                    .and_then(|pane| pane.screen.screen())
+                    .map(PaneMouseProtocol::from_screen)
+            })
+            .unwrap_or_default()
+    }
+
+    fn forward_mouse(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let pane_id = self.tui.focused_pane();
+        if !self.input_allowed(pane_id) {
+            return Ok(());
+        }
+        if let Some(pane) = self.local.get_mut(&pane_id) {
+            pane.input(bytes.clone())?;
+        }
+        if let Some(pane) = self.remote.get_mut(&pane_id) {
+            pane.input(bytes);
+        }
+        Ok(())
+    }
+
     fn forward_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
         let pane_id = self.tui.focused_pane();
         if !self.input_allowed(pane_id) {
@@ -5937,6 +6077,146 @@ fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     } else {
         text.as_bytes().to_vec()
     }
+}
+
+/// Low two bits of an xterm button code, by button.
+const MOUSE_BUTTON_LEFT: u8 = 0;
+const MOUSE_BUTTON_MIDDLE: u8 = 1;
+const MOUSE_BUTTON_RIGHT: u8 = 2;
+/// Legacy encodings report every release with the button bits set.
+const MOUSE_BUTTON_RELEASE: u8 = 3;
+const MOUSE_MOTION_FLAG: u8 = 32;
+const MOUSE_WHEEL_FLAG: u8 = 64;
+const MOUSE_SHIFT_FLAG: u8 = 4;
+const MOUSE_ALT_FLAG: u8 = 8;
+const MOUSE_CONTROL_FLAG: u8 = 16;
+/// Legacy button/coordinate bytes are biased so they land in printable ASCII.
+const MOUSE_LEGACY_BIAS: u16 = 32;
+/// The largest coordinate a single biased byte can carry.
+const MOUSE_LEGACY_MAX: u16 = 223;
+
+/// The xterm mouse reporting a pane's child has asked for, if any.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaneMouseProtocol {
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+}
+
+impl PaneMouseProtocol {
+    pub fn from_screen(screen: &vt100::Screen) -> Self {
+        Self {
+            mode: screen.mouse_protocol_mode(),
+            encoding: screen.mouse_protocol_encoding(),
+        }
+    }
+
+    /// Whether the child wants mouse events at all; when false the mux keeps them.
+    pub fn reports_mouse(self) -> bool {
+        self.mode != vt100::MouseProtocolMode::None
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => MOUSE_BUTTON_LEFT,
+        MouseButton::Middle => MOUSE_BUTTON_MIDDLE,
+        MouseButton::Right => MOUSE_BUTTON_RIGHT,
+    }
+}
+
+fn mouse_modifier_flags(modifiers: KeyModifiers) -> u8 {
+    let mut flags = 0;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        flags |= MOUSE_SHIFT_FLAG;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        flags |= MOUSE_ALT_FLAG;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        flags |= MOUSE_CONTROL_FLAG;
+    }
+    flags
+}
+
+/// Encodes a pane-local mouse event the way the child asked to receive it.
+///
+/// Returns `None` when the child's [`vt100::MouseProtocolMode`] does not subscribe to
+/// this event, so callers can fall back to mux-local handling.
+fn encode_mouse(
+    kind: MouseEventKind,
+    modifiers: KeyModifiers,
+    cell: ScreenCell,
+    protocol: PaneMouseProtocol,
+) -> Option<Vec<u8>> {
+    use vt100::MouseProtocolMode as Mode;
+
+    if !protocol.reports_mouse() {
+        return None;
+    }
+    let (button, release) = match kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button), false),
+        MouseEventKind::Up(button) => {
+            // X10 mode reports presses only.
+            if protocol.mode == Mode::Press {
+                return None;
+            }
+            (mouse_button_code(button), true)
+        }
+        MouseEventKind::Drag(button) => {
+            if !matches!(protocol.mode, Mode::ButtonMotion | Mode::AnyMotion) {
+                return None;
+            }
+            (mouse_button_code(button) | MOUSE_MOTION_FLAG, false)
+        }
+        MouseEventKind::Moved => {
+            if protocol.mode != Mode::AnyMotion {
+                return None;
+            }
+            (MOUSE_BUTTON_RELEASE | MOUSE_MOTION_FLAG, false)
+        }
+        // Wheel reports are presses without a matching release in every mode.
+        MouseEventKind::ScrollUp => (MOUSE_WHEEL_FLAG, false),
+        MouseEventKind::ScrollDown => (MOUSE_WHEEL_FLAG | 1, false),
+        MouseEventKind::ScrollLeft => (MOUSE_WHEEL_FLAG | 2, false),
+        MouseEventKind::ScrollRight => (MOUSE_WHEEL_FLAG | 3, false),
+    };
+    let code = button | mouse_modifier_flags(modifiers);
+    let column = cell.col.saturating_add(1);
+    let row = cell.row.saturating_add(1);
+
+    Some(match protocol.encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let final_byte = if release { 'm' } else { 'M' };
+            format!("\x1b[<{code};{column};{row}{final_byte}").into_bytes()
+        }
+        encoding => {
+            // Legacy encodings cannot name the released button, only that one was.
+            let code = if release {
+                code | MOUSE_BUTTON_RELEASE
+            } else {
+                code
+            };
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [u16::from(code), column, row] {
+                let biased = value.checked_add(MOUSE_LEGACY_BIAS)?;
+                if encoding == vt100::MouseProtocolEncoding::Utf8 {
+                    let mut buffer = [0u8; 4];
+                    bytes.extend_from_slice(
+                        char::from_u32(u32::from(biased))?
+                            .encode_utf8(&mut buffer)
+                            .as_bytes(),
+                    );
+                } else {
+                    // A cell past the single-byte ceiling has no representation at all.
+                    if biased > MOUSE_LEGACY_MAX {
+                        return None;
+                    }
+                    bytes.push(biased as u8);
+                }
+            }
+            bytes
+        }
+    })
 }
 
 struct TerminalGuard {
@@ -6529,16 +6809,229 @@ mod tests {
     use super::{
         AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterMouseInput,
         FooterSegment, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
-        LayoutControlEvent, MultiPaneTui, PaneTextSelection, PaneViewState, PendingEscape,
-        RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane, UiIntent,
-        VtScreen, allocate_node_with_preview, area_from_terminal_size, chord_footer_badge,
-        contextual_footer, copied_line_count, encode_key, encode_paste, grid_for_pane,
-        initial_root_pane_grid, is_chord_command, is_chord_navigation, lease_allows_held_input,
-        member_label, mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
-        reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
+        LayoutControlEvent, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState,
+        PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane,
+        UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
+        chord_footer_badge, contextual_footer, copied_line_count, encode_key, encode_mouse,
+        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command, is_chord_navigation,
+        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
+        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
         render_multi_pane_with_copy_feedback, render_shared_multi_pane, selection_text, text_width,
         viewed_screen, visible_leaf_panes,
     };
+
+    fn mouse_protocol(
+        mode: vt100::MouseProtocolMode,
+        encoding: vt100::MouseProtocolEncoding,
+    ) -> PaneMouseProtocol {
+        PaneMouseProtocol { mode, encoding }
+    }
+
+    fn sgr_protocol(mode: vt100::MouseProtocolMode) -> PaneMouseProtocol {
+        mouse_protocol(mode, vt100::MouseProtocolEncoding::Sgr)
+    }
+
+    #[test]
+    fn encode_mouse_skips_panes_without_mouse_reporting() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                ScreenCell { row: 0, col: 0 },
+                PaneMouseProtocol::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn encode_mouse_reports_sgr_press_with_one_based_cells() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                ScreenCell { row: 4, col: 11 },
+                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
+            ),
+            Some(b"\x1b[<0;12;5M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_marks_sgr_release_with_a_lowercase_final_byte() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Up(MouseButton::Right),
+                KeyModifiers::NONE,
+                ScreenCell { row: 0, col: 0 },
+                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
+            ),
+            Some(b"\x1b[<2;1;1m".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_folds_modifiers_into_the_button_code() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ScreenCell { row: 0, col: 0 },
+                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
+            ),
+            Some(b"\x1b[<24;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_drops_release_in_press_only_mode() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                KeyModifiers::NONE,
+                ScreenCell { row: 0, col: 0 },
+                sgr_protocol(vt100::MouseProtocolMode::Press),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn encode_mouse_reports_drag_only_once_the_child_asks_for_motion() {
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let cell = ScreenCell { row: 0, col: 0 };
+        assert_eq!(
+            encode_mouse(
+                drag,
+                KeyModifiers::NONE,
+                cell,
+                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
+            ),
+            None
+        );
+        assert_eq!(
+            encode_mouse(
+                drag,
+                KeyModifiers::NONE,
+                cell,
+                sgr_protocol(vt100::MouseProtocolMode::ButtonMotion),
+            ),
+            Some(b"\x1b[<32;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_reports_bare_motion_only_in_any_motion_mode() {
+        let cell = ScreenCell { row: 0, col: 0 };
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Moved,
+                KeyModifiers::NONE,
+                cell,
+                sgr_protocol(vt100::MouseProtocolMode::ButtonMotion),
+            ),
+            None
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Moved,
+                KeyModifiers::NONE,
+                cell,
+                sgr_protocol(vt100::MouseProtocolMode::AnyMotion),
+            ),
+            Some(b"\x1b[<35;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_reports_wheel_even_in_press_only_mode() {
+        let cell = ScreenCell { row: 2, col: 2 };
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::ScrollUp,
+                KeyModifiers::NONE,
+                cell,
+                sgr_protocol(vt100::MouseProtocolMode::Press),
+            ),
+            Some(b"\x1b[<64;3;3M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::ScrollDown,
+                KeyModifiers::NONE,
+                cell,
+                sgr_protocol(vt100::MouseProtocolMode::Press),
+            ),
+            Some(b"\x1b[<65;3;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_biases_legacy_reports_into_printable_bytes() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                ScreenCell { row: 4, col: 11 },
+                mouse_protocol(
+                    vt100::MouseProtocolMode::PressRelease,
+                    vt100::MouseProtocolEncoding::Default,
+                ),
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 32 + 12, 32 + 5])
+        );
+    }
+
+    #[test]
+    fn encode_mouse_reports_legacy_release_without_naming_the_button() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Up(MouseButton::Right),
+                KeyModifiers::NONE,
+                ScreenCell { row: 0, col: 0 },
+                mouse_protocol(
+                    vt100::MouseProtocolMode::PressRelease,
+                    vt100::MouseProtocolEncoding::Default,
+                ),
+            ),
+            Some(vec![0x1b, b'[', b'M', 32 + 3, 33, 33])
+        );
+    }
+
+    #[test]
+    fn encode_mouse_drops_legacy_cells_past_the_single_byte_ceiling() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                ScreenCell { row: 0, col: 300 },
+                mouse_protocol(
+                    vt100::MouseProtocolMode::PressRelease,
+                    vt100::MouseProtocolEncoding::Default,
+                ),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn encode_mouse_widens_utf8_cells_past_the_single_byte_ceiling() {
+        let bytes = encode_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            ScreenCell { row: 0, col: 300 },
+            mouse_protocol(
+                vt100::MouseProtocolMode::PressRelease,
+                vt100::MouseProtocolEncoding::Utf8,
+            ),
+        )
+        .expect("utf8 encoding carries wide coordinates");
+        let mut expected = b"\x1b[M".to_vec();
+        expected.push(32);
+        expected.extend_from_slice(char::from_u32(333).unwrap().to_string().as_bytes());
+        expected.push(33);
+        assert_eq!(bytes, expected);
+    }
 
     #[test]
     fn disambiguate_escape_codes_uses_kitty_flag_one() {
@@ -8018,6 +8511,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
 
         assert_eq!(handling, super::MouseHandling::default());
@@ -8044,6 +8538,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         tui.handle_mouse(
             left_mouse(
@@ -8053,6 +8548,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         let handling = tui.handle_mouse(
             left_mouse(
@@ -8062,6 +8558,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         assert!(!tui.pending_join_click);
         assert!(handling.join_copy_command.is_none());
@@ -8074,6 +8571,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         let handling = tui.handle_mouse(
             left_mouse(
@@ -8083,6 +8581,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         assert!(!tui.pending_join_click);
         assert!(handling.join_copy_command.is_none());
@@ -8105,6 +8604,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         let handling = tui.handle_mouse(
             left_mouse(
@@ -8114,6 +8614,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
 
         assert_eq!(
@@ -8146,6 +8647,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         let handling = tui.handle_mouse(
             left_mouse(
@@ -8155,6 +8657,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
 
         assert!(!tui.pending_join_click);
@@ -8182,6 +8685,7 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
         tui.handle_mouse(
             left_mouse(
@@ -8191,9 +8695,180 @@ mod tests {
             ),
             area,
             footer,
+            PaneMouseProtocol::default(),
         );
 
         assert_eq!(tui.selection(), selection);
+    }
+
+    fn reporting_child() -> PaneMouseProtocol {
+        mouse_protocol(
+            vt100::MouseProtocolMode::ButtonMotion,
+            vt100::MouseProtocolEncoding::Sgr,
+        )
+    }
+
+    #[test]
+    fn clicking_a_focused_reporting_pane_forwards_instead_of_selecting() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, Some(b"\x1b[<0;2;2M".to_vec()));
+        assert!(handling.intents.is_empty());
+        assert_eq!(tui.selection(), None);
+    }
+
+    #[test]
+    fn a_forwarded_press_keeps_the_drag_and_release_away_from_selection() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+        let drag = tui.handle_mouse(
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), 4, 3),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+        let up = tui.handle_mouse(
+            left_mouse(MouseEventKind::Up(MouseButton::Left), 4, 3),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+
+        assert_eq!(drag.forward_bytes, Some(b"\x1b[<32;4;2M".to_vec()));
+        assert_eq!(up.forward_bytes, Some(b"\x1b[<0;4;2m".to_vec()));
+        assert!(!up.copy_selection_requested);
+        assert_eq!(tui.selection(), None);
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_pane_still_reports_inside_its_edge() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+        let drag = tui.handle_mouse(
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), 70, 20),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+
+        // The 10x4 grid clamps the report to its last cell rather than dropping it.
+        assert_eq!(drag.forward_bytes, Some(b"\x1b[<32;10;4M".to_vec()));
+    }
+
+    #[test]
+    fn shift_click_selects_even_when_the_child_reports_mouse() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let shift_down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::SHIFT,
+        };
+
+        let handling = tui.handle_mouse(
+            shift_down,
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+        assert!(tui.selection_dragging);
+    }
+
+    #[test]
+    fn clicking_an_unfocused_reporting_pane_only_moves_focus() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(tui.focused_pane(), 1);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 45, 3),
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+        assert_eq!(tui.focused_pane(), 2);
+        assert!(matches!(
+            handling.intents.as_slice(),
+            [UiIntent::FocusPane { pane_id: 2 }]
+        ));
+    }
+
+    #[test]
+    fn a_scrolled_back_pane_selects_history_instead_of_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.set_pane_scrollback_offset(1, 5));
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            FooterMouseInput::default(),
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+        assert!(tui.selection_dragging);
+    }
+
+    #[test]
+    fn a_reporting_child_never_takes_a_border_drag_from_the_mux() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        let down = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 39, 5),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), 49, 5),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+        let up = tui.handle_mouse(
+            left_mouse(MouseEventKind::Up(MouseButton::Left), 49, 5),
+            area,
+            FooterMouseInput::default(),
+            protocol,
+        );
+
+        assert_eq!(down.forward_bytes, None);
+        assert!(matches!(
+            up.intents.as_slice(),
+            [UiIntent::SetSplitRatio { .. }]
+        ));
     }
 
     #[test]
@@ -8220,12 +8895,27 @@ mod tests {
         };
 
         assert!(
-            tui.handle_mouse(down, area, FooterMouseInput::default())
-                .intents
-                .is_empty()
+            tui.handle_mouse(
+                down,
+                area,
+                FooterMouseInput::default(),
+                PaneMouseProtocol::default()
+            )
+            .intents
+            .is_empty()
         );
-        tui.handle_mouse(drag, area, FooterMouseInput::default());
-        let handling = tui.handle_mouse(up, area, FooterMouseInput::default());
+        tui.handle_mouse(
+            drag,
+            area,
+            FooterMouseInput::default(),
+            PaneMouseProtocol::default(),
+        );
+        let handling = tui.handle_mouse(
+            up,
+            area,
+            FooterMouseInput::default(),
+            PaneMouseProtocol::default(),
+        );
         assert!(handling.intents.is_empty());
         assert!(handling.copy_selection_requested);
 
@@ -8247,9 +8937,24 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        tui.handle_mouse(resize_down, area, FooterMouseInput::default());
-        tui.handle_mouse(resize_drag, area, FooterMouseInput::default());
-        let handling = tui.handle_mouse(resize_up, area, FooterMouseInput::default());
+        tui.handle_mouse(
+            resize_down,
+            area,
+            FooterMouseInput::default(),
+            PaneMouseProtocol::default(),
+        );
+        tui.handle_mouse(
+            resize_drag,
+            area,
+            FooterMouseInput::default(),
+            PaneMouseProtocol::default(),
+        );
+        let handling = tui.handle_mouse(
+            resize_up,
+            area,
+            FooterMouseInput::default(),
+            PaneMouseProtocol::default(),
+        );
         assert!(matches!(
             handling.intents.as_slice(),
             [UiIntent::SetSplitRatio { .. }]
@@ -8656,7 +9361,12 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(
-            tui.handle_mouse(mouse, area, FooterMouseInput::default()),
+            tui.handle_mouse(
+                mouse,
+                area,
+                FooterMouseInput::default(),
+                PaneMouseProtocol::default()
+            ),
             super::MouseHandling::default()
         );
         assert_eq!(tui.focused_pane(), 1);
