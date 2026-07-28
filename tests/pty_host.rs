@@ -1,6 +1,6 @@
 use std::{
-    thread,
-    time::{Duration, Instant},
+    fs, thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use p2pmux::pty_host::PtyHost;
@@ -79,4 +79,39 @@ fn pty_host_resizes_without_disrupting_io() {
         .expect("writer stays alive");
     assert!(read_until(&mut host, ":reply:still alive").contains("still alive"));
     host.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn pty_host_default_shell_uses_explicit_working_directory() {
+    let directory = std::env::temp_dir().join(format!(
+        "p2pmux-pty-host-cwd-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).expect("create temporary directory");
+    let expected = fs::canonicalize(&directory).expect("canonicalize temporary directory");
+    let mut host = PtyHost::spawn_default_shell_with_cwd(
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        Some(&directory),
+    )
+    .expect("PTY should spawn");
+
+    thread::sleep(Duration::from_millis(100));
+    host.write_input(b"pwd -P\n")
+        .expect("PTY should accept input");
+    assert!(
+        read_until(&mut host, &expected.display().to_string())
+            .contains(expected.to_str().expect("utf-8 path"))
+    );
+
+    host.shutdown().expect("PTY should shut down cleanly");
+    fs::remove_dir(&directory).expect("remove temporary directory");
 }

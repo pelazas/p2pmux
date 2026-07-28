@@ -4,6 +4,7 @@ use std::{
     error::Error,
     ffi::OsString,
     io::{Read, Write},
+    path::Path,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
 };
@@ -59,10 +60,21 @@ impl PtyHost {
 
     /// Spawn the user's login shell, or `/bin/zsh` when `SHELL` is unset.
     pub fn spawn_default_shell(size: PtySize) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_default_shell_with_cwd(size, None)
+    }
+
+    /// Spawn the user's login shell with an optional working directory.
+    pub fn spawn_default_shell_with_cwd(
+        size: PtySize,
+        cwd: Option<&Path>,
+    ) -> Result<Self, Box<dyn Error>> {
         let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/zsh"));
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.env("TERM", "xterm-256color");
+        if let Some(cwd) = cwd {
+            command.cwd(cwd);
+        }
         Self::spawn(command, size)
     }
 

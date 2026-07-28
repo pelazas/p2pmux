@@ -133,9 +133,11 @@ hosts then resize their own PTY and VT screen and publish their local grids.
 - `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
   tab. Some terminals need Shift with Option for horizontal arrows.
 - `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new PTY
-  runs on the requester’s Mac.
+  runs on the requester’s Mac and inherits the target pane’s cwd when that pane is hosted locally
+  by the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
 - `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
-  focused pane.
+  focused pane. Its local PTY inherits the target pane’s cwd when that pane is hosted locally by
+  the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
   cancels; a blank title restores `Pane #N`.
