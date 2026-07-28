@@ -5012,7 +5012,9 @@ impl SharedLayoutRuntime {
                     local.mark_exited()?;
                 }
             }
-            if pane.exited && let Some(remote) = self.remote.get_mut(pane_id) {
+            if pane.exited
+                && let Some(remote) = self.remote.get_mut(pane_id)
+            {
                 remote.mark_exited();
             }
         }

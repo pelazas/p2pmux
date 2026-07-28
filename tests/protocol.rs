@@ -5,10 +5,9 @@ use p2pmux::protocol::{
     MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
     MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
     MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited, MemberDescriptor, NewPanePosition,
-    PROTOCOL_VERSION,
-    PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, ProtocolError,
-    SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
-    UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
+    PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation,
+    PaneSubscribe, ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
+    TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
