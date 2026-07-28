@@ -466,6 +466,101 @@ its own pane was correctly refused. The scenario now waits out `lease.rs IDLE_AF
 before the exit. Focus and control are separate: g2 keeps the pane *focused* across that
 wait without holding its lease.
 
+### Iteration 10 — B×F: three peers racing structural edits under load (2026-07-29)
+
+Script: `scripts/e2e/scenario_j_edit_storm.py`. Three peers at 140x40. **Final iteration.**
+
+The layout is a revisioned tree and every structural request carries a `base_revision`
+(`layout.rs:546`), so three peers splitting at the same instant means most requests race a
+revision that moved under them. The coordinator must reject the losers with
+`StaleRevision` rather than applying them twice or corrupting the tree. The invariant that
+matters is **convergence** — peers disagreeing about the layout is the worst multiplayer
+outcome short of a crash, since a guest deleting "pane 2" would hit a different pane than
+the one it can see.
+
+Repro:
+1. Host starts `seq 1 4000` streaming, so the storm races real pane traffic.
+2. Four rounds of: all three peers send `Ctrl+P` together, then `n` together.
+3. Host echoes a marker; every peer must see it.
+4. `g1` and `g2` send `Ctrl+T` then `n` at the same instant.
+
+| Check | Result |
+|---|---|
+| **All three peers converge on the same panes after the split storm** | PASS |
+| The pane count is sane, not doubled or corrupted | PASS |
+| Every pane still has a real owner | PASS |
+| No peer died during the storm | PASS |
+| The session still streams to every peer after the storm | PASS |
+| **All three peers converge on the same tab list** | PASS |
+| No runaway memory from the rejected edits | PASS |
+| No panic on any peer | PASS |
+
+**No bug found.** 4/4 runs clean, zero orphans. Concurrency control is doing exactly its
+job: 12 racing split requests (4 rounds × 3 peers) settled to 5 panes — 4 winners, 8
+correctly rejected as stale — with all three peers landing on a byte-identical layout. Two
+simultaneous tab creations produced exactly one new tab, not two.
+
+Harness false-positive caught and fixed (mine, not p2pmux): the first run reported the
+peers "diverging", but host was viewing Tab #1 while g1 had created Tab #2 and switched to
+it. **Which tab a peer is viewing is per-peer UI state, exactly like focus** — comparing
+whatever tab happened to be visible was comparing different tabs. The oracle now compares
+panes while all peers are on the same tab, and compares the *tab list* separately, which
+is meaningful regardless of selection.
+
+## Final summary — loop stopped (2026-07-29)
+
+Stopping per the loop's own rule: three consecutive iterations (8, 9, 10) found no new
+bug, and no open bugs remain.
+
+**Bugs found and fixed: 3.** All three were the *same defect shape* — p2pmux computed the
+correct information and had no channel to carry it to the user:
+
+| | Bug | Root cause |
+|---|---|---|
+| BUG-1 | Guests never told the coordinator died | `status` existed but no wire carried it under the node+client split |
+| BUG-2 | Every CLI error printed as a Rust debug dump | `main` returned `Result`, so Rust printed Debug; detached node's failure went to `/dev/null` |
+| BUG-3 | Refused joiner not told the room is full | Welcome sent before the limit check; then p2pmux rejected its own refusal frame (`request_id` 0) |
+
+Three instances is a structural pattern worth a design pass, not three coincidences.
+
+**What was verified as genuinely solid** (each measured, not assumed):
+- Ownership enforcement is server-side on the *authenticated* peer id; guests cannot delete
+  foreign panes, foreign tabs, or exited foreign panes. Proven with a positive control.
+- Input rejection on exited panes is real — the bytes never reach the host's copy either.
+- Control-lease handoff is lossless: a 20-char string typed at ~2ms/key across the
+  take-control round trip arrived intact, in order, exactly once; races produce one winner.
+- A peer SIGSTOPped through 3000 lines resyncs byte-identically with no duplicated tail.
+- Killing the coordinator wedges nothing; both guests keep rendering and answer a resize.
+- Scrollback is bounded (~123 MB first flood, then free) and retained only by the pane host.
+- `less` replicates byte-identically including paging; guest resize crops and reconverges.
+- Wheel routing is decided per pane state, correctly, both ways in one session.
+- Concurrent structural edits converge across three peers under streaming load.
+
+**Harness defects found: 8** — every one would have produced a false bug report. Worth
+noting: five of the eleven total defects this loop surfaced were in the *test harness*, not
+p2pmux. The recurring lesson was to read the raw PTY bytes before believing an oracle.
+
+### What this harness structurally cannot reach — for a human, by hand
+
+- **Two real machines over the real internet.** Everything here is localhost. Relay
+  fallback, NAT traversal (symmetric NAT, CGNAT, hairpinning), and the direct-vs-relay
+  upgrade path are entirely untested. This is the single biggest gap.
+- **Real latency, loss, and reordering.** No jitter, no packet loss, no MTU/path-MTU
+  effects. The lease handoff and resync paths were only ever exercised at ~0ms RTT.
+- **Sleep/wake and network change.** Close the laptop mid-session; switch Wi-Fi → cellular;
+  change networks while a pane streams. Connection migration is untouched here.
+- **The 30s idle lease with real people.** Two humans genuinely fighting over one pane,
+  where "actively typing" is human-paced rather than scripted.
+- **Long-lived sessions.** Nothing here ran longer than a few minutes. Leaks, revision
+  counter growth, and scrollback behaviour over a working day are unknown.
+- **Real workloads in shared panes.** vim with plugins, `htop`, `claude`, a full TUI IDE —
+  tested only with `less`.
+- **The disconnect-grace features, once written.** No grace window, placeholder pruning, or
+  coordinator failover exists in `src/` yet, so those bank entries were unimplemented
+  rather than failing. They will need their own pass when built.
+- **BUG-2's `.error` file** is written to a fixed path per session id; a human should sanity
+  check behaviour if two nodes ever collide on one id, which this harness never forced.
+
 ## Coverage caveat on the loop's stop rule
 
 Iterations 1-3 each found no bug, which technically fires the "three consecutive clean
