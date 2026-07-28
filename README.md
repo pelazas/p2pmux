@@ -126,9 +126,10 @@ inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disab
 passthrough configuration.
 
 Drag inside a pane's terminal content to select text; releasing the mouse copies it to the macOS
-clipboard. Drag a shared pane border to resize its split. Corner drags lock to one axis after a
-short motion threshold, preview locally, and commit one shared ratio on release. The affected pane
-hosts then resize their own PTY and VT screen and publish their local grids.
+clipboard. Clicking the footer join command copies `p2pmux join <code>` to the clipboard. Drag a
+shared pane border to resize its split. Corner drags lock to one axis after a short motion
+threshold, preview locally, and commit one shared ratio on release. The affected pane hosts then
+resize their own PTY and VT screen and publish their local grids.
 
 - `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
   tab. Some terminals need Shift with Option for horizontal arrows.
