@@ -1183,6 +1183,7 @@ impl MultiPaneTui {
                     tab.title.as_deref(),
                     index + 1,
                     tab.tab_id == self.current_tab,
+                    self.tab_has_unread_agent_pane(tab),
                 ));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
@@ -1190,6 +1191,12 @@ impl MultiPaneTui {
                 (tab.tab_id, rect)
             })
             .collect()
+    }
+
+    fn tab_has_unread_agent_pane(&self, tab: &crate::layout::Tab) -> bool {
+        self.unread_agent_panes
+            .iter()
+            .any(|pane_id| contains_leaf(&tab.root, *pane_id))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
@@ -2015,8 +2022,9 @@ fn truncate_trailing(value: &str, width: usize) -> String {
     result
 }
 
-fn tab_label(title: Option<&str>, index: usize, active: bool) -> String {
+fn tab_label(title: Option<&str>, index: usize, active: bool, unread: bool) -> String {
     let label = title.map_or_else(|| format!("Tab #{index}"), str::to_owned);
+    let label = if unread { format!("* {label}") } else { label };
     if active { format!(" {label} ") } else { label }
 }
 
@@ -2974,7 +2982,12 @@ fn render_shared_multi_pane(
                     .bg(theme.footer_background)
             };
             let label = truncate_trailing(
-                &tab_label(tab.title.as_deref(), index + 1, active),
+                &tab_label(
+                    tab.title.as_deref(),
+                    index + 1,
+                    active,
+                    tui.tab_has_unread_agent_pane(tab),
+                ),
                 usize::from(geometry.tab_labels[&tab.tab_id].width),
             );
             let label_rect = geometry.tab_labels[&tab.tab_id];
@@ -3035,7 +3048,14 @@ fn render_shared_multi_pane(
             &tui.snapshot.members,
             title_width.saturating_sub(badge_width).saturating_sub(2),
         );
-        title.spans.insert(0, Span::raw(" "));
+        title.spans.insert(
+            0,
+            Span::raw(if tui.unread_agent_panes.contains(&pane_id) {
+                " * "
+            } else {
+                " "
+            }),
+        );
         title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
             theme,
@@ -8285,8 +8305,15 @@ mod tests {
 
     #[test]
     fn title_chrome_uses_custom_labels_and_cell_width_ellipsis() {
-        assert_eq!(super::tab_label(Some("build logs"), 1, false), "build logs");
-        assert_eq!(super::tab_label(None, 2, false), "Tab #2");
+        assert_eq!(
+            super::tab_label(Some("build logs"), 1, false, false),
+            "build logs"
+        );
+        assert_eq!(super::tab_label(None, 2, false, false), "Tab #2");
+        assert_eq!(
+            super::tab_label(Some("build logs"), 1, false, true),
+            "* build logs"
+        );
         assert_eq!(super::truncate_trailing("界界", 3), "界…");
         assert_eq!(super::truncate_trailing("界", 1), "…");
         assert_eq!(super::truncate_trailing("title", 0), "");
@@ -8310,6 +8337,44 @@ mod tests {
             .to_string(),
             "build logs …"
         );
+    }
+
+    #[test]
+    fn unread_agent_badges_use_the_same_starred_tab_label_for_hit_testing() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: Some(String::from("build")),
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        ))
+        .expect("valid layout");
+        tui.unread_agent_panes.insert(2);
+        let area = Rect::new(0, 0, 80, 8);
+        let geometry = tui.geometry(area);
+        assert_eq!(
+            geometry.tab_labels[&1].width,
+            text_width(&super::tab_label(Some("build"), 1, true, true))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("test terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let tab_bar = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        let pane_titles = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(tab_bar.contains("* build"));
+        assert!(pane_titles.contains("* Pane #2"));
     }
 
     #[test]
