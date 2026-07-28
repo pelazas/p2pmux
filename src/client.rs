@@ -1170,7 +1170,7 @@ mod tests {
             &mut pending_focus,
         )
         .unwrap();
-        assert!(history.is_empty());
+        assert_eq!(history[&1].available_rows(), 0);
 
         apply_snapshot(
             &mut tui,
@@ -1195,7 +1195,7 @@ mod tests {
             &mut pending_focus,
         )
         .unwrap();
-        assert!(history.is_empty());
+        assert_eq!(history[&1].available_rows(), 0);
     }
 
     #[test]
