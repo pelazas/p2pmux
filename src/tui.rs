@@ -1067,17 +1067,8 @@ impl MultiPaneTui {
             .iter()
             .find(|tab| tab.tab_id == tab_id)
             .ok_or(LayoutError::UnknownTab { tab_id })?;
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.current_tab = tab_id;
-        self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
-        self.log_selection_change(
-            "tab_switch",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        let pane_id = first_leaf(&tab.root).expect("validated layout has a leaf");
+        self.select_pane(tab_id, pane_id, "tab_switch");
         Ok(())
     }
 
@@ -1085,20 +1076,7 @@ impl MultiPaneTui {
         let Some(pane_id) = pane_at(&self.geometry(area).panes, column, row) else {
             return false;
         };
-        if self.focused_pane == pane_id {
-            return false;
-        }
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.focused_pane = pane_id;
-        self.log_selection_change(
-            "mouse",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
-        true
+        self.select_pane(self.current_tab, pane_id, "mouse")
     }
 
     fn hover_pane_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
@@ -1401,17 +1379,7 @@ impl MultiPaneTui {
         if !contains_leaf(&tab.root, pane_id) {
             return Err(LayoutError::UnknownPane { pane_id });
         }
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.current_tab = tab_id;
-        self.focused_pane = pane_id;
-        self.log_selection_change(
-            "node_sync",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        self.select_pane(tab_id, pane_id, "node_sync");
         Ok(())
     }
 
@@ -1563,19 +1531,9 @@ impl MultiPaneTui {
         else {
             return Vec::new();
         };
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.current_tab = tab.tab_id;
-        self.focused_pane = pane_id;
+        self.select_pane(tab.tab_id, pane_id, "overlay_jump");
         self.modal = ModalState::None;
         self.pending_agent_toggle = None;
-        self.log_selection_change(
-            "overlay_jump",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
         ui_debug_log(
             "agents_overlay_close",
             format_args!("reason={close_reason} pane_id={pane_id}"),
@@ -1718,16 +1676,7 @@ impl MultiPaneTui {
                 direction_distance(source_center, rect_center(*rect), direction, *pane_id)
             })?
             .0;
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
-        self.focused_pane = pane_id;
-        self.log_selection_change(
-            "key",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        self.select_pane(self.current_tab, pane_id, "key");
         Some(UiIntent::FocusPane { pane_id })
     }
 
@@ -1757,53 +1706,42 @@ impl MultiPaneTui {
     }
 
     fn repair_selection(&mut self) {
-        let old_tab = self.current_tab;
-        let old_pane = self.focused_pane;
         if let Some(tab_id) = self.pending_created_tab
             && let Some(tab) = self.snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)
         {
-            self.current_tab = tab_id;
-            self.focused_pane = first_leaf(&tab.root).expect("validated layout has a leaf");
+            let pane_id = first_leaf(&tab.root).expect("validated layout has a leaf");
             self.pending_created_tab = None;
-            self.log_selection_change(
-                "snapshot_repair",
-                old_tab,
-                old_pane,
-                self.current_tab,
-                self.focused_pane,
-            );
+            self.select_pane(tab_id, pane_id, "snapshot_repair");
             return;
         }
-        let current_tab = self.current_tab_layout();
-        let current_tab = if let Some(tab) = current_tab {
+        let current_tab = if let Some(tab) = self.current_tab_layout() {
             tab
         } else {
-            self.current_tab = self.snapshot.tabs[0].tab_id;
             &self.snapshot.tabs[0]
         };
-        let (contains_focused_pane, first_pane, created_pane) = {
+        let (tab_id, pane_id) = {
             let root = &current_tab.root;
-            (
-                contains_leaf(root, self.focused_pane),
-                first_leaf(root).expect("validated layout has a leaf"),
-                self.pending_created_pane
-                    .filter(|pane_id| contains_leaf(root, *pane_id)),
-            )
+            let pane_id = self
+                .pending_created_pane
+                .filter(|pane_id| contains_leaf(root, *pane_id))
+                .or_else(|| contains_leaf(root, self.focused_pane).then_some(self.focused_pane))
+                .unwrap_or_else(|| first_leaf(root).expect("validated layout has a leaf"));
+            (current_tab.tab_id, pane_id)
         };
-        if !contains_focused_pane {
-            self.focused_pane = first_pane;
-        }
-        if let Some(pane_id) = created_pane {
-            self.focused_pane = pane_id;
+        if self.pending_created_pane == Some(pane_id) {
             self.pending_created_pane = None;
         }
-        self.log_selection_change(
-            "snapshot_repair",
-            old_tab,
-            old_pane,
-            self.current_tab,
-            self.focused_pane,
-        );
+        self.select_pane(tab_id, pane_id, "snapshot_repair");
+    }
+
+    fn select_pane(&mut self, tab_id: TabId, pane_id: PaneId, reason: &str) -> bool {
+        let old_tab = self.current_tab;
+        let old_pane = self.focused_pane;
+        self.current_tab = tab_id;
+        self.focused_pane = pane_id;
+        let unread_cleared = self.unread_agent_panes.remove(&pane_id);
+        self.log_selection_change(reason, old_tab, old_pane, tab_id, pane_id);
+        old_tab != tab_id || old_pane != pane_id || unread_cleared
     }
 
     fn log_selection_change(
@@ -6598,6 +6536,41 @@ mod tests {
             crate::protocol::AgentRosterState::Idle
         );
         assert!(tui.unread_agent_panes.contains(&2));
+    }
+
+    #[test]
+    fn focus_routes_clear_unread_agent_markers() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+
+        tui.unread_agent_panes.insert(2);
+        tui.select_tab(2).expect("known tab");
+        assert!(!tui.unread_agent_panes.contains(&2));
+
+        tui.unread_agent_panes.insert(1);
+        tui.set_focus(1, 1).expect("known pane");
+        assert!(!tui.unread_agent_panes.contains(&1));
+
+        tui.unread_agent_panes.insert(2);
+        assert_eq!(
+            tui.jump_to_agent_pane(2, "test"),
+            vec![UiIntent::FocusPane { pane_id: 2 }]
+        );
+        assert!(!tui.unread_agent_panes.contains(&2));
     }
 
     #[test]
