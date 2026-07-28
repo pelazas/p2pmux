@@ -161,6 +161,16 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     );
                 }
             };
+            let live_names = SessionStore::for_current_user()?
+                .list_live()?
+                .into_iter()
+                .map(|session| session.name)
+                .collect();
+            if let Some(name) =
+                crate::session_store::unique_local_name(&member.session_name, &live_names)
+            {
+                descriptor.name = name;
+            }
             let panes = member.pane_server(ticket.session_id().to_vec())?;
             panes.replace_roster_from_layout(&state)?;
             let acceptor = panes.clone();
