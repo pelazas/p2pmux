@@ -33,7 +33,8 @@ use crate::{
         Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
         LayoutSplit, LayoutState, MemberDescriptor, NewPanePosition as ProtocolNewPanePosition,
         PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-        ReleaseControl, RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio,
+        MarkPaneExited, ReleaseControl, RenamePane, RenameTab, SessionSnapshot, SetPaneLock,
+        SetSplitRatio,
         Snapshot, SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
@@ -311,7 +312,8 @@ impl LayoutCoordinator {
         let action_count = action_count
             + usize::from(request.rename_pane.is_some())
             + usize::from(request.rename_tab.is_some())
-            + usize::from(request.set_pane_lock.is_some());
+            + usize::from(request.set_pane_lock.is_some())
+            + usize::from(request.mark_pane_exited.is_some());
         if request_id == 0 || request.base_revision == 0 || action_count != 1 {
             return reject(request_id, LayoutRejectReason::Malformed);
         }
@@ -346,6 +348,8 @@ impl LayoutCoordinator {
             self.rename_tab(authenticated_peer_id, request.base_revision, rename)
         } else if let Some(lock) = request.set_pane_lock {
             self.set_pane_lock(authenticated_peer_id, request.base_revision, lock)
+        } else if let Some(exited) = request.mark_pane_exited {
+            self.mark_pane_exited(authenticated_peer_id, request.base_revision, exited)
         } else {
             Err(LayoutError::InvalidSnapshot)
         };
@@ -676,6 +680,22 @@ impl LayoutCoordinator {
         ))
     }
 
+    fn mark_pane_exited(
+        &mut self,
+        peer: &[u8],
+        revision: u64,
+        exited: MarkPaneExited,
+    ) -> Result<CoordinatorResponse, LayoutError> {
+        if exited.pane_id == 0 {
+            return Err(LayoutError::InvalidSnapshot);
+        }
+        self.state
+            .mark_pane_exited(peer, revision, exited.pane_id)?;
+        Ok(CoordinatorResponse::Commit(
+            self.layout_commit().map_err(layout_error)?,
+        ))
+    }
+
     fn layout_commit(&self) -> Result<LayoutCommit, CoordinatorError> {
         let state = self.protocol_layout_state()?;
         Ok(LayoutCommit {
@@ -827,6 +847,7 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
                 grid_cols: u32::from(pane.grid_cols),
                 title: pane.title,
                 locked: pane.locked,
+                exited: pane.exited,
             })
             .collect(),
         tabs: snapshot
@@ -866,6 +887,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
                     pane_id: pane.pane_id,
                     host_peer_id: pane.host_peer_id.clone(),
                     locked: pane.locked,
+                    exited: pane.exited,
                     grid_rows,
                     grid_cols,
                     title: pane.title.clone(),

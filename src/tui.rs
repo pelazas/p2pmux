@@ -4976,6 +4976,7 @@ impl SharedLayoutRuntime {
                 rename_pane: None,
                 rename_tab: None,
                 set_pane_lock: None,
+                mark_pane_exited: None,
             })?;
         }
         Ok(())
@@ -5042,6 +5043,7 @@ impl SharedLayoutRuntime {
                     rename_pane: None,
                     rename_tab: None,
                     set_pane_lock: None,
+                    mark_pane_exited: None,
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -5059,6 +5061,7 @@ impl SharedLayoutRuntime {
                     rename_pane: None,
                     rename_tab: None,
                     set_pane_lock: None,
+                    mark_pane_exited: None,
                 })?
             }
             UiIntent::SetSplitRatio {
@@ -5087,6 +5090,7 @@ impl SharedLayoutRuntime {
                     rename_pane: None,
                     rename_tab: None,
                     set_pane_lock: None,
+                    mark_pane_exited: None,
                 })?;
             }
             UiIntent::RenamePane { pane_id, title } => {
@@ -5103,6 +5107,7 @@ impl SharedLayoutRuntime {
                     rename_pane: Some(RenamePane { pane_id, title }),
                     rename_tab: None,
                     set_pane_lock: None,
+                    mark_pane_exited: None,
                 })?;
             }
             UiIntent::RenameTab { tab_id, title } => {
@@ -5119,6 +5124,7 @@ impl SharedLayoutRuntime {
                     rename_pane: None,
                     rename_tab: Some(RenameTab { tab_id, title }),
                     set_pane_lock: None,
+                    mark_pane_exited: None,
                 })?;
             }
             UiIntent::SetPaneLock { pane_id, locked } => {
@@ -5176,6 +5182,7 @@ impl SharedLayoutRuntime {
             rename_pane: None,
             rename_tab: None,
             set_pane_lock: None,
+            mark_pane_exited: None,
         })
     }
 
@@ -5211,6 +5218,7 @@ impl SharedLayoutRuntime {
             rename_pane: None,
             rename_tab: None,
             set_pane_lock: Some(SetPaneLock { pane_id, locked }),
+            mark_pane_exited: None,
         };
         if let Err(error) = self.send_request(request) {
             self.pending_locks.remove(&request_id);
@@ -5271,6 +5279,7 @@ impl SharedLayoutRuntime {
             grid_cols: u32::from(pending.grid_cols),
             title: None,
             locked: false,
+            exited: false,
         };
         if let Err(error) = self.panes.register_local_pane(descriptor, pane.channels()) {
             let _ = self.control.try_failed(PaneFailed {
@@ -6235,6 +6244,7 @@ mod tests {
                             pane_id: *pane_id,
                             host_peer_id: b"host".to_vec(),
                             locked: false,
+                            exited: false,
                             grid_rows: *rows,
                             grid_cols: *cols,
                             title: None,
@@ -6780,6 +6790,7 @@ mod tests {
                     grid_cols: 8,
                     title: None,
                     locked: false,
+                    exited: false,
                 },
                 initial.channels(),
             )
@@ -6914,6 +6925,7 @@ mod tests {
             grid_cols: 1,
             title: None,
             locked: false,
+            exited: false,
         };
         host_panes
             .register_local_pane(

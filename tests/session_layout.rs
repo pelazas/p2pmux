@@ -2,8 +2,9 @@ use iroh::{EndpointAddr, SecretKey};
 use p2pmux::{
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, NewPanePosition, PaneFailed,
-        PaneGrid, PaneReady, SetPaneLock, SetSplitRatio, SplitAxis, UpdatePaneGrids,
+        DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, MarkPaneExited,
+        NewPanePosition, PaneFailed, PaneGrid, PaneReady, SetPaneLock, SetSplitRatio, SplitAxis,
+        UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -47,6 +48,7 @@ fn request(request_id: u64, base_revision: u64) -> LayoutRequest {
         rename_pane: None,
         rename_tab: None,
         set_pane_lock: None,
+        mark_pane_exited: None,
     }
 }
 
@@ -150,6 +152,44 @@ fn pane_host_can_set_lock_and_guest_is_rejected() {
         },
     ));
     assert_eq!(rejection.reason, LayoutRejectReason::NotHost as i32);
+}
+
+#[test]
+fn pane_host_marks_exit_idempotently_and_guests_are_rejected() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member admitted");
+    let revision = 2;
+    let first = commit(coordinator.handle_request(
+        &host_a(),
+        LayoutRequest {
+            mark_pane_exited: Some(MarkPaneExited { pane_id: 1 }),
+            ..request(1, revision)
+        },
+    ));
+    assert_eq!(first.revision, revision + 1);
+    assert!(first.state.expect("state").panes[0].exited);
+
+    let repeated = commit(coordinator.handle_request(
+        &host_a(),
+        LayoutRequest {
+            mark_pane_exited: Some(MarkPaneExited { pane_id: 1 }),
+            ..request(2, revision + 1)
+        },
+    ));
+    assert_eq!(repeated.revision, revision + 1);
+    assert_eq!(
+        reject(coordinator.handle_request(
+            &host_b(),
+            LayoutRequest {
+                mark_pane_exited: Some(MarkPaneExited { pane_id: 1 }),
+                ..request(3, revision + 1)
+            },
+        ))
+        .reason,
+        LayoutRejectReason::NotHost as i32
+    );
 }
 
 fn commit(response: CoordinatorResponse) -> LayoutCommit {

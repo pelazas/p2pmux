@@ -116,6 +116,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     grid_cols: u32::from(shell_cols),
                     title: None,
                     locked: false,
+                    exited: false,
                 },
                 initial.channels(),
             )?;
@@ -1054,6 +1055,7 @@ mod tests {
                     grid_cols: 8,
                     title: None,
                     locked: false,
+                    exited: false,
                 },
                 initial.channels(),
             )
@@ -1073,6 +1075,7 @@ mod tests {
                 pane_id: 2,
                 host_peer_id,
                 locked: false,
+                exited: false,
                 grid_rows: 2,
                 grid_cols: 8,
                 title: None,

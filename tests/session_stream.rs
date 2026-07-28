@@ -107,6 +107,7 @@ async fn direct_subscription_streams_a_registered_non_default_pane_without_synth
         grid_cols: 3,
         title: None,
         locked: false,
+        exited: false,
     };
     let mut screen = HostScreen::new(1, 3).expect("screen");
     let (screen_tx, screen_rx) = tokio::sync::watch::channel(screen.current_frame().clone());
@@ -221,6 +222,7 @@ async fn one_viewer_subscribes_to_panes_owned_by_two_different_hosts() {
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     let second_descriptor = PaneDescriptor {
         pane_id: 12,
@@ -229,6 +231,7 @@ async fn one_viewer_subscribes_to_panes_owned_by_two_different_hosts() {
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     let first_screen = HostScreen::new(1, 1).expect("first screen");
     let second_screen = HostScreen::new(1, 1).expect("second screen");
@@ -354,6 +357,7 @@ async fn direct_subscriptions_reject_unknown_nonmember_and_mismatched_hosts() {
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     let unknown_task = {
         let server = server.clone();
@@ -392,6 +396,7 @@ async fn direct_subscriptions_reject_unknown_nonmember_and_mismatched_hosts() {
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     server
         .register_pane(
@@ -475,6 +480,7 @@ async fn rejected_direct_subscriber_cannot_inject_control_into_a_registered_pane
                 grid_cols: 1,
                 title: None,
                 locked: false,
+                exited: false,
             },
             HostPaneChannels {
                 pane_id: pane_wire_id(101),
@@ -578,6 +584,7 @@ async fn pane_server_accept_loop_serves_two_viewers_without_waiting_for_the_firs
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     server
         .register_pane(
@@ -665,6 +672,7 @@ async fn pane_server_retries_an_idle_accept_timeout_before_serving_a_later_conne
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     server
         .register_pane(
@@ -741,6 +749,7 @@ async fn removing_a_pane_disconnects_subscribers_and_blocks_later_control_delive
         grid_cols: 1,
         title: None,
         locked: false,
+        exited: false,
     };
     server
         .register_pane(

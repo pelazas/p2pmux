@@ -174,6 +174,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     grid_cols: u32::from(shell_cols),
                     title: None,
                     locked: false,
+                    exited: false,
                 },
                 initial.channels(),
             )?;

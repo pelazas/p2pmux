@@ -4,7 +4,8 @@ use p2pmux::protocol::{
     LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, MAX_AGENT_CWD_BYTES,
     MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
     MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION,
+    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited, MemberDescriptor, NewPanePosition,
+    PROTOCOL_VERSION,
     PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, ProtocolError,
     SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
     UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
@@ -27,8 +28,8 @@ fn envelope(body: envelope::Body) -> Envelope {
 }
 
 #[test]
-fn protocol_version_is_v7() {
-    assert_eq!(PROTOCOL_VERSION, 7);
+fn protocol_version_is_v8() {
+    assert_eq!(PROTOCOL_VERSION, 8);
 }
 
 #[test]
@@ -73,6 +74,7 @@ fn ratio_and_grid_actions_validate_strictly() {
         rename_pane: None,
         rename_tab: None,
         set_pane_lock: None,
+        mark_pane_exited: None,
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid request");
@@ -100,6 +102,7 @@ fn ratio_and_grid_actions_validate_strictly() {
                 rename_pane: None,
                 rename_tab: None,
                 set_pane_lock: None,
+                mark_pane_exited: None,
             }
         };
         assert!(encode_frame(&envelope(envelope::Body::LayoutRequest(invalid))).is_err());
@@ -124,6 +127,7 @@ fn ratio_and_grid_actions_validate_strictly() {
         rename_pane: None,
         rename_tab: None,
         set_pane_lock: None,
+        mark_pane_exited: None,
     };
     assert!(
         decode_frame(
@@ -150,9 +154,34 @@ fn pane_lock_action_round_trips_and_is_the_only_action() {
             pane_id: 1,
             locked: true,
         }),
+        mark_pane_exited: None,
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid lock request");
+    assert_eq!(
+        decode_frame(&encoded).expect("round trip"),
+        envelope(envelope::Body::LayoutRequest(request))
+    );
+}
+
+#[test]
+fn mark_pane_exited_round_trips_and_is_the_only_action() {
+    let request = LayoutRequest {
+        request_id: 1,
+        base_revision: 1,
+        create_pane: None,
+        delete_pane: None,
+        create_tab: None,
+        delete_tab: None,
+        set_split_ratio: None,
+        update_pane_grids: None,
+        rename_pane: None,
+        rename_tab: None,
+        set_pane_lock: None,
+        mark_pane_exited: Some(MarkPaneExited { pane_id: 1 }),
+    };
+    let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
+        .expect("valid exited request");
     assert_eq!(
         decode_frame(&encoded).expect("round trip"),
         envelope(envelope::Body::LayoutRequest(request))
@@ -483,6 +512,7 @@ fn layout_state(root: LayoutNode) -> LayoutState {
             grid_cols: 80,
             title: None,
             locked: true,
+            exited: false,
         }],
         tabs: vec![TabDescriptor {
             tab_id: 1,
@@ -518,6 +548,7 @@ fn v2_envelopes() -> Vec<Envelope> {
             rename_pane: None,
             rename_tab: None,
             set_pane_lock: None,
+            mark_pane_exited: None,
         })),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
@@ -606,6 +637,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         rename_pane: None,
         rename_tab: None,
         set_pane_lock: None,
+        mark_pane_exited: None,
     };
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
@@ -666,6 +698,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                 grid_cols: 80,
                 title: None,
                 locked: false,
+                exited: false,
             })
             .collect(),
         ..state.clone()
@@ -688,6 +721,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             grid_cols: 80,
             title: None,
             locked: true,
+            exited: false,
         }],
         ..state.clone()
     };
@@ -829,6 +863,7 @@ fn create_pane_axis_and_position_are_validated() {
             rename_pane: None,
             rename_tab: None,
             set_pane_lock: None,
+            mark_pane_exited: None,
         }))
     }
 
@@ -842,6 +877,7 @@ fn create_pane_axis_and_position_are_validated() {
                     grid_cols: 80,
                     title: None,
                     locked: false,
+                    exited: false,
                 },
                 PaneDescriptor {
                     pane_id: 2,
@@ -850,6 +886,7 @@ fn create_pane_axis_and_position_are_validated() {
                     grid_cols: 80,
                     title: None,
                     locked: false,
+                    exited: false,
                 },
             ],
             tabs: vec![TabDescriptor {
@@ -938,6 +975,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         rename_pane: None,
         rename_tab: None,
         set_pane_lock: None,
+        mark_pane_exited: None,
     };
 
     for valid in [
@@ -1177,6 +1215,7 @@ fn layout_state_rejects_empty_duplicate_and_dangling_references() {
                 grid_cols: 80,
                 title: None,
                 locked: false,
+                exited: false,
             },
         ],
         ..state
@@ -1228,6 +1267,7 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
             grid_cols: 80,
             title: None,
             locked: true,
+            exited: false,
         }],
         tabs: vec![TabDescriptor {
             tab_id: 13,

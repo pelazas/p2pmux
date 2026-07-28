@@ -58,6 +58,7 @@ fn initial_state_has_one_tab_and_one_hosted_pane() {
     assert_eq!(snapshot.tabs[0].root, Node::Leaf { pane_id: 1 });
     assert_eq!(snapshot.panes[&1].host_peer_id, HOST_A);
     assert!(!snapshot.panes[&1].locked);
+    assert!(!snapshot.panes[&1].exited);
     assert_eq!(snapshot.members[0].endpoint_addr, ADDR_A);
 }
 
@@ -81,6 +82,37 @@ fn pane_host_can_lock_and_unlock_while_guests_cannot() {
         .set_pane_lock(HOST_A, state.revision(), 1, false)
         .expect("host unlocks pane");
     assert!(!state.pane(1).expect("pane").locked);
+}
+
+#[test]
+fn pane_host_marks_exit_once_and_stale_or_guest_requests_fail() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    let revision = state.revision();
+
+    state
+        .mark_pane_exited(HOST_A, revision, 1)
+        .expect("host marks exit");
+    assert!(state.pane(1).expect("pane").exited);
+    assert_eq!(state.revision(), revision + 1);
+
+    state
+        .mark_pane_exited(HOST_A, state.revision(), 1)
+        .expect("matching revision repeat is a no-op");
+    assert_eq!(state.revision(), revision + 1);
+    assert_eq!(
+        state.mark_pane_exited(HOST_B, state.revision(), 1),
+        Err(LayoutError::NotPaneHost { pane_id: 1 })
+    );
+    assert_eq!(
+        state.mark_pane_exited(HOST_A, revision, 1),
+        Err(LayoutError::StaleRevision {
+            expected: revision + 1,
+            got: revision,
+        })
+    );
 }
 
 #[test]
