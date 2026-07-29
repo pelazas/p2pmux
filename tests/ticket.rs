@@ -10,7 +10,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, SecretKey};
 use p2pmux::rendezvous::{LocalRendezvous, RendezvousError, SHORT_CODE_LEN};
 use p2pmux::ticket::{
-    JoinTicket, MAX_TICKET_PAYLOAD_BYTES, TICKET_PREFIX, TICKET_PREFIX_V2, TicketError,
+    JoinTicket, MAX_TICKET_PAYLOAD_BYTES, TICKET_PREFIX, TICKET_PREFIX_V2, TICKET_PREFIX_V3,
+    TicketError,
 };
 use serde_json::{Value, json};
 
@@ -45,33 +46,67 @@ fn minted_ticket_round_trips_and_is_reusable() {
 
     assert_eq!(first, ticket);
     assert_eq!(second, ticket);
-    assert!(text.starts_with(TICKET_PREFIX_V2));
+    assert!(text.starts_with(TICKET_PREFIX_V3));
     assert_eq!(ticket.endpoint_addr(), &endpoint_addr);
-    assert_eq!(ticket.session_id(), endpoint_addr.id.as_bytes());
 }
 
 #[test]
-fn v1_tickets_still_parse_so_a_peer_can_lag_a_release() {
-    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
+fn a_minted_ticket_carries_a_secret_the_endpoint_id_does_not_reveal() {
+    // The whole point of v3. While session_id *was* the endpoint public key, the ticket
+    // granted nothing: an endpoint id is presented in every TLS handshake and published to
+    // discovery, so anyone who learned it could mint a working ticket for the session.
+    let endpoint_addr = endpoint_addr();
+    let ticket = JoinTicket::mint(endpoint_addr.clone()).expect("ticket should mint");
 
-    let parsed = JoinTicket::from_str(&encode_payload(valid_payload()))
+    assert_ne!(
+        ticket.session_id().as_slice(),
+        endpoint_addr.id.as_bytes().as_slice(),
+        "the join secret must not be derivable from the coordinator's public key"
+    );
+    assert!(!ticket.secret_is_public());
+}
+
+#[test]
+fn two_tickets_for_the_same_endpoint_carry_different_secrets() {
+    // Otherwise the "secret" would just be a slow way of naming the endpoint again.
+    let first = JoinTicket::mint(endpoint_addr()).expect("first ticket should mint");
+    let second = JoinTicket::mint(endpoint_addr()).expect("second ticket should mint");
+
+    assert_ne!(first.session_id(), second.session_id());
+}
+
+#[test]
+fn v1_and_v2_tickets_still_parse_but_are_flagged_as_carrying_no_secret() {
+    // They must keep parsing so a stale ticket produces a join refusal rather than a
+    // parser error, but nothing should mistake them for a credential.
+    let v1 = JoinTicket::from_str(&encode_payload(valid_payload()))
         .expect("a v1 ticket should still parse");
+    assert_eq!(v1.endpoint_addr(), &endpoint_addr());
+    assert!(v1.secret_is_public());
 
-    assert_eq!(parsed, ticket, "both encodings name the same session");
+    let v2 = JoinTicket::from_str(&format!(
+        "{TICKET_PREFIX_V2}{}",
+        URL_SAFE_NO_PAD.encode(
+            postcard::to_allocvec(&endpoint_addr()).expect("endpoint address should encode")
+        )
+    ))
+    .expect("a v2 ticket should still parse");
+    assert!(v2.secret_is_public());
 }
 
 #[test]
-fn v2_is_much_shorter_than_the_v1_encoding_of_the_same_session() {
+fn v3_stays_far_shorter_than_the_v1_encoding_of_the_same_session() {
+    // v3 pays 32 bytes more than v2 for a real secret. That must not undo the win over
+    // v1, which restated session_id as 32 decimal numbers inside JSON.
     let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
 
-    let v2 = ticket.to_string();
+    let v3 = ticket.to_string();
     let v1 = encode_payload(valid_payload());
 
-    // v1 restated session_id as 32 decimal numbers in JSON; v2 derives it from the endpoint ID.
     assert!(
-        v2.len() * 2 < v1.len(),
-        "v2 ({} chars) should be far under half of v1 ({} chars)",
-        v2.len(),
+        v3.len() * 2 < v1.len(),
+        "v3 ({} chars) should be under half of v1 ({} chars)",
+        v3.len(),
         v1.len()
     );
 }
@@ -81,8 +116,6 @@ fn parser_rejects_invalid_ticket_classes_without_echoing_input() {
     let valid = valid_payload();
     let mut short_session = valid.clone();
     short_session["session_id"] = json!(vec![7; 31]);
-    let mut mismatched_session = valid.clone();
-    mismatched_session["session_id"] = json!(vec![8; 32]);
     let mut empty_addresses = valid.clone();
     empty_addresses["endpoint_addr"]["addrs"] = json!([]);
 
@@ -109,10 +142,6 @@ fn parser_rejects_invalid_ticket_classes_without_echoing_input() {
         (
             &encode_payload(short_session),
             TicketError::InvalidSessionId,
-        ),
-        (
-            &encode_payload(mismatched_session),
-            TicketError::SessionMismatch,
         ),
         (
             &encode_payload(empty_addresses),

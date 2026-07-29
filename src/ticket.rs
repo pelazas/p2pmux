@@ -8,21 +8,30 @@ use serde::{Deserialize, Serialize};
 
 /// The verbose original encoding: base64 of JSON. Still parsed, never emitted.
 pub const TICKET_PREFIX: &str = "p2pmux-v1:";
-/// The current encoding: base64 of a postcard-encoded [`EndpointAddr`].
-///
-/// v1 spent roughly a third of its length restating `session_id` as a JSON array of 32 decimal
-/// numbers, even though [`JoinTicket::from_parts`] requires it to equal `endpoint_addr.id`. v2
-/// carries the addresses alone and derives the session ID, which takes a 373-character ticket
-/// under 130. Should the two ever stop being the same value — decoupling them is the obvious
-/// hardening step, since today the join credential is the coordinator's public key — this
-/// becomes a genuine field again and needs a v3 prefix rather than a silent format change.
+/// The second encoding: base64 of a postcard-encoded [`EndpointAddr`] alone. Still parsed,
+/// never emitted; see [`TICKET_PREFIX_V3`] for why it had to be replaced.
 pub const TICKET_PREFIX_V2: &str = "p2pmux-v2:";
+/// The current encoding: base64 of a postcard-encoded [`TicketBody`].
+///
+/// v1 and v2 both defined `session_id` to *be* the coordinator's endpoint public key —
+/// v1 restated it, v2 saved space by deriving it. That made the join credential a public
+/// value: an endpoint id is presented in the TLS handshake and published to discovery, so
+/// anyone who learned it could mint a working ticket and walk into the session. There was
+/// no secret to hold.
+///
+/// v3 carries 32 independent random bytes instead. Knowing who the coordinator is no
+/// longer implies permission to join, which is what makes refusing a peer meaningful —
+/// see `SessionLock`. It also gives revocation and per-pane permissions something to name
+/// later, additively.
+pub const TICKET_PREFIX_V3: &str = "p2pmux-v3:";
 pub const TICKET_VERSION: u8 = 1;
 pub const MAX_TICKET_PAYLOAD_BYTES: usize = 16 * 1024;
 
 /// Whether `input` is a ticket rather than a short local join code.
 pub fn looks_like_ticket(input: &str) -> bool {
-    input.starts_with(TICKET_PREFIX) || input.starts_with(TICKET_PREFIX_V2)
+    input.starts_with(TICKET_PREFIX)
+        || input.starts_with(TICKET_PREFIX_V2)
+        || input.starts_with(TICKET_PREFIX_V3)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,8 +48,8 @@ pub enum TicketErrorClass {
     MalformedPayload,
     UnsupportedVersion,
     InvalidSessionId,
-    SessionMismatch,
     MissingAddresses,
+    Random,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -51,8 +60,8 @@ pub enum TicketError {
     MalformedPayload,
     UnsupportedVersion,
     InvalidSessionId,
-    SessionMismatch,
     MissingAddresses,
+    Random,
 }
 
 impl TicketError {
@@ -64,8 +73,8 @@ impl TicketError {
             Self::MalformedPayload => TicketErrorClass::MalformedPayload,
             Self::UnsupportedVersion => TicketErrorClass::UnsupportedVersion,
             Self::InvalidSessionId => TicketErrorClass::InvalidSessionId,
-            Self::SessionMismatch => TicketErrorClass::SessionMismatch,
             Self::MissingAddresses => TicketErrorClass::MissingAddresses,
+            Self::Random => TicketErrorClass::Random,
         }
     }
 }
@@ -79,8 +88,8 @@ impl fmt::Display for TicketError {
             Self::MalformedPayload => "ticket payload is invalid",
             Self::UnsupportedVersion => "ticket version is unsupported",
             Self::InvalidSessionId => "ticket session ID is invalid",
-            Self::SessionMismatch => "ticket session and endpoint IDs do not match",
             Self::MissingAddresses => "ticket has no transport addresses",
+            Self::Random => "could not generate a session secret",
         };
         formatter.write_str(message)
     }
@@ -95,9 +104,19 @@ struct TicketPayload {
     endpoint_addr: EndpointAddr,
 }
 
+/// The v3 wire body: a secret the holder must present, plus where to present it.
+#[derive(Serialize, Deserialize)]
+struct TicketBody {
+    session_id: [u8; 32],
+    endpoint_addr: EndpointAddr,
+}
+
 impl JoinTicket {
+    /// Mint a ticket for a session, with a freshly generated session secret.
     pub fn mint(endpoint_addr: EndpointAddr) -> Result<Self, TicketError> {
-        Self::from_parts(endpoint_addr.id.as_bytes().to_vec(), endpoint_addr)
+        let mut session_id = [0_u8; 32];
+        getrandom::fill(&mut session_id).map_err(|_| TicketError::Random)?;
+        Self::from_parts(session_id.to_vec(), endpoint_addr)
     }
 
     pub fn from_parts(
@@ -111,13 +130,18 @@ impl JoinTicket {
         if endpoint_addr.is_empty() {
             return Err(TicketError::MissingAddresses);
         }
-        if session_id != *endpoint_addr.id.as_bytes() {
-            return Err(TicketError::SessionMismatch);
-        }
         Ok(Self {
             session_id,
             endpoint_addr,
         })
+    }
+
+    /// True when this ticket's secret is merely the coordinator's public key.
+    ///
+    /// That is what a legacy v1/v2 ticket decodes to, and it means the ticket grants
+    /// nothing a passive observer could not derive for itself.
+    pub fn secret_is_public(&self) -> bool {
+        self.session_id == *self.endpoint_addr.id.as_bytes()
     }
 
     pub fn session_id(&self) -> &[u8; 32] {
@@ -131,11 +155,14 @@ impl JoinTicket {
 
 impl fmt::Display for JoinTicket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let bytes =
-            postcard::to_allocvec(&self.endpoint_addr).expect("endpoint address should serialize");
+        let body = TicketBody {
+            session_id: self.session_id,
+            endpoint_addr: self.endpoint_addr.clone(),
+        };
+        let bytes = postcard::to_allocvec(&body).expect("ticket body should serialize");
         write!(
             formatter,
-            "{TICKET_PREFIX_V2}{}",
+            "{TICKET_PREFIX_V3}{}",
             URL_SAFE_NO_PAD.encode(bytes)
         )
     }
@@ -145,10 +172,17 @@ impl FromStr for JoinTicket {
     type Err = TicketError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if let Some(encoded) = input.strip_prefix(TICKET_PREFIX_V3) {
+            let body: TicketBody = postcard::from_bytes(&decode_payload(encoded)?)
+                .map_err(|_| TicketError::MalformedPayload)?;
+            return Self::from_parts(body.session_id.to_vec(), body.endpoint_addr);
+        }
         if let Some(encoded) = input.strip_prefix(TICKET_PREFIX_V2) {
             let endpoint_addr: EndpointAddr = postcard::from_bytes(&decode_payload(encoded)?)
                 .map_err(|_| TicketError::MalformedPayload)?;
-            // v2 does not carry the session ID; `from_parts` re-derives the invariant v1 stated.
+            // v2 carried no session ID because it *was* the endpoint id. Such a ticket still
+            // parses, but it can only match a session minted under the old rule, so in
+            // practice it now fails at the join check rather than here.
             return Self::from_parts(endpoint_addr.id.as_bytes().to_vec(), endpoint_addr);
         }
         let encoded = input
