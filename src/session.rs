@@ -1840,6 +1840,20 @@ impl HostSession {
             .await?;
         Ok(())
     }
+
+    /// Let a refusal actually reach the peer before the connection is torn down.
+    ///
+    /// `finish()` only marks a stream complete; it does not wait for the bytes to leave.
+    /// The caller closes the connection as soon as the refusal returns an error, and a
+    /// QUIC close is immediate, so on a low-latency path the reject frame usually escapes
+    /// first and on a real internet path it usually does not. The joiner then reports
+    /// "connection lost" and the operator cannot tell a refusal from a crashed host.
+    ///
+    /// Waiting for the joiner to hang up gives the frame its flush. Bounded, because a
+    /// peer that never closes must not hold an accept task open.
+    async fn drain_refusal(&self, connection: &Connection) {
+        let _ = timeout(HANDSHAKE_TIMEOUT, connection.closed()).await;
+    }
 }
 
 /// A coordinator that keeps the shared layout authoritative while each admitted member has one
@@ -2324,6 +2338,7 @@ impl SharedLayoutHost {
                 self.host
                     .refuse_join(join_writer, LayoutRejectReason::Limit)
                     .await?;
+                self.host.drain_refusal(&connection).await;
                 return Err(SessionError::SessionFull);
             }
             let receipt = self
