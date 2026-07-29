@@ -161,6 +161,39 @@ fn local_rendezvous_rejects_unknown_codes_without_echoing_them() {
     fs::remove_dir_all(directory).expect("temporary directory should remove");
 }
 
+#[test]
+fn local_rendezvous_lists_published_codes_and_ignores_other_files() {
+    let directory = temporary_directory();
+    let store = LocalRendezvous::at(directory.clone());
+    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
+
+    let first = store.publish(&ticket).expect("first ticket should publish");
+    let second = store
+        .publish(&ticket)
+        .expect("second ticket should publish");
+    fs::write(directory.join("not-a-code"), b"ignored").expect("stray file should write");
+
+    let mut expected = vec![first.code().to_owned(), second.code().to_owned()];
+    expected.sort();
+    assert_eq!(store.codes().expect("codes should list"), expected);
+
+    drop(first);
+    drop(second);
+    fs::remove_dir_all(directory).expect("temporary directory should remove");
+}
+
+#[test]
+fn local_rendezvous_lists_no_codes_before_any_session_exists() {
+    let store = LocalRendezvous::at(temporary_directory());
+
+    assert!(
+        store
+            .codes()
+            .expect("a missing directory should not be an error")
+            .is_empty()
+    );
+}
+
 static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn temporary_directory() -> std::path::PathBuf {
