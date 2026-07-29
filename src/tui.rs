@@ -2599,7 +2599,7 @@ pub fn render_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", None, None, None);
+    render_shared_multi_pane(frame, tui, screens, "", None, None, None, None);
 }
 
 /// Renders the local attachment footer with its own copy feedback.
@@ -2611,6 +2611,7 @@ pub fn render_multi_pane_with_copy_feedback(
     footer_notice: Option<&str>,
     join_code: Option<&str>,
     local_peer_id: Option<&[u8]>,
+    link: Option<&str>,
 ) {
     let exited_notice = tui
         .snapshot()
@@ -2632,6 +2633,7 @@ pub fn render_multi_pane_with_copy_feedback(
         copied_lines,
         footer_notice.or(exited_notice),
         join_code,
+        link,
     );
 }
 
@@ -3089,6 +3091,7 @@ fn render_shared_multi_pane(
     copied_lines: Option<usize>,
     footer_notice: Option<&str>,
     join_code: Option<&str>,
+    link: Option<&str>,
 ) {
     let theme = &tui.theme;
     let geometry = tui.geometry(frame.area());
@@ -3173,6 +3176,32 @@ fn render_shared_multi_pane(
                 style,
             );
             x = x.saturating_add(text_width(&label));
+        }
+        // `direct 35ms` / `relayed 120ms ×3`, right-aligned. Lives in the tab bar rather
+        // than the footer because the footer is transient -- chords, copy feedback and
+        // status notices all take it over -- and connectivity is exactly the fact you
+        // want on screen at the moment something else has gone wrong.
+        let badge = match (tui.session_locked, link.filter(|link| !link.is_empty())) {
+            (true, Some(link)) => Some(format!("locked · {link}")),
+            (true, None) => Some(String::from("locked")),
+            (false, link) => link.map(str::to_owned),
+        };
+        if let Some(link) = badge.as_deref() {
+            let width = text_width(link);
+            let start = geometry.tab_bar.right().saturating_sub(width);
+            // Never overwrite a tab label: if the tabs already reach that far, the tab
+            // names are the more important thing and the badge simply stands down.
+            if width > 0 && start > x {
+                buffer.set_stringn(
+                    start,
+                    geometry.tab_bar.y,
+                    link,
+                    usize::from(width),
+                    Style::default()
+                        .fg(theme.tab_separator)
+                        .bg(theme.footer_background),
+                );
+            }
         }
     }
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
@@ -4604,6 +4633,25 @@ impl SharedLayoutRuntime {
         &self.status
     }
 
+    /// Which network path each connected peer is actually using, and how far away it is.
+    ///
+    /// Travels the same headless route as `status`: the runtime holds the transport, so
+    /// only it can see this, and only the client can draw it.
+    pub(crate) fn peer_paths(&self) -> Vec<crate::transport::PeerPath> {
+        self.transport.paths()
+    }
+
+    /// Whether this session is currently refusing new peers.
+    ///
+    /// Only the coordinator holds the answer, so a guest reports `false`: its own client
+    /// learns the real state from the layout it is shown, not from here.
+    pub(crate) fn session_locked(&self) -> bool {
+        match &self.control {
+            SharedControl::Host(host) => host.is_session_locked().unwrap_or(false),
+            SharedControl::Member(_) => self.tui.session_locked(),
+        }
+    }
+
     fn exited_footer_notice(&self) -> Option<&'static str> {
         let pane = self.tui.snapshot().panes.get(&self.tui.focused_pane())?;
         if !pane.exited {
@@ -4815,6 +4863,9 @@ impl SharedLayoutRuntime {
                     }
                 }
                 begin_synchronized_output()?;
+                // The legacy foreground path owns the transport directly, so unlike the
+                // node+client split it can read the link state without an IPC hop.
+                let link = crate::transport::link_summary(&self.peer_paths());
                 terminal.draw(|frame| {
                     render_shared_multi_pane(
                         frame,
@@ -4826,6 +4877,7 @@ impl SharedLayoutRuntime {
                             .as_deref()
                             .or_else(|| self.exited_footer_notice()),
                         self.join_code.as_deref(),
+                        link.as_deref(),
                     );
                 })?;
                 end_synchronized_output()?;
@@ -8149,6 +8201,7 @@ mod tests {
                     None,
                     Some("layout request 5 rejected"),
                     Some("TESTCODE"),
+                    None,
                 );
             })
             .expect("draw");
@@ -8224,6 +8277,7 @@ mod tests {
                     None,
                     None,
                     Some("TESTCODE"),
+                    None,
                 );
             })
             .expect("draw");
@@ -8266,6 +8320,7 @@ mod tests {
                     Some("copied join command"),
                     Some("TESTCODE"),
                     None,
+                    None,
                 );
             })
             .expect("draw");
@@ -8295,7 +8350,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 5)).expect("terminal");
         terminal
             .draw(|frame| {
-                render_shared_multi_pane(frame, &tui, &BTreeMap::new(), "", Some(3), None, None);
+                render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "",
+                    Some(3),
+                    None,
+                    None,
+                    None,
+                );
             })
             .expect("draw");
         let footer = (0..120)

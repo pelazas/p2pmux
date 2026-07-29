@@ -163,6 +163,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut next_scrollback_request_id = 1_u64;
     let mut copied_lines = None;
     let mut footer_notice = None;
+    let mut link_summary: Option<String> = None;
     let mut dirty = false;
     let mut node_ended = false;
     let mut attach_error = None;
@@ -344,6 +345,19 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         footer_notice = (!message.is_empty()).then_some(message);
                         dirty = true;
                     }
+                    NodeMessage::SessionLock { locked } => {
+                        if let Some(view) = tui.as_mut() {
+                            view.set_session_locked(locked);
+                            dirty = true;
+                        }
+                    }
+                    NodeMessage::Paths { paths } => {
+                        // An empty list means every peer disconnected, which must clear
+                        // the badge: a stale `direct 30ms` beside a dead session is worse
+                        // than showing nothing.
+                        link_summary = crate::transport::link_summary(&paths);
+                        dirty = true;
+                    }
                     NodeMessage::Rosters { rosters } => {
                         if let Some(view) = tui.as_mut() {
                             announce_agent_completions(
@@ -420,6 +434,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         footer_notice.as_deref(),
                         join_code.as_deref(),
                         Some(&local_peer_id),
+                        link_summary.as_deref(),
                     );
                 })?;
                 let draw_elapsed = draw_started.elapsed();

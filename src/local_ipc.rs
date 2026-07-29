@@ -119,6 +119,20 @@ pub enum NodeMessage {
     Status {
         message: String,
     },
+    /// Which network path each connected peer is on, and its round-trip time.
+    ///
+    /// Only the node can observe this -- it owns the Iroh transport -- and only the
+    /// client draws, so a session that silently fell back to a relay is invisible
+    /// without this message.
+    Paths {
+        paths: Vec<crate::transport::PeerPath>,
+    },
+    /// Whether the coordinator is refusing new peers. Every attached client draws it, but
+    /// only the coordinator's node can know it, so it has to be published rather than
+    /// derived from the layout.
+    SessionLock {
+        locked: bool,
+    },
     Focus {
         tab_id: u64,
         pane_id: u64,

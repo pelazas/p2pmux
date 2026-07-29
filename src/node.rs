@@ -843,6 +843,8 @@ struct AttachmentPublishState {
     leases: Option<Vec<PaneLeaseSnapshot>>,
     rosters: Option<Vec<AgentOverlaySnapshotRow>>,
     status: Option<String>,
+    paths: Option<Vec<crate::transport::PeerPath>>,
+    session_locked: Option<bool>,
     focus: Option<(u64, u64)>,
     screen_sequences: BTreeMap<u64, u64>,
     last_screen_publish: Option<Instant>,
@@ -862,6 +864,8 @@ impl AttachmentPublishState {
         self.leases = None;
         self.rosters = None;
         self.status = None;
+        self.paths = None;
+        self.session_locked = None;
         self.focus = None;
         self.screen_sequences.clear();
         self.pending_screens = true;
@@ -932,6 +936,34 @@ fn queue_updates(
             return Ok(published);
         }
         publish.status = Some(status);
+        published = true;
+    }
+    let paths = node.peer_paths();
+    if publish.paths.as_ref() != Some(&paths) {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Paths {
+                paths: paths.clone(),
+            },
+        )? {
+            return Ok(published);
+        }
+        publish.paths = Some(paths);
+        published = true;
+    }
+    let session_locked = node.session_locked();
+    if publish.session_locked != Some(session_locked) {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::SessionLock {
+                locked: session_locked,
+            },
+        )? {
+            return Ok(published);
+        }
+        publish.session_locked = Some(session_locked);
         published = true;
     }
     if publish.rosters.as_ref() != Some(&rosters) {
@@ -1175,6 +1207,12 @@ impl SharedLayoutNode {
     }
     pub(crate) fn status(&self) -> String {
         self.runtime.status().to_owned()
+    }
+    pub(crate) fn peer_paths(&self) -> Vec<crate::transport::PeerPath> {
+        self.runtime.peer_paths()
+    }
+    pub(crate) fn session_locked(&self) -> bool {
+        self.runtime.session_locked()
     }
     pub(crate) fn snapshot(
         &self,
