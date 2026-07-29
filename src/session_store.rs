@@ -271,13 +271,42 @@ impl SessionStore {
             };
             match self.read(id) {
                 Ok(descriptor) if probe(&descriptor.socket_path) => sessions.push(descriptor),
-                Ok(_) | Err(_) => {
+                Ok(descriptor) => {
+                    let _ = fs::remove_file(&descriptor.socket_path);
+                    let _ = fs::remove_file(path);
+                }
+                Err(_) => {
                     let _ = fs::remove_file(path);
                 }
             }
         }
+        self.sweep_dead_sockets();
         sessions.sort_by_key(|session| session.created_at);
         Ok(sessions)
+    }
+
+    /// Unlinks socket files whose node is gone.
+    ///
+    /// A node only removes its own socket on the way out of `run_background`, so anything
+    /// that dies without unwinding — a crash, a SIGKILL, a reboot leaving /tmp behind —
+    /// leaks one, and they accumulate indefinitely.
+    ///
+    /// Failure to connect is the test, not absence of a descriptor: `run_background` binds
+    /// the listener before it writes the record, so a session that is still starting up has
+    /// a live socket and no record yet, and must not be swept.
+    fn sweep_dead_sockets(&self) {
+        let Ok(entries) = fs::read_dir(&self.socket_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("sock") {
+                continue;
+            }
+            if UnixStream::connect(&path).is_err() {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     pub fn rename(&self, old: &str, new: &str) -> io::Result<SessionDescriptor> {
@@ -481,6 +510,35 @@ mod tests {
             .unwrap();
         assert!(store.list_live().unwrap().is_empty());
         assert!(store.read(&id).is_err());
+    }
+
+    #[test]
+    fn dead_sockets_are_swept_but_a_bound_one_without_a_record_survives() {
+        use std::os::unix::net::UnixListener;
+
+        let root = PathBuf::from(format!("/tmp/p2pmux-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = SessionStore::at(root.join("s"), root.join("k"));
+
+        // Left behind by a node that died without unwinding: a plain file, nothing bound.
+        let abandoned = store.socket_path(&generate_id().unwrap()).unwrap();
+        fs::write(&abandoned, b"").unwrap();
+        // A node that has bound its listener but has not written its descriptor yet.
+        let starting = store.socket_path(&generate_id().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&starting).unwrap();
+        // Not ours; left alone whatever its state.
+        let unrelated = store.socket_dir.join("notes.txt");
+        fs::write(&unrelated, b"").unwrap();
+
+        assert!(store.list_live().unwrap().is_empty());
+
+        assert!(!abandoned.exists(), "dead socket should have been swept");
+        assert!(starting.exists(), "a bound socket must survive the sweep");
+        assert!(
+            unrelated.exists(),
+            "non-socket files are not ours to delete"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

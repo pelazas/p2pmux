@@ -42,9 +42,22 @@ use crate::tui::SharedLayoutRuntime;
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
 const ATTACHED_IDLE_BACKOFF: Duration = Duration::from_millis(1);
 const DETACHED_IDLE_BACKOFF: Duration = Duration::from_millis(16);
+// A node with no local client still drains for remote guests, so it cannot simply sleep.
+// It can slow down once nothing has happened for a while: the cost is that the wake-up
+// after a quiet spell (a guest's first keystroke, or a local attach) is noticed up to
+// `DETACHED_QUIET_BACKOFF` late, after which `did_work` puts the loop back to full rate.
+const DETACHED_QUIET_BACKOFF: Duration = Duration::from_millis(100);
+const DETACHED_QUIET_AFTER: Duration = Duration::from_secs(2);
 const SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 const TARGET_SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(8);
 const TARGET_SCREEN_URGENCY_TTL: Duration = Duration::from_millis(64);
+// The client socket read blocks for a millisecond at most, so the loop turns about a
+// thousand times a second while a pane is producing output. Every turn used to call
+// `node.drain()`, which parses and diffs each pane's screen, but `screens_due` only lets a
+// frame reach the client once per `TARGET_SCREEN_PUBLISH_INTERVAL`. The extra drains built
+// frames that were immediately superseded, so pace the periodic drain to the publish
+// cadence. Input still drains immediately, which is what keystroke echo depends on.
+const PERIODIC_DRAIN_INTERVAL: Duration = TARGET_SCREEN_PUBLISH_INTERVAL;
 const MAX_FROZEN_SCROLLBACK_SESSIONS: usize = 8;
 const OUTBOUND_QUEUE: usize = 64;
 
@@ -217,6 +230,8 @@ fn run_socket_loop(
     let mut client: Option<AttachedClient> = None;
     let mut frozen_scrollback = BTreeMap::<u64, FrozenScrollback>::new();
     let mut next_history_id = 1_u64;
+    let mut last_periodic_drain: Option<Instant> = None;
+    let mut last_work = Instant::now();
     loop {
         let mut shutdown = false;
         let mut did_work = false;
@@ -317,10 +332,15 @@ fn run_socket_loop(
             }
         }
         let drain_started = Instant::now();
-        let mut changed = node
-            .drain()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let mut drain_elapsed = drain_started.elapsed();
+        let mut changed = false;
+        let mut drain_elapsed = Duration::ZERO;
+        if periodic_drain_due(last_periodic_drain, drain_started) {
+            last_periodic_drain = Some(drain_started);
+            changed = node
+                .drain()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            drain_elapsed = drain_started.elapsed();
+        }
         did_work |= changed;
         let mut detached = false;
         let mut full_snapshot = false;
@@ -338,6 +358,7 @@ fn run_socket_loop(
                         crate::perf::log(&format!("P2PMUX_PERF id={perf_id} node_input"));
                     }
                     let drain_started = Instant::now();
+                    last_periodic_drain = Some(drain_started);
                     changed |= node
                         .drain()
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -505,7 +526,11 @@ fn run_socket_loop(
         if shutdown {
             return Ok(());
         }
-        match socket_loop_backoff(client.is_some(), did_work) {
+        let now = Instant::now();
+        if did_work {
+            last_work = now;
+        }
+        match socket_loop_backoff(client.is_some(), did_work, now.duration_since(last_work)) {
             Some(backoff) => std::thread::sleep(backoff),
             None => std::thread::yield_now(),
         }
@@ -530,10 +555,23 @@ impl FrozenScrollback {
     }
 }
 
-fn socket_loop_backoff(client_attached: bool, did_work: bool) -> Option<Duration> {
+/// Whether the loop should run the periodic (non-input) drain this turn.
+///
+/// Client input drains straight away and stamps `last_drain` itself, so a burst of
+/// keystrokes never waits on this.
+fn periodic_drain_due(last_drain: Option<Instant>, now: Instant) -> bool {
+    last_drain.is_none_or(|last| now.duration_since(last) >= PERIODIC_DRAIN_INTERVAL)
+}
+
+fn socket_loop_backoff(
+    client_attached: bool,
+    did_work: bool,
+    quiet_for: Duration,
+) -> Option<Duration> {
     match (client_attached, did_work) {
         (true, true) => None,
         (true, false) => Some(ATTACHED_IDLE_BACKOFF),
+        (false, false) if quiet_for >= DETACHED_QUIET_AFTER => Some(DETACHED_QUIET_BACKOFF),
         (false, _) => Some(DETACHED_IDLE_BACKOFF),
     }
 }
@@ -1294,16 +1332,55 @@ mod tests {
 
     #[test]
     fn socket_loop_uses_short_attached_backoff() {
-        assert_eq!(socket_loop_backoff(true, true), None);
+        assert_eq!(socket_loop_backoff(true, true, Duration::ZERO), None);
         assert_eq!(
-            socket_loop_backoff(true, false),
+            socket_loop_backoff(true, false, Duration::ZERO),
             Some(Duration::from_millis(1))
         );
         assert_eq!(
-            socket_loop_backoff(false, false),
+            socket_loop_backoff(false, false, Duration::ZERO),
             Some(Duration::from_millis(16))
         );
         assert!(FIRST_MESSAGE_TIMEOUT <= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn a_detached_node_slows_down_only_after_a_quiet_spell() {
+        // Still serving remote guests, so recent work keeps it at the fast rate.
+        assert_eq!(
+            socket_loop_backoff(false, true, DETACHED_QUIET_AFTER * 10),
+            Some(DETACHED_IDLE_BACKOFF)
+        );
+        assert_eq!(
+            socket_loop_backoff(
+                false,
+                false,
+                DETACHED_QUIET_AFTER - Duration::from_millis(1)
+            ),
+            Some(DETACHED_IDLE_BACKOFF)
+        );
+        assert_eq!(
+            socket_loop_backoff(false, false, DETACHED_QUIET_AFTER),
+            Some(DETACHED_QUIET_BACKOFF)
+        );
+        // An attached client is never slowed, however long it has sat idle.
+        assert_eq!(
+            socket_loop_backoff(true, false, DETACHED_QUIET_AFTER * 10),
+            Some(ATTACHED_IDLE_BACKOFF)
+        );
+    }
+
+    #[test]
+    fn periodic_drain_is_paced_to_the_publish_cadence() {
+        let now = Instant::now();
+        assert!(periodic_drain_due(None, now));
+        assert!(!periodic_drain_due(
+            Some(now),
+            now + PERIODIC_DRAIN_INTERVAL - Duration::from_millis(1),
+        ));
+        assert!(periodic_drain_due(Some(now), now + PERIODIC_DRAIN_INTERVAL));
+        // Draining faster than the client can be sent frames is wasted parse/diff work.
+        assert!(PERIODIC_DRAIN_INTERVAL >= TARGET_SCREEN_PUBLISH_INTERVAL);
     }
 
     #[test]

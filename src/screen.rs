@@ -195,11 +195,21 @@ impl vt100::Callbacks for BellCounter {
 
 pub struct HostScreen {
     parser: vt100::Parser<BellCounter>,
-    previous: vt100::Screen,
+    /// Baseline for `state_diff`, held one batch behind `parser`.
+    ///
+    /// This used to be a clone of the live screen, but `vt100::Screen::clone` copies the
+    /// whole row buffer including up to `SCROLLBACK_LINES` retained rows: measured at
+    /// 7.9ms for 24x80 and 26ms for 60x200 once scrollback fills, per frame, per pane.
+    /// `state_diff` only ever reads `visible_rows()`, so a scrollback-free parser replaying
+    /// the same bytes is an equivalent baseline and costs one extra parse of the batch.
+    previous: vt100::Parser,
     current: ScreenFrame,
     kitty_keyboard: KittyKeyboardTracker,
     history_floor: u64,
     history_end: u64,
+    /// Retained scrollback rows, tracked here because reading it from the screen means
+    /// moving the scrollback offset, which needs `&mut` that `history_metadata` lacks.
+    retained_scrollback: usize,
 }
 
 impl HostScreen {
@@ -207,11 +217,10 @@ impl HostScreen {
         validate_dimensions(rows, cols)?;
         let parser =
             vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, BellCounter::default());
-        let previous = parser.screen().clone();
         let snapshot = snapshot_payload(parser.screen())?;
         Ok(Self {
             parser,
-            previous,
+            previous: vt100::Parser::new(rows, cols, 0),
             current: ScreenFrame {
                 sequence: 1,
                 base_sequence: 0,
@@ -222,14 +231,16 @@ impl HostScreen {
             kitty_keyboard: KittyKeyboardTracker::default(),
             history_floor: 0,
             history_end: 0,
+            retained_scrollback: 0,
         })
     }
 
     pub fn process_pty(&mut self, bytes: &[u8]) -> Result<ScreenFrame, ScreenError> {
-        let before_history = screen_scrollback_len(self.parser.screen());
+        let before_history = self.retained_scrollback;
         self.kitty_keyboard.observe(bytes);
         self.parser.process(bytes);
-        let after_history = screen_scrollback_len(self.parser.screen());
+        let after_history = retained_scrollback_len(self.parser.screen_mut());
+        self.retained_scrollback = after_history;
         let appended = after_history.saturating_sub(before_history).max(
             usize::from(before_history == SCROLLBACK_LINES && after_history == SCROLLBACK_LINES)
                 * bytes.iter().filter(|byte| **byte == b'\n').count(),
@@ -241,7 +252,7 @@ impl HostScreen {
             .checked_add(1)
             .ok_or(ScreenError::SequenceExhausted)?;
         let snapshot = snapshot_payload(self.parser.screen())?;
-        let delta = self.parser.screen().state_diff(&self.previous);
+        let delta = self.parser.screen().state_diff(self.previous.screen());
         // A large batch can outgrow the wire delta cap; fall back to the
         // snapshot-only frame shape (as resize does) so consumers replace
         // their screen instead of patching it.
@@ -257,7 +268,8 @@ impl HostScreen {
             delta: Arc::from(delta),
             kitty_keyboard_active: self.kitty_keyboard.active(),
         };
-        self.previous = self.parser.screen().clone();
+        // Catch the baseline up to the live screen by replaying the same batch.
+        self.previous.process(bytes);
         self.current = frame.clone();
         Ok(frame)
     }
@@ -271,7 +283,14 @@ impl HostScreen {
             .checked_add(1)
             .ok_or(ScreenError::SequenceExhausted)?;
         self.parser.screen_mut().set_size(rows, cols);
-        self.previous = self.parser.screen().clone();
+        // Replaying the batch keeps the baseline in step everywhere except here: `set_size`
+        // reflows against the retained row buffer, which the scrollback-free baseline does
+        // not have. Rebuild it from the live visible state instead, exactly as the client
+        // rebuilds from the snapshot this frame carries.
+        self.previous = vt100::Parser::new(rows, cols, 0);
+        self.previous
+            .process(&self.parser.screen().state_formatted());
+        self.retained_scrollback = retained_scrollback_len(self.parser.screen_mut());
         self.history_floor = self.history_end;
         let frame = ScreenFrame {
             sequence,
@@ -307,9 +326,7 @@ impl HostScreen {
         if self.parser.screen().alternate_screen() {
             return (0, 0);
         }
-        let mut screen = self.parser.screen().clone();
-        screen.set_scrollback(SCROLLBACK_LINES);
-        let retained = screen.scrollback() as u64;
+        let retained = self.retained_scrollback as u64;
         let first = self
             .history_end
             .saturating_sub(retained)
@@ -334,7 +351,7 @@ impl HostScreen {
         let first = last.saturating_sub(max_rows as u64);
         let mut rows = Vec::new();
         let mut bytes = 0_usize;
-        let retained = screen_scrollback_len(self.parser.screen()) as u64;
+        let retained = self.retained_scrollback as u64;
         let retained_start = history_end.saturating_sub(retained);
         let available_start = history_end.saturating_sub(total_rows);
         let mut screen = self.parser.screen().clone();
@@ -365,10 +382,17 @@ impl HostScreen {
     }
 }
 
-fn screen_scrollback_len(screen: &vt100::Screen) -> usize {
-    let mut screen = screen.clone();
+/// Retained scrollback rows, read by clamping the scrollback offset and restoring it.
+///
+/// `set_scrollback` clamps to the retained length and both it and `scrollback` are O(1)
+/// field accesses, so this reads the same number the old `screen.clone()` did without
+/// copying the row buffer.
+fn retained_scrollback_len(screen: &mut vt100::Screen) -> usize {
+    let restore = screen.scrollback();
     screen.set_scrollback(SCROLLBACK_LINES);
-    screen.scrollback()
+    let retained = screen.scrollback();
+    screen.set_scrollback(restore);
+    retained
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -515,6 +539,95 @@ mod tests {
 
         screen.process_pty(b"\x07\x07").expect("processed");
         assert_eq!(screen.take_bell_count(), 2);
+    }
+
+    /// Output shaped like a busy agent pane: colour, cursor moves, redraws, and an
+    /// alternate-screen excursion. `lines` past `SCROLLBACK_LINES` pushes retention to its cap.
+    fn agent_like_batches(lines: usize) -> Vec<Vec<u8>> {
+        let mut batches = Vec::new();
+        for i in 0..lines {
+            batches.push(
+                format!("line {i} \x1b[32mgreen\x1b[0m \x1b[1mbold\x1b[0m padding text\r\n")
+                    .into_bytes(),
+            );
+            if i % 500 == 0 {
+                batches.push(b"\x1b[H\x1b[2J\x1b[3;10Hredrawn header\r\n".to_vec());
+            }
+            if i == 6_000 {
+                batches.push(b"\x1b[?1049h\x1b[2Jalternate screen\r\n".to_vec());
+                batches.push(b"more alt\r\n".to_vec());
+                batches.push(b"\x1b[?1049l".to_vec());
+            }
+        }
+        batches
+    }
+
+    #[test]
+    fn scrollback_free_baseline_produces_the_same_deltas_as_a_cloned_screen() {
+        let mut host = HostScreen::new(24, 80).expect("valid dimensions");
+        // The baseline this replaces: a full clone of the live screen after every batch.
+        let mut reference = vt100::Parser::new(24, 80, super::SCROLLBACK_LINES);
+        let mut reference_previous = reference.screen().clone();
+
+        // Deliberately short: the reference clones the whole screen per batch, which is the
+        // cost this change exists to remove. Scrollback-depth coverage lives in the guest
+        // round-trip test below, which needs no clones.
+        for (index, batch) in agent_like_batches(600).into_iter().enumerate() {
+            let frame = host.process_pty(&batch).expect("processed");
+            reference.process(&batch);
+            let expected = reference.screen().state_diff(&reference_previous);
+            reference_previous = reference.screen().clone();
+            assert_eq!(
+                frame.delta.as_ref(),
+                expected.as_slice(),
+                "delta diverged from the cloned baseline at batch {index}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_guest_following_deltas_across_a_resize_matches_the_host() {
+        let mut host = HostScreen::new(24, 80).expect("valid dimensions");
+        let mut guest = super::GuestScreen::new();
+        let first = host.process_pty(b"first line\r\n").expect("processed");
+        guest
+            .apply_snapshot(first.sequence, &first.snapshot)
+            .expect("snapshot applies");
+
+        // Past SCROLLBACK_LINES so retention sits at its cap for most of the run.
+        let mut resized = false;
+        for batch in agent_like_batches(12_100) {
+            let frame = host.process_pty(&batch).expect("processed");
+            follow(&mut guest, &frame);
+            if !resized {
+                // A resize reflows the host against its retained rows, which the baseline
+                // does not keep; the deltas after it still have to line up.
+                let frame = host.resize(40, 100).expect("valid dimensions");
+                follow(&mut guest, &frame);
+                resized = true;
+            }
+        }
+
+        assert!(resized);
+        assert_eq!(
+            guest.screen().expect("guest screen").contents(),
+            host.screen().contents(),
+        );
+    }
+
+    fn follow(guest: &mut super::GuestScreen, frame: &super::ScreenFrame) {
+        let applied = if frame.base_sequence == 0 {
+            super::ApplyDelta::NeedsSnapshot
+        } else {
+            guest
+                .apply_delta(frame.base_sequence, frame.sequence, &frame.delta)
+                .expect("delta applies")
+        };
+        if applied == super::ApplyDelta::NeedsSnapshot {
+            guest
+                .apply_snapshot(frame.sequence, &frame.snapshot)
+                .expect("snapshot applies");
+        }
     }
 
     #[test]
