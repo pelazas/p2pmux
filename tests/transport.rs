@@ -155,7 +155,11 @@ async fn a_live_connection_is_reported_as_a_direct_path_on_both_sides() {
     );
 
     let host_paths = host.paths();
-    assert_eq!(host_paths.len(), 1, "accepted connections must be observed too");
+    assert_eq!(
+        host_paths.len(),
+        1,
+        "accepted connections must be observed too"
+    );
     assert_eq!(host_paths[0].peer_id, client_id.as_bytes().to_vec());
     assert_eq!(host_paths[0].kind, PathKind::Direct);
 

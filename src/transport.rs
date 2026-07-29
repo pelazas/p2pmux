@@ -109,14 +109,18 @@ pub fn link_summary(paths: &[PeerPath]) -> Option<String> {
     })
 }
 
+/// One observation of a peer's path: which kind it is, and its round-trip estimate --
+/// absent until QUIC has measured one.
+type PathSample = (PathKind, Option<u64>);
+
 /// Live per-peer path state, shared between the observer tasks and whoever renders it.
 #[derive(Clone, Default)]
 pub struct PathRegistry {
-    entries: Arc<Mutex<BTreeMap<[u8; 32], (PathKind, Option<u64>)>>>,
+    entries: Arc<Mutex<BTreeMap<[u8; 32], PathSample>>>,
 }
 
 impl PathRegistry {
-    fn record(&self, peer: [u8; 32], sample: (PathKind, Option<u64>)) {
+    fn record(&self, peer: [u8; 32], sample: PathSample) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(peer, sample);
         }
@@ -145,7 +149,7 @@ impl PathRegistry {
 }
 
 /// The selected path's kind and RTT, or `None` before any path has been selected.
-fn sample_path(connection: &Connection) -> Option<(PathKind, Option<u64>)> {
+fn sample_path(connection: &Connection) -> Option<PathSample> {
     let paths = connection.paths();
     let selected = paths.iter().find(|path| path.is_selected())?;
     let kind = match selected.remote_addr() {

@@ -2603,6 +2603,7 @@ pub fn render_multi_pane(
 }
 
 /// Renders the local attachment footer with its own copy feedback.
+#[allow(clippy::too_many_arguments)]
 pub fn render_multi_pane_with_copy_feedback(
     frame: &mut Frame<'_>,
     tui: &MultiPaneTui,
@@ -3083,6 +3084,7 @@ fn render_contextual_footer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_shared_multi_pane(
     frame: &mut Frame<'_>,
     tui: &MultiPaneTui,
@@ -11398,10 +11400,7 @@ mod tests {
             area,
         );
         assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
-                area
-            ),
+            tui.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT), area),
             KeyHandling::Consumed(vec![UiIntent::SetSessionLock { locked: true }]),
             "Shift+L should offer to lock a session that is currently open"
         );
@@ -11413,10 +11412,7 @@ mod tests {
             area,
         );
         assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
-                area
-            ),
+            tui.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT), area),
             KeyHandling::Consumed(vec![UiIntent::SetSessionLock { locked: false }]),
             "and to unlock one that is locked"
         );

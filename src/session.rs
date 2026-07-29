@@ -2331,7 +2331,10 @@ impl SharedLayoutHost {
     /// Only the coordinator can do this, because only the coordinator answers joins.
     /// Returns the resulting state so a caller can report it without a second lookup.
     pub fn set_session_lock(&self, locked: bool) -> Result<bool, SessionError> {
-        let mut coordinator = self.coordinator.lock().map_err(|_| SessionError::PeerTask)?;
+        let mut coordinator = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?;
         coordinator.set_locked(locked);
         Ok(coordinator.is_locked())
     }

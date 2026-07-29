@@ -783,7 +783,10 @@ fn a_new_session_is_open_and_the_lock_toggles() {
     let mut coordinator = coordinator();
 
     assert!(!coordinator.is_locked(), "sessions start open");
-    assert!(coordinator.set_locked(true), "locking an open session changes it");
+    assert!(
+        coordinator.set_locked(true),
+        "locking an open session changes it"
+    );
     assert!(coordinator.is_locked());
     assert!(
         !coordinator.set_locked(true),
@@ -808,7 +811,7 @@ fn locking_governs_the_door_without_evicting_anyone() {
         "an already-admitted peer must still be recognised while locked"
     );
     assert!(
-        !coordinator.is_admitted(&endpoint(3, 4103).id.as_bytes().to_vec()),
+        !coordinator.is_admitted(endpoint(3, 4103).id.as_bytes().as_ref()),
         "a peer that never joined is not admitted by locking"
     );
 }
