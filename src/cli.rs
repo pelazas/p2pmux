@@ -16,7 +16,7 @@ use crate::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
         layout_snapshot_from_state,
     },
-    ticket::{JoinTicket, TICKET_PREFIX},
+    ticket::{JoinTicket, looks_like_ticket},
     transport::Transport,
 };
 
@@ -49,6 +49,11 @@ enum Command {
         ticket: String,
         #[arg(long)]
         name: Option<String>,
+    },
+    /// Print the full reusable join ticket for a live local session.
+    Ticket {
+        /// The join code shown in the session footer. Omit it when one session is live.
+        code: Option<String>,
     },
     /// Attach a live local session by memorable name.
     Attach { name: String },
@@ -84,6 +89,9 @@ const TRUST_WARNING: &str = "TRUST WARNING: This is a fully trusted shared-shell
 Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege Mac account and avoid production credentials in shared panes.
 
 Processes and credential files stay on the pane host's Mac (not uploaded to peers). That does not stop a controller from using or displaying them via the shared shell.";
+
+/// The short form of `TRUST_WARNING`, for a command whose stdout is meant to be piped.
+const TICKET_WARNING: &str = "TRUST WARNING: this ticket grants full shared-shell access to the session for as long as it lives, to anyone who holds it. Share it only with people you trust with that access.";
 
 #[derive(Debug)]
 struct CliError(&'static str);
@@ -323,6 +331,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             guest_result.map_err(io::Error::other)?;
             Ok(())
         }
+        Some(Command::Ticket { code }) => print_join_ticket(code),
         Some(Command::Attach { name }) => crate::client::run(&find_live(&name)?),
         Some(Command::Kill { name, yes }) => {
             let descriptor = find_live(&name)?;
@@ -539,15 +548,59 @@ fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn
 }
 
 fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
-    if input.starts_with(TICKET_PREFIX) {
+    if looks_like_ticket(input) {
         return JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"));
     }
     LocalRendezvous::for_current_user()
         .and_then(|store| store.resolve(input))
-        .map_err(|error| match error {
-            RendezvousError::NotFound => CliError("join code was not found on this Mac"),
-            _ => CliError("invalid ticket format"),
-        })
+        .map_err(rendezvous_error)
+}
+
+/// Print the portable join ticket for a session created on this Mac.
+///
+/// The short code only resolves through this Mac's local cache, so it is useless to a peer on
+/// another machine. The ticket is the portable form, and until a hosted rendezvous exists this
+/// command is the only way to obtain one. It goes to stdout alone so `p2pmux ticket | pbcopy`
+/// yields something directly pasteable.
+fn print_join_ticket(code: Option<String>) -> Result<(), Box<dyn Error>> {
+    let store = LocalRendezvous::for_current_user().map_err(rendezvous_error)?;
+    let code = match code {
+        Some(code) => code,
+        None => sole_local_code(&store)?,
+    };
+    let ticket = store.resolve(&code).map_err(rendezvous_error)?;
+    {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "{TICKET_WARNING}\n")?;
+        stderr.flush()?;
+    }
+    println!("{ticket}");
+    Ok(())
+}
+
+/// The one code published here, when leaving it off is unambiguous.
+fn sole_local_code(store: &LocalRendezvous) -> Result<String, CliError> {
+    let mut codes = store.codes().map_err(rendezvous_error)?;
+    match codes.len() {
+        0 => Err(CliError(
+            "no session was created on this Mac; run p2pmux create first",
+        )),
+        1 => Ok(codes.remove(0)),
+        _ => Err(CliError(
+            "several sessions are live on this Mac; pass the join code from the session footer",
+        )),
+    }
+}
+
+/// Describe a rendezvous failure without ever echoing the code that caused it.
+fn rendezvous_error(error: RendezvousError) -> CliError {
+    match error {
+        RendezvousError::NotFound => CliError("join code was not found on this Mac"),
+        RendezvousError::InvalidCode | RendezvousError::InvalidRecord => {
+            CliError("invalid ticket format")
+        }
+        _ => CliError("local rendezvous store is unavailable"),
+    }
 }
 
 fn wait_for_enter() -> io::Result<()> {

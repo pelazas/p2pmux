@@ -115,7 +115,29 @@ discard that frozen history. Local IPC is intentionally versioned as an implemen
 restart an existing session after upgrading when attach protocol changes are present.
 Short join codes resolve through a restrictive local cache on the same Mac, so they are for current
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
-it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
+it exits. A peer on another machine cannot resolve one.
+
+To invite someone on another Mac, use the full `p2pmux-v2:` ticket, which `join` also accepts:
+
+```text
+p2pmux ticket            # the one session live on this Mac
+p2pmux ticket <code>     # when several are live; the code is in the session footer
+```
+
+From inside a session, `Ctrl+P`, then `i` copies the same ticket straight to the clipboard and
+flashes `copied full ticket` in the footer. That overlay text is local chrome, so unlike running
+the command in a shared pane it is not visible to the other members. Only a coordinator has a
+ticket to copy; a guest is told so.
+
+The ticket is printed to stdout on its own, so `p2pmux ticket | pbcopy` gives you something
+directly pasteable. Treat it as a password: it grants full shared-shell access to the session, to
+anyone holding it, for as long as the session lives. There is no hosted rendezvous yet, so this is
+the portable invite until one exists.
+
+Tickets are emitted as `p2pmux-v2:` — roughly 66 characters for a typical session, against about
+370 for the original `p2pmux-v1:` form, which restated the session ID as a JSON array of 32
+decimal numbers even though it is required to equal the endpoint ID. `join` still accepts v1
+tickets, so a peer one release behind can be invited without upgrading first.
 
 Only one peer controls a pane while they are actively typing. After about thirty seconds without
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key
@@ -167,6 +189,8 @@ prompt does not report mouse, so nothing changes there.
   focused pane. Its local PTY inherits the target pane’s cwd when that pane is hosted locally by
   the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
+- `Ctrl+P`, then `i` — copy this session’s full join ticket to the clipboard, for inviting
+  someone on another Mac. Coordinator only.
 - `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
   cancels; a blank title restores `Pane #N`.
 - `Ctrl+P`, then arrows — move focus.
@@ -187,7 +211,7 @@ soft-green border; Tab mode dims inactive tab labels. Click tab labels to switch
 claiming control or sending input. Mouse wheel scrolls pane history locally unless the focused
 pane's program reports mouse, in which case the wheel reaches that program. The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`; pane mode is
-`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK`; tab mode is
+`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <i> INVITE   <Esc> BACK`; tab mode is
 `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 For locally hosted panes, mouse-wheel scrollback is loaded from the host on demand when you first

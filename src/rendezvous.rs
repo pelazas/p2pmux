@@ -121,6 +121,26 @@ impl LocalRendezvous {
             .map_err(ticket_error_to_rendezvous_error)
     }
 
+    /// The join codes published on this Mac, sorted.
+    ///
+    /// A missing directory means no session has been created here yet, which is an ordinary
+    /// state rather than a failure. Names that are not codes are ignored so an unrelated file
+    /// dropped in the cache cannot make the whole listing unusable.
+    pub fn codes(&self) -> Result<Vec<String>, RendezvousError> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(RendezvousError::Io),
+        };
+        let mut codes: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| validate_code(name).is_ok())
+            .collect();
+        codes.sort();
+        Ok(codes)
+    }
+
     fn ensure_directory(&self) -> Result<(), RendezvousError> {
         fs::create_dir_all(&self.directory).map_err(|_| RendezvousError::Io)?;
         restrict_directory(&self.directory).map_err(|_| RendezvousError::Io)

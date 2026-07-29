@@ -9,7 +9,9 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, SecretKey};
 use p2pmux::rendezvous::{LocalRendezvous, RendezvousError, SHORT_CODE_LEN};
-use p2pmux::ticket::{JoinTicket, MAX_TICKET_PAYLOAD_BYTES, TICKET_PREFIX, TicketError};
+use p2pmux::ticket::{
+    JoinTicket, MAX_TICKET_PAYLOAD_BYTES, TICKET_PREFIX, TICKET_PREFIX_V2, TicketError,
+};
 use serde_json::{Value, json};
 
 fn endpoint_addr() -> EndpointAddr {
@@ -17,18 +19,13 @@ fn endpoint_addr() -> EndpointAddr {
         .with_ip_addr(SocketAddr::from(([127, 0, 0, 1], 4242)))
 }
 
+/// A well-formed v1 body. Built directly rather than from `Display`, which now emits v2.
 fn valid_payload() -> Value {
-    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
-    let text = ticket.to_string();
-    let encoded = text
-        .strip_prefix(TICKET_PREFIX)
-        .expect("ticket should have the version prefix");
-    serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(encoded)
-            .expect("ticket should decode"),
-    )
-    .expect("ticket should contain JSON")
+    json!({
+        "version": 1,
+        "session_id": endpoint_addr().id.as_bytes().to_vec(),
+        "endpoint_addr": endpoint_addr(),
+    })
 }
 
 fn encode_payload(payload: Value) -> String {
@@ -48,9 +45,35 @@ fn minted_ticket_round_trips_and_is_reusable() {
 
     assert_eq!(first, ticket);
     assert_eq!(second, ticket);
-    assert!(text.starts_with(TICKET_PREFIX));
+    assert!(text.starts_with(TICKET_PREFIX_V2));
     assert_eq!(ticket.endpoint_addr(), &endpoint_addr);
     assert_eq!(ticket.session_id(), endpoint_addr.id.as_bytes());
+}
+
+#[test]
+fn v1_tickets_still_parse_so_a_peer_can_lag_a_release() {
+    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
+
+    let parsed = JoinTicket::from_str(&encode_payload(valid_payload()))
+        .expect("a v1 ticket should still parse");
+
+    assert_eq!(parsed, ticket, "both encodings name the same session");
+}
+
+#[test]
+fn v2_is_much_shorter_than_the_v1_encoding_of_the_same_session() {
+    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
+
+    let v2 = ticket.to_string();
+    let v1 = encode_payload(valid_payload());
+
+    // v1 restated session_id as 32 decimal numbers in JSON; v2 derives it from the endpoint ID.
+    assert!(
+        v2.len() * 2 < v1.len(),
+        "v2 ({} chars) should be far under half of v1 ({} chars)",
+        v2.len(),
+        v1.len()
+    );
 }
 
 #[test]
@@ -96,6 +119,23 @@ fn parser_rejects_invalid_ticket_classes_without_echoing_input() {
             TicketError::MissingAddresses,
         ),
         (&oversized, TicketError::PayloadTooLarge),
+        ("p2pmux-v2:%%%", TicketError::MalformedBase64),
+        (
+            &format!("{TICKET_PREFIX_V2}{}", URL_SAFE_NO_PAD.encode([0_u8; 4])),
+            TicketError::MalformedPayload,
+        ),
+        (
+            &format!(
+                "{TICKET_PREFIX_V2}{}",
+                URL_SAFE_NO_PAD.encode(
+                    postcard::to_allocvec(&EndpointAddr::new(
+                        SecretKey::from_bytes(&[7; 32]).public()
+                    ))
+                    .expect("addressless endpoint should encode")
+                )
+            ),
+            TicketError::MissingAddresses,
+        ),
     ];
 
     for (input, expected) in cases {
@@ -159,6 +199,39 @@ fn local_rendezvous_rejects_unknown_codes_without_echoing_them() {
     assert!(!error.to_string().contains(code));
 
     fs::remove_dir_all(directory).expect("temporary directory should remove");
+}
+
+#[test]
+fn local_rendezvous_lists_published_codes_and_ignores_other_files() {
+    let directory = temporary_directory();
+    let store = LocalRendezvous::at(directory.clone());
+    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
+
+    let first = store.publish(&ticket).expect("first ticket should publish");
+    let second = store
+        .publish(&ticket)
+        .expect("second ticket should publish");
+    fs::write(directory.join("not-a-code"), b"ignored").expect("stray file should write");
+
+    let mut expected = vec![first.code().to_owned(), second.code().to_owned()];
+    expected.sort();
+    assert_eq!(store.codes().expect("codes should list"), expected);
+
+    drop(first);
+    drop(second);
+    fs::remove_dir_all(directory).expect("temporary directory should remove");
+}
+
+#[test]
+fn local_rendezvous_lists_no_codes_before_any_session_exists() {
+    let store = LocalRendezvous::at(temporary_directory());
+
+    assert!(
+        store
+            .codes()
+            .expect("a missing directory should not be an error")
+            .is_empty()
+    );
 }
 
 static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
