@@ -9,10 +9,13 @@ Branch: `e2e-stress`.
 
 ## Standing caveats
 
-- **Localhost / direct path only.** Every peer runs on one Mac. This exercises the direct
-  transport and the local rendezvous join-code file. It does **not** cover relay fallback,
-  NAT traversal, real network latency, packet loss, reordering, or MTU effects. Nothing in
-  this log should be read as "P2P is tested".
+- **Localhost only, for scenarios A–K.** Those peers all run on one Mac, exercising the direct
+  transport and the local rendezvous join-code file, and nothing in them should be read as
+  "P2P is tested". Scenarios **L** and **M** (addenda below) are the exception: one peer runs
+  on a DigitalOcean droplet over the public internet, with latency, loss, and forced relay
+  applied on the Linux side, and both now assert which path the session actually took. Still
+  uncovered anywhere: carrier-grade NAT, which needs a Mac on a phone hotspot and a pair of
+  hands.
 - Per instruction, the network interface is never touched (no `ifconfig`/`pfctl`). Transport
   failure is simulated at the process level (kill / SIGSTOP / SIGCONT).
 - The user's own `target/debug/p2pmux` sessions run on this machine. The harness sandboxes
@@ -569,6 +572,117 @@ those three iterations were all inside categories A and B (which the loop asked 
 prioritised, being the newest code). Categories C (room lifecycle), D (terminal fidelity),
 E (mouse forwarding) and F (load and failure) have **not been touched at all**. The right
 reading is "A and B look solid", so the loop continues into the untouched categories.
+
+## Addendum — Scenario L: the first session that left this Mac (2026-07-29)
+
+Script: `scripts/e2e/scenario_l_internet.py`, helper `scripts/e2e/remote.py`. This retires the
+first standing caveat above for everything it covers: one peer is now a DigitalOcean droplet in
+ams3 (`p2pmux-lab`, ssh alias in `~/.ssh/config`), joined over the public internet.
+
+How a remote peer works: `ssh -tt` allocates a PTY on the droplet and propagates our window size,
+so the remote binary draws a real TUI whose bytes come back down the local PTY that `Peer` already
+pumps into pyte. `Peer` gained one optional field, `launcher`; every existing scenario is
+untouched. Two things a remote peer does not inherit — the sandbox `HOME` (passed explicitly over
+ssh) and pid reaping (killing the local ssh does not kill the remote node, so `remote.reap()` runs
+in a `finally`).
+
+The droplet doubles as the network-impairment lab. `tc netem` shapes latency and loss and
+`iptables` forces a relay, both on Linux, so the standing rule that the Mac's own interface is
+never touched still holds.
+
+The eight checks: the Mac creates a session and mints a ticket; the droplet joins with it; the
+droplet creates its own pane and that pane reaches the Mac's layout; keystrokes execute on the
+droplet's shell; the resulting PTY frame renders back here; both peers survive.
+
+| run | result |
+|---|---|
+| default path, ×2 | 8/8, 8/8 |
+| `--delay-ms=150` (netem, one-way egress) | 8/8 |
+| `--force-relay` | 8/8 |
+| `--force-relay --delay-ms=300` | 8/8 |
+
+**No product code changed.** The Linux build was clean on the first attempt; the only fix needed
+was to this Mac's stale `target/release` binary, which predated the `ticket` subcommand.
+
+**A wrong first instrument, worth recording.** `--force-relay` initially dropped *all* inbound UDP
+above 1024 and the droplet exited 1. That is not a relay-fallback failure: the relay path arrives
+on an ephemeral port too, so the rule killed the very fallback it was meant to test. Scoping the
+rule to the peer Mac's public address — hole-punched datagrams from that host vanish, every relay
+server stays reachable — is the precise instrument, and it passes. Any future "relay is broken"
+result should be checked against this mistake first.
+
+**What this does not prove.** The droplet has a public IP and no NAT, so a direct path here is the
+easy case; carrier-grade NAT still needs a Mac on a phone hotspot, by hand.
+
+**Update, same day — the runs now say which path they took.** The paragraph that stood here said
+the default runs could not distinguish "it worked" from "it worked directly", because nothing in
+the codebase reported a path. Spike 4A closed that (see below), and scenario L gained three
+checks: both peers must report the same path kind, that kind must be `direct` by default and
+`relayed` under `--force-relay`, and the reported RTT must be consistent with the ICMP baseline.
+Re-run at 11 checks: default 11/11 with both peers reading `direct 55ms` against a 32ms ICMP
+baseline, and `--force-relay` 11/11 with both reading `relayed`. Holepunching Mac→droplet is now
+a measured fact rather than an inference.
+
+## Addendum — Spike 4A: the connectivity badge (2026-07-29)
+
+`direct 55ms`, right-aligned in the tab bar; `relayed 120ms ×3` when several peers are connected
+and one of them is worse. Iroh 1.0.3 is multipath QUIC, so the facts were already on hand:
+`Connection::paths()` exposes the selected path, `TransportAddr::{Ip, Relay}` is the bit itself,
+and `Path::rtt()` is the number. `src/transport.rs` samples the selected path once a second per
+connection and forgets a peer when its connection closes, so a stale `direct 20ms` can never
+outlive the link it described.
+
+Three decisions worth keeping:
+
+- **Worst path, not an average.** One peer stuck on a relay is the fact worth surfacing;
+  averaging would hide it behind everyone else's healthy direct links.
+- **RTT rounded up to 5ms.** The value is republished to the client whenever it changes, so raw
+  millisecond jitter would have pushed an IPC message every sample for a digit nobody reads.
+- **Tab bar, not footer.** The footer is transient — chords, copy feedback and status notices all
+  take it over — and connectivity is exactly the fact you want visible at the moment something
+  else has gone wrong. It stands down rather than overwrite a tab label.
+
+Accepted connections must be handed to `Transport::observe` explicitly (five sites in
+`session.rs`), because they are produced by awaiting an `Incoming` rather than by the transport
+itself; only `connect()` can self-register. A missed site shows up as a peer with no badge.
+
+## Addendum — Scenario M: locking the door on a live cross-machine session (2026-07-29)
+
+Script: `scripts/e2e/scenario_m_lock.py`. Mac hosts, a droplet peer joins over the internet, and a
+*second* droplet peer with its own sandbox HOME plays the stranger — remote on purpose, since a
+locked door has to hold against someone arriving over the real network rather than over loopback.
+14/14.
+
+Two different locks turned out to be in play, and both are now covered:
+
+- **Pane lock** (`Ctrl+P` then `k`) already existed and refuses input from anyone but the pane's
+  host — but had only ever run on loopback, where a refusal and a slow network look identical.
+  Scenario M now locks the Mac's pane, has the droplet type into it, and asserts the bytes never
+  execute; then unlocks and asserts they do.
+- **Session lock** (`Ctrl+P` then `Shift+L`) is new. The coordinator refuses peers it has never
+  admitted, and says why. It governs the door only: peers already inside keep working, and a peer
+  admitted once stays on the admitted roster so a transient reconnect is not exiled.
+
+**Two real bugs, both invisible on localhost.**
+
+1. *The refusal lost a race with the connection close.* `finish()` marks a stream complete but does
+   not wait for its bytes to leave, and the caller closes the connection the moment the refusal
+   returns an error. On loopback the reject frame usually escaped first; over a ~50ms path it
+   usually did not, and the rejected peer printed `connection lost` — indistinguishable from a
+   crashed host. Fixed by `drain_refusal`, a bounded wait for the joiner to hang up, which also
+   repairs the pre-existing room-full refusal that had the same race.
+2. *`Shift+L` could never fire.* `is_chord_command` rejected any key carrying a modifier, and SHIFT
+   is how an uppercase letter is typed rather than a modifier the user chose to add. Every unit
+   test passed while the feature was unreachable from a real keyboard. The filter now allows SHIFT
+   for uppercase chord letters only, with a regression test.
+
+**A third bug, found by an existing scenario.** Scenario F compares whole rendered screens to
+check that wheel-down returns to the live bottom. The new badge carries a *live* RTT, so an
+unmasked comparison now fails whenever the path jitters by 5ms between two snapshots. Two fixes:
+`driver.mask_link_badge()` blanks the badge before any whole-screen comparison (same class of
+oracle bug as keying on `Pane #N`, which is a display ordinal), and the badge itself stopped
+printing `direct 0ms` for a sub-millisecond loopback path — it reads `<1ms`, because `0ms` looks
+like a broken measurement rather than a very fast link.
 
 ## Addendum — Scenario K: when a watching peer is told an agent finished (2026-07-29)
 

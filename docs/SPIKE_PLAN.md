@@ -52,11 +52,69 @@ race.
 Run the shared-layout protocol on two Macs / different networks. Show **direct | relayed** and
 add presence without changing host-owned deletion or fixed grids.
 
-**Done when:** pane control and layout work over relay if needed; presence is coherent.
+Four phases, in order. The ordering matters: an earlier draft put the public-IP Linux droplet
+first, but a droplet has no NAT, so it proves only the easy case *and* needs a Linux build
+validated before it reports anything. The hotspot test needs no infrastructure and proves the hard
+case in half an hour. Cheapest test of the riskiest thing goes first.
+
+**A — Instrument first.** `direct | relayed` in the status bar, RTT beside it, path-change
+transitions logged. Without this every later failure is undiagnosable: rendezvous or NAT?
+
+**B — Connectivity ladder.** Two Macs on one LAN; then hotspot Mac to home-wifi Mac (the real NAT
+proof); then forced relay with the direct UDP paths firewalled; then Mac to Linux droplet, which
+also gives the dev loop an always-on peer. With only one Mac, hotspot-Mac to droplet still
+exercises cellular CGNAT on the side that matters.
+
+**C — What localhost cannot show.** Expected in order of pain: screen-snapshot bandwidth starving
+typing over a relay (no frame-rate cap or delta coalescing is tuned for a ~100ms path); input
+latency with no local echo, since mosh prediction is a non-goal that may not survive 80-150ms;
+transient drops killing sessions because disconnect grace is Spike 5, which will masquerade as a
+connectivity failure unless minimal reconnect is pulled forward; and ticket staleness, since a v2
+ticket snapshots `EndpointAddr` at mint time and a network switch invalidates its direct
+addresses. Whether n0 discovery still resolves the node ID alone decides the shape of any future
+rendezvous record, so test it explicitly.
+
+**D — Spend the breaking-change window.** ALPN is `p2pmux/2` with no external users, so protocol
+breaks are free now and expensive after distribution. Mint `session_id` as independent random
+bytes instead of the coordinator's endpoint public key, check it at `handshake_join`, and have the
+coordinator hold a roster of admitted node public keys. Not ACLs — just make identity exist, so
+revocation and per-pane permissions become additive later.
+
+**Done when:** `direct | relayed` and RTT are correct; the hotspot test carries pane control and
+layout on whichever path it gets; a forced-relay session is usable for typing, or the latency
+number saying otherwise is written down; the droplet build runs a session against a Mac; ticket
+staleness across a network switch is characterized either way; `session_id` is independent of the
+endpoint key; presence is coherent.
+
+**Status (2026-07-29).** A — done: `direct 55ms` / `relayed 120ms ×3` in the tab bar, asserted on
+both peers by `scripts/e2e/scenario_l_internet.py`. B — Mac↔droplet done, direct and forced-relay,
+up to +300ms shaping; the hotspot rung is the one still needing hands, see *Two-Mac checklist*
+below. D — done, and it turned out to be a real hole rather than tidiness: `session_id` *was* the
+coordinator's public key, a value presented in every TLS handshake and published to discovery, so
+anyone who learned the node id could mint a working ticket. Ticket v3 carries 32 independent
+random bytes; v1/v2 still parse and are flagged `secret_is_public()`. The coordinator now keeps an
+admitted roster, which is what the session lock is built on. C is the remainder: bandwidth and
+input-latency behaviour under a relay, and ticket staleness across a network switch.
+
+### Two-Mac checklist (hands-on, ~10 minutes)
+
+Everything below is already automated against the droplet; this is the part only a human can do.
+
+1. On Mac A: `p2pmux create --name a`, then `Ctrl+P` then `i` to copy the full ticket.
+2. On Mac B: `p2pmux join <ticket> --name b`. Both tab bars should read `direct` with an RTT near
+   your LAN ping. Create a pane on each; each pane's shell runs on its own Mac.
+3. Put Mac A on a phone hotspot and repeat. This is the carrier-NAT case no droplet can produce:
+   `direct` means holepunching survived CGNAT, `relayed` means it fell back, and either is a
+   result worth writing down — the point is that the badge now tells you which.
+4. `Ctrl+P` then `Shift+L` on Mac A, then have Mac B leave and try to rejoin: it must be told the
+   session is locked, not merely dropped.
+5. `Ctrl+P` then `k` on a Mac A pane while Mac B is typing into it: Mac B's keystrokes must stop
+   reaching it, and the pane header must say `locked by a`.
 
 ### Spike 5 — Disconnect grace + coordinator failover
 
 5-minute placeholders; structural freeze during coordinator grace; earliest-join promotion.
+Minimal reconnect lands early, in Spike 4, so internet tests are not read as failures.
 
 ### Spike 6 — Brew formula
 

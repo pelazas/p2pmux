@@ -191,6 +191,12 @@ prompt does not report mouse, so nothing changes there.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane’s host may delete it.
 - `Ctrl+P`, then `i` — copy this session’s full join ticket to the clipboard, for inviting
   someone on another Mac. Coordinator only.
+- `Ctrl+P`, then `k` — lock the focused pane. A locked pane accepts input only from its own host,
+  and its header reads `locked by <name>` for everyone else.
+- `Ctrl+P`, then `Shift+L` — lock the whole session. The coordinator then refuses any peer that
+  has never joined it, telling them the session is locked rather than just dropping them. Peers
+  already inside are untouched, and one that reconnects after a drop is still let back in. The tab
+  bar reads `locked` while it holds. Coordinator only; a guest is told so.
 - `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
   cancels; a blank title restores `Pane #N`.
 - `Ctrl+P`, then arrows — move focus.
@@ -204,6 +210,11 @@ The final pane in a tab must be removed by deleting its tab; the final tab canno
 When a pane shell exits, p2pmux preserves its final screen and marks the pane exited for everyone.
 Exited panes accept no input or control claims; only the pane host can close one with `Ctrl+P`, then
 `X`.
+The tab bar's right edge reports the session's connectivity: `direct 55ms` when traffic is
+peer-to-peer, `relayed 120ms` when it is going through a relay server, and `×N` when more than one
+peer is connected — the number shown is always the worst path, since one peer stuck on a relay is
+the thing worth noticing. `locked · direct 55ms` when the session is locked.
+
 Nested ratio-controlled splits are part of Spike 3 (depth 4, at most 8 panes per tab, at most 9 tabs). Each
 pane title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white
 border and actively controlled panes use red-orange. Pane mode gives the locally focused pane a
@@ -211,7 +222,7 @@ soft-green border; Tab mode dims inactive tab labels. Click tab labels to switch
 claiming control or sending input. Mouse wheel scrolls pane history locally unless the focused
 pane's program reports mouse, in which case the wheel reaches that program. The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`; pane mode is
-`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <i> INVITE   <Esc> BACK`; tab mode is
+`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <i> INVITE   <Esc> BACK`; tab mode is
 `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 For locally hosted panes, mouse-wheel scrollback is loaded from the host on demand when you first
