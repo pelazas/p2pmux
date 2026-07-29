@@ -8,7 +8,14 @@ use std::{
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const DONE_GRACE: Duration = Duration::from_secs(15);
-const WORKING_WINDOW: Duration = Duration::from_secs(2);
+/// Output this recent starts a working interval. Entering must be fast so the overlay reacts
+/// as soon as an agent does anything.
+const WORKING_ENTER: Duration = Duration::from_secs(2);
+/// Silence this long ends a working interval. Leaving must be slow because an agent that is
+/// still working goes quiet for many seconds at a time — waiting on a model response, or
+/// running a tool that streams nothing. Treating a short pause as "finished" is what made the
+/// completion notification fire mid-task.
+pub const DEFAULT_QUIET_BEFORE_DONE: Duration = Duration::from_secs(20);
 
 /// Return a process's current working directory when it is an existing absolute directory.
 pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
@@ -268,13 +275,27 @@ pub struct DoneAgent {
 }
 
 /// Per-pane agent state maintained between global sampler snapshots.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PaneAgentTracker {
     pub last_output_at: Option<Instant>,
     pub active_agent: Option<DetectedAgent>,
     pub done_agent: Option<DoneAgent>,
     pub working_since: Option<Instant>,
     pub working_since_unix_ms: u64,
+    quiet_before_done: Duration,
+}
+
+impl Default for PaneAgentTracker {
+    fn default() -> Self {
+        Self {
+            last_output_at: None,
+            active_agent: None,
+            done_agent: None,
+            working_since: None,
+            working_since_unix_ms: 0,
+            quiet_before_done: DEFAULT_QUIET_BEFORE_DONE,
+        }
+    }
 }
 
 impl PaneAgentTracker {
@@ -351,18 +372,26 @@ impl PaneAgentTracker {
             })
     }
 
+    /// Working state uses hysteresis: it is entered on any recent output but only left after a
+    /// much longer silence. One symmetric threshold cannot serve both, because "how fast we
+    /// notice work" and "how sure we are it stopped" want opposite values.
     fn reconcile_working_state(&mut self, now: Instant, unix_ms_now: u64) {
-        let is_working = self.active_agent.is_some()
-            && self
-                .last_output_at
-                .is_some_and(|last_output| now.duration_since(last_output) <= WORKING_WINDOW);
-        if is_working {
-            if self.working_since.is_none() {
-                self.working_since = Some(now);
-                self.working_since_unix_ms = unix_ms_now;
-            }
-        } else {
+        if self.active_agent.is_none() {
             self.clear_working_state();
+            return;
+        }
+        let Some(last_output) = self.last_output_at else {
+            self.clear_working_state();
+            return;
+        };
+        let quiet_for = now.duration_since(last_output);
+        if self.working_since.is_some() {
+            if quiet_for >= self.quiet_before_done {
+                self.clear_working_state();
+            }
+        } else if quiet_for <= WORKING_ENTER {
+            self.working_since = Some(now);
+            self.working_since_unix_ms = unix_ms_now;
         }
     }
 
@@ -591,19 +620,74 @@ mod tests {
             Some((agent.clone(), AgentState::Working))
         );
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(3), 4_001),
+            tracker.listed_agent(now + DEFAULT_QUIET_BEFORE_DONE, 21_001),
             Some((agent.clone(), AgentState::Idle))
         );
 
-        tracker.update(None, now + Duration::from_secs(4), 5_001);
+        tracker.update(None, now + Duration::from_secs(21), 22_001);
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(19), 20_001),
+            tracker.listed_agent(now + Duration::from_secs(35), 36_001),
             Some((agent.clone(), AgentState::Done))
         );
-        tracker.update(None, now + Duration::from_secs(20), 21_001);
+        tracker.update(None, now + Duration::from_secs(37), 38_001);
         assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(20), 21_001),
+            tracker.listed_agent(now + Duration::from_secs(37), 38_001),
             None
+        );
+    }
+
+    #[test]
+    fn a_pause_shorter_than_the_quiet_window_stays_working() {
+        let now = Instant::now();
+        let agent = DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: "/repo".into(),
+        };
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(Some(agent.clone()), now, 1_000);
+        tracker.record_output(now, 1_000);
+
+        // An agent waiting on a model response or a silent tool call goes quiet for many
+        // seconds without having finished. Every one of these used to report Idle, which is
+        // what rang the completion sound mid-task.
+        for pause_secs in [3, 5, 10, 19] {
+            assert_eq!(
+                tracker.listed_agent(now + Duration::from_secs(pause_secs), 1_000),
+                Some((agent.clone(), AgentState::Working)),
+                "a {pause_secs}s pause must not read as finished"
+            );
+        }
+
+        assert_eq!(
+            tracker.listed_agent(now + DEFAULT_QUIET_BEFORE_DONE, 1_000),
+            Some((agent.clone(), AgentState::Idle))
+        );
+    }
+
+    #[test]
+    fn output_during_a_pause_extends_the_working_interval_without_restarting_it() {
+        let now = Instant::now();
+        let agent = DetectedAgent {
+            kind: AgentKind::Codex,
+            cwd: "/repo".into(),
+        };
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(Some(agent.clone()), now, 1_000);
+        tracker.record_output(now, 1_000);
+        let first_episode = tracker.working_since_unix_ms;
+
+        // Output at 15s resets the silence clock, so the interval must survive past the
+        // original 20s deadline and keep the same episode start.
+        tracker.record_output(now + Duration::from_secs(15), 16_000);
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(30), 31_000),
+            Some((agent.clone(), AgentState::Working))
+        );
+        assert_eq!(tracker.working_since_unix_ms, first_episode);
+
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(35), 36_000),
+            Some((agent, AgentState::Idle))
         );
     }
 
@@ -662,7 +746,15 @@ mod tests {
         assert_eq!(tracker.working_since, started_at);
         assert_eq!(tracker.working_since_unix_ms, 1_001);
 
+        // The interval ends only once the pane has been quiet for the full window, measured
+        // from the most recent output rather than from when the interval began.
         tracker.listed_agent(now + Duration::from_secs(4), 5_001);
+        assert_eq!(tracker.working_since, started_at);
+
+        tracker.listed_agent(
+            now + Duration::from_secs(1) + DEFAULT_QUIET_BEFORE_DONE,
+            22_001,
+        );
         assert_eq!(tracker.working_since, None);
         assert_eq!(tracker.working_since_unix_ms, 0);
     }
