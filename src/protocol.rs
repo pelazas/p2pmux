@@ -513,6 +513,11 @@ pub enum LayoutRejectReason {
     UnknownId = 6,
     LastPaneOrTab = 7,
     ReservationFailure = 8,
+    /// The host locked the session, so no new peer is admitted.
+    ///
+    /// Distinct from `Limit`: a full session may have room again later, a locked one is a
+    /// deliberate refusal, and the joiner must be told which so it can say something true.
+    Locked = 9,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

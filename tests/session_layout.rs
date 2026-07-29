@@ -777,3 +777,64 @@ fn endpoints_and_ready_request_ids_must_match_authenticated_reservations() {
         LayoutRejectReason::ReservationFailure as i32
     );
 }
+
+#[test]
+fn a_new_session_is_open_and_the_lock_toggles() {
+    let mut coordinator = coordinator();
+
+    assert!(!coordinator.is_locked(), "sessions start open");
+    assert!(coordinator.set_locked(true), "locking an open session changes it");
+    assert!(coordinator.is_locked());
+    assert!(
+        !coordinator.set_locked(true),
+        "locking an already locked session is a no-op"
+    );
+    assert!(coordinator.set_locked(false));
+    assert!(!coordinator.is_locked());
+}
+
+#[test]
+fn locking_governs_the_door_without_evicting_anyone() {
+    // The lock must not throw out the people already working, and a peer that has been
+    // admitted once has to survive a reconnect through a locked door -- otherwise a
+    // transient drop would permanently exile a teammate mid-session.
+    let mut coordinator = coordinator();
+    coordinator.remember_admitted(host_b());
+
+    coordinator.set_locked(true);
+
+    assert!(
+        coordinator.is_admitted(&host_b()),
+        "an already-admitted peer must still be recognised while locked"
+    );
+    assert!(
+        !coordinator.is_admitted(&endpoint(3, 4103).id.as_bytes().to_vec()),
+        "a peer that never joined is not admitted by locking"
+    );
+}
+
+#[test]
+fn admission_is_remembered_independently_of_the_member_roster() {
+    // `is_admitted` deliberately does not read the member list: a member removed during a
+    // disconnect must still be let back in, which is the whole reason for a second set.
+    let mut coordinator = coordinator();
+    let stranger = endpoint(4, 4104).id.as_bytes().to_vec();
+
+    assert!(!coordinator.is_admitted(&stranger));
+    coordinator.remember_admitted(stranger.clone());
+    assert!(coordinator.is_admitted(&stranger));
+}
+
+#[test]
+fn a_locked_refusal_is_distinct_from_a_full_one() {
+    // A joiner has to be able to tell "come back later, it is full" from "the host shut
+    // the door", so these must never collapse to one reason code.
+    assert_ne!(
+        LayoutRejectReason::Locked as i32,
+        LayoutRejectReason::Limit as i32
+    );
+    assert_eq!(
+        LayoutRejectReason::try_from(LayoutRejectReason::Locked as i32),
+        Ok(LayoutRejectReason::Locked)
+    );
+}

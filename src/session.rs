@@ -1,7 +1,7 @@
 //! Authenticated Join/Welcome session handshakes over Iroh bi-streams.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     future::Future,
@@ -52,6 +52,8 @@ pub struct LayoutCoordinator {
     reservations: BTreeMap<u64, ReservationContext>,
     agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     reservation_timeout: Duration,
+    locked: bool,
+    admitted: BTreeSet<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +196,8 @@ impl LayoutCoordinator {
             reservations: BTreeMap::new(),
             agent_rosters: BTreeMap::new(),
             reservation_timeout,
+            locked: false,
+            admitted: BTreeSet::new(),
         })
     }
 
@@ -204,6 +208,35 @@ impl LayoutCoordinator {
     /// peer it is admitted and then drop it.
     pub fn is_full(&self) -> bool {
         self.state.members().len() >= MAX_MEMBERS
+    }
+
+    /// Whether the host has closed the session to newcomers.
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// Close or reopen the session to new peers. Returns whether the state changed.
+    ///
+    /// Locking deliberately does not evict anybody: the people already working keep
+    /// working, and the lock only governs the door. Reconnecting after a transient drop
+    /// therefore still succeeds, because such a peer is already on the admitted roster.
+    pub fn set_locked(&mut self, locked: bool) -> bool {
+        let changed = self.locked != locked;
+        self.locked = locked;
+        changed
+    }
+
+    /// Whether this peer has been admitted at some point in this session's life.
+    ///
+    /// Kept separately from the member list because a member who drops off the roster
+    /// during a disconnect must still be able to come back through a locked door.
+    pub fn is_admitted(&self, peer_id: &[u8]) -> bool {
+        self.admitted.contains(peer_id)
+    }
+
+    /// Record a peer as admitted, so a later lock cannot shut it out of its own session.
+    pub fn remember_admitted(&mut self, peer_id: Vec<u8>) {
+        self.admitted.insert(peer_id);
     }
 
     pub fn session_snapshot(&self) -> Result<SessionSnapshot, CoordinatorError> {
@@ -1541,6 +1574,7 @@ pub enum SessionError {
     InvalidPostWelcome,
     PeerTask,
     SessionFull,
+    SessionLocked,
     JoinRefused,
     Coordinator(CoordinatorError),
 }
@@ -1565,6 +1599,9 @@ impl fmt::Display for SessionError {
             Self::SessionFull => {
                 write!(formatter, "this session is full ({MAX_MEMBERS} members)")
             }
+            Self::SessionLocked => {
+                formatter.write_str("this session is locked; ask the host to unlock it")
+            }
             Self::JoinRefused => formatter.write_str("the session coordinator refused the join"),
             Self::Coordinator(error) => write!(formatter, "layout coordinator error: {error}"),
         }
@@ -1585,6 +1622,7 @@ impl Error for SessionError {
             | Self::InvalidPostWelcome
             | Self::PeerTask
             | Self::SessionFull
+            | Self::SessionLocked
             | Self::JoinRefused => None,
             Self::Coordinator(error) => Some(error),
         }
@@ -2288,6 +2326,24 @@ impl SharedLayoutHost {
 
     /// Creates the only incoming acceptor for an endpoint that serves both layout control and
     /// direct panes. Do not run `accept_one_member` or `PaneServer::accept_loop` beside it.
+    /// Close or reopen the session to peers that have never been admitted.
+    ///
+    /// Only the coordinator can do this, because only the coordinator answers joins.
+    /// Returns the resulting state so a caller can report it without a second lookup.
+    pub fn set_session_lock(&self, locked: bool) -> Result<bool, SessionError> {
+        let mut coordinator = self.coordinator.lock().map_err(|_| SessionError::PeerTask)?;
+        coordinator.set_locked(locked);
+        Ok(coordinator.is_locked())
+    }
+
+    pub fn is_session_locked(&self) -> Result<bool, SessionError> {
+        Ok(self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .is_locked())
+    }
+
     pub fn incoming_dispatcher(
         &self,
         panes: PaneServer,
@@ -2325,6 +2381,26 @@ impl SharedLayoutHost {
     ) -> Result<JoinReceipt, SessionError> {
         let mut admitted_peer_id = None;
         let result = async {
+            // A locked session turns away peers it has never admitted, before the
+            // handshake can welcome them. Peers already admitted are let back through, so
+            // locking never strands someone mid-session over a transient reconnect.
+            // Resolved into a plain bool first: the lock guard must not be alive across
+            // the refusal's await, or this whole accept future stops being `Send`.
+            let shut_out = {
+                let coordinator_guard = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| SessionError::PeerTask)?;
+                coordinator_guard.is_locked()
+                    && !coordinator_guard.is_admitted(connection.remote_id().as_bytes())
+            };
+            if shut_out {
+                self.host
+                    .refuse_join(join_writer, LayoutRejectReason::Locked)
+                    .await?;
+                self.host.drain_refusal(&connection).await;
+                return Err(SessionError::SessionLocked);
+            }
             // Refuse a full session *before* welcoming it. `admit_with_display_name`
             // below enforces the same limit, but only after `Welcome` has gone out --
             // so an over-cap peer was being told it was admitted and then dropped, and
@@ -2369,6 +2445,13 @@ impl SharedLayoutHost {
                 if let Some(reject) = membership.invalidated_reservation {
                     self.send_reject(reject);
                 }
+            }
+            {
+                let mut coordinator_guard = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| SessionError::PeerTask)?;
+                coordinator_guard.remember_admitted(receipt.admitted_peer_id.clone());
             }
             admitted_peer_id = Some(receipt.admitted_peer_id.clone());
 
@@ -3483,6 +3566,7 @@ async fn join_handshake_with_display_name(
         Some(envelope::Body::LayoutReject(reject)) => {
             return Err(match LayoutRejectReason::try_from(reject.reason) {
                 Ok(LayoutRejectReason::Limit) => SessionError::SessionFull,
+                Ok(LayoutRejectReason::Locked) => SessionError::SessionLocked,
                 _ => SessionError::JoinRefused,
             });
         }
