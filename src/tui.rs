@@ -3797,6 +3797,11 @@ impl SharedLocalPane {
             // One parse/snapshot/diff for the whole batch: process_pty clones the
             // screen per call, so per-chunk calls dominated CPU under output floods.
             let frame = self.screen.process_pty(&ready)?;
+            // Read after parsing: the bell is a parser callback, so the count only reflects
+            // this batch once the batch has been fed through.
+            if self.screen.take_bell_count() > 0 {
+                self.agent_tracker.record_completion_signal(Instant::now());
+            }
             if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
                 && self.host.write_input(&reply).is_err()
             {

@@ -16,6 +16,10 @@ const WORKING_ENTER: Duration = Duration::from_secs(2);
 /// running a tool that streams nothing. Treating a short pause as "finished" is what made the
 /// completion notification fire mid-task.
 pub const DEFAULT_QUIET_BEFORE_DONE: Duration = Duration::from_secs(20);
+/// After an agent signals completion, ignore output this recent for the purpose of starting a
+/// new working interval. Agents ring the bell and then repaint their prompt, and that trailing
+/// redraw would otherwise open a fresh interval that has to time out all over again.
+const COMPLETION_SETTLE: Duration = Duration::from_secs(3);
 
 /// Return a process's current working directory when it is an existing absolute directory.
 pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
@@ -283,6 +287,7 @@ pub struct PaneAgentTracker {
     pub working_since: Option<Instant>,
     pub working_since_unix_ms: u64,
     quiet_before_done: Duration,
+    settle_until: Option<Instant>,
 }
 
 impl Default for PaneAgentTracker {
@@ -294,6 +299,7 @@ impl Default for PaneAgentTracker {
             working_since: None,
             working_since_unix_ms: 0,
             quiet_before_done: DEFAULT_QUIET_BEFORE_DONE,
+            settle_until: None,
         }
     }
 }
@@ -303,6 +309,20 @@ impl PaneAgentTracker {
     pub fn record_output(&mut self, now: Instant, unix_ms_now: u64) {
         self.last_output_at = Some(now);
         self.reconcile_working_state(now, unix_ms_now);
+    }
+
+    /// Record an explicit completion signal from the agent (a terminal bell).
+    ///
+    /// This ends the working interval immediately rather than waiting out the quiet window,
+    /// which is the whole point of preferring it: the timing heuristic can only ever guess when
+    /// an agent stopped, while the bell says so.
+    pub fn record_completion_signal(&mut self, now: Instant) {
+        if self.active_agent.is_none() {
+            return;
+        }
+        self.last_output_at = None;
+        self.settle_until = Some(now + COMPLETION_SETTLE);
+        self.clear_working_state();
     }
 
     /// Apply this pane's latest process-tree classification.
@@ -315,6 +335,7 @@ impl PaneAgentTracker {
                     .is_some_and(|active| active != &agent)
                 {
                     self.last_output_at = None;
+                    self.settle_until = None;
                     self.clear_working_state();
                 }
                 self.active_agent = Some(agent);
@@ -389,9 +410,20 @@ impl PaneAgentTracker {
             if quiet_for >= self.quiet_before_done {
                 self.clear_working_state();
             }
-        } else if quiet_for <= WORKING_ENTER {
+        } else if quiet_for <= WORKING_ENTER && !self.settling(now) {
             self.working_since = Some(now);
             self.working_since_unix_ms = unix_ms_now;
+        }
+    }
+
+    fn settling(&mut self, now: Instant) -> bool {
+        match self.settle_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.settle_until = None;
+                false
+            }
+            None => false,
         }
     }
 
@@ -689,6 +721,56 @@ mod tests {
             tracker.listed_agent(now + Duration::from_secs(35), 36_000),
             Some((agent, AgentState::Idle))
         );
+    }
+
+    #[test]
+    fn a_completion_signal_ends_the_working_interval_immediately() {
+        let now = Instant::now();
+        let agent = DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: "/repo".into(),
+        };
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(Some(agent.clone()), now, 1_000);
+        tracker.record_output(now, 1_000);
+        assert_eq!(
+            tracker.listed_agent(now, 1_000),
+            Some((agent.clone(), AgentState::Working))
+        );
+
+        // The bell says the agent is done, so there is no need to wait out the quiet window.
+        tracker.record_completion_signal(now + Duration::from_secs(1));
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(1), 2_000),
+            Some((agent.clone(), AgentState::Idle))
+        );
+
+        // Agents repaint their prompt right after ringing. That trailing output must not open
+        // a new interval, or the completion would have to time out all over again.
+        tracker.record_output(now + Duration::from_secs(2), 3_000);
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(2), 3_000),
+            Some((agent.clone(), AgentState::Idle))
+        );
+
+        // Once settled, real new work is tracked normally.
+        tracker.record_output(now + Duration::from_secs(10), 11_000);
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(10), 11_000),
+            Some((agent, AgentState::Working))
+        );
+    }
+
+    #[test]
+    fn a_completion_signal_without_an_agent_is_ignored() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.record_output(now, 1_000);
+        tracker.record_completion_signal(now);
+
+        // A plain shell ringing the bell must not manufacture agent state.
+        assert_eq!(tracker.listed_agent(now, 1_000), None);
+        assert_eq!(tracker.last_output_at, Some(now));
     }
 
     #[test]

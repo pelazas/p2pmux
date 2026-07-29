@@ -176,8 +176,25 @@ fn partial_marker_suffix(tail: &[u8], marker: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+/// Counts standalone audible bells (`^G`) seen by a hosted pane's parser.
+///
+/// This deliberately hangs off the parser rather than scanning the raw PTY bytes for `0x07`:
+/// BEL also terminates an OSC string, and agents set the window title constantly, so a byte
+/// scan would count every title update as a bell. vt100 routes an OSC-terminating BEL through
+/// `osc_dispatch` and only reaches this callback for a standalone bell.
+#[derive(Debug, Default)]
+pub struct BellCounter {
+    count: u64,
+}
+
+impl vt100::Callbacks for BellCounter {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.count = self.count.saturating_add(1);
+    }
+}
+
 pub struct HostScreen {
-    parser: vt100::Parser,
+    parser: vt100::Parser<BellCounter>,
     previous: vt100::Screen,
     current: ScreenFrame,
     kitty_keyboard: KittyKeyboardTracker,
@@ -188,7 +205,8 @@ pub struct HostScreen {
 impl HostScreen {
     pub fn new(rows: u16, cols: u16) -> Result<Self, ScreenError> {
         validate_dimensions(rows, cols)?;
-        let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        let parser =
+            vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, BellCounter::default());
         let previous = parser.screen().clone();
         let snapshot = snapshot_payload(parser.screen())?;
         Ok(Self {
@@ -276,6 +294,12 @@ impl HostScreen {
 
     pub fn kitty_keyboard_active(&self) -> bool {
         self.kitty_keyboard.active()
+    }
+
+    /// Number of audible bells since the last call. An agent that rings when it finishes gives
+    /// a far better completion signal than inferring one from how long the pane stayed quiet.
+    pub fn take_bell_count(&mut self) -> u64 {
+        std::mem::take(&mut self.parser.callbacks_mut().count)
     }
 
     /// Returns available rows and the monotonic end position without formatting rows.
@@ -471,6 +495,27 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+
+    #[test]
+    fn bell_count_ignores_osc_terminators_and_counts_standalone_bells() {
+        let mut screen = HostScreen::new(24, 80).expect("valid dimensions");
+        assert_eq!(screen.take_bell_count(), 0);
+
+        // Agents set the window title constantly, and OSC strings are BEL-terminated. A raw
+        // scan for 0x07 would report each of these as a completion.
+        screen
+            .process_pty(b"\x1b]0;a title\x07\x1b]2;another\x07")
+            .expect("processed");
+        assert_eq!(screen.take_bell_count(), 0);
+
+        screen.process_pty(b"done\x07").expect("processed");
+        assert_eq!(screen.take_bell_count(), 1);
+        // Taking the count clears it, so one bell is reported once.
+        assert_eq!(screen.take_bell_count(), 0);
+
+        screen.process_pty(b"\x07\x07").expect("processed");
+        assert_eq!(screen.take_bell_count(), 2);
+    }
 
     #[test]
     fn sync_gate_passes_unmarked_output_through() {
