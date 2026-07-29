@@ -117,7 +117,7 @@ Short join codes resolve through a restrictive local cache on the same Mac, so t
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
 it exits. A peer on another machine cannot resolve one.
 
-To invite someone on another Mac, use the full `p2pmux-v1:` ticket, which `join` also accepts:
+To invite someone on another Mac, use the full `p2pmux-v2:` ticket, which `join` also accepts:
 
 ```text
 p2pmux ticket            # the one session live on this Mac
@@ -133,6 +133,11 @@ The ticket is printed to stdout on its own, so `p2pmux ticket | pbcopy` gives yo
 directly pasteable. Treat it as a password: it grants full shared-shell access to the session, to
 anyone holding it, for as long as the session lives. There is no hosted rendezvous yet, so this is
 the portable invite until one exists.
+
+Tickets are emitted as `p2pmux-v2:` — roughly 66 characters for a typical session, against about
+370 for the original `p2pmux-v1:` form, which restated the session ID as a JSON array of 32
+decimal numbers even though it is required to equal the endpoint ID. `join` still accepts v1
+tickets, so a peer one release behind can be invited without upgrading first.
 
 Only one peer controls a pane while they are actively typing. After about thirty seconds without
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key

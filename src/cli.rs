@@ -16,7 +16,7 @@ use crate::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
         layout_snapshot_from_state,
     },
-    ticket::{JoinTicket, TICKET_PREFIX},
+    ticket::{JoinTicket, looks_like_ticket},
     transport::Transport,
 };
 
@@ -548,7 +548,7 @@ fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn
 }
 
 fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
-    if input.starts_with(TICKET_PREFIX) {
+    if looks_like_ticket(input) {
         return JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"));
     }
     LocalRendezvous::for_current_user()

@@ -10,6 +10,7 @@ crossterm = "0.29"
 getrandom = "0.3"
 iroh = "1.0.3"
 portable-pty = "0.9"
+postcard = { version = "1", features = ["alloc"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
