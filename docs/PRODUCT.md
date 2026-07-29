@@ -3,6 +3,12 @@
 Source: Notion — *peer-to-peer multiplayer terminal multiplexer*  
 Name: **to decide**
 
+> **Scope note (2026-07-29).** This brief describes the mux accurately and stays normative for
+> what the binary does. It is *not* the company sequencing. As of 2026-07-29 the mux is substrate
+> rather than the wedge: the entry surface is single-player multi-machine agent supervision — one
+> human, several agents, several boxes — and human multiplayer arrives as an upgrade to something
+> already in use. See Notion, *Strategy — Agent rooms, the session ledger & async direction*.
+
 ## Core idea
 
 The multiplexer is a **shared control surface, not a shared computer**.
