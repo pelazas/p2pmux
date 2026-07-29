@@ -113,7 +113,23 @@ pub async fn parse_and_run() -> Result<(), Box<dyn Error>> {
     run(Cli::parse()).await
 }
 
+/// Hand this Mac's completion tuning to the detector, once per process.
+///
+/// Panes are hosted by the detached node, which reaches this same dispatch, so every process
+/// that can own a PTY passes through here. A config that cannot be read is not worth failing a
+/// session over — the built-in defaults are the ones most users want anyway.
+fn apply_notification_tuning() {
+    let notifications = crate::config::load_config()
+        .map(|config| config.ui.notifications)
+        .unwrap_or_default();
+    crate::agent_detect::set_notification_tuning(crate::agent_detect::NotificationTuning {
+        quiet_before_done: Duration::from_secs(notifications.quiet_seconds),
+        require_bell: notifications.require_bell,
+    });
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    apply_notification_tuning();
     if cli.resume {
         return resume_picker(true);
     }

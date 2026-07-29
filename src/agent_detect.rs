@@ -2,6 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -38,6 +39,38 @@ pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
 
 fn existing_absolute_directory(path: &Path) -> Option<PathBuf> {
     (path.is_absolute() && path.is_dir()).then(|| path.to_path_buf())
+}
+
+/// Local tuning for when an agent counts as finished.
+///
+/// This module stays free of configuration IO: the values are handed to it during startup by
+/// whoever read the config file, so the detection logic remains pure and testable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NotificationTuning {
+    pub quiet_before_done: Duration,
+    /// Only end a working interval on an explicit completion signal. Removes every false
+    /// positive at the cost of showing an agent as working indefinitely when it never rings.
+    pub require_bell: bool,
+}
+
+impl Default for NotificationTuning {
+    fn default() -> Self {
+        Self {
+            quiet_before_done: DEFAULT_QUIET_BEFORE_DONE,
+            require_bell: false,
+        }
+    }
+}
+
+static NOTIFICATION_TUNING: OnceLock<NotificationTuning> = OnceLock::new();
+
+/// Install this process's tuning. Called once during startup; later calls are ignored.
+pub fn set_notification_tuning(tuning: NotificationTuning) {
+    let _ = NOTIFICATION_TUNING.set(tuning);
+}
+
+fn notification_tuning() -> NotificationTuning {
+    NOTIFICATION_TUNING.get().copied().unwrap_or_default()
 }
 
 /// A supported coding agent kind.
@@ -286,25 +319,29 @@ pub struct PaneAgentTracker {
     pub done_agent: Option<DoneAgent>,
     pub working_since: Option<Instant>,
     pub working_since_unix_ms: u64,
-    quiet_before_done: Duration,
+    tuning: NotificationTuning,
     settle_until: Option<Instant>,
 }
 
 impl Default for PaneAgentTracker {
     fn default() -> Self {
+        Self::with_tuning(notification_tuning())
+    }
+}
+
+impl PaneAgentTracker {
+    pub fn with_tuning(tuning: NotificationTuning) -> Self {
         Self {
             last_output_at: None,
             active_agent: None,
             done_agent: None,
             working_since: None,
             working_since_unix_ms: 0,
-            quiet_before_done: DEFAULT_QUIET_BEFORE_DONE,
+            tuning,
             settle_until: None,
         }
     }
-}
 
-impl PaneAgentTracker {
     /// Record PTY output for the working/idle state calculation.
     pub fn record_output(&mut self, now: Instant, unix_ms_now: u64) {
         self.last_output_at = Some(now);
@@ -407,7 +444,7 @@ impl PaneAgentTracker {
         };
         let quiet_for = now.duration_since(last_output);
         if self.working_since.is_some() {
-            if quiet_for >= self.quiet_before_done {
+            if !self.tuning.require_bell && quiet_for >= self.tuning.quiet_before_done {
                 self.clear_working_state();
             }
         } else if quiet_for <= WORKING_ENTER && !self.settling(now) {
@@ -758,6 +795,33 @@ mod tests {
         assert_eq!(
             tracker.listed_agent(now + Duration::from_secs(10), 11_000),
             Some((agent, AgentState::Working))
+        );
+    }
+
+    #[test]
+    fn require_bell_never_finishes_on_the_silence_timer_alone() {
+        let now = Instant::now();
+        let agent = DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: "/repo".into(),
+        };
+        let mut tracker = PaneAgentTracker::with_tuning(NotificationTuning {
+            quiet_before_done: Duration::from_secs(20),
+            require_bell: true,
+        });
+        tracker.update(Some(agent.clone()), now, 1_000);
+        tracker.record_output(now, 1_000);
+
+        // An hour of silence is not a completion when the user asked for explicit signals only.
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(3_600), 1_000),
+            Some((agent.clone(), AgentState::Working))
+        );
+
+        tracker.record_completion_signal(now + Duration::from_secs(3_601));
+        assert_eq!(
+            tracker.listed_agent(now + Duration::from_secs(3_601), 1_000),
+            Some((agent, AgentState::Idle))
         );
     }
 

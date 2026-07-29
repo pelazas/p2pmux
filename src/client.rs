@@ -195,13 +195,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         )?;
                         apply_leases(view, leases);
                         apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
-                        if sound_enabled {
-                            for _ in apply_rosters(view, rosters) {
-                                notification_sound.play();
-                            }
-                        } else {
-                            let _ = apply_rosters(view, rosters);
-                        }
+                        announce_agent_completions(
+                            apply_rosters(view, rosters),
+                            sound_enabled,
+                            &notification_sound,
+                        );
                         let apply_elapsed = apply_started.elapsed();
                         if crate::perf::enabled() && apply_elapsed >= Duration::from_millis(5) {
                             crate::perf::log(&format!(
@@ -327,13 +325,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     NodeMessage::Rosters { rosters } => {
                         if let Some(view) = tui.as_mut() {
-                            if sound_enabled {
-                                for _ in apply_rosters(view, rosters) {
-                                    notification_sound.play();
-                                }
-                            } else {
-                                let _ = apply_rosters(view, rosters);
-                            }
+                            announce_agent_completions(
+                                apply_rosters(view, rosters),
+                                sound_enabled,
+                                &notification_sound,
+                            );
                             dirty = true;
                         }
                     }
@@ -806,6 +802,27 @@ fn apply_leases(view: &mut MultiPaneTui, leases: Vec<crate::local_ipc::PaneLease
                 lease.controller_active,
             ),
         );
+    }
+}
+
+/// Ring for panes whose agent just finished, and record the decision.
+///
+/// The log line matters: a spurious notification is otherwise invisible after the fact, and
+/// the last round of false positives had to be diagnosed by reasoning about the state machine
+/// rather than by reading what it actually did.
+fn announce_agent_completions(
+    panes: Vec<u64>,
+    sound_enabled: bool,
+    sound: &crate::notify_sound::NotificationSound,
+) {
+    for pane_id in panes {
+        crate::tui::ui_debug_log(
+            "agent_completion",
+            format_args!("pane={pane_id} sound={sound_enabled}"),
+        );
+        if sound_enabled {
+            sound.play();
+        }
     }
 }
 

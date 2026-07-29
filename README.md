@@ -82,6 +82,14 @@ the local unread stars while silencing sound. By default p2pmux plays
 `/System/Library/Sounds/Tink.aiff`; set the optional `sound_path` to any local sound file. These
 settings are client-local and load when the client attaches.
 
+An agent counts as finished when it rings the terminal bell, or failing that after
+`quiet_seconds` of silence (default 20, clamped to 5-3600). The bell is by far the better
+signal — silence cannot distinguish an agent that finished from one waiting on a model
+response — so configure your agent to ring when it completes if it supports that. Set
+`require_bell = true` to notify *only* on the bell; that removes every false notification, at
+the cost of showing an agent that never rings as working until it exits. Each pane is announced
+once per work episode, so revisiting a pane does not replay its notification.
+
 Every `create` automatically receives a memorable world-city session name such as `tokyo` or
 `cape-town`; no session name is required. `create --session-name <name>` remains available when
 you want to choose a name explicitly. A joining peer uses the coordinator's session name for its

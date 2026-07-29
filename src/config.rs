@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n#\n# An agent counts as finished after this many seconds of silence. Agents pause for a\n# long time mid-task (waiting on a model response, running a quiet tool), so a small\n# value reports unfinished work as finished. Clamped to 5-3600.\n# quiet_seconds = 20\n#\n# Only finish on an explicit signal from the agent (a terminal bell) and never on the\n# silence timer above. Removes every false notification, but an agent that does not\n# ring will show as working until it exits.\n# require_bell = false\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -56,13 +56,23 @@ pub struct UiConfig {
 pub struct NotificationsConfig {
     pub sound_enabled: bool,
     pub sound_path: Option<PathBuf>,
+    /// Seconds of silence before an agent counts as finished. Clamped to a sane range on load,
+    /// because a very small value reports every mid-task pause as a completion.
+    pub quiet_seconds: u64,
+    pub require_bell: bool,
 }
+
+/// Below this, ordinary pauses inside a running task start reading as completions.
+const MIN_QUIET_SECONDS: u64 = 5;
+const MAX_QUIET_SECONDS: u64 = 3_600;
 
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
             sound_enabled: true,
             sound_path: None,
+            quiet_seconds: crate::agent_detect::DEFAULT_QUIET_BEFORE_DONE.as_secs(),
+            require_bell: false,
         }
     }
 }
@@ -137,6 +147,8 @@ struct UiConfigFile {
 struct NotificationsConfigFile {
     sound_enabled: Option<bool>,
     sound_path: Option<PathBuf>,
+    quiet_seconds: Option<u64>,
+    require_bell: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -305,9 +317,21 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         config.ui.theme.pane_border_remote_control,
         "pane_border_remote_control",
     )?;
+    let defaults = NotificationsConfig::default();
     let notifications = NotificationsConfig {
         sound_enabled: config.ui.notifications.sound_enabled.unwrap_or(true),
         sound_path: config.ui.notifications.sound_path,
+        quiet_seconds: config
+            .ui
+            .notifications
+            .quiet_seconds
+            .unwrap_or(defaults.quiet_seconds)
+            .clamp(MIN_QUIET_SECONDS, MAX_QUIET_SECONDS),
+        require_bell: config
+            .ui
+            .notifications
+            .require_bell
+            .unwrap_or(defaults.require_bell),
     };
     Ok(Config {
         display_name,
@@ -474,6 +498,47 @@ mod tests {
         assert_eq!(
             notifications.sound_path,
             Some(PathBuf::from("/tmp/complete.aiff"))
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn completion_timing_parses_and_clamps_out_of_range_values() {
+        assert_eq!(NotificationsConfig::default().quiet_seconds, 20);
+        assert!(!NotificationsConfig::default().require_bell);
+
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[ui.notifications]\nquiet_seconds = 45\nrequire_bell = true\n",
+        )
+        .unwrap();
+        let notifications = load_config_from(&path).unwrap().ui.notifications;
+        assert_eq!(notifications.quiet_seconds, 45);
+        assert!(notifications.require_bell);
+
+        // A tiny window is what made the notification fire mid-task in the first place, so it
+        // is clamped rather than honoured.
+        fs::write(&path, "[ui.notifications]\nquiet_seconds = 1\n").unwrap();
+        assert_eq!(
+            load_config_from(&path)
+                .unwrap()
+                .ui
+                .notifications
+                .quiet_seconds,
+            MIN_QUIET_SECONDS
+        );
+
+        fs::write(&path, "[ui.notifications]\nquiet_seconds = 999999\n").unwrap();
+        assert_eq!(
+            load_config_from(&path)
+                .unwrap()
+                .ui
+                .notifications
+                .quiet_seconds,
+            MAX_QUIET_SECONDS
         );
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
