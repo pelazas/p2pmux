@@ -115,7 +115,19 @@ discard that frozen history. Local IPC is intentionally versioned as an implemen
 restart an existing session after upgrading when attach protocol changes are present.
 Short join codes resolve through a restrictive local cache on the same Mac, so they are for current
 dogfooding only; they work while the corresponding `create` process is alive and are removed when
-it exits. Long `p2pmux-v1:` tickets remain accepted for backwards compatibility.
+it exits. A peer on another machine cannot resolve one.
+
+To invite someone on another Mac, use the full `p2pmux-v1:` ticket, which `join` also accepts:
+
+```text
+p2pmux ticket            # the one session live on this Mac
+p2pmux ticket <code>     # when several are live; the code is in the session footer
+```
+
+The ticket is printed to stdout on its own, so `p2pmux ticket | pbcopy` gives you something
+directly pasteable. Treat it as a password: it grants full shared-shell access to the session, to
+anyone holding it, for as long as the session lives. There is no hosted rendezvous yet, so this is
+the portable invite until one exists.
 
 Only one peer controls a pane while they are actively typing. After about thirty seconds without
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key
