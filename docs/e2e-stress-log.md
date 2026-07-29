@@ -570,6 +570,62 @@ prioritised, being the newest code). Categories C (room lifecycle), D (terminal 
 E (mouse forwarding) and F (load and failure) have **not been touched at all**. The right
 reading is "A and B look solid", so the loop continues into the untouched categories.
 
+## Addendum — Scenario K: when a watching peer is told an agent finished (2026-07-29)
+
+Script: `scripts/e2e/scenario_k_agent_notify.py`. Added after the loop stopped, to cover a
+user-reported bug the loop never reached: the agent-completion notification fired repeatedly
+while an agent was still working.
+
+The root cause was that "working" meant "this pane printed something in the last 2 seconds"
+(`agent_detect.rs` `WORKING_WINDOW`), so every pause longer than that — waiting on a model
+response, running a tool that streams nothing — was reported as a completion. A second defect
+amplified it: the unread-pane set was both the overlay star and the sound's dedup key, so
+focusing a pane to check on it silently re-armed the sound.
+
+Two peers. A fake agent runs in the host's pane; the guest creates its own pane so it is *not*
+viewing the agent, since a focused pane is suppressed by design and the scenario would
+otherwise pass without testing anything.
+
+Repro:
+1. Host creates, guest joins, guest presses `Ctrl+P, n` so it is focused elsewhere.
+2. Host runs a fake `claude` that prints, pauses 6s, prints, pauses 6s, prints, pauses 6s,
+   then rings `BEL` and stays alive.
+3. Sample the announcement count after each pause, then after the bell, then after settling.
+
+| Check | Result |
+|---|---|
+| The agent's output reaches the watching guest | PASS |
+| **A mid-task pause is not announced as a completion** | PASS |
+| **The bell announces the completion** | PASS — 0.0s after the bell |
+| **The completion is announced exactly once** | PASS |
+| **Focusing the finished pane does not re-announce it** | PASS |
+| The peer viewing the pane is not notified | PASS |
+| The fake agent is classified as Claude Code | PASS |
+| No panic on either peer | PASS |
+
+2/2 runs clean, zero orphans.
+
+**Two harness notes worth keeping** (both mine, not p2pmux's):
+
+- **A fake agent cannot just be a script named `claude`.** Detection matches the process's own
+  name, so a shebang script is reported as its interpreter and never classified. Copying
+  `/bin/sh` to `claude` does not work either — macOS SIGKILLs a copy of a signed platform
+  binary (`Killed: 9`). `/bin/sh -c 'exec -a claude /bin/sh <script>'` runs the real, signed
+  binary under the right `argv[0]`.
+- **The first version of the oracle sampled too late.** The bell followed the last step with no
+  pause between them, so the "mid-task" sample already included the bell's announcement and
+  reported a false failure. The agent now pauses before ringing.
+
+**The oracle was verified to be able to fail**, rather than assumed. Running the *fixed* binary
+with `quiet_seconds = 5` against 8s pauses — the shape of the original bug, pauses longer than
+the window — produced announcements of 1, 2, 3 at the three sample points: one spurious ring
+per pause, exactly as reported. At the default 20s window the same scenario reports 0, 0, 0.
+
+Note for anyone re-running this against an older build: the count comes from an
+`agent_completion` line in the UI debug log that was added by the fix, so a pre-fix binary
+reads zero for every sample. That comparison measures the absence of the instrument, not the
+behaviour, and cannot be used as an A/B.
+
 ## Open bugs
 
 _None._
