@@ -1413,6 +1413,7 @@ impl PaneServer {
             .await
             .map_err(|_| SessionError::TimedOut("incoming pane connection"))?
             .map_err(SessionError::Incoming)?;
+        self.transport.observe(&connection);
         let result = self.serve_connection(&connection).await;
         if result.is_err() {
             connection.close(0u8.into(), b"");
@@ -1653,6 +1654,7 @@ impl HostSession {
             .await
             .map_err(|_| SessionError::TimedOut("incoming connection"))?
             .map_err(SessionError::Incoming)?;
+        self.transport.observe(&connection);
         match self.handshake_connection(&connection).await {
             Ok(receipt) => {
                 let _ = timeout(HANDSHAKE_TIMEOUT, connection.closed()).await;
@@ -1693,6 +1695,7 @@ impl HostSession {
             .await
             .map_err(|_| SessionError::TimedOut("incoming connection"))?
             .map_err(SessionError::Incoming)?;
+        self.transport.observe(&connection);
         let result = async {
             self.handshake_connection(&connection).await?;
             let (screen_writer, _) = self.transport.open_framed_bi(&connection).await?;
@@ -2285,6 +2288,7 @@ impl SharedLayoutHost {
             .await
             .map_err(|_| SessionError::TimedOut("incoming connection"))?
             .map_err(SessionError::Incoming)?;
+        self.host.transport.observe(&connection);
         let result = async {
             let (mut join_writer, mut join_reader) =
                 self.host.transport.accept_bi(&connection).await?;
@@ -2538,6 +2542,7 @@ impl IncomingDispatcher {
             .await
             .map_err(|_| SessionError::TimedOut("incoming connection"))?
             .map_err(SessionError::Incoming)?;
+        self.layout.host.transport.observe(&connection);
         let result = async {
             let (mut first_writer, mut first_reader) =
                 self.layout.host.transport.accept_bi(&connection).await?;
