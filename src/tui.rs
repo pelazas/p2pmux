@@ -457,6 +457,12 @@ pub struct MultiPaneTui {
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
     prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
+    /// Start of the working interval last seen for a pane. An idle row carries the `0`
+    /// sentinel, so the episode a completion refers to has to be remembered while it runs.
+    prior_agent_episodes: BTreeMap<PaneId, u64>,
+    /// Working interval a pane was last announced for. Keyed separately from
+    /// `unread_agent_panes` because that set is cleared by focusing the pane.
+    notified_agent_episodes: BTreeMap<PaneId, u64>,
     unread_agent_panes: BTreeSet<PaneId>,
     modal: ModalState,
     agent_selected_pane: Option<PaneId>,
@@ -500,6 +506,8 @@ impl MultiPaneTui {
             selection_dragging: false,
             agent_rows: Vec::new(),
             prior_agent_states: BTreeMap::new(),
+            prior_agent_episodes: BTreeMap::new(),
+            notified_agent_episodes: BTreeMap::new(),
             unread_agent_panes: BTreeSet::new(),
             modal: ModalState::None,
             agent_selected_pane: None,
@@ -594,18 +602,36 @@ impl MultiPaneTui {
     ///
     /// The first observed roster only establishes the local baseline. Roster rows that disappear
     /// intentionally retain their previous state and unread marker until their pane is deleted.
+    /// Apply the latest roster and return the panes whose agent just finished a work episode
+    /// the user has not been told about. Announcing is keyed on the work episode rather than on
+    /// the unread marker: focusing a pane clears the marker, and that must not re-arm the
+    /// completion sound for work the user has already been notified about.
     pub fn update_attached_agent_rows(&mut self, rows: Vec<AgentOverlayRow>) -> Vec<PaneId> {
         self.set_agent_rows(rows);
         let mut newly_unread = Vec::new();
         for row in &self.agent_rows {
-            let previous = self.prior_agent_states.insert(row.pane_id, row.state);
-            if previous == Some(AgentRosterState::Working)
-                && row.state == AgentRosterState::Idle
-                && row.pane_id != self.focused_pane
-                && self.unread_agent_panes.insert(row.pane_id)
-            {
-                newly_unread.push(row.pane_id);
+            if row.state == AgentRosterState::Working {
+                self.prior_agent_episodes
+                    .insert(row.pane_id, row.working_since_unix_ms);
             }
+            let previous = self.prior_agent_states.insert(row.pane_id, row.state);
+            if previous != Some(AgentRosterState::Working)
+                || row.state != AgentRosterState::Idle
+                || row.pane_id == self.focused_pane
+            {
+                continue;
+            }
+            let episode = self
+                .prior_agent_episodes
+                .get(&row.pane_id)
+                .copied()
+                .unwrap_or_default();
+            if self.notified_agent_episodes.get(&row.pane_id) == Some(&episode) {
+                continue;
+            }
+            self.notified_agent_episodes.insert(row.pane_id, episode);
+            self.unread_agent_panes.insert(row.pane_id);
+            newly_unread.push(row.pane_id);
         }
         newly_unread
     }
@@ -1053,6 +1079,10 @@ impl MultiPaneTui {
             .collect();
         self.snapshot = snapshot;
         self.prior_agent_states
+            .retain(|pane_id, _| self.snapshot.panes.contains_key(pane_id));
+        self.prior_agent_episodes
+            .retain(|pane_id, _| self.snapshot.panes.contains_key(pane_id));
+        self.notified_agent_episodes
             .retain(|pane_id, _| self.snapshot.panes.contains_key(pane_id));
         self.unread_agent_panes
             .retain(|pane_id| self.snapshot.panes.contains_key(pane_id));
@@ -7175,6 +7205,52 @@ mod tests {
             Vec::<u64>::new()
         );
         assert!(!tui.unread_agent_panes.contains(&1));
+    }
+
+    #[test]
+    fn focusing_a_pane_does_not_re_announce_the_same_work_episode() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+        // A real host sends the `0` sentinel on a non-working row, so the episode a completion
+        // refers to is only ever visible on the working row that preceded it.
+        idle.working_since_unix_ms = 0;
+
+        tui.update_attached_agent_rows(vec![working.clone()]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle.clone()]), vec![2]);
+
+        // Looking at the pane clears the unread marker. That must not re-arm the sound: the
+        // user has already been told about this episode.
+        tui.set_focus(1, 2).expect("known pane");
+        tui.set_focus(1, 1).expect("known pane");
+        assert!(!tui.unread_agent_panes.contains(&2));
+
+        tui.update_attached_agent_rows(vec![working.clone()]);
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![idle.clone()]),
+            Vec::<u64>::new(),
+            "the same work episode must only be announced once"
+        );
+
+        // A genuinely new working interval is a new episode and does announce again.
+        let mut next_working = working;
+        next_working.working_since_unix_ms += 1;
+        tui.update_attached_agent_rows(vec![next_working]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle]), vec![2]);
     }
 
     #[test]
