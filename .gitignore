@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# Python bytecode from the e2e and research scripts
+__pycache__/
+*.py[cod]
+
 # macOS and local editor metadata
 .DS_Store
 .idea/
