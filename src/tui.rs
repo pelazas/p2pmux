@@ -299,6 +299,14 @@ pub enum UiIntent {
         pane_id: PaneId,
         locked: bool,
     },
+    /// Close or reopen the whole session to peers that have never joined it.
+    ///
+    /// Unlike `SetPaneLock` this is not layout state and never travels as a layout
+    /// request: only the coordinator answers joins, so only the coordinator can enforce
+    /// it, and a guest pressing the key is told so rather than silently ignored.
+    SetSessionLock {
+        locked: bool,
+    },
 }
 
 /// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
@@ -479,6 +487,9 @@ pub struct MultiPaneTui {
     /// A pane-mode invite request. The ticket lives in the node's rendezvous record rather
     /// than in the layout, so the attached client resolves and copies it.
     pending_ticket_copy: bool,
+    /// Whether the coordinator is refusing new peers. Mirrored from the node rather than
+    /// derived, because only the coordinator knows it and any peer may be drawing it.
+    session_locked: bool,
 }
 
 impl MultiPaneTui {
@@ -521,6 +532,7 @@ impl MultiPaneTui {
             pending_agent_toggle: None,
             resize_drag: None,
             pending_join_click: false,
+            session_locked: false,
             mouse_forwarding: false,
             pending_ticket_copy: false,
         })
@@ -1716,6 +1728,12 @@ impl MultiPaneTui {
                     pane_id: self.focused_pane,
                     locked: !pane.locked,
                 }),
+            // Shift+L, deliberately a different key from the lowercase `k` pane lock:
+            // locking one pane and locking the front door are very different acts to
+            // perform by accident.
+            KeyCode::Char('L') => Some(UiIntent::SetSessionLock {
+                locked: !self.session_locked,
+            }),
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                 if key.modifiers.is_empty() =>
             {
@@ -1723,6 +1741,15 @@ impl MultiPaneTui {
             }
             _ => None,
         }
+    }
+
+    /// Mirror the coordinator's current session lock, for display and for the toggle.
+    pub fn set_session_locked(&mut self, locked: bool) {
+        self.session_locked = locked;
+    }
+
+    pub fn session_locked(&self) -> bool {
+        self.session_locked
     }
 
     /// Claim a pending invite request, if the last key asked for one.
@@ -1996,7 +2023,16 @@ fn collect_pending_events(max: usize) -> io::Result<Vec<Event>> {
 }
 
 fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
-    if !key.modifiers.is_empty() {
+    // An uppercase chord letter arrives with SHIFT held, which is not a modifier the user
+    // added on purpose -- it is how the letter is typed. Rejecting it outright would make
+    // any uppercase chord permanently unreachable.
+    let uppercase = matches!(key.code, KeyCode::Char(letter) if letter.is_ascii_uppercase());
+    let permitted = if uppercase {
+        (key.modifiers - KeyModifiers::SHIFT).is_empty()
+    } else {
+        key.modifiers.is_empty()
+    };
+    if !permitted {
         return false;
     }
     match mode {
@@ -2010,6 +2046,7 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
                 | KeyCode::Char('u')
                 | KeyCode::Char('x')
                 | KeyCode::Char('k')
+                | KeyCode::Char('L')
                 | KeyCode::Char('i')
                 | KeyCode::Left
                 | KeyCode::Right
@@ -2602,7 +2639,7 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <i> INVITE   <Esc> BACK",
+            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <i> INVITE   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
@@ -5574,8 +5611,30 @@ impl SharedLayoutRuntime {
             UiIntent::SetPaneLock { pane_id, locked } => {
                 self.set_pane_lock(pane_id, locked)?;
             }
+            UiIntent::SetSessionLock { locked } => {
+                self.set_session_lock(locked)?;
+            }
             UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. } => {}
         }
+        Ok(())
+    }
+
+    /// Close or reopen the session to newcomers.
+    ///
+    /// Refused for a guest rather than forwarded: the coordinator is the only peer that
+    /// answers joins, so a guest "locking" would change nothing while looking like it had.
+    fn set_session_lock(&mut self, locked: bool) -> Result<(), Box<dyn Error>> {
+        let SharedControl::Host(host) = &self.control else {
+            self.status = String::from("only the session host can lock this session");
+            return Ok(());
+        };
+        let locked = host.set_session_lock(locked)?;
+        self.tui.set_session_locked(locked);
+        self.status = String::from(if locked {
+            "session locked — new peers are refused"
+        } else {
+            "session unlocked — anyone with the ticket can join"
+        });
         Ok(())
     }
 
@@ -11239,6 +11298,64 @@ mod tests {
             .expect("render");
 
         terminal.backend_mut().assert_cursor_position((2, 0));
+    }
+
+    #[test]
+    fn an_uppercase_chord_letter_is_reachable_despite_its_shift_modifier() {
+        // Shift is how `L` is typed, not a modifier the user chose to add. An earlier
+        // version rejected every modified key here, which made the session lock
+        // impossible to trigger from a real keyboard while every unit test passed.
+        assert!(is_chord_command(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT)
+        ));
+        assert!(is_chord_command(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)
+        ));
+        // A genuinely extra modifier is still not a chord command.
+        assert!(!is_chord_command(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::CONTROL)
+        ));
+        assert!(!is_chord_command(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT)
+        ));
+    }
+
+    #[test]
+    fn shift_l_toggles_the_session_lock_from_whatever_state_it_is_in() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+                area
+            ),
+            KeyHandling::Consumed(vec![UiIntent::SetSessionLock { locked: true }]),
+            "Shift+L should offer to lock a session that is currently open"
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        tui.set_session_locked(true);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+                area
+            ),
+            KeyHandling::Consumed(vec![UiIntent::SetSessionLock { locked: false }]),
+            "and to unlock one that is locked"
+        );
     }
 
     #[test]
