@@ -196,6 +196,8 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> CLOSE   <"),
     FooterSegment::Key("k"),
     FooterSegment::Text("> LOCK   <"),
+    FooterSegment::Key("i"),
+    FooterSegment::Text("> INVITE   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
@@ -474,6 +476,9 @@ pub struct MultiPaneTui {
     pending_join_click: bool,
     /// Set while a press forwarded to a child owns the drag and release that follow.
     mouse_forwarding: bool,
+    /// A pane-mode invite request. The ticket lives in the node's rendezvous record rather
+    /// than in the layout, so the attached client resolves and copies it.
+    pending_ticket_copy: bool,
 }
 
 impl MultiPaneTui {
@@ -517,6 +522,7 @@ impl MultiPaneTui {
             resize_drag: None,
             pending_join_click: false,
             mouse_forwarding: false,
+            pending_ticket_copy: false,
         })
     }
 
@@ -1698,6 +1704,10 @@ impl MultiPaneTui {
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeletePane {
                 pane_id: self.focused_pane,
             }),
+            KeyCode::Char('i') if key.modifiers.is_empty() => {
+                self.pending_ticket_copy = true;
+                None
+            }
             KeyCode::Char('k') if key.modifiers.is_empty() => self
                 .snapshot
                 .panes
@@ -1713,6 +1723,11 @@ impl MultiPaneTui {
             }
             _ => None,
         }
+    }
+
+    /// Claim a pending invite request, if the last key asked for one.
+    pub fn take_ticket_copy_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_ticket_copy)
     }
 
     fn create_pane(&self, axis: Axis, position: NewPanePosition, area: Rect) -> Option<UiIntent> {
@@ -1995,6 +2010,7 @@ fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
                 | KeyCode::Char('u')
                 | KeyCode::Char('x')
                 | KeyCode::Char('k')
+                | KeyCode::Char('i')
                 | KeyCode::Left
                 | KeyCode::Right
                 | KeyCode::Up
@@ -2586,7 +2602,7 @@ fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSe
     match chord_mode {
         ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
         ChordMode::Pane => (
-            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
+            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <i> INVITE   <Esc> BACK",
             PANE_FOOTER,
         ),
         ChordMode::Tab => (
@@ -10199,6 +10215,41 @@ mod tests {
     }
 
     #[test]
+    fn pane_mode_invite_requests_a_ticket_copy_once_and_leaves_the_mode() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![]),
+            "invite is a mux command and never reaches the PTY"
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        assert!(tui.take_ticket_copy_request());
+        assert!(
+            !tui.take_ticket_copy_request(),
+            "a claimed request must not copy again on the next key"
+        );
+    }
+
+    #[test]
+    fn plain_invite_key_reaches_the_pty_outside_pane_mode() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert!(!tui.take_ticket_copy_request());
+    }
+
+    #[test]
     fn option_arrows_accept_extra_modifiers_but_not_control() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -10454,7 +10505,7 @@ mod tests {
             ),
             (
                 ChordMode::Pane,
-                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <Esc> BACK",
+                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <i> INVITE   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,

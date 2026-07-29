@@ -89,6 +89,27 @@ fn copy_attach_selection(
     copy_selection_to_clipboard(&text).ok()
 }
 
+/// Put the session's full join ticket on the clipboard, and say what the footer should report.
+///
+/// A client shares a Mac with its node, so it reads the same rendezvous record rather than
+/// having a bearer credential travel over the local socket for the sake of one keypress. Only a
+/// coordinator publishes a record, so a guest is told plainly that it has no invite to give.
+fn copy_join_ticket(join_code: Option<&str>) -> String {
+    let Some(code) = join_code else {
+        return String::from("only the session host has a ticket to copy");
+    };
+    let ticket = match crate::rendezvous::LocalRendezvous::for_current_user()
+        .and_then(|store| store.resolve(code))
+    {
+        Ok(ticket) => ticket,
+        Err(error) => return format!("ticket unavailable: {error}"),
+    };
+    match copy_selection_to_clipboard(&ticket.to_string()) {
+        Ok(_) => String::from("copied full ticket"),
+        Err(error) => format!("clipboard copy failed: {error}"),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PendingScroll {
     request_id: u64,
@@ -444,6 +465,9 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     KeyHandling::Consumed(intents) => {
                         send_intents(&mut stream, tui, intents, &mut pending_focus)?;
+                        if tui.take_ticket_copy_request() {
+                            footer_notice = Some(copy_join_ticket(join_code.as_deref()));
+                        }
                         dirty = true;
                     }
                     KeyHandling::Forward => {
