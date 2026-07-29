@@ -666,6 +666,27 @@ def join_code_from(screen: str) -> str:
     return match.group(1)
 
 
+# `direct 55ms`, `relayed 120ms ×3`, `locked · direct <1ms` -- the connectivity badge
+# p2pmux draws at the right edge of the tab bar.
+LINK_BADGE = re.compile(r"(?:locked · )?(?:direct|relayed|other)(?: (?:<1|\d+)ms)?(?: ×\d+)?")
+
+
+def mask_link_badge(screen: str) -> str:
+    """Blank the tab bar's connectivity badge so two screens can be compared.
+
+    The badge carries a live RTT, so it legitimately differs between any two snapshots
+    taken seconds apart. Any assertion that compares whole rendered screens has to mask
+    it or it reports a phantom failure every time the network jitters by 5ms -- the same
+    class of oracle bug as keying on `Pane #N`, which is a display ordinal.
+
+    Only the first line is touched: the badge lives in the tab bar and nowhere else.
+    """
+    rows = screen.split("\n")
+    if rows:
+        rows[0] = LINK_BADGE.sub(lambda match: " " * len(match.group(0)), rows[0])
+    return "\n".join(rows)
+
+
 def diff_screens(label_a: str, a: str, label_b: str, b: str) -> str:
     """Human-readable per-line diff of two rendered screens."""
     rows_a, rows_b = a.split("\n"), b.split("\n")

@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from driver import Harness, diff_screens, p2pmux_pids  # noqa: E402
+from driver import Harness, diff_screens, mask_link_badge, p2pmux_pids  # noqa: E402
 
 UNICODE = "日本語 ABC 🙂🎉 café ĄŻ"
 
@@ -101,10 +101,19 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
 
         host.wheel_down(20, 10, times=8)
         time.sleep(2.0)
+        # Masked: the tab bar's connectivity badge carries a live RTT, so an unmasked
+        # whole-screen comparison fails whenever the path jitters between the two
+        # snapshots -- a phantom failure that says nothing about scrollback.
         check(
             "wheel-down returns exactly to the live bottom",
-            host.snapshot() == at_bottom,
-            "\n" + diff_screens("at bottom", at_bottom, "after scroll down", host.snapshot()),
+            mask_link_badge(host.snapshot()) == mask_link_badge(at_bottom),
+            "\n"
+            + diff_screens(
+                "at bottom",
+                mask_link_badge(at_bottom),
+                "after scroll down",
+                mask_link_badge(host.snapshot()),
+            ),
         )
 
         # --- E, part 2: same pane, same peer, but now the child turns mouse reporting on.
