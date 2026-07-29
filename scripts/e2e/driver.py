@@ -113,6 +113,10 @@ class Peer:
     rows: int = DEFAULT_ROWS
     env: dict[str, str] = field(default_factory=dict)
     cwd: Path | None = None
+    # When set, argv becomes [*launcher, *args] instead of [BINARY, *args], and this
+    # process's env is *not* forwarded: a remote launcher carries its own environment.
+    # See remote.py -- this is how a peer runs on another machine over ssh.
+    launcher: Sequence[str] | None = None
 
     process: subprocess.Popen | None = field(default=None, init=False)
     master_fd: int = field(default=-1, init=False)
@@ -128,7 +132,7 @@ class Peer:
     # ---------------------------------------------------------------- lifecycle
 
     def start(self) -> "Peer":
-        if not BINARY.exists():
+        if self.launcher is None and not BINARY.exists():
             raise FileNotFoundError(f"{BINARY} missing -- run: cargo build --release")
 
         self._screen = AltScreen(self.cols, self.rows)
@@ -143,8 +147,13 @@ class Peer:
             # crossterm's raw mode and any child shell job control misbehave.
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
+        argv = (
+            [*self.launcher, *self.args]
+            if self.launcher is not None
+            else [str(BINARY), *self.args]
+        )
         self.process = subprocess.Popen(
-            [str(BINARY), *self.args],
+            argv,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -511,8 +520,13 @@ class Harness:
         rows: int = DEFAULT_ROWS,
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
+        launcher: Sequence[str] | None = None,
     ) -> Peer:
-        """Start one p2pmux peer on its own PTY inside this harness's sandbox HOME."""
+        """Start one p2pmux peer on its own PTY inside this harness's sandbox HOME.
+
+        With `launcher` set the peer runs on another machine (see remote.py); the
+        sandbox HOME below is this Mac's and does not apply to it.
+        """
         peer_env = {
             "HOME": str(self.home),
             "TERM": "xterm-256color",
@@ -528,6 +542,7 @@ class Harness:
             rows=rows,
             env=peer_env,
             cwd=cwd or REPO_ROOT,
+            launcher=list(launcher) if launcher is not None else None,
         )
         self.peers.append(peer)
         peer.start()
