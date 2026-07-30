@@ -11,11 +11,12 @@ Branch: `e2e-stress`.
 
 - **Localhost only, for scenarios A–K.** Those peers all run on one Mac, exercising the direct
   transport and the local rendezvous join-code file, and nothing in them should be read as
-  "P2P is tested". Scenarios **L** and **M** (addenda below) are the exception: one peer runs
-  on a DigitalOcean droplet over the public internet, with latency, loss, and forced relay
-  applied on the Linux side, and both now assert which path the session actually took. Still
-  uncovered anywhere: carrier-grade NAT, which needs a Mac on a phone hotspot and a pair of
-  hands.
+  "P2P is tested". Scenarios **L**, **M**, **N** and **O** (addenda below) are the
+  exception: they run over the public internet against DigitalOcean droplets, with latency,
+  loss, and forced relay applied on the Linux side, and each asserts which path the session
+  actually took. N removes this Mac from the session entirely; O puts it back in the middle of
+  two droplets, behind its own router. Still uncovered anywhere: carrier-grade NAT, which needs
+  a Mac on a phone hotspot and a pair of hands.
 - Per instruction, the network interface is never touched (no `ifconfig`/`pfctl`). Transport
   failure is simulated at the process level (kill / SIGSTOP / SIGCONT).
 - The user's own `target/debug/p2pmux` sessions run on this machine. The harness sandboxes
@@ -545,9 +546,11 @@ p2pmux. The recurring lesson was to read the raw PTY bytes before believing an o
 
 ### What this harness structurally cannot reach — for a human, by hand
 
-- **Two real machines over the real internet.** Everything here is localhost. Relay
-  fallback, NAT traversal (symmetric NAT, CGNAT, hairpinning), and the direct-vs-relay
-  upgrade path are entirely untested. This is the single biggest gap.
+- **Two real machines over the real internet.** ~~Everything here is localhost.~~
+  *Closed by scenarios L, N and O (addenda below), which run over the public internet and assert
+  the path taken; forced relay is covered by `--force-relay`.* What remains open is NAT traversal
+  from behind **carrier-grade** NAT — symmetric NAT and hairpinning — which a home router and a
+  public-IP droplet cannot exercise.
 - **Real latency, loss, and reordering.** No jitter, no packet loss, no MTU/path-MTU
   effects. The lease handoff and resync paths were only ever exercised at ~0ms RTT.
 - **Sleep/wake and network change.** Close the laptop mid-session; switch Wi-Fi → cellular;
@@ -739,6 +742,81 @@ Note for anyone re-running this against an older build: the count comes from an
 `agent_completion` line in the UI debug log that was added by the fix, so a pre-fix binary
 reads zero for every sample. That comparison measures the absence of the instrument, not the
 behaviour, and cannot be used as an A/B.
+
+## Addendum — Scenario N: a session this Mac is not a member of (2026-07-30)
+
+Script: `scripts/e2e/scenario_n_two_remotes.py`. Lab: `scripts/e2e/provision_droplets.sh`.
+
+Scenario L still had this Mac on one end of the wire, and only the droplet's pane ever streamed.
+That leaves the product's actual claim untested: *two* people on *two* machines, each hosting
+their own terminals, each able to take control of the other's. Scenario N removes the Mac from
+the session entirely — it holds two ssh reins and nothing else — and runs the whole session
+between a droplet in **nyc3** and a droplet in **fra1**.
+
+**The lab is disposable, and the tag is the contract.** `provision_droplets.sh create` stands up
+two `s-4vcpu-8gb` Ubuntu 24.04 droplets, imports a throwaway ed25519 key, and tags every resource
+`p2pmux-itest`; `destroy` removes exactly what carries that tag, so the pre-existing `p2pmux-lab`
+and `mybotvm` droplets and the developer's own ssh keys are never in scope. Source ships as a
+tarball and is built on the nyc3 box, then the binary is copied to fra1 rather than built twice —
+same image, same architecture, and the release build is most of the ~10 minutes. Coordinates land
+in `~/.cache/p2pmux/itest/droplets.json`, which `remote.py` reads, so no scenario needs a
+hand-edited `~/.ssh/config` entry for a host that will not exist in an hour.
+
+| run | result |
+|---|---|
+| first run, pre-fix | **16/20** — the four cross-control checks failed |
+| default path, post-fix | 27/27, both peers reading `direct` |
+| `--force-relay` | 27/27, both peers reading `relayed` |
+| `--delay-ms=200` | 27/27, still `direct` |
+
+**One real product bug, and no localhost scenario could ever have found it.** Typing into a free
+remote pane claims it, and the pane host bumps the lease epoch the moment it accepts that first
+byte. Everything typed during the round trip that follows still carried the *old* epoch, so the
+host rejected it as stale and the characters were gone — silently, with no redraw and no error.
+On loopback that window is under a millisecond, which is why all ten localhost iterations passed.
+Between nyc3 and fra1 it is 85ms and ate the next eight characters:
+`echo N-CROSS-A2B-$(hostname)` reached the far shell as `eOSS-A2B-$(hostname)`, and `/bin/sh` ran
+the wreckage. That is the shape of every failure in the pre-fix run above.
+
+The fix treats claim-by-typing as what it is — a control request in flight — and holds the rest
+of the burst in the existing `held_input` buffer until the new lease lands, exactly as an
+explicit take-control request already did. Three copies of that rule (the shared layout, and the
+guest loop's key and paste arms) had drifted apart; they now share one `remote_input_decision`
+helper, which is also what made the case unit-testable.
+
+`--delay-ms=200` exists for exactly this class of defect: it is the cheap way to check that a
+race fixed at 85ms stays fixed at 300ms rather than merely moving.
+
+## Addendum — Scenario O: three members, two continents, one Mac behind a router (2026-07-30)
+
+Script: `scripts/e2e/scenario_o_three_peers.py`. Coordinator in nyc3, **this Mac** in the middle,
+a third member in fra1. **20/20.**
+
+Scenario N proved two droplets can share a session, but droplets are the easy case: public IPs,
+no NAT, nothing in the way. The machine p2pmux actually ships to is a Mac behind a consumer
+router, and the thing that machine's owner will want to believe is that somebody else can drive a
+terminal *on it*. So this scenario joins from here and hands the Mac's pane to fra1.
+
+| Check | Result |
+|---|---|
+| A NAT'd Mac and two droplets land in one room | PASS |
+| **The coordinator reports both peers, not just the last one** | PASS — `direct 140ms ×2` |
+| Each of the three machines hosts a pane of its own | PASS |
+| All three peers render all three panes | PASS |
+| **fra1 drives this Mac's terminal: the whole line arrives** | PASS |
+| **…and the process runs on this Mac, as this user** | PASS — `O-ONTO-MAC-<mac hostname>` |
+| …and the third member sees it happen | PASS |
+| **This Mac drives fra1's terminal, and it runs in fra1** | PASS — `O-FROM-MAC-p2pmux-itest-b` |
+| No peer died | PASS |
+
+The badge is the interesting number: `direct 140ms ×2` means this Mac holepunched to **both**
+droplets from behind its router, and no leg of a three-way session fell back to a relay. The
+`×2` also retires a smaller doubt — the tab bar reports the worst of several peers rather than
+whichever one connected last.
+
+**Still not proven: carrier-grade NAT.** A home router doing endpoint-independent NAT is the
+common case, not the hard one. A Mac on a phone hotspot remains the outstanding test, and it
+needs a pair of hands.
 
 ## Open bugs
 
