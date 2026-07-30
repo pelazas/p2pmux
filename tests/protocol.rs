@@ -454,16 +454,106 @@ fn agent_roster_allows_zero_working_since_while_working() {
 }
 
 #[test]
+fn agent_roster_survives_states_and_kinds_from_a_newer_peer() {
+    // Both fields are open vocabularies. A peer on a newer build may name an
+    // agent this binary has never heard of, or report a state it has no variant
+    // for; neither may fail the frame, because `decode_frame` failing drops the
+    // whole peer stream in `FrameReader::read_next`. An unknown state reads as
+    // `Idle` rather than vanishing from the overlay.
+    let roster = agent_roster(vec![AgentRosterEntry {
+        agent_kind: String::from("some-future-agent"),
+        state: 99,
+        ..agent_entry(9)
+    }]);
+    let original = envelope(envelope::Body::AgentRoster(roster));
+
+    let frame = encode_frame(&original).expect("an unknown kind and state still encode");
+    assert_eq!(
+        decode_frame(&frame).expect("an unknown kind and state still decode"),
+        original
+    );
+    assert_eq!(AgentRosterState::from_wire(99), AgentRosterState::Idle);
+    assert_eq!(
+        AgentRosterState::from_wire(AgentRosterState::Done as i32),
+        AgentRosterState::Done
+    );
+}
+
+#[test]
+fn agent_roster_state_severity_ranks_failures_over_waiting_over_work() {
+    // Severity is deliberately not the enum's own ordering: `Working = 1` and
+    // `Done = 2` are frozen wire values, so declaration order says Done is more
+    // severe than Working, which is backwards. `severity()` is the real order.
+    let mut by_severity = [
+        AgentRosterState::Pending,
+        AgentRosterState::Idle,
+        AgentRosterState::Error,
+        AgentRosterState::Done,
+        AgentRosterState::Working,
+    ];
+    by_severity.sort_by_key(|state| state.severity());
+    assert_eq!(
+        by_severity,
+        [
+            AgentRosterState::Idle,
+            AgentRosterState::Done,
+            AgentRosterState::Working,
+            AgentRosterState::Pending,
+            AgentRosterState::Error,
+        ]
+    );
+
+    // needs_you is the blocked set; needs_attention adds a finished turn.
+    assert!(AgentRosterState::Pending.needs_you());
+    assert!(AgentRosterState::Error.needs_you());
+    assert!(!AgentRosterState::Done.needs_you());
+    assert!(!AgentRosterState::Working.needs_you());
+    assert!(!AgentRosterState::Idle.needs_you());
+
+    assert!(AgentRosterState::Done.needs_attention());
+    assert!(!AgentRosterState::Working.needs_attention());
+    assert!(!AgentRosterState::Idle.needs_attention());
+
+    assert!(AgentRosterState::Done.is_completion());
+    assert!(AgentRosterState::Error.is_completion());
+    assert!(!AgentRosterState::Pending.is_completion());
+}
+
+#[test]
+fn agent_roster_carries_the_new_states_over_the_wire() {
+    for state in [AgentRosterState::Pending, AgentRosterState::Error] {
+        let roster = agent_roster(vec![AgentRosterEntry {
+            state: state as i32,
+            ..agent_entry(9)
+        }]);
+        let original = envelope(envelope::Body::AgentRoster(roster));
+        let frame = encode_frame(&original).expect("new states encode");
+        assert_eq!(decode_frame(&frame).expect("new states decode"), original);
+        assert_eq!(AgentRosterState::from_wire(state as i32), state);
+    }
+}
+
+#[test]
 fn agent_roster_validation_rejects_bad_entries() {
     let cases = [
         agent_roster(vec![agent_entry(0)]),
         agent_roster(vec![agent_entry(1), agent_entry(1)]),
+        // A kind is still shape-checked, so nothing that would corrupt a
+        // rendered cell gets through: empty, uppercase, spaces, control chars.
         agent_roster(vec![AgentRosterEntry {
-            agent_kind: String::from("unknown"),
+            agent_kind: String::new(),
             ..agent_entry(1)
         }]),
         agent_roster(vec![AgentRosterEntry {
-            state: 99,
+            agent_kind: String::from("Claude"),
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            agent_kind: String::from("claude code"),
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            agent_kind: String::from("claude\u{1b}[2J"),
             ..agent_entry(1)
         }]),
         agent_roster(vec![AgentRosterEntry {

@@ -563,6 +563,64 @@ pub enum AgentRosterState {
     Idle = 0,
     Working = 1,
     Done = 2,
+    /// The agent is blocked on a human: a permission prompt, an elicitation
+    /// dialog, or a turn that ended by asking a question. Only a producer that
+    /// hooks the agent can report this — no amount of output-timing inference
+    /// distinguishes "waiting on you" from "waiting on the model".
+    Pending = 3,
+    /// The agent's turn failed.
+    Error = 4,
+}
+
+impl AgentRosterState {
+    /// Rank for aggregation and ordering: `Error > Pending > Working > Done >
+    /// Idle`. Failures outrank everything so they never hide behind a spinner,
+    /// and a blocked agent outranks a busy one because only the first needs a
+    /// human.
+    ///
+    /// Severity is a method rather than the enum's own `Ord` because the
+    /// discriminants are wire values that predate these variants and cannot be
+    /// renumbered — `Working = 1` and `Done = 2` are already on the wire, so
+    /// declaration order and severity order are permanently divorced.
+    pub fn severity(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Done => 1,
+            Self::Working => 2,
+            Self::Pending => 3,
+            Self::Error => 4,
+        }
+    }
+
+    /// States that are actively blocked on a human. Drives the overlay's
+    /// needs-you badge. Distinct from [`Self::needs_attention`]: a finished
+    /// agent is worth a glance, but it is not holding anyone up.
+    pub fn needs_you(self) -> bool {
+        matches!(self, Self::Pending | Self::Error)
+    }
+
+    /// States worth putting a human's eyes on, including a finished turn.
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::Pending | Self::Error | Self::Done)
+    }
+
+    /// A turn that ended, either way.
+    pub fn is_completion(self) -> bool {
+        matches!(self, Self::Done | Self::Error)
+    }
+    /// Decode a wire state, folding anything this build does not recognize into
+    /// `Idle`.
+    ///
+    /// A peer on a newer build may publish a state this binary has no variant
+    /// for. Refusing it is not an option: `validate_agent_roster` runs inside
+    /// `validate_envelope`, so a rejection fails `decode_frame`, and
+    /// `FrameReader::read_next` turns that into a transport error that drops the
+    /// whole peer stream. One unknown enum value would disconnect the session
+    /// rather than dim one overlay row, so unknown states degrade to the
+    /// quietest state instead.
+    pub fn from_wire(raw: i32) -> Self {
+        Self::try_from(raw).unwrap_or(Self::Idle)
+    }
 }
 
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
@@ -873,10 +931,7 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
             entry.agent_kind.len(),
             MAX_AGENT_KIND_BYTES,
         )?;
-        if !matches!(
-            entry.agent_kind.as_str(),
-            "claude" | "codex" | "cursor" | "pi" | "opencode"
-        ) {
+        if !is_agent_kind_token(&entry.agent_kind) {
             return Err(ProtocolError::InvalidLayout(
                 "agent_roster.entry.agent_kind",
             ));
@@ -886,10 +941,26 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
             entry.cwd.len(),
             MAX_AGENT_CWD_BYTES,
         )?;
-        AgentRosterState::try_from(entry.state)
-            .map_err(|_| ProtocolError::InvalidLayout("agent_roster.entry.state"))?;
+        // `entry.state` is deliberately not checked against the known variants:
+        // see `AgentRosterState::from_wire`. Readers fold an unknown state to
+        // `Idle` instead of failing the frame.
     }
     Ok(())
+}
+
+/// Whether an agent kind is a well-formed slug: non-empty lowercase ASCII
+/// letters, digits, and dashes.
+///
+/// This checks the shape rather than a closed set of known agents on purpose.
+/// The shape check is what actually protects the overlay — it keeps control
+/// characters, ANSI, and newlines out of a rendered cell — while a closed set
+/// would additionally make every newly supported agent a connection-tearing
+/// protocol break, for the same reason unknown states cannot be rejected.
+fn is_agent_kind_token(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn validate_id(field: &'static str, bytes: &[u8], limit: usize) -> Result<(), ProtocolError> {

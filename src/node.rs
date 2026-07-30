@@ -108,6 +108,9 @@ pub fn read_bootstrap(path: &std::path::Path) -> io::Result<NodeBootstrap> {
 pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Error>> {
     let mut descriptor = bootstrap.descriptor.clone();
     descriptor.node_pid = std::process::id();
+    // Before the first pane spawns: every PTY this node opens inherits the
+    // socket path from here, and pane 1 is created a few lines below.
+    crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
     let (mut node, dispatcher_task, rendezvous) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
@@ -248,6 +251,20 @@ fn run_socket_loop(
                         // contend with the single interactive attachment slot.
                         Ok(Some(ClientMessage::Probe)) => {
                             let _ = write_message(reader.get_mut(), &NodeMessage::ProbeAck);
+                        }
+                        // Like a probe: a one-shot request from a short-lived
+                        // process, not the interactive client, so it must not
+                        // contend for the single attachment slot. The producer
+                        // gets no reply — it has already exited by the time one
+                        // could be written, and a hook that blocks on the mux
+                        // is a hook that stalls the agent it is reporting on.
+                        Ok(Some(ClientMessage::AgentStatus {
+                            pane_id,
+                            kind,
+                            status,
+                            cwd,
+                        })) => {
+                            did_work |= node.apply_agent_status(pane_id, &kind, &status, &cwd);
                         }
                         Ok(Some(ClientMessage::Shutdown { generation })) => {
                             let _ = write_message(
@@ -1279,6 +1296,15 @@ impl SharedLayoutNode {
     }
     pub fn intent(&mut self, intent: crate::tui::UiIntent) -> Result<(), Box<dyn Error>> {
         self.runtime.node_intent(intent)
+    }
+    pub fn apply_agent_status(
+        &mut self,
+        pane_id: u64,
+        kind: &str,
+        status: &str,
+        cwd: &str,
+    ) -> bool {
+        self.runtime.apply_agent_status(pane_id, kind, status, cwd)
     }
     pub fn shutdown(self) {
         self.runtime.shutdown_node();

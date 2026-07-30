@@ -872,20 +872,18 @@ fn apply_rosters(
     view.update_attached_agent_rows(
         rosters
             .into_iter()
-            .filter_map(|row| {
-                Some(AgentOverlayRow {
-                    pane_id: row.pane_id,
-                    tab_ordinal: 0,
-                    pane_ordinal: 0,
-                    tab_label: String::new(),
-                    pane_label: String::new(),
-                    kind: row.kind,
-                    cwd: row.cwd,
-                    state: AgentRosterState::try_from(row.state).ok()?,
-                    working_since_unix_ms: row.working_since_unix_ms,
-                    host: row.host,
-                    controller: row.controller,
-                })
+            .map(|row| AgentOverlayRow {
+                pane_id: row.pane_id,
+                tab_ordinal: 0,
+                pane_ordinal: 0,
+                tab_label: String::new(),
+                pane_label: String::new(),
+                kind: row.kind,
+                cwd: row.cwd,
+                state: AgentRosterState::from_wire(row.state),
+                working_since_unix_ms: row.working_since_unix_ms,
+                host: row.host,
+                controller: row.controller,
             })
             .collect(),
     )

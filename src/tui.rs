@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self as sync_mpsc, Receiver},
     },
     thread::{self, JoinHandle},
@@ -49,8 +49,8 @@ use ratatui::{
 
 use crate::{
     agent_detect::{
-        PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree, cwd_for_pid,
-        sample_global_snapshot,
+        AgentKind, AgentScan, AgentState, PaneAgentTracker, ProcessSnapshot, SysinfoSampler,
+        cwd_for_pid, sample_global_snapshot,
     },
     config::UiTheme,
     kitty_keyboard::KittyKeyboardTracker,
@@ -61,8 +61,9 @@ use crate::{
     local_ipc::AgentOverlaySnapshotRow,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, LayoutRequest, MarkPaneExited, NewPanePosition as ProtocolNewPanePosition,
-        PaneDescriptor, PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
+        DeleteTab, LayoutRequest, MAX_AGENT_CWD_BYTES, MarkPaneExited,
+        NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
+        RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame, SyncGate},
@@ -112,7 +113,14 @@ fn unix_ms_now() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
+/// Scan cadence while any pane's agent state is being inferred from output
+/// timing. Inference has to notice silence promptly, so this is the floor.
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Scan cadence when nothing needs inference — no agents at all, or every agent
+/// reporting through a hook. The scan is then only watching for a process to
+/// appear or exit, and a full `sysinfo` refresh of every process on the machine
+/// once a second to do that is most of this process's idle cost.
+const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
@@ -3324,11 +3332,17 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
     let area = frame.area();
     let panel = agents_overlay_panel(area);
     frame.render_widget(Clear, panel);
+    let needs_you = tui.agent_rows.iter().any(|row| row.state.needs_you());
+    let title_color = if needs_you {
+        tui.theme.agent_overlay_attention
+    } else {
+        tui.theme.agent_overlay_chrome
+    };
     let block = Block::bordered()
         .title(Line::styled(
-            " Agents ",
+            agents_overlay_title(&tui.agent_rows),
             Style::default()
-                .fg(tui.theme.agent_overlay_chrome)
+                .fg(title_color)
                 .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
@@ -3506,6 +3520,30 @@ fn render_delete_tab_confirmation(frame: &mut Frame<'_>, pane_count: usize, them
     );
 }
 
+/// Colour for a state's glyph and label. `Working` keeps the chrome accent it
+/// has always had; the two states that want a human get their own roles so a
+/// blocked or failed agent never reads as ordinary muted text.
+fn agent_overlay_state_color(state: AgentRosterState, theme: &UiTheme) -> Color {
+    match state {
+        AgentRosterState::Working => theme.agent_overlay_chrome,
+        AgentRosterState::Pending => theme.agent_overlay_attention,
+        AgentRosterState::Error => theme.agent_overlay_error,
+        AgentRosterState::Idle | AgentRosterState::Done => theme.agent_overlay_muted,
+    }
+}
+
+/// Overlay title, carrying a count of agents blocked on a human when there are
+/// any. The whole point of opening the overlay is finding those, so the count
+/// belongs where it is readable before the eye reaches the cards.
+fn agents_overlay_title(rows: &[AgentOverlayRow]) -> String {
+    let needs_you = rows.iter().filter(|row| row.state.needs_you()).count();
+    match needs_you {
+        0 => String::from(" Agents "),
+        1 => String::from(" Agents · 1 needs you "),
+        count => format!(" Agents · {count} need you "),
+    }
+}
+
 fn format_agent_overlay_card(
     row: &AgentOverlayRow,
     selected: bool,
@@ -3552,7 +3590,10 @@ fn format_agent_overlay_card(
         ),
         AgentRosterState::Idle => ("○", "idle", None),
         AgentRosterState::Done => ("✓", "done", None),
+        AgentRosterState::Pending => ("◆", "needs you", None),
+        AgentRosterState::Error => ("✗", "error", None),
     };
+    let state_color = agent_overlay_state_color(row.state, theme);
     let location = format!(
         " · {} · {} · host: {}",
         truncate_trailing(&row.tab_label, usize::from(width / 3)),
@@ -3571,24 +3612,16 @@ fn format_agent_overlay_card(
     );
     let controller = (controller_width > 0)
         .then(|| truncate_trailing(&row.controller, usize::from(controller_width)));
+    let mut state_style = Style::default().fg(state_color);
+    if row.state.needs_you() {
+        // A blocked agent is the one row in the overlay that is costing someone
+        // time right now, so it gets the only weight in the state column.
+        state_style = state_style.add_modifier(Modifier::BOLD);
+    }
     let mut second_spans = vec![
-        Span::styled(
-            glyph,
-            Style::default().fg(if row.state == AgentRosterState::Working {
-                theme.agent_overlay_chrome
-            } else {
-                theme.agent_overlay_muted
-            }),
-        ),
+        Span::styled(glyph, Style::default().fg(state_color)),
         Span::raw(" "),
-        Span::styled(
-            state,
-            Style::default().fg(if row.state == AgentRosterState::Working {
-                theme.agent_overlay_foreground
-            } else {
-                theme.agent_overlay_muted
-            }),
-        ),
+        Span::styled(state, state_style),
     ];
     if let Some(elapsed) = elapsed {
         second_spans.push(Span::raw(" "));
@@ -3701,6 +3734,18 @@ fn sanitize_single_line(value: &str) -> String {
         .collect()
 }
 
+/// Cut `text` to at most `limit` bytes on a character boundary.
+fn truncate_bytes(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let end = (0..=limit)
+            .rev()
+            .find(|index| text.is_char_boundary(*index))
+            .unwrap_or(0);
+        text.truncate(end);
+    }
+    text
+}
+
 /// One fixed-grid PTY owned by this process. Its watch channels are registered with the pane
 /// service before the layout coordinator is told that the pane is ready.
 pub struct SharedLocalPane {
@@ -3744,9 +3789,11 @@ impl SharedLocalPane {
             pixel_height: 0,
         };
         let cwd = cwd.filter(|path| path.is_dir());
-        let host = match PtyHost::spawn_default_shell_with_cwd(size, cwd) {
+        let host = match PtyHost::spawn_default_shell_with_cwd(size, cwd, Some(pane_id)) {
             Ok(host) => host,
-            Err(_) if cwd.is_some_and(|path| !path.is_dir()) => PtyHost::spawn_default_shell(size)?,
+            Err(_) if cwd.is_some_and(|path| !path.is_dir()) => {
+                PtyHost::spawn_default_shell_with_cwd(size, None, Some(pane_id))?
+            }
             Err(error) => return Err(error),
         };
         let screen = HostScreen::new(grid_rows, grid_cols)?;
@@ -3904,15 +3951,22 @@ impl SharedLocalPane {
         })
     }
 
-    fn apply_agent_snapshot(&mut self, processes: &[ProcessSnapshot], now: Instant) -> bool {
+    fn apply_agent_snapshot(&mut self, scan: &AgentScan<'_>, now: Instant) -> bool {
         let unix_ms_now = unix_ms_now();
         let before = self.agent_tracker.listed_agent(now, unix_ms_now);
-        let detected = self
-            .host
-            .process_id()
-            .and_then(|pid| classify_pane_tree(pid, processes));
+        let session_child = self.host.process_id();
+        let detected = session_child.and_then(|pid| scan.classify(pid));
         self.agent_tracker.update(detected, now, unix_ms_now);
+        self.agent_tracker
+            .observe_pane_liveness(session_child.is_some_and(|pid| scan.has_children(pid)), now);
         self.agent_tracker.listed_agent(now, unix_ms_now) != before
+    }
+
+    /// Whether this pane's reported state comes from output-timing inference
+    /// rather than a producer inside it — the only case that needs the fast
+    /// sampler cadence, since only inference has to notice silence promptly.
+    fn agent_state_is_inferred(&self) -> bool {
+        self.agent_tracker.active_agent.is_some() && !self.agent_tracker.has_owning_push()
     }
 
     fn agent_roster_entry(&mut self, now: Instant) -> Option<AgentRosterEntry> {
@@ -3925,9 +3979,11 @@ impl SharedLocalPane {
                 crate::agent_detect::AgentState::Idle => AgentRosterState::Idle as i32,
                 crate::agent_detect::AgentState::Working => AgentRosterState::Working as i32,
                 crate::agent_detect::AgentState::Done => AgentRosterState::Done as i32,
+                crate::agent_detect::AgentState::Pending => AgentRosterState::Pending as i32,
+                crate::agent_detect::AgentState::Error => AgentRosterState::Error as i32,
             },
             working_since_unix_ms: if state == crate::agent_detect::AgentState::Working {
-                self.agent_tracker.working_since_unix_ms
+                self.agent_tracker.reported_working_since_unix_ms()
             } else {
                 0
             },
@@ -4033,6 +4089,7 @@ struct LocalPaneDrain {
 struct AgentSamplingWorker {
     snapshots: Receiver<Vec<ProcessSnapshot>>,
     stop: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -4040,7 +4097,9 @@ impl AgentSamplingWorker {
     fn spawn() -> Self {
         let (snapshot_tx, snapshots) = sync_mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let interval_ms = Arc::new(AtomicU64::new(AGENT_SAMPLE_INTERVAL.as_millis() as u64));
         let worker_stop = stop.clone();
+        let worker_interval = interval_ms.clone();
         let join = thread::spawn(move || {
             let mut sampler = SysinfoSampler::default();
             while !worker_stop.load(Ordering::Relaxed) {
@@ -4050,14 +4109,31 @@ impl AgentSamplingWorker {
                 {
                     break;
                 }
-                thread::sleep(AGENT_SAMPLE_INTERVAL);
+                thread::sleep(Duration::from_millis(
+                    worker_interval.load(Ordering::Relaxed),
+                ));
             }
         });
         Self {
             snapshots,
             stop,
+            interval_ms,
             join: Some(join),
         }
+    }
+
+    /// Set how often the global process scan runs.
+    ///
+    /// The scan is the single most expensive thing this process does when
+    /// nothing is happening — a full `sysinfo` refresh of every process on the
+    /// machine, with exe, cmdline and cwd. It only needs the fast cadence when
+    /// a pane's state is being *inferred* from output timing, which is the one
+    /// case that depends on noticing silence promptly. Panes whose agent
+    /// reports through a hook, and panes with no agent at all, only need the
+    /// scan for liveness and for spotting a new launch.
+    fn set_interval(&self, interval: Duration) {
+        self.interval_ms
+            .store(interval.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn latest_snapshot(&self) -> Option<Vec<ProcessSnapshot>> {
@@ -4766,6 +4842,44 @@ impl SharedLayoutRuntime {
         self.handle_intent(intent)
     }
 
+    /// Apply a status pushed by a producer running inside one of this node's
+    /// own panes. Returns whether it was accepted.
+    ///
+    /// The pane id is a claim from an unauthenticated local process, so it is
+    /// checked against the panes this node actually hosts. That is the local
+    /// half of the containment `Coordinator::accept_agent_roster` enforces
+    /// between peers: a producer can only ever speak for a pane on the machine
+    /// it runs on, and the roster it feeds is published under this node's own
+    /// peer id.
+    ///
+    /// A kind or status this build does not know is refused rather than
+    /// coerced — a lenient parse would let a typo file status under the wrong
+    /// agent, or blank the row it meant to update.
+    pub fn apply_agent_status(
+        &mut self,
+        pane_id: PaneId,
+        kind: &str,
+        status: &str,
+        cwd: &str,
+    ) -> bool {
+        let (Some(kind), Some(state)) = (AgentKind::from_wire(kind), AgentState::from_wire(status))
+        else {
+            return false;
+        };
+        let Some(pane) = self.local.get_mut(&pane_id) else {
+            return false;
+        };
+        if pane.exited {
+            return false;
+        }
+        // Capped here rather than at publish time: an over-long cwd would fail
+        // `validate_agent_roster` and silently drop this host's whole roster.
+        let cwd = truncate_bytes(sanitize_single_line(cwd), MAX_AGENT_CWD_BYTES);
+        pane.agent_tracker
+            .record_pushed_status(kind, cwd, state, Instant::now(), unix_ms_now());
+        true
+    }
+
     pub fn shutdown_node(self) {
         self.shutdown();
     }
@@ -5156,11 +5270,20 @@ impl SharedLayoutRuntime {
         self.send_pending_exit_marks()?;
         if let Some(snapshot) = self.agent_sampler.latest_snapshot() {
             let now = Instant::now();
+            // One scan for the whole session, not one per pane.
+            let scan = AgentScan::new(&snapshot);
+            let mut inferred_agents = false;
             for pane in self.local.values_mut() {
                 if !pane.exited {
-                    changed |= pane.apply_agent_snapshot(&snapshot, now);
+                    changed |= pane.apply_agent_snapshot(&scan, now);
+                    inferred_agents |= pane.agent_state_is_inferred();
                 }
             }
+            self.agent_sampler.set_interval(if inferred_agents {
+                AGENT_SAMPLE_INTERVAL
+            } else {
+                AGENT_WATCH_INTERVAL
+            });
         }
         changed |= self.publish_local_agent_roster();
         let disconnected = self
@@ -5291,7 +5414,7 @@ impl SharedLayoutRuntime {
                             .unwrap_or_else(|| format!("Pane #{pane_ordinal}")),
                         kind: sanitize_single_line(&entry.agent_kind),
                         cwd: sanitize_single_line(&entry.cwd),
-                        state: AgentRosterState::try_from(entry.state).ok()?,
+                        state: AgentRosterState::from_wire(entry.state),
                         working_since_unix_ms: entry.working_since_unix_ms,
                         host,
                         controller,
@@ -7611,6 +7734,77 @@ mod tests {
     }
 
     #[test]
+    fn agents_overlay_cards_mark_blocked_and_failed_agents() {
+        use crate::protocol::AgentRosterState;
+
+        let theme = UiTheme::default();
+        let mut row = agent_row(2, 2, 1);
+
+        row.state = AgentRosterState::Pending;
+        let pending =
+            super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
+        assert!(pending[1].to_string().starts_with("◆ needs you"));
+        // A blocked agent is the one row costing someone time, so it carries
+        // the attention colour and the only weight in the state column.
+        let state_span = &pending[1].spans[2];
+        assert_eq!(state_span.style.fg, Some(theme.agent_overlay_attention));
+        assert!(state_span.style.add_modifier.contains(Modifier::BOLD));
+
+        row.state = AgentRosterState::Error;
+        let error =
+            super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
+        assert!(error[1].to_string().starts_with("✗ error"));
+        assert_eq!(error[1].spans[2].style.fg, Some(theme.agent_overlay_error));
+
+        // Working keeps the chrome accent and stays unweighted.
+        row.state = AgentRosterState::Working;
+        let working =
+            super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
+        assert_eq!(
+            working[1].spans[2].style.fg,
+            Some(theme.agent_overlay_chrome)
+        );
+        assert!(
+            !working[1].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn agents_overlay_title_counts_agents_blocked_on_a_human() {
+        use crate::protocol::AgentRosterState;
+
+        let working = agent_row(1, 1, 1);
+        assert_eq!(super::agents_overlay_title(&[]), " Agents ");
+        assert_eq!(
+            super::agents_overlay_title(std::slice::from_ref(&working)),
+            " Agents "
+        );
+
+        let mut pending = agent_row(2, 1, 2);
+        pending.state = AgentRosterState::Pending;
+        assert_eq!(
+            super::agents_overlay_title(&[working.clone(), pending.clone()]),
+            " Agents · 1 needs you "
+        );
+
+        // Errors count too: a failed turn is blocking whoever asked for it.
+        let mut failed = agent_row(3, 1, 3);
+        failed.state = AgentRosterState::Error;
+        assert_eq!(
+            super::agents_overlay_title(&[working.clone(), pending, failed]),
+            " Agents · 2 need you "
+        );
+
+        // A finished agent is worth a glance but is not holding anyone up.
+        let mut done = agent_row(4, 1, 4);
+        done.state = AgentRosterState::Done;
+        assert_eq!(super::agents_overlay_title(&[working, done]), " Agents ");
+    }
+
+    #[test]
     fn agents_overlay_elapsed_uses_compact_saturating_durations() {
         assert_eq!(super::format_agent_elapsed(1_000, 43_000), "42s");
         assert_eq!(super::format_agent_elapsed(1_000, 85_000), "1m 24s");
@@ -7918,6 +8112,95 @@ mod tests {
             .await
             .expect("loopback endpoint");
         Transport::from_endpoint(endpoint)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pushed_agent_status_is_confined_to_panes_this_node_hosts() {
+        use crate::agent_detect::{AgentKind, AgentState};
+        use crate::protocol::MAX_AGENT_CWD_BYTES;
+
+        let host = SharedLayoutHost::new(
+            HostSession::from_transport(loopback_transport().await).expect("host session"),
+            2,
+            8,
+        )
+        .expect("shared host");
+        let pane_server = host.pane_server();
+        let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_id.clone()).expect("initial pty");
+        pane_server
+            .register_local_pane(
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_id,
+                    grid_rows: 2,
+                    grid_cols: 8,
+                    title: None,
+                    locked: false,
+                    exited: false,
+                },
+                initial.channels(),
+            )
+            .expect("initial pane registered");
+        let state = host
+            .session_snapshot()
+            .expect("snapshot")
+            .state
+            .expect("layout state");
+        let snapshot = layout_snapshot_from_state(&state).expect("render layout");
+        let mut runtime = SharedLayoutRuntime::host(
+            host,
+            pane_server,
+            snapshot,
+            initial,
+            String::from("TESTCODE"),
+            tokio::runtime::Handle::current(),
+        )
+        .expect("runtime");
+
+        assert!(
+            runtime.apply_agent_status(1, "claude", "pending", "/repo"),
+            "a producer may report for a pane this node hosts"
+        );
+        assert_eq!(
+            runtime
+                .local
+                .get_mut(&1)
+                .expect("local pane")
+                .agent_tracker
+                .listed_agent(Instant::now(), 1_000)
+                .map(|(agent, state)| (agent.kind, state)),
+            Some((AgentKind::Claude, AgentState::Pending))
+        );
+
+        // A pane id this node does not host is refused outright. This is the
+        // local half of `Coordinator::accept_agent_roster`: without it, any
+        // process on this machine could publish status for a peer's pane under
+        // this node's authenticated peer id.
+        assert!(
+            !runtime.apply_agent_status(99, "claude", "pending", "/repo"),
+            "a producer may not report for a pane hosted elsewhere"
+        );
+
+        // Unparseable kinds and statuses are refused rather than coerced.
+        assert!(!runtime.apply_agent_status(1, "gemini", "pending", "/repo"));
+        assert!(!runtime.apply_agent_status(1, "claude", "pendign", "/repo"));
+
+        // An over-long cwd is cut at intake: letting it through would fail
+        // `validate_agent_roster` and drop this host's entire roster.
+        assert!(runtime.apply_agent_status(
+            1,
+            "claude",
+            "working",
+            &"/x".repeat(MAX_AGENT_CWD_BYTES)
+        ));
+        let cwd = runtime
+            .local
+            .get(&1)
+            .and_then(|pane| pane.agent_tracker.pushed.as_ref())
+            .map(|pushed| pushed.cwd.clone())
+            .expect("pushed status");
+        assert!(cwd.len() <= MAX_AGENT_CWD_BYTES);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

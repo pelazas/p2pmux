@@ -126,6 +126,7 @@ fn pty_host_default_shell_uses_explicit_working_directory() {
             pixel_height: 0,
         },
         Some(&directory),
+        None,
     )
     .expect("PTY should spawn");
 
@@ -139,4 +140,34 @@ fn pty_host_default_shell_uses_explicit_working_directory() {
 
     host.shutdown().expect("PTY should shut down cleanly");
     fs::remove_dir(&directory).expect("remove temporary directory");
+}
+
+#[test]
+fn pane_shells_learn_their_pane_id_and_plain_shells_do_not() {
+    let size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    // A roster pane's shell can identify itself, which is what lets an agent
+    // hook running inside it report status back for the right pane.
+    let mut pane =
+        PtyHost::spawn_default_shell_with_cwd(size, None, Some(42)).expect("pane PTY should spawn");
+    thread::sleep(Duration::from_millis(100));
+    pane.write_input(b"printf 'pane=[%s]\\n' \"$P2PMUX_PANE_ID\"\n")
+        .expect("PTY should accept input");
+    assert!(read_until(&mut pane, "pane=[42]").contains("pane=[42]"));
+    pane.shutdown().expect("PTY should shut down cleanly");
+
+    // `p2pmux local` and the single-pane host runtime are not roster panes, so
+    // nothing inside them can claim to be a pane that exists.
+    let mut plain = PtyHost::spawn_default_shell(size).expect("plain PTY should spawn");
+    thread::sleep(Duration::from_millis(100));
+    plain
+        .write_input(b"printf 'pane=[%s]\\n' \"$P2PMUX_PANE_ID\"\n")
+        .expect("PTY should accept input");
+    assert!(read_until(&mut plain, "pane=[]").contains("pane=[]"));
+    plain.shutdown().expect("PTY should shut down cleanly");
 }

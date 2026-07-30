@@ -4,12 +4,38 @@ use std::{
     error::Error,
     ffi::OsString,
     io::{Read, Write},
-    path::Path,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    path::{Path, PathBuf},
+    sync::{
+        OnceLock,
+        mpsc::{self, Receiver, TryRecvError},
+    },
     thread::{self, JoinHandle},
 };
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+/// Environment variable naming the pane a process is running in.
+pub const PANE_ID_ENV: &str = "P2PMUX_PANE_ID";
+/// Environment variable naming this node's local IPC socket.
+pub const SOCKET_ENV: &str = "P2PMUX_SOCK";
+
+static AGENT_SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Publish this node's local IPC socket path to every PTY spawned afterwards.
+///
+/// Together with `P2PMUX_PANE_ID`, this is what lets a program running inside a
+/// pane — an agent hook, a build script — report back to the mux: it knows
+/// which pane it is and where to say so. Both are set on the pane's PTY rather
+/// than inherited from the client, because a peer's client process is on a
+/// different machine from the node that owns the pane.
+///
+/// The path is process-global rather than a spawn argument because the socket
+/// belongs to the node, not to any one pane; this mirrors how `agent_detect`
+/// installs its notification tuning. Called once during node startup before the
+/// first pane spawns; later calls are ignored.
+pub fn set_agent_socket_path(path: PathBuf) {
+    let _ = AGENT_SOCKET_PATH.set(path);
+}
 
 /// The single local shell PTY used by the Spike 1 terminal.
 pub struct PtyHost {
@@ -60,18 +86,29 @@ impl PtyHost {
 
     /// Spawn the user's login shell, or `/bin/zsh` when `SHELL` is unset.
     pub fn spawn_default_shell(size: PtySize) -> Result<Self, Box<dyn Error>> {
-        Self::spawn_default_shell_with_cwd(size, None)
+        Self::spawn_default_shell_with_cwd(size, None, None)
     }
 
     /// Spawn the user's login shell with an optional working directory.
+    ///
+    /// `pane_id` is `None` for the shells that are not roster panes — the plain
+    /// `p2pmux local` terminal and the single-pane host runtime — so nothing
+    /// running in them can claim to be a pane that exists.
     pub fn spawn_default_shell_with_cwd(
         size: PtySize,
         cwd: Option<&Path>,
+        pane_id: Option<u64>,
     ) -> Result<Self, Box<dyn Error>> {
         let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/zsh"));
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.env("TERM", "xterm-256color");
+        if let Some(pane_id) = pane_id {
+            command.env(PANE_ID_ENV, pane_id.to_string());
+            if let Some(socket) = AGENT_SOCKET_PATH.get() {
+                command.env(SOCKET_ENV, socket);
+            }
+        }
         if let Some(cwd) = cwd {
             command.cwd(cwd);
         }

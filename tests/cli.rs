@@ -1,8 +1,10 @@
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     net::SocketAddr,
+    os::unix::net::UnixListener,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -130,6 +132,107 @@ fn ticket_asks_for_a_code_when_several_sessions_are_live() {
     drop(first);
     drop(second);
     fs::remove_dir_all(cache_home).expect("temporary cache should remove");
+}
+
+/// Run `p2pmux notify` with a hook payload on stdin and the pane environment a
+/// hosted PTY would have provided.
+fn run_notify(env: &[(&str, &str)], args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("p2pmux binary should run");
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(stdin.as_bytes())
+        .expect("hook payload should write");
+    child.wait_with_output().expect("notify should exit")
+}
+
+#[test]
+fn notify_reports_a_blocked_agent_to_the_pane_socket() {
+    let directory = temporary_cache_home();
+    fs::create_dir_all(&directory).expect("temporary directory");
+    let socket = directory.join("node.sock");
+    let listener = UnixListener::bind(&socket).expect("socket should bind");
+
+    let accepted = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("producer should connect");
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .expect("producer should write one line");
+        line
+    });
+
+    // A turn that ends by asking a question: Claude fires `Stop`, which would
+    // otherwise show as a finished agent nobody needs to look at.
+    let output = run_notify(
+        &[
+            ("P2PMUX_PANE_ID", "7"),
+            ("P2PMUX_SOCK", socket.to_str().expect("utf-8 path")),
+        ],
+        &["notify", "claude", "--status", "done"],
+        r#"{"hook_event_name":"Stop","last_assistant_message":"Done. Should I push?","cwd":"/repo"}"#,
+    );
+    assert!(output.status.success(), "a hook must never fail its agent");
+
+    let line = accepted.join().expect("listener thread");
+    let message: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+    assert_eq!(message["type"], "agent_status");
+    assert_eq!(message["pane_id"], 7);
+    assert_eq!(message["kind"], "claude");
+    assert_eq!(message["status"], "pending");
+    assert_eq!(message["cwd"], "/repo");
+    // The assistant's message decided the status but must not ride along: a
+    // session is shared with every member.
+    assert!(message.get("msg").is_none());
+    assert!(!line.contains("Should I push"));
+
+    fs::remove_dir_all(&directory).expect("temporary directory should remove");
+}
+
+#[test]
+fn notify_is_a_silent_no_op_outside_a_pane() {
+    // Registered globally in a user's Claude config, this runs everywhere. A
+    // non-zero exit or any stderr would surface as a hook failure in sessions
+    // that have nothing to do with p2pmux.
+    let output = run_notify(
+        &[],
+        &["notify", "claude", "--status", "running"],
+        r#"{"hook_event_name":"PreToolUse"}"#,
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A pane id with no socket, and a socket nothing is listening on, are the
+    // same silent no-op rather than a hang or an error.
+    let directory = temporary_cache_home();
+    fs::create_dir_all(&directory).expect("temporary directory");
+    let output = run_notify(
+        &[
+            ("P2PMUX_PANE_ID", "3"),
+            (
+                "P2PMUX_SOCK",
+                directory.join("absent.sock").to_str().expect("utf-8 path"),
+            ),
+        ],
+        &["notify", "claude", "--status", "running"],
+        r#"{"hook_event_name":"PreToolUse"}"#,
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    fs::remove_dir_all(&directory).expect("temporary directory should remove");
 }
 
 fn minted_ticket() -> JoinTicket {

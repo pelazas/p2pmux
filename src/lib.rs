@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_detect;
+pub mod agent_notify;
 pub mod cli;
 pub mod client;
 pub mod config;

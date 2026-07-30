@@ -57,6 +57,24 @@ pub enum ClientMessage {
     Rename {
         name: String,
     },
+    /// A status pushed by a producer running inside a pane — an agent hook.
+    ///
+    /// Unlike every other message here, the sender is not the attached client:
+    /// it is a short-lived process that connects, writes this one line, and
+    /// exits. It is handled like `Probe` — as a one-shot control request that
+    /// never touches the single interactive attachment slot.
+    ///
+    /// `pane_id` is a claim, not an authority. The node accepts it only for a
+    /// pane it hosts itself, which is what confines a producer to the machine
+    /// it runs on; the peer-facing half of that check already lives in
+    /// `Coordinator::accept_agent_roster`.
+    AgentStatus {
+        pane_id: u64,
+        kind: String,
+        status: String,
+        #[serde(default)]
+        cwd: String,
+    },
     Shutdown {
         generation: u64,
     },
