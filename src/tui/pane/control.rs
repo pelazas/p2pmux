@@ -1,0 +1,213 @@
+//! The layout-control side of a session: requests to the coordinator, the
+//! reservations they create, and remote pane subscriptions.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
+
+use crate::{
+    layout::PaneId,
+    protocol::{AgentRoster, LayoutRequest, PaneFailed, PaneReady},
+    session::{
+        CoordinatorResponse, LayoutControlEvent, LayoutControlQueueError, SharedLayoutHost,
+        SharedLayoutMember,
+    },
+};
+
+pub(in crate::tui) enum SharedControl {
+    Host(SharedLayoutHost),
+    Member(SharedLayoutMember),
+}
+impl SharedControl {
+    pub(in crate::tui) fn peer_id(&self) -> Vec<u8> {
+        match self {
+            Self::Host(host) => host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+            Self::Member(member) => member.peer_id.clone(),
+        }
+    }
+
+    pub(in crate::tui) fn try_request(
+        &self,
+        request: LayoutRequest,
+    ) -> Result<Option<CoordinatorResponse>, String> {
+        match self {
+            Self::Host(host) => host
+                .handle_local_request(request)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_request(request)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    pub(in crate::tui) fn try_ready(
+        &self,
+        ready: PaneReady,
+    ) -> Result<Option<CoordinatorResponse>, String> {
+        match self {
+            Self::Host(host) => host
+                .handle_local_ready(ready)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_ready(ready)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    pub(in crate::tui) fn try_failed(&self, failed: PaneFailed) -> Result<(), String> {
+        match self {
+            Self::Host(host) => host
+                .handle_local_failed(failed)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member.try_failed(failed).map_err(layout_queue_message),
+        }
+    }
+
+    pub(in crate::tui) fn try_agent_roster(&self, roster: AgentRoster) -> Result<(), String> {
+        match self {
+            Self::Host(host) => host
+                .publish_local_agent_roster(roster)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_agent_roster(roster)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    pub(in crate::tui) fn try_event(
+        &mut self,
+        current_revision: u64,
+    ) -> Option<LayoutControlEvent> {
+        match self {
+            // The coordinator is the authority, so it does not receive its own broadcasts. Poll
+            // its tiny in-memory snapshot to observe joins, departures, and member-originated
+            // commits without adding a second internal control stream.
+            Self::Host(host) => host
+                .session_snapshot()
+                .ok()
+                .filter(|snapshot| {
+                    snapshot
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.revision > current_revision)
+                })
+                .map(LayoutControlEvent::Snapshot),
+            Self::Member(member) => member.events.try_recv().ok(),
+        }
+    }
+
+    pub(in crate::tui) async fn shutdown(self) {
+        match self {
+            Self::Host(host) => host.close().await,
+            Self::Member(member) => member.shutdown().await,
+        }
+    }
+}
+pub(in crate::tui) fn layout_queue_message(error: LayoutControlQueueError) -> String {
+    match error {
+        LayoutControlQueueError::Full => String::from("layout request queue is busy"),
+        LayoutControlQueueError::Closed => String::from("layout coordinator disconnected"),
+    }
+}
+pub(in crate::tui) struct PendingCreate {
+    pub(in crate::tui) request_id: u64,
+    pub(in crate::tui) base_revision: u64,
+    pub(in crate::tui) grid_rows: u16,
+    pub(in crate::tui) grid_cols: u16,
+    pub(in crate::tui) cwd: Option<PathBuf>,
+}
+/// Pure retry state for direct remote-pane subscriptions. Ticks are supplied by the UI drain
+/// loop, which keeps retry behavior deterministic in tests and prevents a failed connect from
+/// either becoming permanent or spinning a busy loop.
+#[derive(Default)]
+pub(in crate::tui) struct RemoteSubscriptionState {
+    pub(in crate::tui) in_flight: BTreeSet<PaneId>,
+    pub(in crate::tui) retry_at: BTreeMap<PaneId, u64>,
+    pub(in crate::tui) failures: BTreeMap<PaneId, u8>,
+}
+impl RemoteSubscriptionState {
+    const MAX_BACKOFF_TICKS: u64 = 32;
+
+    pub(in crate::tui) fn start(&mut self, pane_id: PaneId, tick: u64) -> bool {
+        if self.in_flight.contains(&pane_id)
+            || self
+                .retry_at
+                .get(&pane_id)
+                .is_some_and(|retry_at| *retry_at > tick)
+        {
+            return false;
+        }
+        self.in_flight.insert(pane_id);
+        true
+    }
+
+    pub(in crate::tui) fn succeeded(&mut self, pane_id: PaneId) {
+        self.in_flight.remove(&pane_id);
+        self.retry_at.remove(&pane_id);
+        self.failures.remove(&pane_id);
+    }
+
+    pub(in crate::tui) fn failed(&mut self, pane_id: PaneId, tick: u64) {
+        self.in_flight.remove(&pane_id);
+        let failures = self.failures.entry(pane_id).or_default();
+        *failures = failures.saturating_add(1);
+        let delay = 1_u64
+            .checked_shl(u32::from((*failures).saturating_sub(1)))
+            .unwrap_or(Self::MAX_BACKOFF_TICKS)
+            .min(Self::MAX_BACKOFF_TICKS);
+        self.retry_at.insert(pane_id, tick.saturating_add(delay));
+    }
+
+    pub(in crate::tui) fn nudge(&mut self) {
+        for retry_at in self.retry_at.values_mut() {
+            *retry_at = 0;
+        }
+    }
+
+    pub(in crate::tui) fn retain(&mut self, pane_ids: &BTreeSet<PaneId>) {
+        self.in_flight.retain(|pane_id| pane_ids.contains(pane_id));
+        self.retry_at
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+        self.failures
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn next_retry_at(&self, pane_id: PaneId) -> Option<u64> {
+        self.retry_at.get(&pane_id).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RemoteSubscriptionState;
+
+    #[test]
+    fn failed_remote_subscription_retries_with_bounded_backoff_and_commit_nudge() {
+        let mut subscriptions = RemoteSubscriptionState::default();
+        assert!(subscriptions.start(7, 0));
+        subscriptions.failed(7, 0);
+        assert!(!subscriptions.start(7, 0));
+        assert!(subscriptions.start(7, 1));
+        subscriptions.failed(7, 1);
+        assert!(!subscriptions.start(7, 2));
+        assert!(subscriptions.start(7, 3));
+
+        for tick in [3, 7, 15, 31, 63, 95] {
+            subscriptions.failed(7, tick);
+            assert!(
+                subscriptions
+                    .next_retry_at(7)
+                    .is_some_and(|next| next <= tick + 32)
+            );
+        }
+        subscriptions.nudge();
+        assert!(subscriptions.start(7, 95));
+    }
+}
