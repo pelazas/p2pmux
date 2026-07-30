@@ -58,7 +58,7 @@ TMP="$(mktemp -d)"
 # temp directory behind.
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-say "Downloading $ASSET…"
+say "Downloading ${ASSET}..."
 curl -fsSL --proto '=https' --tlsv1.2 -o "$TMP/$ASSET" "$BASE/$ASSET" || die \
   "could not download $BASE/$ASSET
 If this is the first release, it may not be published yet. Build from source:
