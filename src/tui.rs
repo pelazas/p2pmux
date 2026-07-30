@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self as sync_mpsc, Receiver},
     },
     thread::{self, JoinHandle},
@@ -49,8 +49,8 @@ use ratatui::{
 
 use crate::{
     agent_detect::{
-        AgentKind, AgentState, PaneAgentTracker, ProcessSnapshot, SysinfoSampler,
-        classify_pane_tree, cwd_for_pid, sample_global_snapshot,
+        AgentKind, AgentScan, AgentState, PaneAgentTracker, ProcessSnapshot, SysinfoSampler,
+        cwd_for_pid, sample_global_snapshot,
     },
     config::UiTheme,
     kitty_keyboard::KittyKeyboardTracker,
@@ -113,7 +113,14 @@ fn unix_ms_now() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
+/// Scan cadence while any pane's agent state is being inferred from output
+/// timing. Inference has to notice silence promptly, so this is the floor.
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Scan cadence when nothing needs inference — no agents at all, or every agent
+/// reporting through a hook. The scan is then only watching for a process to
+/// appear or exit, and a full `sysinfo` refresh of every process on the machine
+/// once a second to do that is most of this process's idle cost.
+const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
@@ -3944,15 +3951,19 @@ impl SharedLocalPane {
         })
     }
 
-    fn apply_agent_snapshot(&mut self, processes: &[ProcessSnapshot], now: Instant) -> bool {
+    fn apply_agent_snapshot(&mut self, scan: &AgentScan<'_>, now: Instant) -> bool {
         let unix_ms_now = unix_ms_now();
         let before = self.agent_tracker.listed_agent(now, unix_ms_now);
-        let detected = self
-            .host
-            .process_id()
-            .and_then(|pid| classify_pane_tree(pid, processes));
+        let detected = self.host.process_id().and_then(|pid| scan.classify(pid));
         self.agent_tracker.update(detected, now, unix_ms_now);
         self.agent_tracker.listed_agent(now, unix_ms_now) != before
+    }
+
+    /// Whether this pane's reported state comes from output-timing inference
+    /// rather than a producer inside it — the only case that needs the fast
+    /// sampler cadence, since only inference has to notice silence promptly.
+    fn agent_state_is_inferred(&self) -> bool {
+        self.agent_tracker.active_agent.is_some() && !self.agent_tracker.has_owning_push()
     }
 
     fn agent_roster_entry(&mut self, now: Instant) -> Option<AgentRosterEntry> {
@@ -4075,6 +4086,7 @@ struct LocalPaneDrain {
 struct AgentSamplingWorker {
     snapshots: Receiver<Vec<ProcessSnapshot>>,
     stop: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -4082,7 +4094,9 @@ impl AgentSamplingWorker {
     fn spawn() -> Self {
         let (snapshot_tx, snapshots) = sync_mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let interval_ms = Arc::new(AtomicU64::new(AGENT_SAMPLE_INTERVAL.as_millis() as u64));
         let worker_stop = stop.clone();
+        let worker_interval = interval_ms.clone();
         let join = thread::spawn(move || {
             let mut sampler = SysinfoSampler::default();
             while !worker_stop.load(Ordering::Relaxed) {
@@ -4092,14 +4106,31 @@ impl AgentSamplingWorker {
                 {
                     break;
                 }
-                thread::sleep(AGENT_SAMPLE_INTERVAL);
+                thread::sleep(Duration::from_millis(
+                    worker_interval.load(Ordering::Relaxed),
+                ));
             }
         });
         Self {
             snapshots,
             stop,
+            interval_ms,
             join: Some(join),
         }
+    }
+
+    /// Set how often the global process scan runs.
+    ///
+    /// The scan is the single most expensive thing this process does when
+    /// nothing is happening — a full `sysinfo` refresh of every process on the
+    /// machine, with exe, cmdline and cwd. It only needs the fast cadence when
+    /// a pane's state is being *inferred* from output timing, which is the one
+    /// case that depends on noticing silence promptly. Panes whose agent
+    /// reports through a hook, and panes with no agent at all, only need the
+    /// scan for liveness and for spotting a new launch.
+    fn set_interval(&self, interval: Duration) {
+        self.interval_ms
+            .store(interval.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn latest_snapshot(&self) -> Option<Vec<ProcessSnapshot>> {
@@ -5236,11 +5267,20 @@ impl SharedLayoutRuntime {
         self.send_pending_exit_marks()?;
         if let Some(snapshot) = self.agent_sampler.latest_snapshot() {
             let now = Instant::now();
+            // One scan for the whole session, not one per pane.
+            let scan = AgentScan::new(&snapshot);
+            let mut inferred_agents = false;
             for pane in self.local.values_mut() {
                 if !pane.exited {
-                    changed |= pane.apply_agent_snapshot(&snapshot, now);
+                    changed |= pane.apply_agent_snapshot(&scan, now);
+                    inferred_agents |= pane.agent_state_is_inferred();
                 }
             }
+            self.agent_sampler.set_interval(if inferred_agents {
+                AGENT_SAMPLE_INTERVAL
+            } else {
+                AGENT_WATCH_INTERVAL
+            });
         }
         changed |= self.publish_local_agent_roster();
         let disconnected = self

@@ -1,6 +1,7 @@
 //! Pure helpers for detecting supported coding agents in a hosted PTY tree.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::{Duration, Instant},
@@ -246,67 +247,94 @@ struct Candidate<'a> {
     kind: AgentKind,
 }
 
-/// Classify a PTY session child process tree from one global process snapshot.
+/// One snapshot, prepared for classification.
 ///
-/// The deepest matching descendant wins, then the newest available start time,
-/// then the highest PID. The PTY session child itself is included in the tree.
+/// The expensive parts of classifying a pane — running every agent matcher over
+/// every process, and finding a process by pid — do not depend on which pane is
+/// being classified, so they happen once per snapshot here rather than once per
+/// pane. With one global scan feeding a session's worth of panes, that is the
+/// difference between O(panes × processes) matcher calls per second and O(panes
+/// × agents).
+pub struct AgentScan<'a> {
+    by_pid: HashMap<u32, &'a ProcessSnapshot>,
+    /// Every process in the snapshot that looks like a supported agent. Tiny
+    /// next to the snapshot itself: a machine has a handful of these, not
+    /// hundreds.
+    agents: Vec<(&'a ProcessSnapshot, AgentKind)>,
+}
+
+impl<'a> AgentScan<'a> {
+    pub fn new(processes: &'a [ProcessSnapshot]) -> Self {
+        let by_pid = processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        let agents = processes
+            .iter()
+            .filter_map(|process| {
+                AgentKind::from_process(&process.exe_basename, &process.name, &process.cmdline)
+                    .map(|kind| (process, kind))
+            })
+            .collect();
+        Self { by_pid, agents }
+    }
+
+    /// Classify one PTY session child's process tree.
+    ///
+    /// The deepest matching descendant wins, then the newest available start
+    /// time, then the highest PID. The PTY session child itself is included in
+    /// the tree.
+    pub fn classify(&self, session_child_pid: u32) -> Option<DetectedAgent> {
+        self.agents
+            .iter()
+            .filter_map(|&(process, kind)| {
+                self.descendant_depth(session_child_pid, process.pid)
+                    .map(|depth| Candidate {
+                        process,
+                        depth,
+                        kind,
+                    })
+            })
+            .max_by(|left, right| {
+                left.depth
+                    .cmp(&right.depth)
+                    .then_with(
+                        || match (left.process.start_time, right.process.start_time) {
+                            (Some(left), Some(right)) => left.cmp(&right),
+                            _ => std::cmp::Ordering::Equal,
+                        },
+                    )
+                    .then_with(|| left.process.pid.cmp(&right.process.pid))
+            })
+            .map(|candidate| DetectedAgent {
+                kind: candidate.kind,
+                cwd: candidate.process.cwd.clone().unwrap_or_default(),
+            })
+    }
+
+    fn descendant_depth(&self, root_pid: u32, pid: u32) -> Option<usize> {
+        let mut current_pid = pid;
+        let mut depth = 0;
+
+        while current_pid != root_pid {
+            current_pid = self.by_pid.get(&current_pid)?.parent_pid?;
+            depth += 1;
+            if depth > self.by_pid.len() {
+                return None;
+            }
+        }
+
+        Some(depth)
+    }
+}
+
+/// Classify one pane against a whole snapshot. Convenience for a single lookup;
+/// classifying several panes should build one [`AgentScan`] and reuse it.
 pub fn classify_pane_tree(
     session_child_pid: u32,
     processes: &[ProcessSnapshot],
 ) -> Option<DetectedAgent> {
-    let mut candidates = Vec::new();
-
-    for process in processes {
-        let Some(kind) =
-            AgentKind::from_process(&process.exe_basename, &process.name, &process.cmdline)
-        else {
-            continue;
-        };
-        let Some(depth) = descendant_depth(session_child_pid, process.pid, processes) else {
-            continue;
-        };
-        candidates.push(Candidate {
-            process,
-            depth,
-            kind,
-        });
-    }
-
-    candidates
-        .into_iter()
-        .max_by(|left, right| {
-            left.depth
-                .cmp(&right.depth)
-                .then_with(
-                    || match (left.process.start_time, right.process.start_time) {
-                        (Some(left), Some(right)) => left.cmp(&right),
-                        _ => std::cmp::Ordering::Equal,
-                    },
-                )
-                .then_with(|| left.process.pid.cmp(&right.process.pid))
-        })
-        .map(|candidate| DetectedAgent {
-            kind: candidate.kind,
-            cwd: candidate.process.cwd.clone().unwrap_or_default(),
-        })
-}
-
-fn descendant_depth(root_pid: u32, pid: u32, processes: &[ProcessSnapshot]) -> Option<usize> {
-    let mut current_pid = pid;
-    let mut depth = 0;
-
-    while current_pid != root_pid {
-        let process = processes
-            .iter()
-            .find(|process| process.pid == current_pid)?;
-        current_pid = process.parent_pid?;
-        depth += 1;
-        if depth > processes.len() {
-            return None;
-        }
-    }
-
-    Some(depth)
+    AgentScan::new(processes).classify(session_child_pid)
 }
 
 /// Coarse activity state shown in the agents overlay.
@@ -454,6 +482,11 @@ impl PaneAgentTracker {
         self.pushed
             .as_ref()
             .filter(|pushed| pushed.state != AgentState::Idle)
+    }
+
+    /// Whether a producer currently owns this pane's state.
+    pub fn has_owning_push(&self) -> bool {
+        self.owning_push().is_some()
     }
 
     /// Working-interval start for whichever source currently owns the state.
@@ -789,6 +822,83 @@ mod tests {
                 cwd: "/repo".into(),
             })
         );
+    }
+
+    #[test]
+    fn one_scan_classifies_every_pane_identically_to_a_per_pane_scan() {
+        // Two panes, two agents, plus filler that no matcher should ever touch
+        // twice. `AgentScan` exists to move the matcher pass off the per-pane
+        // path; it must not change a single verdict doing so.
+        let mut processes = vec![
+            process(10, None, "zsh", None),
+            process(11, Some(10), "claude", Some(1)),
+            process(20, None, "zsh", None),
+            process(21, Some(20), "codex", Some(1)),
+        ];
+        processes[1].cwd = Some("/one".into());
+        processes[3].cwd = Some("/two".into());
+        processes.extend((100..160).map(|pid| process(pid, Some(1), "node", None)));
+
+        let scan = AgentScan::new(&processes);
+        for root in [10, 20, 999] {
+            assert_eq!(
+                scan.classify(root),
+                classify_pane_tree(root, &processes),
+                "shared scan must agree with a standalone one for root {root}"
+            );
+        }
+        assert_eq!(
+            scan.classify(10).map(|agent| agent.kind),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            scan.classify(20).map(|agent| agent.cwd),
+            Some("/two".into())
+        );
+        assert_eq!(scan.classify(999), None);
+    }
+
+    #[test]
+    fn has_owning_push_tracks_who_owns_the_state() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        assert!(!tracker.has_owning_push());
+
+        tracker.update(
+            Some(DetectedAgent {
+                kind: AgentKind::Claude,
+                cwd: "/repo".into(),
+            }),
+            now,
+            1_000,
+        );
+        assert!(
+            !tracker.has_owning_push(),
+            "a detected agent alone is inference, and inference needs fast sampling"
+        );
+
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Working,
+            now,
+            1_000,
+        );
+        assert!(
+            tracker.has_owning_push(),
+            "a hooked agent reports its own state; sampling only has to watch it exit"
+        );
+
+        // An idle push hands the pane back to inference, so the fast cadence
+        // has to come back with it.
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Idle,
+            now,
+            1_000,
+        );
+        assert!(!tracker.has_owning_push());
     }
 
     #[test]
