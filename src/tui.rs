@@ -5,7 +5,10 @@ mod debug_log;
 mod geometry;
 mod input;
 mod render;
+mod selection;
 mod share;
+mod snapshot;
+mod state;
 #[cfg(test)]
 mod test_support;
 mod text;
@@ -17,7 +20,6 @@ use std::{
     io,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,8 +29,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
-
-use serde::{Deserialize, Serialize};
 
 use crossterm::{
     event::{
@@ -75,6 +75,7 @@ use crate::{
 
 use clock::unix_ms_now;
 pub(crate) use debug_log::ui_debug_log;
+use geometry::{ResizeDrag, ResizePreview};
 use geometry::{
     allocate_node_with_preview, area_from_terminal_size, clamp_to_viewport, contains_leaf,
     direction_distance, first_leaf, fixed_grid_viewport, is_in_direction, mouse_to_screen_cell,
@@ -102,28 +103,20 @@ pub use render::panes::{render_multi_pane, render_multi_pane_with_copy_feedback}
 use render::vt::{
     VtScreen, available_scrollback, render_guest_screen, render_host_screen, viewed_screen,
 };
+pub(crate) use selection::copy_selection_to_clipboard;
+use selection::selection_text;
 pub(crate) use share::{resolve_local_ticket, share_copy_result};
-use text::{copied_line_count, sanitize_single_line, text_width, truncate_bytes};
-
-pub(crate) enum NodeScreenSnapshot {
-    Local {
-        frame: ScreenFrame,
-        history_len: u64,
-        history_end: u64,
-    },
-    Remote {
-        sequence: u64,
-        kitty_keyboard_active: bool,
-    },
-}
-pub(crate) type NodeScreenSnapshots = BTreeMap<PaneId, NodeScreenSnapshot>;
-pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bool)>;
-
-#[derive(Clone, Debug)]
-pub(crate) struct LocalScrollbackWindow {
-    pub total_rows: u64,
-    pub screen: vt100::Screen,
-}
+pub(crate) use snapshot::{
+    LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot, NodeScreenSnapshots,
+};
+pub use state::{
+    AgentOverlayRow, ChordMode, KeyHandling, MouseHandling, PaneGeometry, PaneViewState, ShareCopy,
+    ShareView, UiIntent,
+};
+pub(in crate::tui) use state::{
+    ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
+};
+use text::{sanitize_single_line, text_width, truncate_bytes};
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
@@ -143,242 +136,6 @@ const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
-
-/// The in-progress multi-pane command prefix, kept entirely local to one terminal.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ChordMode {
-    #[default]
-    None,
-    Pane,
-    Tab,
-}
-
-/// Metadata used to draw a pane before its runtime has delivered a screen and lease.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PaneViewState {
-    pub ready: bool,
-    pub controller_peer_id: Option<Vec<u8>>,
-    pub controller_active: bool,
-    scrollback: usize,
-}
-
-impl PaneViewState {
-    pub fn from_chrome(
-        ready: bool,
-        controller_peer_id: Option<Vec<u8>>,
-        controller_active: bool,
-    ) -> Self {
-        Self {
-            ready,
-            controller_peer_id,
-            controller_active,
-            scrollback: 0,
-        }
-    }
-}
-
-/// User operations emitted by the TUI. Session code owns all resulting mutations and PTYs.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum UiIntent {
-    CreatePane {
-        target_pane_id: PaneId,
-        axis: Axis,
-        position: NewPanePosition,
-        grid_rows: u16,
-        grid_cols: u16,
-    },
-    DeletePane {
-        pane_id: PaneId,
-    },
-    CreateTab {
-        grid_rows: u16,
-        grid_cols: u16,
-    },
-    DeleteTab {
-        tab_id: TabId,
-    },
-    FocusPane {
-        pane_id: PaneId,
-    },
-    SwitchTab {
-        tab_id: TabId,
-    },
-    SetSplitRatio {
-        pane_id: PaneId,
-        axis: Axis,
-        first_share_bps: u16,
-        base_revision: u64,
-    },
-    RenamePane {
-        pane_id: PaneId,
-        title: String,
-    },
-    RenameTab {
-        tab_id: TabId,
-        title: String,
-    },
-    SetPaneLock {
-        pane_id: PaneId,
-        locked: bool,
-    },
-    /// Close or reopen the whole session to peers that have never joined it.
-    ///
-    /// Unlike `SetPaneLock` this is not layout state and never travels as a layout
-    /// request: only the coordinator answers joins, so only the coordinator can enforce
-    /// it, and a guest pressing the key is told so rather than silently ignored.
-    SetSessionLock {
-        locked: bool,
-    },
-}
-
-/// Whether a terminal key belongs to the mux or should later be offered to the focused pane.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KeyHandling {
-    Forward,
-    Consumed(Vec<UiIntent>),
-    Quit,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MouseHandling {
-    pub intents: Vec<UiIntent>,
-    pub copy_selection_requested: bool,
-    /// An xterm mouse report the focused pane's child asked to receive.
-    pub forward_bytes: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentOverlayRow {
-    pub pane_id: PaneId,
-    pub tab_ordinal: usize,
-    pub pane_ordinal: usize,
-    pub tab_label: String,
-    pub pane_label: String,
-    pub kind: String,
-    pub cwd: String,
-    pub state: AgentRosterState,
-    pub working_since_unix_ms: u64,
-    pub host: String,
-    pub controller: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RenameTarget {
-    Pane(PaneId),
-    Tab(TabId),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RenamePrompt {
-    target: RenameTarget,
-    value: String,
-    error: Option<String>,
-}
-
-/// Which piece of invite material the share modal asked the client to copy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShareCopy {
-    Ticket,
-    Code,
-}
-
-/// The host-only invite material the share modal renders.
-///
-/// The ticket is resolved by the attaching process, so a guest — who has no rendezvous record
-/// to resolve — simply arrives here with both fields empty and gets told so.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ShareView<'a> {
-    pub code: Option<&'a str>,
-    pub ticket: Option<&'a str>,
-    /// The result of the last copy, shown in the modal rather than the footer.
-    pub notice: Option<&'a str>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-enum ModalState {
-    #[default]
-    None,
-    Agents,
-    Share,
-    Rename(RenamePrompt),
-    ConfirmDeleteTab {
-        tab_id: TabId,
-        pane_count: usize,
-    },
-}
-
-/// Rectangles for one rendered terminal frame.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaneGeometry {
-    pub tab_bar: Rect,
-    pub tab_labels: BTreeMap<TabId, Rect>,
-    pub content: Rect,
-    pub footer: Rect,
-    pub panes: BTreeMap<PaneId, Rect>,
-}
-
-/// One cell in a pane's fixed VT grid.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ScreenCell {
-    row: u16,
-    col: u16,
-}
-
-/// A local, pane-scoped text selection. Both ends are inclusive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PaneTextSelection {
-    pane_id: PaneId,
-    anchor: ScreenCell,
-    cursor: ScreenCell,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ResizeDrag {
-    pane_id: PaneId,
-    base_revision: u64,
-    origin_column: u16,
-    origin_row: u16,
-    axis: Option<Axis>,
-    horizontal: bool,
-    vertical: bool,
-    original_share_bps: u16,
-    preview_first_share_bps: Option<u16>,
-    span: u16,
-    content: Rect,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SplitTarget {
-    first_share_bps: u16,
-    span: u16,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ResizePreview {
-    pane_id: PaneId,
-    axis: Axis,
-    first_share_bps: u16,
-}
-
-impl PaneTextSelection {
-    fn is_empty(self) -> bool {
-        self.anchor == self.cursor
-    }
-
-    fn contains(self, cell: ScreenCell) -> bool {
-        let (start, end) = self.bounds();
-        match cell.row {
-            row if row == start.row && row == end.row => (start.col..=end.col).contains(&cell.col),
-            row if row == start.row => cell.col >= start.col,
-            row if row == end.row => cell.col <= end.col,
-            row => (start.row..end.row).contains(&row),
-        }
-    }
-
-    fn bounds(self) -> (ScreenCell, ScreenCell) {
-        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
-    }
-}
 
 /// Pure local rendering and selection state for a revisioned shared layout.
 #[derive(Clone, Debug)]
@@ -1839,64 +1596,6 @@ impl MultiPaneTui {
                 ),
             );
         }
-    }
-}
-
-fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Option<String> {
-    if selection.is_empty() {
-        return None;
-    }
-    let (rows, cols) = screen.size();
-    if rows == 0 || cols == 0 {
-        return None;
-    }
-    let (start, end) = selection.bounds();
-    let start = ScreenCell {
-        row: start.row.min(rows.saturating_sub(1)),
-        col: start.col.min(cols.saturating_sub(1)),
-    };
-    let end = ScreenCell {
-        row: end.row.min(rows.saturating_sub(1)),
-        col: end.col.min(cols.saturating_sub(1)),
-    };
-
-    let lines = (start.row..=end.row)
-        .map(|row| {
-            let first_col = if row == start.row { start.col } else { 0 };
-            let last_col = if row == end.row { end.col } else { cols - 1 };
-            let mut line = String::new();
-            for col in first_col..=last_col {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if !cell.is_wide_continuation() {
-                    let contents = cell.contents();
-                    line.push_str(if contents.is_empty() { " " } else { contents });
-                }
-            }
-            line.trim_end().to_owned()
-        })
-        .collect::<Vec<_>>();
-    Some(lines.join("\n"))
-}
-
-pub(crate) fn copy_selection_to_clipboard(text: &str) -> io::Result<usize> {
-    copy_to_macos_clipboard(text)?;
-    Ok(copied_line_count(text))
-}
-
-fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
-    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("pbcopy stdin unavailable"))?;
-    stdin.write_all(text.as_bytes())?;
-    drop(stdin);
-    if child.wait()?.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("pbcopy failed"))
     }
 }
 

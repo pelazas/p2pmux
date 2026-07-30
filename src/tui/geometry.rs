@@ -8,7 +8,7 @@ use ratatui::{layout::Rect, widgets::Block};
 
 use crate::{
     layout::{Axis, Node, PaneId},
-    tui::{ResizeDrag, ResizePreview, ScreenCell, SplitTarget},
+    tui::ScreenCell,
 };
 
 pub(in crate::tui) fn first_leaf(node: &Node) -> Option<PaneId> {
@@ -363,6 +363,32 @@ pub(in crate::tui) fn mouse_to_screen_cell(
 pub(in crate::tui) fn area_from_terminal_size(size: io::Result<(u16, u16)>) -> Option<Rect> {
     size.ok()
         .map(|(width, height)| Rect::new(0, 0, width, height))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) struct ResizeDrag {
+    pub(in crate::tui) pane_id: PaneId,
+    pub(in crate::tui) base_revision: u64,
+    pub(in crate::tui) origin_column: u16,
+    pub(in crate::tui) origin_row: u16,
+    pub(in crate::tui) axis: Option<Axis>,
+    pub(in crate::tui) horizontal: bool,
+    pub(in crate::tui) vertical: bool,
+    pub(in crate::tui) original_share_bps: u16,
+    pub(in crate::tui) preview_first_share_bps: Option<u16>,
+    pub(in crate::tui) span: u16,
+    pub(in crate::tui) content: Rect,
+}
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) struct SplitTarget {
+    pub(in crate::tui) first_share_bps: u16,
+    pub(in crate::tui) span: u16,
+}
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) struct ResizePreview {
+    pub(in crate::tui) pane_id: PaneId,
+    pub(in crate::tui) axis: Axis,
+    pub(in crate::tui) first_share_bps: u16,
 }
 
 #[cfg(test)]
