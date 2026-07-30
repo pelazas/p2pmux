@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n#\n# An agent counts as finished after this many seconds of silence. Agents pause for a\n# long time mid-task (waiting on a model response, running a quiet tool), so a small\n# value reports unfinished work as finished. Clamped to 5-3600.\n# quiet_seconds = 20\n#\n# Only finish on an explicit signal from the agent (a terminal bell) and never on the\n# silence timer above. Removes every false notification, but an agent that does not\n# ring will show as working until it exits.\n# require_bell = false\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#4fc3f7\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n#\n# An agent counts as finished after this many seconds of silence. Agents pause for a\n# long time mid-task (waiting on a model response, running a quiet tool), so a small\n# value reports unfinished work as finished. Clamped to 5-3600.\n# quiet_seconds = 20\n#\n# Only finish on an explicit signal from the agent (a terminal bell) and never on the\n# silence timer above. Removes every false notification, but an agent that does not\n# ring will show as working until it exits.\n# require_bell = false\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -101,7 +101,30 @@ pub struct UiTheme {
     pub pane_border_hovered: Color,
     pub pane_border_idle: Color,
     pub pane_border_remote_control: Color,
+    /// One color per member slot, used to identify who is where. Identity only: the
+    /// reds and oranges stay reserved for control and alert state, so no entry here
+    /// may collide with `pane_border_remote_control`.
+    pub member_colors: [Color; MEMBER_COLOR_SLOTS],
 }
+
+/// One color per admitted member, so a live session never has to recycle a slot.
+/// Kept in step with `crate::layout::MAX_MEMBERS` by a unit test.
+pub const MEMBER_COLOR_SLOTS: usize = 8;
+
+/// Cool hues only. Warm colors are taken: the active tab is `#dc322f` and an actively
+/// controlled pane border is `#ff4500`, and a member tinted like either reads as an
+/// alert. Every color here also carries the member's initial at the call site, so the
+/// palette never has to survive on hue alone.
+const DEFAULT_MEMBER_COLORS: [Color; MEMBER_COLOR_SLOTS] = [
+    Color::Rgb(79, 195, 247),
+    Color::Rgb(126, 214, 126),
+    Color::Rgb(240, 98, 146),
+    Color::Rgb(121, 134, 203),
+    Color::Rgb(77, 182, 172),
+    Color::Rgb(186, 104, 200),
+    Color::Rgb(192, 202, 51),
+    Color::Rgb(144, 164, 174),
+];
 
 impl Default for UiTheme {
     fn default() -> Self {
@@ -128,6 +151,7 @@ impl Default for UiTheme {
             pane_border_hovered: Color::Gray,
             pane_border_idle: Color::DarkGray,
             pane_border_remote_control: Color::Rgb(255, 69, 0),
+            member_colors: DEFAULT_MEMBER_COLORS,
         }
     }
 }
@@ -179,6 +203,7 @@ struct UiThemeFile {
     pane_border_hovered: Option<String>,
     pane_border_idle: Option<String>,
     pane_border_remote_control: Option<String>,
+    member_colors: Option<Vec<String>>,
 }
 
 pub fn config_path() -> Result<PathBuf, ConfigError> {
@@ -333,6 +358,7 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         config.ui.theme.pane_border_remote_control,
         "pane_border_remote_control",
     )?;
+    apply_member_colors(&mut theme.member_colors, config.ui.theme.member_colors)?;
     let defaults = NotificationsConfig::default();
     let notifications = NotificationsConfig {
         sound_enabled: config.ui.notifications.sound_enabled.unwrap_or(true),
@@ -365,6 +391,31 @@ fn apply_color(
 ) -> Result<(), ConfigError> {
     if let Some(value) = value {
         *color = parse_color(&value).ok_or(ConfigError::InvalidColor { key, value })?;
+    }
+    Ok(())
+}
+
+/// Override member colors from the front of the list, so a short list keeps the
+/// built-in colors for the slots it does not mention -- the same "omitted keys keep
+/// today's colors" rule every other theme key follows.
+fn apply_member_colors(
+    colors: &mut [Color; MEMBER_COLOR_SLOTS],
+    values: Option<Vec<String>>,
+) -> Result<(), ConfigError> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.len() > MEMBER_COLOR_SLOTS {
+        return Err(ConfigError::InvalidColor {
+            key: "member_colors",
+            value: format!("at most {MEMBER_COLOR_SLOTS} colors, got {}", values.len()),
+        });
+    }
+    for (slot, value) in colors.iter_mut().zip(values) {
+        *slot = parse_color(&value).ok_or(ConfigError::InvalidColor {
+            key: "member_colors",
+            value,
+        })?;
     }
     Ok(())
 }
@@ -595,6 +646,61 @@ mod tests {
                 .pane_border_chord_focused,
             Color::Rgb(1, 2, 3)
         );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn member_color_slots_cover_every_admissible_member() {
+        assert_eq!(MEMBER_COLOR_SLOTS, crate::layout::MAX_MEMBERS);
+    }
+
+    #[test]
+    fn member_colors_override_from_the_front_and_keep_the_rest() {
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# member_colors = [\"#4fc3f7\""));
+
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[ui.theme]\nmember_colors = [\"#010203\", \"yellow\"]\n",
+        )
+        .unwrap();
+
+        let colors = load_config_from(&path).unwrap().ui.theme.member_colors;
+        assert_eq!(colors[0], Color::Rgb(1, 2, 3));
+        assert_eq!(colors[1], Color::Yellow);
+        assert_eq!(
+            colors[2],
+            UiTheme::default().member_colors[2],
+            "slots the file leaves out keep their built-in color"
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn member_colors_reject_an_oversized_list_and_a_bad_entry() {
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let too_many = ["\"white\""; MEMBER_COLOR_SLOTS + 1].join(", ");
+        fs::write(&path, format!("[ui.theme]\nmember_colors = [{too_many}]\n")).unwrap();
+        assert!(matches!(
+            load_config_from(&path),
+            Err(ConfigError::InvalidColor {
+                key: "member_colors",
+                ..
+            })
+        ));
+
+        fs::write(&path, "[ui.theme]\nmember_colors = [\"#gggggg\"]\n").unwrap();
+        assert!(matches!(
+            load_config_from(&path),
+            Err(ConfigError::InvalidColor {
+                key: "member_colors",
+                ..
+            })
+        ));
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
