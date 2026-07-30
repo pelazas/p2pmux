@@ -19,7 +19,15 @@ What each check is really asking:
 
 Run:  scripts/e2e/provision_droplets.sh create
       python3 scripts/e2e/scenario_n_two_remotes.py
+      python3 scripts/e2e/scenario_n_two_remotes.py --force-relay
+      python3 scripts/e2e/scenario_n_two_remotes.py --delay-ms=200
       scripts/e2e/provision_droplets.sh destroy
+
+`--force-relay` drops UDP between the two droplets so holepunching cannot succeed and
+the session has to fall back to a relay -- the path most real users behind carrier NAT
+will actually get, and the one two public-IP droplets would otherwise never exercise.
+`--delay-ms` shapes egress with netem, which widens every round-trip-shaped window in
+the protocol; it is the cheap way to check that a race fixed at 85ms stays fixed at 300.
 """
 
 from __future__ import annotations
@@ -149,7 +157,16 @@ def main() -> int:
         print(error, file=sys.stderr)
         return 2
 
-    print(f"== scenario N: {alpha_host.alias} + {beta_host.alias} ==", flush=True)
+    force_relay = "--force-relay" in sys.argv
+    delay_ms = None
+    for argument in sys.argv[1:]:
+        if argument.startswith("--delay-ms="):
+            delay_ms = int(argument.split("=", 1)[1])
+
+    mode = "forced relay" if force_relay else "whatever path it gets"
+    if delay_ms is not None:
+        mode += f", +{delay_ms}ms egress each way"
+    print(f"== scenario N: {alpha_host.alias} + {beta_host.alias} ({mode}) ==", flush=True)
     for host in (alpha_host, beta_host):
         if not host.binary_ready():
             print(f"{host.alias} has no binary at {host.binary}", file=sys.stderr)
@@ -162,6 +179,16 @@ def main() -> int:
     for host in (alpha_host, beta_host):
         host.reset_network()
         host.reset_home()
+    if delay_ms is not None:
+        for host in (alpha_host, beta_host):
+            host.netem(delay_ms=delay_ms)
+    if force_relay:
+        # Blocked on both sides and before the join, so the direct path never forms even
+        # briefly. Filtering on the peer's address rather than on UDP as a whole leaves
+        # every relay server reachable, which is the fallback under test.
+        alpha_host.block_direct_udp(beta_host.host_ip())
+        beta_host.block_direct_udp(alpha_host.host_ip())
+        print("   UDP between the droplets dropped: only a relay path can form", flush=True)
 
     try:
         with Harness("scenario_n_two_remotes") as harness:
@@ -211,13 +238,14 @@ def main() -> int:
                 print(beta.snapshot(), flush=True)
                 return 1
 
+            expected_path = "relayed" if force_relay else "direct"
             for peer in (alpha, beta):
                 guard(
-                    f"{peer.name} reports a path kind",
+                    f"{peer.name} reports the path as {expected_path}",
                     lambda peer=peer: peer.wait_until(
-                        lambda screen: link_badge(screen) is not None,
-                        timeout=45.0,
-                        what="a connectivity badge",
+                        lambda screen: link_badge(screen) == expected_path,
+                        timeout=60.0,
+                        what=f"a {expected_path} connectivity badge",
                     ),
                     link_badge(peer.snapshot()) or "",
                 )
