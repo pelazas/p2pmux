@@ -33,9 +33,9 @@ use crate::{
         Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
         LayoutSplit, LayoutState, MarkPaneExited, MemberDescriptor,
         NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
-        PaneReady, PaneReservation, PaneSubscribe, ReleaseControl, RenamePane, RenameTab,
-        SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
-        TakeControl, UpdatePaneGrids, Welcome, envelope,
+        PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ReleaseControl,
+        RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
+        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -51,6 +51,8 @@ pub struct LayoutCoordinator {
     state: SessionState,
     reservations: BTreeMap<u64, ReservationContext>,
     agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
+    presence: BTreeMap<Vec<u8>, Presence>,
+    presence_epoch: u64,
     reservation_timeout: Duration,
     locked: bool,
     admitted: BTreeSet<Vec<u8>>,
@@ -195,6 +197,8 @@ impl LayoutCoordinator {
             )?,
             reservations: BTreeMap::new(),
             agent_rosters: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_epoch: 0,
             reservation_timeout,
             locked: false,
             admitted: BTreeSet::new(),
@@ -286,6 +290,57 @@ impl LayoutCoordinator {
         Some(roster)
     }
 
+    /// Return the cached presence of every member in deterministic peer order.
+    pub fn presence(&self) -> Vec<Presence> {
+        self.presence.values().cloned().collect()
+    }
+
+    /// Counts accepted presence updates. The coordinator does not receive its own
+    /// broadcasts, so its renderer polls this to notice that somebody else moved.
+    pub fn presence_epoch(&self) -> u64 {
+        self.presence_epoch
+    }
+
+    /// Accept a member's latest focus after checking it against the authoritative layout.
+    ///
+    /// Like the agent roster, the authenticated connection identity always wins over the
+    /// message's claimed peer id, and a stale generation is dropped. Unlike the roster,
+    /// the location is not required to exist: a member can focus a pane in the same breath
+    /// another member deletes it, and rejecting that would strand them nowhere. An unknown
+    /// tab or pane simply draws no marker until their next update.
+    pub fn accept_presence(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        mut presence: Presence,
+    ) -> Option<Presence> {
+        if !self
+            .state
+            .members()
+            .iter()
+            .any(|member| member.peer_id == authenticated_peer_id)
+        {
+            return None;
+        }
+        if self
+            .presence
+            .get(authenticated_peer_id)
+            .is_some_and(|current| presence.generation <= current.generation)
+        {
+            return None;
+        }
+        presence.peer_id = authenticated_peer_id.to_vec();
+        if !presence.attached {
+            // A detached member is looking at nothing. Normalize here so no renderer has
+            // to remember that the location is meaningless when the flag is false.
+            presence.tab_id = 0;
+            presence.pane_id = 0;
+        }
+        self.presence
+            .insert(authenticated_peer_id.to_vec(), presence.clone());
+        self.presence_epoch = self.presence_epoch.saturating_add(1);
+        Some(presence)
+    }
+
     pub fn admit(
         &mut self,
         peer_id: Vec<u8>,
@@ -327,6 +382,9 @@ impl LayoutCoordinator {
     pub fn remove_member(&mut self, peer_id: &[u8]) -> Result<MembershipChange, CoordinatorError> {
         let invalidated = self.state.remove_member(peer_id)?;
         self.prune_agent_rosters();
+        if self.presence.remove(peer_id).is_some() {
+            self.presence_epoch = self.presence_epoch.saturating_add(1);
+        }
         self.membership_change(invalidated)
     }
 
@@ -1910,6 +1968,7 @@ pub struct SharedLayoutHost {
 pub enum LayoutControlEvent {
     Snapshot(SessionSnapshot),
     AgentRoster(AgentRoster),
+    Presence(PresenceRoster),
     Reservation(PaneReservation),
     Commit(LayoutCommit),
     Reject(LayoutReject),
@@ -1933,6 +1992,7 @@ impl PaneLayoutReconciler {
             LayoutControlEvent::Snapshot(snapshot) => snapshot.state.as_ref(),
             LayoutControlEvent::Commit(commit) => commit.state.as_ref(),
             LayoutControlEvent::AgentRoster(_)
+            | LayoutControlEvent::Presence(_)
             | LayoutControlEvent::Reservation(_)
             | LayoutControlEvent::Reject(_)
             | LayoutControlEvent::Disconnected => None,
@@ -1955,15 +2015,25 @@ enum LayoutClientMessage {
     Ready(PaneReady),
     Failed(PaneFailed),
     AgentRoster(AgentRoster),
+    Presence(Presence),
 }
 
 const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
+
+/// Latest-wins outbound classes, in the order their slots appear in `pending_watch`.
+/// Each is its own watch channel so a newer message of one class never discards a
+/// pending message of another.
+const WATCH_STATE: usize = 0;
+const WATCH_ROSTER: usize = 1;
+const WATCH_PRESENCE: usize = 2;
+const WATCH_CLASSES: usize = 3;
 
 #[derive(Clone)]
 struct ControlMailbox {
     initial_tx: mpsc::Sender<Envelope>,
     state_tx: watch::Sender<Option<SequencedEnvelope>>,
     roster_tx: watch::Sender<Option<SequencedEnvelope>>,
+    presence_tx: watch::Sender<Option<SequencedEnvelope>>,
     targeted_tx: mpsc::Sender<SequencedEnvelope>,
     next_sequence: Arc<AtomicU64>,
 }
@@ -1972,6 +2042,7 @@ struct ControlMailboxReceivers {
     initial_rx: mpsc::Receiver<Envelope>,
     state_rx: watch::Receiver<Option<SequencedEnvelope>>,
     roster_rx: watch::Receiver<Option<SequencedEnvelope>>,
+    presence_rx: watch::Receiver<Option<SequencedEnvelope>>,
     targeted_rx: mpsc::Receiver<SequencedEnvelope>,
 }
 
@@ -1986,12 +2057,14 @@ impl ControlMailbox {
         let (initial_tx, initial_rx) = mpsc::channel(33);
         let (state_tx, state_rx) = watch::channel(None);
         let (roster_tx, roster_rx) = watch::channel(None);
+        let (presence_tx, presence_rx) = watch::channel(None);
         let (targeted_tx, targeted_rx) = mpsc::channel(TARGETED_CONTROL_QUEUE_CAPACITY);
         (
             Self {
                 initial_tx,
                 state_tx,
                 roster_tx,
+                presence_tx,
                 targeted_tx,
                 next_sequence: Arc::new(AtomicU64::new(1)),
             },
@@ -1999,6 +2072,7 @@ impl ControlMailbox {
                 initial_rx,
                 state_rx,
                 roster_rx,
+                presence_rx,
                 targeted_rx,
             },
         )
@@ -2014,6 +2088,11 @@ impl ControlMailbox {
 
     fn publish_roster(&self, envelope: Envelope) {
         self.roster_tx.send_replace(Some(self.sequenced(envelope)));
+    }
+
+    fn publish_presence(&self, envelope: Envelope) {
+        self.presence_tx
+            .send_replace(Some(self.sequenced(envelope)));
     }
 
     fn enqueue_targeted(&self, envelope: Envelope) -> bool {
@@ -2130,6 +2209,13 @@ impl SharedLayoutMember {
     pub fn try_agent_roster(&self, roster: AgentRoster) -> Result<(), LayoutControlQueueError> {
         self.outbound
             .try_send(LayoutClientMessage::AgentRoster(roster))
+            .map_err(layout_queue_error)
+    }
+
+    /// Publish where this member is now looking to the coordinator.
+    pub fn try_presence(&self, presence: Presence) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::Presence(presence))
             .map_err(layout_queue_error)
     }
 
@@ -2259,6 +2345,50 @@ impl SharedLayoutHost {
             );
         }
         Ok(())
+    }
+
+    /// The full presence set, but only if it changed since the caller last saw it.
+    ///
+    /// The coordinator is the authority and never receives its own broadcasts, so this is
+    /// how its renderer learns that a member moved. Returns the epoch to poll with next.
+    pub fn presence_if_newer(&self, seen_epoch: u64) -> Option<(u64, PresenceRoster)> {
+        let coordinator = self.coordinator.lock().ok()?;
+        let epoch = coordinator.presence_epoch();
+        (epoch > seen_epoch).then(|| {
+            (
+                epoch,
+                PresenceRoster {
+                    entries: coordinator.presence(),
+                },
+            )
+        })
+    }
+
+    /// Publish the coordinator host's own focus through the same relay path.
+    ///
+    /// Returns the resulting full roster so the coordinator's renderer can show itself in
+    /// the same place its peers will, without a round trip.
+    pub fn publish_local_presence(
+        &self,
+        presence: Presence,
+    ) -> Result<Option<PresenceRoster>, SessionError> {
+        let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
+        let mut coordinator = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?;
+        let Some(_) = coordinator.accept_presence(&peer_id, presence) else {
+            return Ok(None);
+        };
+        let roster = PresenceRoster {
+            entries: coordinator.presence(),
+        };
+        drop(coordinator);
+        broadcast_presence(
+            &self.peers,
+            coordinator_envelope(&peer_id, envelope::Body::PresenceRoster(roster.clone())),
+        );
+        Ok(Some(roster))
     }
 
     /// Applies a request made by the coordinator process itself. Remote peers receive the same
@@ -2489,6 +2619,21 @@ impl SharedLayoutHost {
                     .enqueue_initial(coordinator_envelope(
                         self.host.ticket().endpoint_addr().id.as_bytes(),
                         envelope::Body::AgentRoster(roster),
+                    ))
+                    .then_some(())
+                    .ok_or(SessionError::PeerTask)?;
+            }
+            // A joiner sees where everyone already is without waiting for them to move.
+            let presence = self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?
+                .presence();
+            if !presence.is_empty() {
+                mailbox
+                    .enqueue_initial(coordinator_envelope(
+                        self.host.ticket().endpoint_addr().id.as_bytes(),
+                        envelope::Body::PresenceRoster(PresenceRoster { entries: presence }),
                     ))
                     .then_some(())
                     .ok_or(SessionError::PeerTask)?;
@@ -2734,6 +2879,18 @@ fn broadcast_roster(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelope
     }
 }
 
+fn broadcast_presence(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelope: Envelope) {
+    let peers = match peers.lock() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+    for peer in peers.values() {
+        // Safe to supersede an older presence roster because each one carries every
+        // member, so the newest is always the whole truth.
+        peer.mailbox.publish_presence(envelope.clone());
+    }
+}
+
 fn send_to_peer(
     peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     peer_id: &[u8],
@@ -2863,6 +3020,7 @@ async fn layout_peer_writer_task<W>(
         mut initial_rx,
         mut state_rx,
         mut roster_rx,
+        mut presence_rx,
         mut targeted_rx,
     }: ControlMailboxReceivers,
     peer_id: Vec<u8>,
@@ -2888,9 +3046,12 @@ async fn layout_peer_writer_task<W>(
     let mut targeted_open = true;
     let mut state_open = true;
     let mut roster_open = true;
+    let mut presence_open = true;
     let mut pending_targeted = None;
-    let mut pending_state = None;
-    let mut pending_roster = None;
+    // Every latest-wins class shares one shape, so the send order below stays a
+    // min-by-sequence over an array. Adding a class is one more slot here, not another
+    // branch in a hand-written comparison that has to stay in sync with itself.
+    let mut pending_watch: [Option<SequencedEnvelope>; WATCH_CLASSES] = [None, None, None];
     loop {
         if pending_targeted.is_none() {
             match targeted_rx.try_recv() {
@@ -2899,48 +3060,66 @@ async fn layout_peer_writer_task<W>(
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
         }
-        if pending_state.is_none() && state_open && state_rx.has_changed().unwrap_or(false) {
-            pending_state = state_rx.borrow_and_update().clone();
+        if pending_watch[WATCH_STATE].is_none()
+            && state_open
+            && state_rx.has_changed().unwrap_or(false)
+        {
+            pending_watch[WATCH_STATE] = state_rx.borrow_and_update().clone();
         }
-        if pending_roster.is_none() && roster_open && roster_rx.has_changed().unwrap_or(false) {
-            pending_roster = roster_rx.borrow_and_update().clone();
+        if pending_watch[WATCH_ROSTER].is_none()
+            && roster_open
+            && roster_rx.has_changed().unwrap_or(false)
+        {
+            pending_watch[WATCH_ROSTER] = roster_rx.borrow_and_update().clone();
+        }
+        if pending_watch[WATCH_PRESENCE].is_none()
+            && presence_open
+            && presence_rx.has_changed().unwrap_or(false)
+        {
+            pending_watch[WATCH_PRESENCE] = presence_rx.borrow_and_update().clone();
         }
 
+        let earliest_watch = pending_watch
+            .iter()
+            .enumerate()
+            .filter_map(|(class, pending)| pending.as_ref().map(|item| (item.sequence, class)))
+            .min();
         let next = match (
-            pending_state.as_ref().map(|item| item.sequence),
-            pending_roster.as_ref().map(|item| item.sequence),
-            pending_targeted.as_ref().map(|item| item.sequence),
+            earliest_watch,
+            pending_targeted.as_ref().map(|i| i.sequence),
         ) {
-            (None, None, None) => {
+            (None, None) => {
                 tokio::select! {
                     targeted = targeted_rx.recv(), if targeted_open => match targeted {
                         Some(targeted) => pending_targeted = Some(targeted),
                         None => targeted_open = false,
                     },
                     changed = state_rx.changed(), if state_open => match changed {
-                        Ok(()) => pending_state = state_rx.borrow_and_update().clone(),
+                        Ok(()) => pending_watch[WATCH_STATE] = state_rx.borrow_and_update().clone(),
                         Err(_) => state_open = false,
                     },
                     changed = roster_rx.changed(), if roster_open => match changed {
-                        Ok(()) => pending_roster = roster_rx.borrow_and_update().clone(),
+                        Ok(()) => pending_watch[WATCH_ROSTER] = roster_rx.borrow_and_update().clone(),
                         Err(_) => roster_open = false,
+                    },
+                    changed = presence_rx.changed(), if presence_open => match changed {
+                        Ok(()) => {
+                            pending_watch[WATCH_PRESENCE] =
+                                presence_rx.borrow_and_update().clone();
+                        }
+                        Err(_) => presence_open = false,
                     },
                     else => return,
                 }
                 continue;
             }
-            (state, roster, targeted) => {
-                let state = state.unwrap_or(u64::MAX);
-                let roster = roster.unwrap_or(u64::MAX);
-                let targeted = targeted.unwrap_or(u64::MAX);
-                if targeted <= state && targeted <= roster {
-                    pending_targeted.take()
-                } else if state <= roster {
-                    pending_state.take()
-                } else {
-                    pending_roster.take()
-                }
+            // Targeted messages win ties: they are point-to-point replies whose ordering a
+            // peer is waiting on, while every watch class is latest-wins state.
+            (Some((watch_sequence, _)), Some(targeted)) if targeted <= watch_sequence => {
+                pending_targeted.take()
             }
+            (None, Some(_)) => pending_targeted.take(),
+            (Some((_, class)), _) => pending_watch[class].take(),
         };
         let Some(next) = next else {
             continue;
@@ -2963,6 +3142,7 @@ async fn layout_member_writer_task(
             LayoutClientMessage::Ready(ready) => envelope::Body::PaneReady(ready),
             LayoutClientMessage::Failed(failed) => envelope::Body::PaneFailed(failed),
             LayoutClientMessage::AgentRoster(roster) => envelope::Body::AgentRoster(roster),
+            LayoutClientMessage::Presence(presence) => envelope::Body::Presence(presence),
         };
         if writer
             .write_next(&coordinator_envelope(&peer_id, body))
@@ -2988,6 +3168,7 @@ async fn layout_member_reader_task(
                 LayoutControlEvent::Snapshot(snapshot)
             }
             Some(envelope::Body::AgentRoster(roster)) => LayoutControlEvent::AgentRoster(roster),
+            Some(envelope::Body::PresenceRoster(roster)) => LayoutControlEvent::Presence(roster),
             Some(envelope::Body::PaneReservation(reservation)) => {
                 LayoutControlEvent::Reservation(reservation)
             }
@@ -3088,6 +3269,30 @@ async fn layout_host_reader_task(
                         coordinator_envelope(
                             &coordinator_peer_id,
                             envelope::Body::AgentRoster(roster),
+                        ),
+                    );
+                }
+            }
+            Some(envelope::Body::Presence(presence)) => {
+                // Re-broadcast the whole set rather than the one entry that moved, so a
+                // peer whose writer is behind can drop all but the newest message and
+                // still be correct about everybody.
+                let roster = match coordinator.lock() {
+                    Ok(mut coordinator) => {
+                        coordinator
+                            .accept_presence(&peer_id, presence)
+                            .map(|_| PresenceRoster {
+                                entries: coordinator.presence(),
+                            })
+                    }
+                    Err(_) => break,
+                };
+                if let Some(roster) = roster {
+                    broadcast_presence(
+                        &peers,
+                        coordinator_envelope(
+                            &coordinator_peer_id,
+                            envelope::Body::PresenceRoster(roster),
                         ),
                     );
                 }
@@ -3762,6 +3967,21 @@ mod control_queue_tests {
         )
     }
 
+    fn presence_envelope(pane_id: u64) -> Envelope {
+        coordinator_envelope(
+            b"coordinator",
+            envelope::Body::PresenceRoster(PresenceRoster {
+                entries: vec![Presence {
+                    peer_id: b"member".to_vec(),
+                    generation: pane_id,
+                    tab_id: 1,
+                    pane_id,
+                    attached: true,
+                }],
+            }),
+        )
+    }
+
     fn roster(generation: u64) -> Envelope {
         coordinator_envelope(
             b"coordinator",
@@ -4049,6 +4269,58 @@ mod control_queue_tests {
                 ..
             })
         ));
+        remove_control_peer(&peers, b"member");
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn presence_watch_never_swallows_a_pending_commit_or_roster() {
+        // Each latest-wins class owns its own slot. A presence burst is the cheapest way
+        // to prove it: if presence shared the roster slot, the roster below would vanish
+        // and, having no heartbeat of its own, presence would too.
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let (mailbox, receivers) = ControlMailbox::new();
+        let reader = tokio::spawn(std::future::pending::<()>());
+        peers.lock().unwrap().insert(
+            b"member".to_vec(),
+            ControlPeer::new(mailbox.clone(), reader.abort_handle(), None),
+        );
+        assert!(mailbox.enqueue_initial(commit(1)), "initial frame queues");
+        mailbox.publish_roster(roster(1));
+        mailbox.publish_presence(presence_envelope(1));
+        mailbox.publish_presence(presence_envelope(2));
+        mailbox.publish_state(commit(2));
+
+        let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(layout_peer_writer_task(
+            RecordingWriter(recorded_tx),
+            receivers,
+            b"member".to_vec(),
+            peers.clone(),
+            None,
+        ));
+
+        let _initial = recorded_rx.recv().await.expect("initial output");
+        let mut saw_roster = false;
+        let mut saw_commit = false;
+        let mut presence_pane_id = None;
+        for _ in 0..3 {
+            match recorded_rx.recv().await.expect("coalesced update").body {
+                Some(envelope::Body::AgentRoster(_)) => saw_roster = true,
+                Some(envelope::Body::LayoutCommit(_)) => saw_commit = true,
+                Some(envelope::Body::PresenceRoster(roster)) => {
+                    presence_pane_id = roster.entries.first().map(|entry| entry.pane_id);
+                }
+                other => panic!("unexpected body {other:?}"),
+            }
+        }
+        assert!(saw_roster, "an agent roster must survive a presence burst");
+        assert!(saw_commit, "a layout commit must survive a presence burst");
+        assert_eq!(
+            presence_pane_id,
+            Some(2),
+            "only the newest presence is sent, and it carries the whole session"
+        );
         remove_control_peer(&peers, b"member");
         writer_task.abort();
     }

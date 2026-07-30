@@ -18,6 +18,7 @@ use crate::{
     layout::PaneId,
     tui::{
         ChordMode, ModalState, MultiPaneTui, ShareView,
+        app::{member_color, member_initial},
         clock::unix_ms_now,
         geometry::{fixed_grid_viewport, pane_content_rect, visible_leaf_panes},
         member_label,
@@ -44,6 +45,67 @@ pub(in crate::tui) fn tab_label(
     let label = if unread { format!("* {label}") } else { label };
     if active { format!(" {label} ") } else { label }
 }
+/// A dot per other member on the tab: a separator space, then one cell each.
+///
+/// Measured by `tab_label_rects` and drawn by the renderer from this one function, so a
+/// tab's click target can never drift from what is on screen.
+pub(in crate::tui) fn tab_presence_width(watchers: usize) -> u16 {
+    match u16::try_from(watchers) {
+        Ok(0) => 0,
+        Ok(watchers) => watchers.saturating_add(1),
+        Err(_) => 0,
+    }
+}
+
+pub(in crate::tui) const PRESENCE_WATCHING: &str = "●";
+
+/// Right-aligned chips for the members watching a pane, one initial each.
+///
+/// This lives on the bottom border because the top one is already carrying
+/// `host: … control: …` and a right-aligned `(locked by …)` badge. The border color is
+/// left alone: it encodes focus and control state, one pane can have several watchers,
+/// and recoloring it per member would make watching look like controlling.
+///
+/// The member holding the control lease is drawn reversed rather than in a second glyph,
+/// so "someone is watching" and "someone can type here" differ without costing a column.
+pub(in crate::tui) fn pane_presence_chips(
+    watchers: &[&crate::local_ipc::PresenceRow],
+    controller_peer_id: Option<&[u8]>,
+    members: &[crate::layout::Member],
+    theme: &UiTheme,
+    available_width: usize,
+) -> Option<Line<'static>> {
+    if watchers.is_empty() || available_width < 3 {
+        return None;
+    }
+    let mut spans = Vec::new();
+    let mut width = 0;
+    for watcher in watchers {
+        if width + 2 > available_width.saturating_sub(1) {
+            break;
+        }
+        let color = member_color(&watcher.peer_id, members, theme).unwrap_or(theme.footer_muted);
+        let controlling =
+            controller_peer_id.is_some_and(|controller| controller == watcher.peer_id);
+        let style = if controlling {
+            Style::default().fg(theme.footer_background).bg(color)
+        } else {
+            Style::default().fg(color)
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            member_initial(&watcher.peer_id, members).to_string(),
+            style,
+        ));
+        width += 2;
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    spans.push(Span::raw(" "));
+    Some(Line::from(spans).alignment(Alignment::Right))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::tui) fn pane_title(
     custom_title: Option<&str>,
@@ -230,6 +292,15 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     })
                     .bg(theme.footer_background)
             };
+            let label_rect = geometry.tab_labels[&tab.tab_id];
+            if label_rect.width == 0 {
+                continue;
+            }
+            // Dots first: they are the whole point of glancing at a tab you are not on,
+            // so when the bar runs out of room the tab name gives way, not the presence.
+            let watchers = tui.tab_watchers(tab.tab_id);
+            let presence_width = tab_presence_width(watchers.len()).min(label_rect.width);
+            let name_width = label_rect.width.saturating_sub(presence_width);
             let label = truncate_trailing(
                 &tab_label(
                     tab.title.as_deref(),
@@ -237,20 +308,31 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     active,
                     tui.tab_has_unread_agent_pane(tab),
                 ),
-                usize::from(geometry.tab_labels[&tab.tab_id].width),
+                usize::from(name_width),
             );
-            let label_rect = geometry.tab_labels[&tab.tab_id];
-            if label_rect.width == 0 {
-                continue;
-            }
-            buffer.set_stringn(
+            let (mut cursor, _) = buffer.set_stringn(
                 label_rect.x,
                 label_rect.y,
                 &label,
-                usize::from(label_rect.width),
+                usize::from(name_width),
                 style,
             );
-            x = x.saturating_add(text_width(&label));
+            if presence_width > 0 {
+                cursor = buffer.set_stringn(cursor, label_rect.y, " ", 1, style).0;
+                for watcher in watchers
+                    .iter()
+                    .take(usize::from(presence_width.saturating_sub(1)))
+                {
+                    let color = member_color(&watcher.peer_id, &tui.snapshot.members, theme)
+                        .unwrap_or(theme.tab_foreground);
+                    cursor = buffer
+                        .set_stringn(cursor, label_rect.y, PRESENCE_WATCHING, 1, style.fg(color))
+                        .0;
+                }
+            }
+            x = x
+                .saturating_add(text_width(&label))
+                .saturating_add(presence_width);
         }
         // `direct 35ms` / `relayed 120ms ×3`, right-aligned. Lives in the tab bar rather
         // than the footer because the footer is transient -- chords, copy feedback and
@@ -348,6 +430,15 @@ pub(in crate::tui) fn render_shared_multi_pane(
                 Line::from(truncate_trailing(&badge, badge_width)).alignment(Alignment::Right),
             );
         }
+        if let Some(chips) = pane_presence_chips(
+            &tui.pane_watchers(pane_id),
+            view.controller_peer_id.as_deref(),
+            &tui.snapshot.members,
+            theme,
+            title_width,
+        ) {
+            block = block.title_bottom(chips);
+        }
         let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
         // The fixed VT grid may be smaller than this pane after layout reflow. Clear the full
@@ -412,12 +503,15 @@ mod tests {
         tui::{
             ChordMode, MultiPaneTui, PaneViewState, ShareView,
             geometry::visible_leaf_panes,
-            test_support::{layout, split_layout},
+            test_support::{layout, named_members, split_layout, two_tab_presence_tui, watcher},
             text::text_width,
         },
     };
 
-    use super::{pane_border_color, pane_title, render_multi_pane, render_shared_multi_pane};
+    use super::{
+        PRESENCE_WATCHING, pane_border_color, pane_presence_chips, pane_title, render_multi_pane,
+        render_shared_multi_pane,
+    };
 
     #[test]
     fn shared_footer_places_rejection_notice_after_help() {
@@ -1135,5 +1229,192 @@ mod tests {
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         assert_eq!(terminal.backend().buffer()[(20, 0)].fg, Color::White);
+    }
+
+    #[test]
+    fn a_tab_shows_a_colored_dot_per_other_member_on_it() {
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(
+            tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2 ●"),
+            "the dot belongs to the tab that member is on: {tab_bar:?}"
+        );
+        let dots = (0..40)
+            .filter(|x| buffer[(*x, 0)].symbol() == PRESENCE_WATCHING)
+            .collect::<Vec<u16>>();
+        assert_eq!(dots.len(), 1, "one member on one tab draws one dot");
+        assert_eq!(
+            buffer[(dots[0], 0)].fg,
+            UiTheme::default().member_colors[1],
+            "a member's dot uses their own slot color"
+        );
+    }
+    #[test]
+    fn presence_dots_stay_inside_the_tabs_click_target() {
+        // The tab bar measures click targets from tab_label_rects and draws from the
+        // render path. If the dots were added to only one of them, every tab click after
+        // a member moved would land on the wrong tab.
+        let mut tui = two_tab_presence_tui();
+        let area = Rect::new(0, 0, 40, 4);
+        let before = tui.geometry(area).tab_labels[&20];
+
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 10,
+            pane_id: 1,
+        }]));
+        let after = tui.geometry(area).tab_labels[&20];
+
+        assert_eq!(
+            after.x,
+            before.x.saturating_add(2),
+            "a dot on tab one shifts tab two's click target by the space plus the dot"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let drawn = (after.x..after.right())
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert_eq!(
+            drawn, "Tab #2",
+            "the click target has to cover exactly the label that was drawn"
+        );
+    }
+    #[test]
+    fn a_tab_too_narrow_for_both_keeps_the_dot_and_drops_the_name() {
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+        // Wide enough for the brand and the active tab, and then almost nothing.
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..24).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(
+            tab_bar.contains('●'),
+            "presence outranks the tab name when the bar runs out of room: {tab_bar:?}"
+        );
+    }
+    #[test]
+    fn pane_chips_mark_the_controller_apart_from_plain_watchers() {
+        let theme = UiTheme::default();
+        let members = named_members();
+        let rows = [watcher(b"tis", 1, 1), watcher(b"ana", 1, 1)];
+        let watchers = rows.iter().collect::<Vec<_>>();
+
+        let chips = pane_presence_chips(&watchers, Some(b"ana"), &members, &theme, 40)
+            .expect("two watchers draw chips");
+        let initials = chips
+            .spans
+            .iter()
+            .filter(|span| span.content.trim() != "")
+            .collect::<Vec<_>>();
+
+        assert_eq!(initials.len(), 2);
+        assert_eq!(initials[0].content, "T");
+        assert_eq!(initials[1].content, "A");
+        // Watching is foreground-only; holding the lease reverses the chip. Nothing here
+        // may borrow the alert color that means "this pane is under remote control".
+        assert_eq!(initials[0].style.fg, Some(theme.member_colors[1]));
+        assert_eq!(initials[0].style.bg, None);
+        assert_eq!(initials[1].style.bg, Some(theme.member_colors[2]));
+        assert_ne!(initials[1].style.bg, Some(theme.pane_border_remote_control));
+    }
+    #[test]
+    fn pane_chips_stand_down_when_the_pane_is_too_narrow() {
+        let theme = UiTheme::default();
+        let members = named_members();
+        let rows = [watcher(b"tis", 1, 1), watcher(b"ana", 1, 1)];
+        let watchers = rows.iter().collect::<Vec<_>>();
+
+        assert!(pane_presence_chips(&watchers, None, &members, &theme, 2).is_none());
+        let cramped = pane_presence_chips(&watchers, None, &members, &theme, 4)
+            .expect("a narrow pane still shows who it can");
+        assert_eq!(
+            cramped
+                .spans
+                .iter()
+                .filter(|span| span.content.trim() != "")
+                .count(),
+            1,
+            "chips are dropped from the end rather than overflowing the border"
+        );
+    }
+    #[test]
+    fn watcher_chips_reach_the_pane_bottom_border() {
+        let mut snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 4, 20)],
+        );
+        snapshot.members = named_members();
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        assert!(tui.set_presence(vec![watcher(b"tis", 1, 1)]));
+        let mut terminal = Terminal::new(TestBackend::new(24, 8)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let bottom = buffer.area.bottom().saturating_sub(2);
+        let border = (0..24)
+            .map(|x| buffer[(x, bottom)].symbol())
+            .collect::<String>();
+
+        assert!(
+            border.contains('T'),
+            "the watcher's initial belongs on the bottom border: {border:?}"
+        );
+        let chip_x = (0..24)
+            .find(|x| buffer[(*x, bottom)].symbol() == "T")
+            .expect("chip column");
+        assert_eq!(
+            buffer[(chip_x, bottom)].fg,
+            UiTheme::default().member_colors[1]
+        );
+    }
+    #[test]
+    fn a_pane_border_keeps_its_meaning_when_somebody_watches_it() {
+        // Presence must not repaint the border: it encodes focus and control, and one
+        // pane can have several watchers that a single color could not express.
+        let theme = UiTheme::default();
+        let watched = pane_border_color(
+            &theme,
+            false,
+            Some(&[]),
+            false,
+            true,
+            false,
+            ChordMode::None,
+        );
+
+        assert_eq!(watched, theme.pane_border_free_focused);
+        assert_ne!(watched, theme.pane_border_remote_control);
     }
 }

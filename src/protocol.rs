@@ -14,6 +14,9 @@ pub const MAX_INPUT_BYTES: usize = 8 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
 pub const MAX_DELTA_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_ROSTER_ENTRIES: usize = 32;
+/// One presence entry per admittable member. Kept in step with `crate::layout::MAX_MEMBERS`
+/// by a unit test rather than an import, so the wire limits stay readable in one place.
+pub const MAX_PRESENCE_ENTRIES: usize = 8;
 pub const MAX_AGENT_KIND_BYTES: usize = 32;
 pub const MAX_AGENT_CWD_BYTES: usize = 512;
 pub const MAX_LAYOUT_TITLE_BYTES: usize = 128;
@@ -113,7 +116,7 @@ pub struct Envelope {
     pub sender_peer_id: Vec<u8>,
     #[prost(
         oneof = "envelope::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -155,6 +158,10 @@ pub mod envelope {
         ReleaseControl(super::ReleaseControl),
         #[prost(message, tag = "26")]
         AgentRoster(super::AgentRoster),
+        #[prost(message, tag = "27")]
+        Presence(super::Presence),
+        #[prost(message, tag = "28")]
+        PresenceRoster(super::PresenceRoster),
     }
 }
 
@@ -623,6 +630,47 @@ impl AgentRosterState {
     }
 }
 
+/// Where one member is looking, sent by that member to the coordinator.
+///
+/// This is deliberately the smallest thing that answers "where is everyone": the pane a
+/// member has focused and whether they are attached at all. It carries no timestamp,
+/// because nothing here decays -- the coordinator caches the latest one per member, so
+/// there is no timer anywhere in the presence path.
+///
+/// Watching is not controlling. A member appears here the moment they focus a pane;
+/// whether they may type into it is the control lease's business, and only the lease
+/// paints the alert-colored border.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Presence {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    /// The focused tab and pane. Both are `0` when `attached` is false: a detached node
+    /// keeps its panes alive but its member is looking at nothing, and drawing them
+    /// somewhere would be a ghost.
+    #[prost(uint64, tag = "3")]
+    pub tab_id: u64,
+    #[prost(uint64, tag = "4")]
+    pub pane_id: u64,
+    #[prost(bool, tag = "5")]
+    pub attached: bool,
+}
+
+/// Every member's presence at once, sent by the coordinator to everyone.
+///
+/// The full set rather than the one entry that changed, because a peer's outbound
+/// presence slot keeps only the newest message while its writer catches up. One member's
+/// update would otherwise overwrite another's and be lost for good -- the agent roster
+/// survives the same coalescing only because it heartbeats every five seconds to repair
+/// itself. Carrying everyone makes the newest message always the complete truth, which is
+/// what lets presence cost nothing when nobody is moving.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PresenceRoster {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<Presence>,
+}
+
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
     validate_envelope(envelope)?;
 
@@ -902,6 +950,8 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             validate_nonzero("pane_subscribe.pane_id", subscribe.pane_id)?;
         }
         envelope::Body::AgentRoster(roster) => validate_agent_roster(roster)?,
+        envelope::Body::Presence(presence) => validate_presence(presence)?,
+        envelope::Body::PresenceRoster(roster) => validate_presence_roster(roster)?,
     }
 
     Ok(())
@@ -961,6 +1011,39 @@ fn is_agent_kind_token(kind: &str) -> bool {
         && kind
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_presence(presence: &Presence) -> Result<(), ProtocolError> {
+    validate_id("presence.peer_id", &presence.peer_id, MAX_PEER_ID_BYTES)?;
+    // A detached member reports no location at all, and an attached one is always
+    // looking at some pane in some tab. Anything else is a half-built update.
+    if presence.attached {
+        validate_nonzero("presence.tab_id", presence.tab_id)?;
+        validate_nonzero("presence.pane_id", presence.pane_id)?;
+    } else if presence.tab_id != 0 || presence.pane_id != 0 {
+        return Err(ProtocolError::InvalidLayout("presence.attached"));
+    }
+    Ok(())
+}
+
+fn validate_presence_roster(roster: &PresenceRoster) -> Result<(), ProtocolError> {
+    if roster.entries.len() > MAX_PRESENCE_ENTRIES {
+        return Err(ProtocolError::FieldTooLarge {
+            field: "presence_roster.entries",
+            limit: MAX_PRESENCE_ENTRIES,
+            actual: roster.entries.len(),
+        });
+    }
+    let mut peer_ids = HashSet::new();
+    for entry in &roster.entries {
+        validate_presence(entry)?;
+        if !peer_ids.insert(entry.peer_id.as_slice()) {
+            return Err(ProtocolError::InvalidLayout(
+                "presence_roster.entry.peer_id",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_id(field: &'static str, bytes: &[u8], limit: usize) -> Result<(), ProtocolError> {

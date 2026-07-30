@@ -28,7 +28,10 @@ use crate::{
             ResizeDrag, ResizePreview, allocate_node_with_preview, contains_leaf, first_leaf,
             fixed_grid_viewport, pane_content_rect, visible_leaf_panes,
         },
-        render::panes::{TAB_BAR_SEPARATOR, TOP_BAR_BRAND, TOP_BAR_BRAND_SEPARATOR, tab_label},
+        render::panes::{
+            TAB_BAR_SEPARATOR, TOP_BAR_BRAND, TOP_BAR_BRAND_SEPARATOR, tab_label,
+            tab_presence_width,
+        },
         text::text_width,
     },
 };
@@ -50,6 +53,7 @@ pub struct MultiPaneTui {
     pub(in crate::tui) selection: Option<PaneTextSelection>,
     pub(in crate::tui) selection_dragging: bool,
     pub(in crate::tui) agent_rows: Vec<AgentOverlayRow>,
+    pub(in crate::tui) presence: Vec<crate::local_ipc::PresenceRow>,
     pub(in crate::tui) prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
     /// Start of the working interval last seen for a pane. An idle row carries the `0`
     /// sentinel, so the episode a completion refers to has to be remembered while it runs.
@@ -103,6 +107,7 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
+            presence: Vec::new(),
             prior_agent_states: BTreeMap::new(),
             prior_agent_episodes: BTreeMap::new(),
             notified_agent_episodes: BTreeMap::new(),
@@ -154,6 +159,52 @@ impl MultiPaneTui {
             self.modal,
             ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. } | ModalState::Share
         )
+    }
+
+    /// Replace where the other members are looking. Returns whether anything moved, so a
+    /// presence update that changes nothing never costs a repaint.
+    pub fn set_presence(&mut self, presence: Vec<crate::local_ipc::PresenceRow>) -> bool {
+        if self.presence == presence {
+            return false;
+        }
+        self.presence = presence;
+        true
+    }
+
+    /// The other members watching a pane, in member-list order so chips never reshuffle.
+    pub(in crate::tui) fn pane_watchers(
+        &self,
+        pane_id: PaneId,
+    ) -> Vec<&crate::local_ipc::PresenceRow> {
+        let mut watchers = self
+            .presence
+            .iter()
+            .filter(|row| row.pane_id == pane_id)
+            .collect::<Vec<_>>();
+        watchers.sort_by_key(|row| self.member_slot(&row.peer_id));
+        watchers
+    }
+
+    pub(in crate::tui) fn member_slot(&self, peer_id: &[u8]) -> usize {
+        self.snapshot
+            .members
+            .iter()
+            .position(|member| member.peer_id == peer_id)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The other members on a tab, in member-list order so the dots never reshuffle.
+    pub(in crate::tui) fn tab_watchers(
+        &self,
+        tab_id: TabId,
+    ) -> Vec<&crate::local_ipc::PresenceRow> {
+        let mut watchers = self
+            .presence
+            .iter()
+            .filter(|row| row.tab_id == tab_id)
+            .collect::<Vec<_>>();
+        watchers.sort_by_key(|row| self.member_slot(&row.peer_id));
+        watchers
     }
 
     pub fn share_open(&self) -> bool {
@@ -325,7 +376,8 @@ impl MultiPaneTui {
                     index + 1,
                     tab.tab_id == self.current_tab,
                     self.tab_has_unread_agent_pane(tab),
-                ));
+                ))
+                .saturating_add(tab_presence_width(self.tab_watchers(tab.tab_id).len()));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);

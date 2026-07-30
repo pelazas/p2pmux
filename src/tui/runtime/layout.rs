@@ -42,6 +42,7 @@ impl SharedLayoutRuntime {
                 self.agent_rosters
                     .insert(roster.host_peer_id.clone(), roster);
             }
+            LayoutControlEvent::Presence(roster) => self.presence = roster.entries,
             LayoutControlEvent::Commit(commit) => {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }

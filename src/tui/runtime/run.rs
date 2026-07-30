@@ -380,10 +380,15 @@ impl SharedLayoutRuntime {
     pub(in crate::tui) fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = false;
         self.retry_tick = self.retry_tick.saturating_add(1);
-        while let Some(event) = self.control.try_event(self.tui.snapshot().revision) {
+        let mut seen_presence_epoch = self.seen_presence_epoch;
+        while let Some(event) = self
+            .control
+            .try_event(self.tui.snapshot().revision, &mut seen_presence_epoch)
+        {
             self.handle_control_event(event)?;
             changed = true;
         }
+        self.seen_presence_epoch = seen_presence_epoch;
         while let Ok((pane_id, result)) = self.subscription_rx.try_recv() {
             match result {
                 Ok(pane) => {
@@ -428,6 +433,9 @@ impl SharedLayoutRuntime {
             });
         }
         changed |= self.publish_local_agent_roster();
+        // Cheap: returns immediately unless the focused pane actually moved since the last
+        // drain, and a keypress cannot move focus more than once per drain.
+        changed |= self.maybe_publish_presence();
         let disconnected = self
             .remote
             .iter_mut()

@@ -98,6 +98,8 @@ pub enum NodeMessage {
         screens: Vec<PaneScreenSnapshot>,
         leases: Vec<PaneLeaseSnapshot>,
         rosters: Vec<AgentOverlaySnapshotRow>,
+        #[serde(default)]
+        presence: Vec<PresenceRow>,
         local_peer_id: Vec<u8>,
         tab_id: u64,
         pane_id: u64,
@@ -130,6 +132,11 @@ pub enum NodeMessage {
     },
     Rosters {
         rosters: Vec<AgentOverlaySnapshotRow>,
+    },
+    /// Where the other members are looking. Only the node holds the session's control
+    /// stream, so an attached client cannot learn this any other way.
+    Presence {
+        presence: Vec<PresenceRow>,
     },
     /// Operator-facing runtime status, e.g. a lost coordinator or a pane that is retrying.
     /// The node owns the session, so this is the only way an attached client can learn
@@ -193,6 +200,18 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
             controller: row.controller.clone(),
         }
     }
+}
+
+/// Where one other member is looking, ready to draw.
+///
+/// Only attached members appear, so the renderer never has to reason about what a
+/// detached member's location means -- they are simply absent. Colors and labels are
+/// derived from the layout's member list that the client already holds.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PresenceRow {
+    pub peer_id: Vec<u8>,
+    pub tab_id: u64,
+    pub pane_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -379,6 +398,7 @@ mod tests {
             screens: vec![],
             leases: vec![],
             rosters: vec![],
+            presence: vec![],
             local_peer_id: vec![],
             tab_id: 1,
             pane_id: 1,

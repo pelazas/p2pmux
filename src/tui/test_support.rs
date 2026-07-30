@@ -109,3 +109,69 @@ pub(in crate::tui) fn agent_overlay_tui(count: u64) -> MultiPaneTui {
     tui.modal = ModalState::Agents;
     tui
 }
+
+pub(in crate::tui) fn two_tab_presence_tui() -> MultiPaneTui {
+    let mut snapshot = layout(
+        vec![
+            Tab {
+                tab_id: 10,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            },
+            Tab {
+                tab_id: 20,
+                root: Node::Leaf { pane_id: 2 },
+                title: None,
+            },
+        ],
+        &[(1, 2, 2), (2, 2, 2)],
+    );
+    snapshot.members.push(crate::layout::Member {
+        peer_id: b"tis".to_vec(),
+        endpoint_addr: b"endpoint-tis".to_vec(),
+        display_name: "tis".into(),
+    });
+    MultiPaneTui::new(snapshot).expect("valid layout")
+}
+
+pub(in crate::tui) fn watcher(
+    peer_id: &[u8],
+    tab_id: u64,
+    pane_id: u64,
+) -> crate::local_ipc::PresenceRow {
+    crate::local_ipc::PresenceRow {
+        peer_id: peer_id.to_vec(),
+        tab_id,
+        pane_id,
+    }
+}
+
+pub(in crate::tui) fn named_members() -> Vec<crate::layout::Member> {
+    vec![
+        crate::layout::Member {
+            peer_id: b"host".to_vec(),
+            endpoint_addr: b"endpoint".to_vec(),
+            display_name: "pelazas".into(),
+        },
+        crate::layout::Member {
+            peer_id: b"tis".to_vec(),
+            endpoint_addr: b"endpoint-tis".to_vec(),
+            display_name: "tis".into(),
+        },
+        crate::layout::Member {
+            peer_id: b"ana".to_vec(),
+            endpoint_addr: b"endpoint-ana".to_vec(),
+            display_name: "ana".into(),
+        },
+    ]
+}
+
+pub(in crate::tui) fn presence_members(count: usize) -> Vec<crate::layout::Member> {
+    (0..count)
+        .map(|index| crate::layout::Member {
+            peer_id: vec![index as u8; 4],
+            endpoint_addr: vec![index as u8],
+            display_name: format!("member{index}"),
+        })
+        .collect()
+}

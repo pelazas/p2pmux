@@ -15,7 +15,10 @@ use crossterm::{
 use portable_pty::PtySize;
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 
+use ratatui::style::Color;
+
 use crate::{
+    config::UiTheme,
     kitty_keyboard::KittyKeyboardTracker,
     lease::{IDLE_AFTER, LeaseDecision},
     pty_host::PtyHost,
@@ -553,10 +556,46 @@ pub(in crate::tui) fn member_label(peer_id: &[u8], members: &[crate::layout::Mem
     }
 }
 
+/// The color identifying a member everywhere presence is drawn.
+///
+/// The slot is the member's position in the authoritative member list, which every
+/// client receives at the same revision, so all of them agree on who is which color
+/// without a wire field to carry it. The cost is that slots shift when a member
+/// leaves; the initial from [`member_initial`] rides alongside every color so an
+/// identity is only ever recolored, never lost.
+pub fn member_color(
+    peer_id: &[u8],
+    members: &[crate::layout::Member],
+    theme: &UiTheme,
+) -> Option<Color> {
+    let slot = members
+        .iter()
+        .position(|member| member.peer_id == peer_id)?;
+    Some(theme.member_colors[slot % theme.member_colors.len()])
+}
+
+/// The one-character stand-in for a member, for terminals and eyes that cannot separate
+/// eight hues. Falls back to the peer id when a display name is missing or unprintable.
+pub fn member_initial(peer_id: &[u8], members: &[crate::layout::Member]) -> char {
+    members
+        .iter()
+        .find(|member| member.peer_id == peer_id)
+        .and_then(|member| {
+            member
+                .display_name
+                .chars()
+                .find(|character| character.is_alphanumeric())
+        })
+        .or_else(|| short_peer(peer_id).chars().next())
+        .map(|character| character.to_ascii_uppercase())
+        .unwrap_or('?')
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::{config::UiTheme, tui::test_support::presence_members};
 
-    use super::member_label;
+    use super::{member_color, member_initial, member_label};
 
     #[test]
     fn member_labels_disambiguate_duplicate_display_names() {
@@ -583,5 +622,64 @@ mod tests {
             "sam · aabbccdd"
         );
         assert_eq!(member_label(&members[2].peer_id, &members), "pat");
+    }
+
+    #[test]
+    fn member_colors_are_distinct_per_slot_and_agree_across_clients() {
+        let theme = UiTheme::default();
+        let members = presence_members(crate::config::MEMBER_COLOR_SLOTS);
+
+        let colors = members
+            .iter()
+            .map(|member| member_color(&member.peer_id, &members, &theme))
+            .collect::<Option<Vec<_>>>()
+            .expect("every member has a color");
+        for (slot, color) in colors.iter().enumerate() {
+            assert!(
+                !colors[..slot].contains(color),
+                "a full session must never show two members the same color"
+            );
+        }
+
+        // A second client holding the same authoritative member list derives the same
+        // colors: that agreement is what lets presence ship without a wire color field.
+        let mirrored = members.clone();
+        for member in &members {
+            assert_eq!(
+                member_color(&member.peer_id, &members, &theme),
+                member_color(&member.peer_id, &mirrored, &theme)
+            );
+        }
+    }
+    #[test]
+    fn member_colors_avoid_the_reserved_control_and_alert_colors() {
+        let theme = UiTheme::default();
+        for color in theme.member_colors {
+            assert_ne!(
+                color, theme.pane_border_remote_control,
+                "a member color must not read as an actively controlled pane"
+            );
+            assert_ne!(color, theme.tab_active_background);
+            assert_ne!(color, theme.footer_accent);
+        }
+    }
+    #[test]
+    fn member_color_is_none_for_a_departed_peer() {
+        let theme = UiTheme::default();
+        let members = presence_members(2);
+
+        assert_eq!(
+            member_color(&[0xff, 0xff, 0xff, 0xff], &members, &theme),
+            None
+        );
+    }
+    #[test]
+    fn member_initials_fall_back_to_the_peer_id() {
+        let mut members = presence_members(2);
+        members[1].display_name = "  ".into();
+
+        assert_eq!(member_initial(&members[0].peer_id, &members), 'M');
+        assert_eq!(member_initial(&members[1].peer_id, &members), '0');
+        assert_eq!(member_initial(&[0x9a], &members), '9');
     }
 }

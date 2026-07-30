@@ -14,7 +14,7 @@ use iroh::EndpointAddr;
 
 use crate::{
     layout::{LayoutSnapshot, PaneId},
-    protocol::{AgentRoster, AgentRosterEntry, PaneDescriptor},
+    protocol::{AgentRoster, AgentRosterEntry, PaneDescriptor, Presence},
     session::{
         GuestPane, PaneLayoutReconciler, PaneServer, SharedLayoutHost, SharedLayoutMember,
         layout_snapshot_from_state,
@@ -67,6 +67,10 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) last_local_agent_entries: Vec<AgentRosterEntry>,
     pub(in crate::tui) next_agent_roster_heartbeat: Instant,
     pub(in crate::tui) last_agent_overlay_animation: Instant,
+    pub(in crate::tui) presence_generation: u64,
+    pub(in crate::tui) last_local_presence: Option<Presence>,
+    pub(in crate::tui) seen_presence_epoch: u64,
+    pub(in crate::tui) presence: Vec<Presence>,
 }
 impl SharedLayoutRuntime {
     pub fn host(
@@ -178,6 +182,10 @@ impl SharedLayoutRuntime {
             last_local_agent_entries: Vec::new(),
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
+            presence_generation: 0,
+            last_local_presence: None,
+            seen_presence_epoch: 0,
+            presence: Vec::new(),
         };
         value.refresh_local_views();
         Ok(value)
@@ -459,7 +467,10 @@ mod tests {
             .host
             .write_input(format!("cd -- {}\n", directory.display()).as_bytes())
             .expect("change source PTY directory");
-        let source_cwd = (0..20).find_map(|_| {
+        // A real shell has to boot and process the `cd` before its cwd moves. Half a
+        // second is enough on an idle Mac and not enough on a loaded CI runner, which
+        // made this fail for reasons that had nothing to do with pane lifecycle.
+        let source_cwd = (0..200).find_map(|_| {
             let cwd = cwd_for_pid(source_pid);
             if cwd
                 .as_ref()

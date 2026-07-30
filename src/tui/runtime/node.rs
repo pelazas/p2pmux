@@ -14,7 +14,7 @@ use crate::{
     agent_detect::{AgentKind, AgentState},
     layout::{LayoutSnapshot, PaneId, TabId},
     local_ipc::AgentOverlaySnapshotRow,
-    protocol::{AgentRoster, AgentRosterState, MAX_AGENT_CWD_BYTES},
+    protocol::{AgentRoster, AgentRosterState, MAX_AGENT_CWD_BYTES, Presence},
     tui::{
         AgentOverlayRow, LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot,
         NodeScreenSnapshots, UiIntent,
@@ -144,6 +144,7 @@ impl SharedLayoutRuntime {
         self.tui
             .set_focus(tab_id, pane_id)
             .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))?;
+        self.maybe_publish_presence();
         self.release_blurred_pane(previous)
     }
 
@@ -233,6 +234,52 @@ impl SharedLayoutRuntime {
 
     pub(in crate::tui) fn refresh_agent_rows(&mut self) -> bool {
         self.tui.set_agent_rows(self.agent_overlay_rows())
+    }
+
+    /// Tell the session where this member is now looking, if it moved.
+    ///
+    /// Called after anything that can change focus. There is no heartbeat and no timer:
+    /// a human moving is the only thing that produces traffic here, so an idle session
+    /// costs nothing.
+    pub(in crate::tui) fn maybe_publish_presence(&mut self) -> bool {
+        let presence = Presence {
+            peer_id: self.control.peer_id(),
+            generation: self.presence_generation.saturating_add(1),
+            tab_id: self.tui.current_tab(),
+            pane_id: self.tui.focused_pane(),
+            attached: true,
+        };
+        if self
+            .last_local_presence
+            .as_ref()
+            .is_some_and(|last| last.tab_id == presence.tab_id && last.pane_id == presence.pane_id)
+        {
+            return false;
+        }
+        match self.control.try_presence(presence.clone()) {
+            // The coordinator never receives its own broadcast, so it applies the roster
+            // its own update produced rather than waiting for one to come back.
+            Ok(Some(roster)) => self.presence = roster.entries,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        self.presence_generation = presence.generation;
+        self.last_local_presence = Some(presence);
+        true
+    }
+
+    /// Presence of every member other than this one, ready for the renderer.
+    pub fn presence_rows(&self) -> Vec<crate::local_ipc::PresenceRow> {
+        let local_peer_id = self.control.peer_id();
+        self.presence
+            .iter()
+            .filter(|entry| entry.attached && entry.peer_id != local_peer_id)
+            .map(|entry| crate::local_ipc::PresenceRow {
+                peer_id: entry.peer_id.clone(),
+                tab_id: entry.tab_id,
+                pane_id: entry.pane_id,
+            })
+            .collect()
     }
 
     pub fn agent_overlay_rows(&self) -> Vec<AgentOverlayRow> {

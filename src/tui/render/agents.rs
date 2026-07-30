@@ -15,8 +15,13 @@ use crate::{
     protocol::AgentRosterState,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, MultiPaneTui,
-        render::footer::{AGENT_OVERLAY_HELP, render_footer_segments},
-        text::{text_width, truncate_leading, truncate_trailing},
+        app::member_color,
+        member_label,
+        render::{
+            footer::{AGENT_OVERLAY_HELP, render_footer_segments},
+            panes::PRESENCE_WATCHING,
+        },
+        text::{sanitize_single_line, text_width, truncate_leading, truncate_trailing},
     },
 };
 
@@ -45,16 +50,19 @@ pub(in crate::tui) fn render_agents_overlay(
         .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
     let content = agents_overlay_content(area);
     frame.render_widget(block, panel);
+    // The overlay is already the place you look to answer "what is happening in this
+    // session". Who is here and where belongs in the same glance, above the agents.
+    let members = presence_overlay_lines(tui);
     if tui.agent_rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "No agents running",
-                Style::default().fg(tui.theme.agent_overlay_muted),
-            )),
-            content,
-        );
+        let mut lines = members;
+        lines.push(Line::styled(
+            "No agents running",
+            Style::default().fg(tui.theme.agent_overlay_muted),
+        ));
+        frame.render_widget(Paragraph::new(lines), content);
     } else {
-        let mut lines = Vec::with_capacity(tui.agent_rows.len().saturating_mul(3));
+        let mut lines = members;
+        lines.reserve(tui.agent_rows.len().saturating_mul(3));
         let animation_phase = agent_overlay_animation_phase(now_unix_ms);
         for (index, row) in tui.agent_rows.iter().enumerate() {
             lines.extend(format_agent_overlay_card(
@@ -81,6 +89,50 @@ pub(in crate::tui) fn render_agents_overlay(
     }
     render_agents_overlay_help(frame.buffer_mut(), &tui.theme, agents_overlay_help(area));
 }
+/// One line per other member: their dot, their name, and where they are.
+///
+/// Empty in a solo session, so a single-player overlay gains no header for nobody. The
+/// tab and pane ordinals come from the same lookup the agent rows use, so a member on a
+/// pane this client cannot resolve is reported honestly rather than placed at a guess.
+pub(in crate::tui) fn presence_overlay_lines(tui: &MultiPaneTui) -> Vec<Line<'static>> {
+    let watchers = tui.presence.iter().collect::<Vec<_>>();
+    if watchers.is_empty() {
+        return Vec::new();
+    }
+    let mut watchers = watchers;
+    watchers.sort_by_key(|row| tui.member_slot(&row.peer_id));
+    let mut lines = vec![Line::styled(
+        "Members",
+        Style::default()
+            .fg(tui.theme.agent_overlay_muted)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for row in watchers {
+        let color = member_color(&row.peer_id, &tui.snapshot.members, &tui.theme)
+            .unwrap_or(tui.theme.agent_overlay_muted);
+        let location = match tui.pane_location(row.pane_id) {
+            Some((tab_ordinal, pane_ordinal)) => {
+                format!("Tab {tab_ordinal} · Pane {pane_ordinal}")
+            }
+            None => String::from("elsewhere"),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(PRESENCE_WATCHING, Style::default().fg(color)),
+            Span::raw(" "),
+            Span::styled(
+                sanitize_single_line(&member_label(&row.peer_id, &tui.snapshot.members)),
+                Style::default().fg(tui.theme.agent_overlay_foreground),
+            ),
+            Span::styled(
+                format!(" · {location}"),
+                Style::default().fg(tui.theme.agent_overlay_muted),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
 fn agents_overlay_panel(area: Rect) -> Rect {
     let width = area.width.saturating_sub(2).clamp(24, 96);
     let height = area.height.saturating_sub(2).clamp(5, 28);
@@ -331,14 +383,14 @@ mod tests {
         layout::{Node, Tab},
         tui::{
             MultiPaneTui,
-            test_support::{agent_row, layout},
+            test_support::{agent_row, layout, named_members, watcher},
         },
     };
 
     use super::{
         agent_overlay_working_glyph, agents_overlay_content, agents_overlay_help,
         agents_overlay_inner, agents_overlay_panel, agents_overlay_title, format_agent_elapsed,
-        format_agent_overlay_card, render_agents_overlay,
+        format_agent_overlay_card, presence_overlay_lines, render_agents_overlay,
     };
 
     #[test]
@@ -553,5 +605,54 @@ mod tests {
         assert_eq!(agent_overlay_working_glyph(0), "◐");
         assert_eq!(agent_overlay_working_glyph(1), "◓");
         assert_eq!(agent_overlay_working_glyph(4), "◐");
+    }
+
+    #[test]
+    fn the_overlay_lists_who_is_here_and_where() {
+        let mut snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        );
+        snapshot.members = named_members();
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+
+        assert!(
+            presence_overlay_lines(&tui).is_empty(),
+            "a solo session gains no header for nobody"
+        );
+
+        assert!(tui.set_presence(vec![watcher(b"tis", 2, 2), watcher(b"ana", 1, 404)]));
+        let lines = presence_overlay_lines(&tui);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "Members");
+        assert_eq!(rendered[1], "● tis · Tab 2 · Pane 1");
+        assert_eq!(
+            rendered[2], "● ana · elsewhere",
+            "a pane this client cannot resolve is reported, not guessed at"
+        );
+        assert_eq!(
+            rendered[3], "",
+            "the agents below get their own breathing room"
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     layout::PaneId,
-    protocol::{AgentRoster, LayoutRequest, PaneFailed, PaneReady},
+    protocol::{AgentRoster, LayoutRequest, PaneFailed, PaneReady, Presence, PresenceRoster},
     session::{
         CoordinatorResponse, LayoutControlEvent, LayoutControlQueueError, SharedLayoutHost,
         SharedLayoutMember,
@@ -80,24 +80,50 @@ impl SharedControl {
         }
     }
 
+    /// Publishes this member's focus. The coordinator applies it locally and gets the
+    /// resulting full roster back; a member has to wait for the broadcast.
+    pub(in crate::tui) fn try_presence(
+        &self,
+        presence: Presence,
+    ) -> Result<Option<PresenceRoster>, String> {
+        match self {
+            Self::Host(host) => host
+                .publish_local_presence(presence)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_presence(presence)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
     pub(in crate::tui) fn try_event(
         &mut self,
         current_revision: u64,
+        seen_presence_epoch: &mut u64,
     ) -> Option<LayoutControlEvent> {
         match self {
             // The coordinator is the authority, so it does not receive its own broadcasts. Poll
             // its tiny in-memory snapshot to observe joins, departures, and member-originated
             // commits without adding a second internal control stream.
-            Self::Host(host) => host
-                .session_snapshot()
-                .ok()
-                .filter(|snapshot| {
-                    snapshot
-                        .state
-                        .as_ref()
-                        .is_some_and(|state| state.revision > current_revision)
-                })
-                .map(LayoutControlEvent::Snapshot),
+            Self::Host(host) => {
+                // Presence has its own counter because it deliberately does not touch the
+                // layout revision: focus changes are frequent, and bumping the revision
+                // for one would reject every in-flight layout request as stale.
+                if let Some((epoch, roster)) = host.presence_if_newer(*seen_presence_epoch) {
+                    *seen_presence_epoch = epoch;
+                    return Some(LayoutControlEvent::Presence(roster));
+                }
+                host.session_snapshot()
+                    .ok()
+                    .filter(|snapshot| {
+                        snapshot
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.revision > current_revision)
+                    })
+                    .map(LayoutControlEvent::Snapshot)
+            }
             Self::Member(member) => member.events.try_recv().ok(),
         }
     }
