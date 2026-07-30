@@ -19,7 +19,7 @@
 //! provides relays and node discovery, and a pasted ticket dials fine. The code exists so
 //! an invite is ten characters instead of two hundred.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -219,6 +219,189 @@ impl JoinCode {
 impl fmt::Debug for JoinCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("JoinCode(<redacted>)")
+    }
+}
+
+/// The deployed blind store. Overridable so a test or a fork can point elsewhere.
+pub const DEFAULT_ENDPOINT: &str = "https://rv.p2pmux.com";
+pub const ENDPOINT_ENV: &str = "P2PMUX_RENDEZVOUS_URL";
+
+/// How long a published record outlives its last refresh.
+///
+/// The node re-seals well inside this window and deletes on a clean exit, so the only thing
+/// this actually bounds is how long a *crashed* node's record lingers. Six hours costs four
+/// KV writes a day per live session, which matters: writes are the binding free-tier limit at
+/// roughly 1k/day against ~100k reads.
+pub const RECORD_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// A slow rendezvous must not wedge session startup: the ticket still works without it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+pub enum PublishError {
+    Code(CodeError),
+    Record(RecordError),
+    /// The store could not be reached, or answered with something unusable.
+    Unreachable(String),
+    /// The store refused the write, almost always rate limiting.
+    Refused,
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Code(error) => error.fmt(formatter),
+            Self::Record(error) => error.fmt(formatter),
+            Self::Unreachable(detail) => {
+                write!(
+                    formatter,
+                    "the rendezvous service is unreachable ({detail})"
+                )
+            }
+            Self::Refused => formatter.write_str("the rendezvous service refused the request"),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+#[derive(Debug)]
+pub enum ResolveError {
+    Code(CodeError),
+    /// No record at that index: expired, deleted, or never existed. Deliberately not
+    /// distinguished from a wrong code — the store cannot tell those apart either.
+    NotFound,
+    /// A record was found but this code does not open it.
+    WrongCode,
+    Unreachable(String),
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Code(error) => error.fmt(formatter),
+            Self::NotFound => formatter
+                .write_str("that join code has expired or does not exist; ask for a fresh one"),
+            Self::WrongCode => formatter.write_str("that join code does not open this record"),
+            Self::Unreachable(detail) => {
+                write!(
+                    formatter,
+                    "the rendezvous service is unreachable ({detail})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// A client for the blind store.
+#[derive(Clone, Debug)]
+pub struct HostedRendezvous {
+    endpoint: String,
+    http: reqwest::Client,
+}
+
+impl HostedRendezvous {
+    pub fn new() -> Result<Self, PublishError> {
+        Self::at(std::env::var(ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned()))
+    }
+
+    pub fn at(endpoint: impl Into<String>) -> Result<Self, PublishError> {
+        // reqwest is built without a default crypto provider so that it rides the `ring`
+        // build iroh already pulls in, rather than dragging aws-lc-rs and a cmake toolchain
+        // into the build. That means the process default has to exist before the first
+        // client is constructed; installing it twice is not an error worth reporting.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(concat!("p2pmux/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| PublishError::Unreachable(error.to_string()))?;
+        Ok(Self {
+            endpoint: endpoint.into().trim_end_matches('/').to_owned(),
+            http,
+        })
+    }
+
+    fn record_url(&self, code: &JoinCode) -> String {
+        format!("{}/r/{}", self.endpoint, code.index())
+    }
+
+    /// Seal `ticket` under a fresh code and store it. Returns the code to hand out.
+    pub async fn publish(&self, ticket: &str) -> Result<JoinCode, PublishError> {
+        let code = JoinCode::mint().map_err(PublishError::Code)?;
+        self.republish(&code, ticket).await?;
+        Ok(code)
+    }
+
+    /// Re-seal an existing code's record, resetting its TTL.
+    ///
+    /// This deliberately seals again rather than reusing the stored bytes: it is a fresh
+    /// nonce every time, and the alternative would be a read-modify-write against a store
+    /// that is allowed to lie about what it holds.
+    pub async fn republish(&self, code: &JoinCode, ticket: &str) -> Result<(), PublishError> {
+        let record = code.seal(ticket).map_err(PublishError::Record)?;
+        let response = self
+            .http
+            .put(self.record_url(code))
+            .query(&[("ttl", RECORD_TTL.as_secs().to_string())])
+            .header("content-type", "application/octet-stream")
+            .body(record)
+            .send()
+            .await
+            .map_err(|error| PublishError::Unreachable(strip_url(&error.to_string())))?;
+        match response.status().as_u16() {
+            200..=299 => Ok(()),
+            // 429 in practice; the rest of the 4xx range means this client and the store
+            // disagree about the protocol, which is equally not worth retrying.
+            400..=499 => Err(PublishError::Refused),
+            status => Err(PublishError::Unreachable(format!("HTTP {status}"))),
+        }
+    }
+
+    /// Fetch and open the record a code points at.
+    pub async fn resolve(&self, code: &JoinCode) -> Result<String, ResolveError> {
+        let response = self
+            .http
+            .get(self.record_url(code))
+            .send()
+            .await
+            .map_err(|error| ResolveError::Unreachable(strip_url(&error.to_string())))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ResolveError::NotFound);
+        }
+        if !response.status().is_success() {
+            return Err(ResolveError::Unreachable(format!(
+                "HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let record = response
+            .bytes()
+            .await
+            .map_err(|error| ResolveError::Unreachable(strip_url(&error.to_string())))?;
+        code.open(&record).map_err(|_| ResolveError::WrongCode)
+    }
+
+    /// Best-effort removal on a clean exit. A failure here is covered by the TTL.
+    pub async fn remove(&self, code: &JoinCode) -> Result<(), PublishError> {
+        self.http
+            .delete(self.record_url(code))
+            .send()
+            .await
+            .map_err(|error| PublishError::Unreachable(strip_url(&error.to_string())))?;
+        Ok(())
+    }
+}
+
+/// reqwest puts the full request URL in its error strings, and ours carries the index —
+/// which is derived from the code. Errors reach logs and shared panes, so cut it out.
+fn strip_url(message: &str) -> String {
+    match message.split_once(" for url (") {
+        Some((head, _)) => head.to_owned(),
+        None => message.to_owned(),
     }
 }
 
