@@ -45,8 +45,20 @@ revisioned tab/split tree, including authoritative split ratios. Every pane is a
 the member that created it, and its host publishes the absolute grid for that host's window.
 Each process serves its own locally hosted panes directly to the other admitted members.
 
-This is still a dogfooding spike: relay/internet validation, disconnect grace, coordinator
-failover and presence remain later work. Shared ratios are portable while absolute pane grids are
+Presence shows where every other member is looking. Each member gets a color from their slot
+in the session's member list, and that color identifies them everywhere: a dot per member on
+each tab they are on, their initial on the bottom border of the pane they are watching, and a
+members block in the agents overlay listing everyone with their tab and pane. Watching is not
+controlling — the pane border keeps meaning focus and control state, and the member holding
+the control lease is drawn as a reversed chip.
+
+Presence is silent when nobody moves. A member publishes their focus only when it changes, the
+coordinator caches the latest one per member and replays it to joiners, and there is no
+heartbeat or timer in the path. Detached members report no location rather than leaving a
+marker behind.
+
+This is still a dogfooding spike: relay/internet validation, disconnect grace and coordinator
+failover remain later work. Shared ratios are portable while absolute pane grids are
 host-owned: guests consume the host's resized screen stream and never resize a remote PTY.
 
 ## Local Spike 1
@@ -76,6 +88,12 @@ optional, and omitted keys retain today's built-in colors; the template document
 its default. Colors accept lowercase named values (`white`, `yellow`, `gray`, `dark_gray`) or
 case-insensitive `#RRGGBB` values. The theme is client-local and is never synchronized over P2P;
 detach and reattach after editing the file to reload it.
+
+`member_colors` under `[ui.theme]` is a list of up to eight colors, one per member slot in join
+order, used for the presence dots and chips. Listing fewer than eight overrides from the front
+and leaves the rest at their built-in color. The defaults are cool hues on purpose: warm colors
+are reserved for the active tab and for a pane under remote control, so a member tinted like
+either would read as an alert.
 
 Agent-completion notifications live under `[ui.notifications]`. `sound_enabled = false` keeps
 the local unread stars while silencing sound. By default p2pmux plays

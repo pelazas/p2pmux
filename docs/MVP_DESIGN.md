@@ -139,9 +139,33 @@ The dark contextual footer uses red key accents: normal mode shows
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT    type to claim when free`; pane and tab modes show their
 focus/switch, new, close, and back commands. Direct | relayed indicator.
 
+Presence identifies each member by a color taken from their slot in the authoritative member
+list, so every client derives the same colors from state they already hold and no wire field
+carries them. Slots shift when a member leaves; every color is drawn beside that member's
+initial, so an identity is recolored rather than lost. Three surfaces use it: a dot per other
+member on each tab label, that member's initial right-aligned on the bottom border of the pane
+they are watching, and a members block above the agent rows in the overlay.
+
+Watching is not controlling. The pane border keeps its existing five-way meaning — a single
+color could not express several watchers on one pane, and tinting it per member would make
+watching look like the one state that matters in a shared shell. The member holding the control
+lease is drawn as a reversed chip instead.
+
 ## 6. Wire sketch
 
 Membership, `LayoutCommit` revisions, presence, control lease / Take control, Snapshot/Delta, SessionSnapshot bootstrap for joiners. Split/close → coordinator commit (except during coordinator grace freeze).
+
+Presence is two messages. A member sends `Presence` (its focused tab and pane, plus whether it
+is attached at all) to the coordinator, which caches the latest one per member and re-broadcasts
+the whole set as a `PresenceRoster`. Carrying every member is what makes the broadcast safe to
+coalesce: a peer's outbound presence slot keeps only the newest message, so per-member updates
+sharing one slot would silently overwrite each other. Because the newest message is always the
+complete truth, presence needs no heartbeat, and an idle session produces no presence traffic.
+
+Focus deliberately does not touch the layout revision. Focus changes are frequent, and bumping
+the revision for each would reject every in-flight `LayoutRequest` as stale, so the coordinator
+counts presence separately. That counter is also how the coordinator's own renderer notices a
+member moved, since the coordinator is the authority and never receives its own broadcasts.
 
 ## 7. Failure modes
 
