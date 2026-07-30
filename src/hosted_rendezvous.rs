@@ -396,6 +396,52 @@ impl HostedRendezvous {
     }
 }
 
+/// A live code, kept resolvable for as long as the session runs.
+///
+/// A published record expires on its own, which is what keeps a crashed node from leaving an
+/// invite behind forever. A node that is still running therefore has to say so periodically,
+/// and say so again on the way out by deleting the record outright.
+pub struct PublishedCode {
+    store: HostedRendezvous,
+    code: JoinCode,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl PublishedCode {
+    /// Publish `ticket` under a fresh code and hold its TTL open until [`Self::retire`].
+    pub async fn publish(ticket: String) -> Result<Self, PublishError> {
+        let store = HostedRendezvous::new()?;
+        let code = store.publish(&ticket).await?;
+        let refresh = tokio::spawn({
+            let store = store.clone();
+            let code = code.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(REFRESH_INTERVAL).await;
+                    // A failed refresh is not worth surfacing or retrying tightly: the record
+                    // still has most of its TTL left, and the next tick is well inside it.
+                    let _ = store.republish(&code, &ticket).await;
+                }
+            }
+        });
+        Ok(Self {
+            store,
+            code,
+            refresh,
+        })
+    }
+
+    pub fn code(&self) -> &JoinCode {
+        &self.code
+    }
+
+    /// Stop refreshing and delete the record. Best effort: the TTL is the real guarantee.
+    pub async fn retire(self) {
+        self.refresh.abort();
+        let _ = self.store.remove(&self.code).await;
+    }
+}
+
 /// reqwest puts the full request URL in its error strings, and ours carries the index —
 /// which is derived from the code. Errors reach logs and shared panes, so cut it out.
 fn strip_url(message: &str) -> String {

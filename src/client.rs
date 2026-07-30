@@ -155,6 +155,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     // Carried on the snapshot rather than looked up here: only the node holds the ticket,
     // and a member's node has none to send.
     let mut share_ticket: Option<String> = None;
+    let mut share_code: Option<String> = None;
     let mut share_notice: Option<String> = None;
     let mut pending_wake = None;
     let mut next_perf_id = 1_u64;
@@ -179,6 +180,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         tab_id,
                         pane_id,
                         ticket: next_ticket,
+                        code: next_code,
                         ..
                     } => {
                         let apply_started = Instant::now();
@@ -229,6 +231,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         }
                         local_peer_id = next_local_peer_id;
                         share_ticket = next_ticket;
+                        share_code = next_code;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
                         }
@@ -423,6 +426,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         footer_notice.as_deref(),
                         ShareView {
                             ticket: share_ticket.as_deref(),
+                            code: share_code.as_deref(),
                             notice: share_notice.as_deref(),
                         },
                         Some(&local_peer_id),
@@ -472,8 +476,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     KeyHandling::Consumed(intents) => {
                         send_intents(&mut stream, tui, intents, &mut pending_focus)?;
-                        if tui.take_share_copy_request().is_some() {
-                            share_notice = Some(share_copy_result(share_ticket.as_deref()));
+                        if let Some(request) = tui.take_share_copy_request() {
+                            share_notice = Some(share_copy_result(
+                                request,
+                                share_ticket.as_deref(),
+                                share_code.as_deref(),
+                            ));
                         }
                         // The notice belongs to one visit to the modal, not to the session.
                         if !tui.share_open() {

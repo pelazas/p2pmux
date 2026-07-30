@@ -59,6 +59,7 @@ fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
         tab_id: 2,
         pane_id: 3,
         ticket: None,
+        code: None,
     };
     assert_eq!(serde_json::to_value(message).unwrap()["type"], "snapshot");
     assert_eq!(

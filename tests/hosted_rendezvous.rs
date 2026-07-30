@@ -115,5 +115,8 @@ async fn errors_never_echo_the_index_the_code_derived() {
 
     let message = error.to_string();
     assert!(!message.contains(&code.index()), "leaked index: {message}");
-    assert!(!message.contains(code.canonical()), "leaked code: {message}");
+    assert!(
+        !message.contains(code.canonical()),
+        "leaked code: {message}"
+    );
 }

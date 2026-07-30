@@ -41,9 +41,8 @@ fn join_rejects_an_invalid_ticket_without_echoing_it() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
     assert!(stdout.contains("TRUST WARNING"));
     assert!(stdout.contains("fully trusted shared-shell session"));
-    // Anything that is not a ticket is now rejected on shape alone — there is no second
-    // namespace left for it to be looked up in.
-    assert!(stderr.contains("expected a join ticket"));
+    // Neither a ticket nor a code by shape, so it is refused without a network round trip.
+    assert!(stderr.contains("expected a join code or ticket"));
     assert!(!stdout.contains("not-a-ticket"));
     assert!(!stderr.contains("not-a-ticket"));
 }
@@ -56,6 +55,28 @@ fn join_rejects_a_malformed_ticket_without_echoing_it() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
     assert!(stderr.contains("invalid ticket format"));
     assert!(!stderr.contains("notbase64"));
+}
+
+#[test]
+fn join_reports_an_unreachable_rendezvous_without_echoing_the_code() {
+    // A code-shaped argument is exchanged for a ticket at the rendezvous, so this is the one
+    // join path that can fail on the network. The code is a credential and the derived index
+    // is one hash away from it, so neither may appear in what the user sees.
+    let code = "4KP7Q-M2XRW";
+    let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(["join", code])
+        .env("P2PMUX_RENDEZVOUS_URL", "https://127.0.0.1:1")
+        .output()
+        .expect("p2pmux binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(
+        stderr.contains("rendezvous service is unreachable"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!stderr.contains(code));
+    assert!(!stderr.contains("4KP7QM2XRW"));
 }
 
 #[test]
@@ -76,7 +97,7 @@ fn help_lists_the_local_terminal_command() {
     assert!(stdout.contains("local"));
     assert!(stdout.contains("local interactive shell"));
     assert!(stdout.contains("reusable shared-session ticket"));
-    assert!(stdout.contains("remote fixed-grid shared pane"));
+    assert!(stdout.contains("join code or a reusable shared-session ticket"));
     assert!(stdout.contains("ticket"));
     assert!(stdout.contains("full reusable join ticket"));
 }

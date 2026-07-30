@@ -22,6 +22,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    hosted_rendezvous::PublishedCode,
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
@@ -110,7 +111,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     // Before the first pane spawns: every PTY this node opens inherits the
     // socket path from here, and pane 1 is created a few lines below.
     crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
-    let (mut node, dispatcher_task) = match bootstrap.kind {
+    let (mut node, dispatcher_task, published_code) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -148,13 +149,24 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             // the attaching client both read it from there rather than minting their own.
             let ticket = host.ticket().to_string();
             descriptor.ticket = Some(ticket.clone());
+            // The short code is a convenience layered on the ticket, so a rendezvous outage
+            // degrades the invite rather than failing the session: the ticket still works,
+            // and the share panel says there is no code instead of showing a dead one.
+            let published_code = PublishedCode::publish(ticket.clone()).await.ok();
+            let code = published_code
+                .as_ref()
+                .map(|published| published.code().printable());
             let session_id = host.ticket().session_id().to_vec();
             let handle = tokio::runtime::Handle::current();
             let mut runtime = crate::tui::SharedLayoutRuntime::host(
-                host, panes, layout, initial, ticket, handle,
+                host, panes, layout, initial, ticket, code, handle,
             )?;
             runtime.set_session_id(session_id);
-            (SharedLayoutNode::new(runtime), dispatcher_task)
+            (
+                SharedLayoutNode::new(runtime),
+                dispatcher_task,
+                published_code,
+            )
         }
         NodeBootstrapKind::Join {
             ticket,
@@ -199,7 +211,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                 state,
                 tokio::runtime::Handle::current(),
             )?;
-            (SharedLayoutNode::new(runtime), dispatcher_task)
+            (SharedLayoutNode::new(runtime), dispatcher_task, None)
         }
     };
     let store = SessionStore::for_current_user()?;
@@ -213,6 +225,9 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     tokio::task::block_in_place(|| node.shutdown());
     dispatcher_task.abort();
     let _ = dispatcher_task.await;
+    if let Some(published) = published_code {
+        published.retire().await;
+    }
     let _ = fs::remove_file(&descriptor.socket_path);
     let _ = store.remove(&descriptor.id);
     result.map_err(Into::into)
@@ -852,6 +867,7 @@ fn snapshot_message(
         tab_id,
         pane_id,
         ticket: node.runtime.share_ticket().map(str::to_owned),
+        code: node.runtime.share_code().map(str::to_owned),
     };
     Ok((message, layout, leases, rosters, screens, updates))
 }
@@ -1682,6 +1698,7 @@ mod tests {
                 snapshot,
                 initial,
                 String::from("TESTCODE"),
+                None,
                 tokio::runtime::Handle::current(),
             )
             .unwrap(),
@@ -1754,6 +1771,7 @@ mod tests {
                 tab_id: 1,
                 pane_id: 1,
                 ticket: None,
+                code: None,
             },
         )
         .unwrap();

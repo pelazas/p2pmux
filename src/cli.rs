@@ -11,6 +11,7 @@ use std::{
 use clap::{Parser, Subcommand};
 
 use crate::{
+    hosted_rendezvous::{HostedRendezvous, JoinCode},
     session::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
         layout_snapshot_from_state,
@@ -43,8 +44,9 @@ enum Command {
         #[arg(long = "session-name")]
         session_name: Option<String>,
     },
-    /// Join a remote fixed-grid shared pane using a reusable shared-session ticket.
+    /// Join a shared session with a join code or a reusable shared-session ticket.
     Join {
+        /// The short code from the host's Ctrl+S panel, or the full ticket.
         ticket: String,
         #[arg(long)]
         name: Option<String>,
@@ -301,6 +303,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     layout,
                     initial,
                     ticket,
+                    None,
                     handle,
                 )
                 .map_err(|error| error.to_string())?;
@@ -319,7 +322,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 writeln!(stdout, "{TRUST_WARNING}\n")?;
                 stdout.flush()?;
             }
-            let ticket = resolve_join_ticket(&ticket)?;
+            let ticket = resolve_join_ticket(&ticket).await?;
             let display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
             let descriptor = launch_background_node(
@@ -587,13 +590,22 @@ fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn
     Ok(crate::config::save(&name)?)
 }
 
-fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
-    if !looks_like_ticket(input) {
-        return Err(CliError(
-            "expected a join ticket; the host gets one from the session's Ctrl+S panel or p2pmux ticket",
-        ));
+/// Turn whatever the user pasted into a dialable ticket.
+///
+/// A ticket is self-contained and resolves offline; a short code has to be exchanged for one
+/// at the rendezvous service. The two are told apart by shape, and the check is ordered
+/// ticket-first so a working invite never depends on a network round trip it does not need.
+async fn resolve_join_ticket(input: &str) -> Result<JoinTicket, Box<dyn Error>> {
+    if looks_like_ticket(input) {
+        return Ok(JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"))?);
     }
-    JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"))
+    let code = JoinCode::parse(input).map_err(|_| {
+        CliError(
+            "expected a join code or ticket; the host finds both in the session's Ctrl+S panel",
+        )
+    })?;
+    let ticket = HostedRendezvous::new()?.resolve(&code).await?;
+    Ok(JoinTicket::from_str(&ticket).map_err(|_| CliError("invalid ticket format"))?)
 }
 
 /// Print the portable join ticket for a session hosted on this Mac.

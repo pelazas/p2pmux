@@ -107,6 +107,10 @@ pub enum NodeMessage {
         /// modal says so rather than offering an invite the client cannot make.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ticket: Option<String>,
+        /// The short code the ticket was published under, when the rendezvous accepted it.
+        /// `None` on a member, and also on a coordinator that could not reach the service.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     Screens {
         screens: Vec<PaneScreenSnapshot>,
@@ -387,7 +391,7 @@ mod tests {
 
     #[test]
     fn snapshot_ticket_serde_is_optional_and_backwards_compatible() {
-        let snapshot = |ticket| NodeMessage::Snapshot {
+        let snapshot = |ticket: Option<String>| NodeMessage::Snapshot {
             room_name: "test".into(),
             role: "coordinator".into(),
             summary: SessionSummary::default(),
@@ -404,6 +408,7 @@ mod tests {
             local_peer_id: vec![],
             tab_id: 1,
             pane_id: 1,
+            code: ticket.as_ref().map(|_| "4KP7Q-M2XRW".to_owned()),
             ticket,
         };
 
