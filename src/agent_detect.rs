@@ -1,7 +1,7 @@
 //! Pure helpers for detecting supported coding agents in a hosted PTY tree.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::OnceLock,
     time::{Duration, Instant},
@@ -22,6 +22,14 @@ pub const DEFAULT_QUIET_BEFORE_DONE: Duration = Duration::from_secs(20);
 /// new working interval. Agents ring the bell and then repaint their prompt, and that trailing
 /// redraw would otherwise open a fresh interval that has to time out all over again.
 const COMPLETION_SETTLE: Duration = Duration::from_secs(3);
+/// How long a pane may sit at its shell prompt with a pushed status still
+/// standing before that status is dropped.
+///
+/// No hook fires when an agent is killed, so a `working` or `needs you` push
+/// would otherwise stand forever on a pane whose agent is long gone. Long
+/// enough that a turn briefly between child processes never trips it; short
+/// enough that a killed agent stops asking for attention it will never use.
+pub const PUSHED_STATUS_GRACE: Duration = Duration::from_secs(20);
 
 /// Return a process's current working directory when it is an existing absolute directory.
 pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
@@ -257,6 +265,8 @@ struct Candidate<'a> {
 /// × agents).
 pub struct AgentScan<'a> {
     by_pid: HashMap<u32, &'a ProcessSnapshot>,
+    /// Every pid in the snapshot that is some process's parent.
+    parents: HashSet<u32>,
     /// Every process in the snapshot that looks like a supported agent. Tiny
     /// next to the snapshot itself: a machine has a handful of these, not
     /// hundreds.
@@ -269,6 +279,10 @@ impl<'a> AgentScan<'a> {
             .iter()
             .map(|process| (process.pid, process))
             .collect();
+        let parents = processes
+            .iter()
+            .filter_map(|process| process.parent_pid)
+            .collect();
         let agents = processes
             .iter()
             .filter_map(|process| {
@@ -276,7 +290,22 @@ impl<'a> AgentScan<'a> {
                     .map(|kind| (process, kind))
             })
             .collect();
-        Self { by_pid, agents }
+        Self {
+            by_pid,
+            parents,
+            agents,
+        }
+    }
+
+    /// Whether a pane's session child still has any child process — whether the
+    /// pane is running something rather than sitting at its shell prompt.
+    ///
+    /// Deliberately not an agent-aware check. This is the evidence that a
+    /// producer has gone, and it must hold even for an agent launched through a
+    /// wrapper no matcher in this module recognizes: whatever the pane was
+    /// running, it is not running it any more.
+    pub fn has_children(&self, session_child_pid: u32) -> bool {
+        self.parents.contains(&session_child_pid)
     }
 
     /// Classify one PTY session child's process tree.
@@ -413,6 +442,9 @@ pub struct PaneAgentTracker {
     pub working_since_unix_ms: u64,
     /// Latest producer-pushed status, when one is running in this pane.
     pub pushed: Option<PushedAgent>,
+    /// When this pane was first seen sitting at its shell prompt while a pushed
+    /// status was still standing. `None` cancels the grace clock.
+    push_suspect_since: Option<Instant>,
     tuning: NotificationTuning,
     settle_until: Option<Instant>,
 }
@@ -432,8 +464,34 @@ impl PaneAgentTracker {
             working_since: None,
             working_since_unix_ms: 0,
             pushed: None,
+            push_suspect_since: None,
             tuning,
             settle_until: None,
+        }
+    }
+
+    /// Feed the pane's liveness into the pushed-status grace clock.
+    ///
+    /// `has_children` is whether the pane is running anything at all. Nothing
+    /// fires a hook when an agent is killed — no `Stop`, no `SessionEnd` — so a
+    /// `working` or `needs you` push has no other way to end. A pane that has
+    /// fallen back to its shell prompt is the evidence that the producer is
+    /// gone.
+    ///
+    /// A first sighting only starts the clock. A turn is legitimately between
+    /// child processes for moments at a time, and a `pending` agent can sit
+    /// waiting for an answer indefinitely, so nothing is dropped until the pane
+    /// has *stayed* at its prompt for [`PUSHED_STATUS_GRACE`] — and repeat
+    /// sightings do not reset it, because staying there is exactly the point.
+    pub fn observe_pane_liveness(&mut self, has_children: bool, now: Instant) {
+        if self.pushed.is_none() || has_children {
+            self.push_suspect_since = None;
+            return;
+        }
+        let since = *self.push_suspect_since.get_or_insert(now);
+        if now.duration_since(since) >= PUSHED_STATUS_GRACE {
+            self.pushed = None;
+            self.push_suspect_since = None;
         }
     }
 
@@ -471,6 +529,9 @@ impl PaneAgentTracker {
             at: now,
             working_since_unix_ms,
         });
+        // A payload is proof the producer is alive — cancel any grace clock
+        // before it can misfire.
+        self.push_suspect_since = None;
     }
 
     /// The authoritative pushed status, if a producer currently owns this pane.
@@ -856,6 +917,88 @@ mod tests {
             Some("/two".into())
         );
         assert_eq!(scan.classify(999), None);
+    }
+
+    #[test]
+    fn a_pushed_status_expires_once_the_pane_is_back_at_its_prompt() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Pending,
+            now,
+            1_000,
+        );
+
+        // Killing an agent mid-question fires no hook at all, so nothing else
+        // would ever retire this row.
+        tracker.observe_pane_liveness(false, now);
+        assert_eq!(
+            tracker.listed_agent(now, 1_000).map(|(_, state)| state),
+            Some(AgentState::Pending),
+            "one sighting only starts the clock"
+        );
+
+        // Repeat sightings must not push expiry out — the pane *staying* at its
+        // prompt is the evidence.
+        tracker.observe_pane_liveness(false, now + PUSHED_STATUS_GRACE - Duration::from_secs(1));
+        assert!(tracker.pushed.is_some());
+
+        tracker.observe_pane_liveness(false, now + PUSHED_STATUS_GRACE);
+        assert!(tracker.pushed.is_none(), "a dead producer stops asking");
+        assert_eq!(tracker.listed_agent(now + PUSHED_STATUS_GRACE, 1_000), None);
+    }
+
+    #[test]
+    fn a_live_pane_or_a_fresh_push_cancels_the_grace_clock() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Working,
+            now,
+            1_000,
+        );
+
+        // A turn is legitimately between child processes for moments at a time.
+        tracker.observe_pane_liveness(false, now);
+        tracker.observe_pane_liveness(true, now + Duration::from_secs(1));
+        tracker.observe_pane_liveness(false, now + Duration::from_secs(2));
+        tracker.observe_pane_liveness(false, now + PUSHED_STATUS_GRACE);
+        assert!(
+            tracker.pushed.is_some(),
+            "the clock restarted when the pane came back to life"
+        );
+
+        // A payload is proof the producer is alive, even mid-suspicion.
+        tracker.observe_pane_liveness(false, now + PUSHED_STATUS_GRACE + Duration::from_secs(1));
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Working,
+            now + PUSHED_STATUS_GRACE + Duration::from_secs(2),
+            1_000,
+        );
+        tracker.observe_pane_liveness(
+            false,
+            now + PUSHED_STATUS_GRACE + PUSHED_STATUS_GRACE + Duration::from_secs(1),
+        );
+        assert!(tracker.pushed.is_some());
+    }
+
+    #[test]
+    fn scan_reports_whether_a_pane_is_running_anything() {
+        let processes = vec![
+            process(10, None, "zsh", None),
+            process(11, Some(10), "claude", None),
+            process(20, None, "zsh", None),
+        ];
+        let scan = AgentScan::new(&processes);
+        assert!(scan.has_children(10), "pane 10 is running an agent");
+        assert!(!scan.has_children(20), "pane 20 is back at its prompt");
+        assert!(!scan.has_children(999));
     }
 
     #[test]

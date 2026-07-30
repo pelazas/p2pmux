@@ -3954,8 +3954,11 @@ impl SharedLocalPane {
     fn apply_agent_snapshot(&mut self, scan: &AgentScan<'_>, now: Instant) -> bool {
         let unix_ms_now = unix_ms_now();
         let before = self.agent_tracker.listed_agent(now, unix_ms_now);
-        let detected = self.host.process_id().and_then(|pid| scan.classify(pid));
+        let session_child = self.host.process_id();
+        let detected = session_child.and_then(|pid| scan.classify(pid));
         self.agent_tracker.update(detected, now, unix_ms_now);
+        self.agent_tracker
+            .observe_pane_liveness(session_child.is_some_and(|pid| scan.has_children(pid)), now);
         self.agent_tracker.listed_agent(now, unix_ms_now) != before
     }
 
