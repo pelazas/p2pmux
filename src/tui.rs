@@ -2,6 +2,9 @@
 
 mod clock;
 mod debug_log;
+mod input;
+#[cfg(test)]
+mod test_support;
 mod text;
 
 use std::{
@@ -80,6 +83,18 @@ use crate::{
 
 use clock::unix_ms_now;
 pub(crate) use debug_log::ui_debug_log;
+pub use input::mouse::PaneMouseProtocol;
+use input::{
+    events::{
+        MAX_EVENTS_PER_CYCLE, begin_synchronized_output, collect_pending_events,
+        end_synchronized_output, event_poll_timeout, frame_due,
+    },
+    keys::{
+        PendingEscape, encode_key, encode_paste, is_chord_command, is_chord_navigation,
+        is_option_arrow, is_quit,
+    },
+    mouse::encode_mouse,
+};
 use text::{
     copied_line_count, sanitize_single_line, text_width, truncate_bytes, truncate_leading,
     truncate_trailing, wrap_fixed,
@@ -113,7 +128,6 @@ const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
 /// The legacy fixed-grid host/guest footer, which has no chords, agents, or share modal.
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
-const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const PANE_SCROLL_WHEEL_STEP: usize = 3;
 
@@ -1965,175 +1979,6 @@ impl MultiPaneTui {
                 ),
             );
         }
-    }
-}
-
-fn is_option_arrow(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::ALT)
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(
-            key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-        )
-}
-
-#[derive(Default)]
-struct PendingEscape {
-    started: Option<Instant>,
-}
-
-impl PendingEscape {
-    fn start(&mut self, now: Instant) {
-        self.started = Some(now);
-    }
-
-    fn take_if_expired(&mut self, now: Instant) -> bool {
-        if !self
-            .started
-            .is_some_and(|started| now.saturating_duration_since(started) >= ESC_PREFIX_WINDOW)
-        {
-            return false;
-        }
-        self.started = None;
-        true
-    }
-
-    fn take_option_arrow(&mut self, key: KeyEvent) -> Option<KeyEvent> {
-        (self.started.is_some() && key.modifiers.is_empty())
-            .then_some(key.code)
-            .filter(|code| {
-                matches!(
-                    code,
-                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-                )
-            })
-            .map(|code| {
-                self.started = None;
-                KeyEvent::new(code, KeyModifiers::ALT)
-            })
-    }
-
-    fn take(&mut self) -> bool {
-        self.started.take().is_some()
-    }
-}
-
-/// Upper bound on terminal events applied per loop cycle so one burst cannot
-/// starve PTY draining forever.
-const MAX_EVENTS_PER_CYCLE: usize = 256;
-
-/// Frames are presented at most once per interval (~60 fps) so parse and input
-/// work is never crowded out by redraws faster than anyone can perceive.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-
-fn frame_due(last_draw: Option<Instant>) -> bool {
-    last_draw.is_none_or(|drawn| drawn.elapsed() >= FRAME_INTERVAL)
-}
-
-/// Asks the outer terminal to present the writes up to the matching end marker
-/// atomically (DEC 2026). Terminals without support ignore both markers.
-fn begin_synchronized_output() -> io::Result<()> {
-    io::stdout().write_all(b"\x1b[?2026h")
-}
-
-fn end_synchronized_output() -> io::Result<()> {
-    let mut stdout = io::stdout();
-    stdout.write_all(b"\x1b[?2026l")?;
-    stdout.flush()
-}
-
-/// Poll timeout for the run loops: until the next frame deadline while a dirty
-/// frame is waiting, one full interval when idle.
-fn event_poll_timeout(dirty: bool, last_draw: Option<Instant>) -> Duration {
-    if !dirty {
-        return FRAME_INTERVAL;
-    }
-    last_draw
-        .map(|drawn| FRAME_INTERVAL.saturating_sub(drawn.elapsed()))
-        .unwrap_or(Duration::ZERO)
-        .max(Duration::from_millis(1))
-}
-
-fn is_mouse_moved(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
-    )
-}
-
-/// Reads every queued terminal event without blocking. Hover only depends on the
-/// final pointer position, so all mouse-moves but the last are dropped; a burst
-/// of moves then costs one update instead of one redraw cycle each.
-fn collect_pending_events(max: usize) -> io::Result<Vec<Event>> {
-    let mut events = Vec::new();
-    while events.len() < max && event::poll(Duration::ZERO)? {
-        events.push(event::read()?);
-    }
-    if let Some(last_moved) = events.iter().rposition(is_mouse_moved) {
-        let mut index = 0;
-        events.retain(|event| {
-            let keep = index == last_moved || !is_mouse_moved(event);
-            index += 1;
-            keep
-        });
-    }
-    Ok(events)
-}
-
-fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
-    // An uppercase chord letter arrives with SHIFT held, which is not a modifier the user
-    // added on purpose -- it is how the letter is typed. Rejecting it outright would make
-    // any uppercase chord permanently unreachable.
-    let uppercase = matches!(key.code, KeyCode::Char(letter) if letter.is_ascii_uppercase());
-    let permitted = if uppercase {
-        (key.modifiers - KeyModifiers::SHIFT).is_empty()
-    } else {
-        key.modifiers.is_empty()
-    };
-    if !permitted {
-        return false;
-    }
-    match mode {
-        ChordMode::Pane => matches!(
-            key.code,
-            KeyCode::Char('e')
-                | KeyCode::Char('n')
-                | KeyCode::Char('r')
-                | KeyCode::Char('l')
-                | KeyCode::Char('d')
-                | KeyCode::Char('u')
-                | KeyCode::Char('x')
-                | KeyCode::Char('k')
-                | KeyCode::Char('L')
-                | KeyCode::Char('i')
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
-        ),
-        ChordMode::Tab => matches!(
-            key.code,
-            KeyCode::Char('e')
-                | KeyCode::Char('n')
-                | KeyCode::Char('x')
-                | KeyCode::Left
-                | KeyCode::Right
-        ),
-        ChordMode::None => false,
-    }
-}
-
-fn is_chord_navigation(mode: ChordMode, key: KeyEvent) -> bool {
-    if !key.modifiers.is_empty() {
-        return false;
-    }
-    match mode {
-        ChordMode::Pane => matches!(
-            key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-        ),
-        ChordMode::Tab => matches!(key.code, KeyCode::Left | KeyCode::Right),
-        ChordMode::None => false,
     }
 }
 
@@ -6358,272 +6203,6 @@ fn render_host_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, footer: &st
     render_guest_screen(frame, screen, footer);
 }
 
-fn is_quit(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL
-}
-
-fn encode_key(
-    key: KeyEvent,
-    screen: &vt100::Screen,
-    kitty_keyboard_active: bool,
-) -> Option<Vec<u8>> {
-    if is_quit(key) {
-        return None;
-    }
-
-    let modifiers = modifier_parameter(key.modifiers)?;
-    let bytes = match key.code {
-        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let character = character.to_ascii_lowercase();
-            if !character.is_ascii_lowercase() {
-                return None;
-            }
-            let mut bytes = Vec::new();
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                bytes.push(0x1b);
-            }
-            bytes.push(character as u8 - b'a' + 1);
-            bytes
-        }
-        KeyCode::Char(character) => {
-            let mut bytes = Vec::new();
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                bytes.push(0x1b);
-            }
-            bytes.extend(character.to_string().bytes());
-            bytes
-        }
-        KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
-        // Use kitty CSI-u when the child opted in; otherwise LF is the newline fallback.
-        KeyCode::Enter if modifiers == 2 => {
-            if kitty_keyboard_active {
-                b"\x1b[13;2u".to_vec()
-            } else {
-                b"\n".to_vec()
-            }
-        }
-        KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
-        KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
-        KeyCode::Esc if modifiers == 1 => b"\x1b".to_vec(),
-        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => {
-            let suffix = match key.code {
-                KeyCode::Up => b'A',
-                KeyCode::Down => b'B',
-                KeyCode::Right => b'C',
-                KeyCode::Left => b'D',
-                _ => unreachable!(),
-            };
-            if modifiers == 1 && screen.application_cursor() {
-                vec![0x1b, b'O', suffix]
-            } else if modifiers == 1 {
-                vec![0x1b, b'[', suffix]
-            } else {
-                format!("\x1b[1;{modifiers}{}", suffix as char).into_bytes()
-            }
-        }
-        KeyCode::Home if modifiers == 1 => b"\x1b[H".to_vec(),
-        KeyCode::End if modifiers == 1 => b"\x1b[F".to_vec(),
-        KeyCode::Delete if modifiers == 1 => b"\x1b[3~".to_vec(),
-        KeyCode::Insert if modifiers == 1 => b"\x1b[2~".to_vec(),
-        KeyCode::PageUp if modifiers == 1 => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown if modifiers == 1 => b"\x1b[6~".to_vec(),
-        KeyCode::F(number) if modifiers == 1 => function_key(number)?,
-        _ => return None,
-    };
-    Some(bytes)
-}
-
-fn modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
-    let supported = KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL;
-    if !(modifiers - supported).is_empty() {
-        return None;
-    }
-    let mut parameter = 1;
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        parameter += 1;
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        parameter += 2;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        parameter += 4;
-    }
-    Some(parameter)
-}
-
-fn function_key(number: u8) -> Option<Vec<u8>> {
-    let bytes = match number {
-        1 => b"\x1bOP".as_slice(),
-        2 => b"\x1bOQ".as_slice(),
-        3 => b"\x1bOR".as_slice(),
-        4 => b"\x1bOS".as_slice(),
-        5 => b"\x1b[15~".as_slice(),
-        6 => b"\x1b[17~".as_slice(),
-        7 => b"\x1b[18~".as_slice(),
-        8 => b"\x1b[19~".as_slice(),
-        9 => b"\x1b[20~".as_slice(),
-        10 => b"\x1b[21~".as_slice(),
-        11 => b"\x1b[23~".as_slice(),
-        12 => b"\x1b[24~".as_slice(),
-        _ => return None,
-    };
-    Some(bytes.to_vec())
-}
-
-fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
-    if bracketed_paste {
-        [
-            b"\x1b[200~".as_slice(),
-            text.as_bytes(),
-            b"\x1b[201~".as_slice(),
-        ]
-        .concat()
-    } else {
-        text.as_bytes().to_vec()
-    }
-}
-
-/// Low two bits of an xterm button code, by button.
-const MOUSE_BUTTON_LEFT: u8 = 0;
-const MOUSE_BUTTON_MIDDLE: u8 = 1;
-const MOUSE_BUTTON_RIGHT: u8 = 2;
-/// Legacy encodings report every release with the button bits set.
-const MOUSE_BUTTON_RELEASE: u8 = 3;
-const MOUSE_MOTION_FLAG: u8 = 32;
-const MOUSE_WHEEL_FLAG: u8 = 64;
-const MOUSE_SHIFT_FLAG: u8 = 4;
-const MOUSE_ALT_FLAG: u8 = 8;
-const MOUSE_CONTROL_FLAG: u8 = 16;
-/// Legacy button/coordinate bytes are biased so they land in printable ASCII.
-const MOUSE_LEGACY_BIAS: u16 = 32;
-/// The largest coordinate a single biased byte can carry.
-const MOUSE_LEGACY_MAX: u16 = 223;
-
-/// The xterm mouse reporting a pane's child has asked for, if any.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PaneMouseProtocol {
-    mode: vt100::MouseProtocolMode,
-    encoding: vt100::MouseProtocolEncoding,
-}
-
-impl PaneMouseProtocol {
-    pub fn from_screen(screen: &vt100::Screen) -> Self {
-        Self {
-            mode: screen.mouse_protocol_mode(),
-            encoding: screen.mouse_protocol_encoding(),
-        }
-    }
-
-    /// Whether the child wants mouse events at all; when false the mux keeps them.
-    pub fn reports_mouse(self) -> bool {
-        self.mode != vt100::MouseProtocolMode::None
-    }
-}
-
-fn mouse_button_code(button: MouseButton) -> u8 {
-    match button {
-        MouseButton::Left => MOUSE_BUTTON_LEFT,
-        MouseButton::Middle => MOUSE_BUTTON_MIDDLE,
-        MouseButton::Right => MOUSE_BUTTON_RIGHT,
-    }
-}
-
-fn mouse_modifier_flags(modifiers: KeyModifiers) -> u8 {
-    let mut flags = 0;
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        flags |= MOUSE_SHIFT_FLAG;
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        flags |= MOUSE_ALT_FLAG;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        flags |= MOUSE_CONTROL_FLAG;
-    }
-    flags
-}
-
-/// Encodes a pane-local mouse event the way the child asked to receive it.
-///
-/// Returns `None` when the child's [`vt100::MouseProtocolMode`] does not subscribe to
-/// this event, so callers can fall back to mux-local handling.
-fn encode_mouse(
-    kind: MouseEventKind,
-    modifiers: KeyModifiers,
-    cell: ScreenCell,
-    protocol: PaneMouseProtocol,
-) -> Option<Vec<u8>> {
-    use vt100::MouseProtocolMode as Mode;
-
-    if !protocol.reports_mouse() {
-        return None;
-    }
-    let (button, release) = match kind {
-        MouseEventKind::Down(button) => (mouse_button_code(button), false),
-        MouseEventKind::Up(button) => {
-            // X10 mode reports presses only.
-            if protocol.mode == Mode::Press {
-                return None;
-            }
-            (mouse_button_code(button), true)
-        }
-        MouseEventKind::Drag(button) => {
-            if !matches!(protocol.mode, Mode::ButtonMotion | Mode::AnyMotion) {
-                return None;
-            }
-            (mouse_button_code(button) | MOUSE_MOTION_FLAG, false)
-        }
-        MouseEventKind::Moved => {
-            if protocol.mode != Mode::AnyMotion {
-                return None;
-            }
-            (MOUSE_BUTTON_RELEASE | MOUSE_MOTION_FLAG, false)
-        }
-        // Wheel reports are presses without a matching release in every mode.
-        MouseEventKind::ScrollUp => (MOUSE_WHEEL_FLAG, false),
-        MouseEventKind::ScrollDown => (MOUSE_WHEEL_FLAG | 1, false),
-        MouseEventKind::ScrollLeft => (MOUSE_WHEEL_FLAG | 2, false),
-        MouseEventKind::ScrollRight => (MOUSE_WHEEL_FLAG | 3, false),
-    };
-    let code = button | mouse_modifier_flags(modifiers);
-    let column = cell.col.saturating_add(1);
-    let row = cell.row.saturating_add(1);
-
-    Some(match protocol.encoding {
-        vt100::MouseProtocolEncoding::Sgr => {
-            let final_byte = if release { 'm' } else { 'M' };
-            format!("\x1b[<{code};{column};{row}{final_byte}").into_bytes()
-        }
-        encoding => {
-            // Legacy encodings cannot name the released button, only that one was.
-            let code = if release {
-                code | MOUSE_BUTTON_RELEASE
-            } else {
-                code
-            };
-            let mut bytes = b"\x1b[M".to_vec();
-            for value in [u16::from(code), column, row] {
-                let biased = value.checked_add(MOUSE_LEGACY_BIAS)?;
-                if encoding == vt100::MouseProtocolEncoding::Utf8 {
-                    let mut buffer = [0u8; 4];
-                    bytes.extend_from_slice(
-                        char::from_u32(u32::from(biased))?
-                            .encode_utf8(&mut buffer)
-                            .as_bytes(),
-                    );
-                } else {
-                    // A cell past the single-byte ceiling has no representation at all.
-                    if biased > MOUSE_LEGACY_MAX {
-                        return None;
-                    }
-                    bytes.push(biased as u8);
-                }
-            }
-            bytes
-        }
-    })
-}
-
 struct TerminalGuard {
     raw_mode: bool,
     keyboard_enhancement: bool,
@@ -7205,9 +6784,7 @@ mod tests {
     };
     use tokio::sync::{mpsc, watch};
 
-    use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
-    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use portable_pty::PtySize;
     use ratatui::{
         Terminal,
@@ -7227,240 +6804,21 @@ mod tests {
     };
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
+    use super::input::keys::ESC_PREFIX_WINDOW;
+    use super::test_support::mouse_protocol;
     use super::{
-        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterSegment,
-        HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
-        MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState, PendingEscape,
-        RemoteInput, RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView,
-        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview,
-        area_from_terminal_size, chord_footer_badge, contextual_footer, encode_key, encode_mouse,
-        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command, is_chord_navigation,
-        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
+        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, FooterSegment, HostControlEvent,
+        HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui,
+        PaneMouseProtocol, PaneTextSelection, PaneViewState, PendingEscape, RemoteInput,
+        RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView, SharedLayoutRuntime,
+        SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
+        chord_footer_badge, contextual_footer, grid_for_pane, initial_root_pane_grid,
+        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
         render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
         selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
-
-    fn mouse_protocol(
-        mode: vt100::MouseProtocolMode,
-        encoding: vt100::MouseProtocolEncoding,
-    ) -> PaneMouseProtocol {
-        PaneMouseProtocol { mode, encoding }
-    }
-
-    fn sgr_protocol(mode: vt100::MouseProtocolMode) -> PaneMouseProtocol {
-        mouse_protocol(mode, vt100::MouseProtocolEncoding::Sgr)
-    }
-
-    #[test]
-    fn encode_mouse_skips_panes_without_mouse_reporting() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                KeyModifiers::NONE,
-                ScreenCell { row: 0, col: 0 },
-                PaneMouseProtocol::default(),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn encode_mouse_reports_sgr_press_with_one_based_cells() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                KeyModifiers::NONE,
-                ScreenCell { row: 4, col: 11 },
-                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
-            ),
-            Some(b"\x1b[<0;12;5M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_marks_sgr_release_with_a_lowercase_final_byte() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Up(MouseButton::Right),
-                KeyModifiers::NONE,
-                ScreenCell { row: 0, col: 0 },
-                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
-            ),
-            Some(b"\x1b[<2;1;1m".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_folds_modifiers_into_the_button_code() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ScreenCell { row: 0, col: 0 },
-                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
-            ),
-            Some(b"\x1b[<24;1;1M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_drops_release_in_press_only_mode() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                KeyModifiers::NONE,
-                ScreenCell { row: 0, col: 0 },
-                sgr_protocol(vt100::MouseProtocolMode::Press),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn encode_mouse_reports_drag_only_once_the_child_asks_for_motion() {
-        let drag = MouseEventKind::Drag(MouseButton::Left);
-        let cell = ScreenCell { row: 0, col: 0 };
-        assert_eq!(
-            encode_mouse(
-                drag,
-                KeyModifiers::NONE,
-                cell,
-                sgr_protocol(vt100::MouseProtocolMode::PressRelease),
-            ),
-            None
-        );
-        assert_eq!(
-            encode_mouse(
-                drag,
-                KeyModifiers::NONE,
-                cell,
-                sgr_protocol(vt100::MouseProtocolMode::ButtonMotion),
-            ),
-            Some(b"\x1b[<32;1;1M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_reports_bare_motion_only_in_any_motion_mode() {
-        let cell = ScreenCell { row: 0, col: 0 };
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Moved,
-                KeyModifiers::NONE,
-                cell,
-                sgr_protocol(vt100::MouseProtocolMode::ButtonMotion),
-            ),
-            None
-        );
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Moved,
-                KeyModifiers::NONE,
-                cell,
-                sgr_protocol(vt100::MouseProtocolMode::AnyMotion),
-            ),
-            Some(b"\x1b[<35;1;1M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_reports_wheel_even_in_press_only_mode() {
-        let cell = ScreenCell { row: 2, col: 2 };
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::ScrollUp,
-                KeyModifiers::NONE,
-                cell,
-                sgr_protocol(vt100::MouseProtocolMode::Press),
-            ),
-            Some(b"\x1b[<64;3;3M".to_vec())
-        );
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::ScrollDown,
-                KeyModifiers::NONE,
-                cell,
-                sgr_protocol(vt100::MouseProtocolMode::Press),
-            ),
-            Some(b"\x1b[<65;3;3M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_biases_legacy_reports_into_printable_bytes() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                KeyModifiers::NONE,
-                ScreenCell { row: 4, col: 11 },
-                mouse_protocol(
-                    vt100::MouseProtocolMode::PressRelease,
-                    vt100::MouseProtocolEncoding::Default,
-                ),
-            ),
-            Some(vec![0x1b, b'[', b'M', 32, 32 + 12, 32 + 5])
-        );
-    }
-
-    #[test]
-    fn encode_mouse_reports_legacy_release_without_naming_the_button() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Up(MouseButton::Right),
-                KeyModifiers::NONE,
-                ScreenCell { row: 0, col: 0 },
-                mouse_protocol(
-                    vt100::MouseProtocolMode::PressRelease,
-                    vt100::MouseProtocolEncoding::Default,
-                ),
-            ),
-            Some(vec![0x1b, b'[', b'M', 32 + 3, 33, 33])
-        );
-    }
-
-    #[test]
-    fn encode_mouse_drops_legacy_cells_past_the_single_byte_ceiling() {
-        assert_eq!(
-            encode_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                KeyModifiers::NONE,
-                ScreenCell { row: 0, col: 300 },
-                mouse_protocol(
-                    vt100::MouseProtocolMode::PressRelease,
-                    vt100::MouseProtocolEncoding::Default,
-                ),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn encode_mouse_widens_utf8_cells_past_the_single_byte_ceiling() {
-        let bytes = encode_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            KeyModifiers::NONE,
-            ScreenCell { row: 0, col: 300 },
-            mouse_protocol(
-                vt100::MouseProtocolMode::PressRelease,
-                vt100::MouseProtocolEncoding::Utf8,
-            ),
-        )
-        .expect("utf8 encoding carries wide coordinates");
-        let mut expected = b"\x1b[M".to_vec();
-        expected.push(32);
-        expected.extend_from_slice(char::from_u32(333).unwrap().to_string().as_bytes());
-        expected.push(33);
-        assert_eq!(bytes, expected);
-    }
-
-    #[test]
-    fn disambiguate_escape_codes_uses_kitty_flag_one() {
-        assert_eq!(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
-            1
-        );
-    }
 
     fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> LayoutSnapshot {
         LayoutSnapshot {
@@ -10658,20 +10016,6 @@ mod tests {
     }
 
     #[test]
-    fn directional_split_keys_are_commands_but_not_chord_navigation() {
-        for key in ['r', 'l', 'd', 'u'] {
-            assert!(is_chord_command(
-                ChordMode::Pane,
-                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
-            ));
-            assert!(!is_chord_navigation(
-                ChordMode::Pane,
-                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
-            ));
-        }
-    }
-
-    #[test]
     fn pane_lock_chord_toggles_lock_and_exits_mode() {
         let area = Rect::new(0, 0, 80, 24);
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
@@ -11566,30 +10910,6 @@ mod tests {
     }
 
     #[test]
-    fn an_uppercase_chord_letter_is_reachable_despite_its_shift_modifier() {
-        // Shift is how `L` is typed, not a modifier the user chose to add. An earlier
-        // version rejected every modified key here, which made the session lock
-        // impossible to trigger from a real keyboard while every unit test passed.
-        assert!(is_chord_command(
-            ChordMode::Pane,
-            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT)
-        ));
-        assert!(is_chord_command(
-            ChordMode::Pane,
-            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)
-        ));
-        // A genuinely extra modifier is still not a chord command.
-        assert!(!is_chord_command(
-            ChordMode::Pane,
-            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::CONTROL)
-        ));
-        assert!(!is_chord_command(
-            ChordMode::Pane,
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT)
-        ));
-    }
-
-    #[test]
     fn shift_l_toggles_the_session_lock_from_whatever_state_it_is_in() {
         let area = Rect::new(0, 0, 80, 24);
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
@@ -11719,160 +11039,5 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), " ");
         assert_eq!(buffer[(2, 0)].symbol(), " ");
-    }
-
-    #[test]
-    fn up_respects_application_cursor_mode() {
-        let normal = vt100::Parser::new(1, 1, 0);
-        assert_eq!(
-            encode_key(
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                normal.screen(),
-                false,
-            ),
-            Some(b"\x1b[A".to_vec())
-        );
-
-        let mut application = vt100::Parser::new(1, 1, 0);
-        application.process(b"\x1b[?1h");
-        assert_eq!(
-            encode_key(
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                application.screen(),
-                false,
-            ),
-            Some(b"\x1bOA".to_vec())
-        );
-    }
-
-    #[test]
-    fn paste_respects_bracketed_paste_mode() {
-        assert_eq!(encode_paste("one\ntwo", false), b"one\ntwo");
-        assert_eq!(
-            encode_paste("one\ntwo", true),
-            b"\x1b[200~one\ntwo\x1b[201~"
-        );
-    }
-
-    #[test]
-    fn encodes_supported_keys_and_reserves_ctrl_q_only() {
-        let parser = vt100::Parser::new(1, 1, 0);
-        let screen = parser.screen();
-        let cases = [
-            (
-                KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE),
-                Some("é"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                Some("\r"),
-            ),
-            (KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), Some("\t")),
-            (
-                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-                Some("\x7f"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                Some("\x1b"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                Some("\x03"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
-                Some("\x1bx"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
-                Some("\x1b[H"),
-            ),
-            (
-                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
-                Some("\x1b[F"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-                Some("\x1b[3~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
-                Some("\x1b[2~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-                Some("\x1b[5~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
-                Some("\x1b[6~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
-                Some("\x1bOP"),
-            ),
-            (
-                KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
-                Some("\x1b[20~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
-                Some("\x1b[21~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
-                Some("\x1b[24~"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
-                Some("\x1b[1;5C"),
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-                None,
-            ),
-            (KeyEvent::new(KeyCode::Null, KeyModifiers::NONE), None),
-        ];
-
-        for (event, expected) in cases {
-            assert_eq!(
-                encode_key(event, screen, false).as_deref(),
-                expected.map(str::as_bytes),
-                "{event:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn shift_enter_uses_kitty_csi_u_when_active_and_lf_when_inactive() {
-        let parser = vt100::Parser::new(1, 1, 0);
-        let plain = encode_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            parser.screen(),
-            false,
-        );
-        let plain_active = encode_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            parser.screen(),
-            true,
-        );
-        let shifted_inactive = encode_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-            parser.screen(),
-            false,
-        );
-        let shifted_active = encode_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-            parser.screen(),
-            true,
-        );
-
-        assert_eq!(plain, Some(b"\r".to_vec()));
-        assert_eq!(plain_active, Some(b"\r".to_vec()));
-        assert_eq!(shifted_inactive, Some(b"\n".to_vec()));
-        assert_eq!(shifted_active, Some(b"\x1b[13;2u".to_vec()));
-        assert_ne!(shifted_inactive, plain);
-        assert_ne!(shifted_active, plain);
     }
 }
