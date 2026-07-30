@@ -156,6 +156,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             let code = published_code
                 .as_ref()
                 .map(|published| published.code().printable());
+            descriptor.join_code = code.clone();
             let session_id = host.ticket().session_id().to_vec();
             let handle = tokio::runtime::Handle::current();
             let mut runtime = crate::tui::SharedLayoutRuntime::host(

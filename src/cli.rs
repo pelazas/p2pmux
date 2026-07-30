@@ -57,6 +57,12 @@ enum Command {
         /// is hosted here.
         session: Option<String>,
     },
+    /// Print the short join code for a session hosted on this Mac.
+    Code {
+        /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
+        /// is hosted here.
+        session: Option<String>,
+    },
     /// Attach a live local session by memorable name.
     Attach { name: String },
     /// Gracefully stop a live local session.
@@ -375,6 +381,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Some(Command::Ticket { session }) => print_join_ticket(session),
+        Some(Command::Code { session }) => print_join_code(session),
         Some(Command::Attach { name }) => crate::client::run(&find_live(&name)?),
         Some(Command::Kill { name, yes }) => {
             let descriptor = find_live(&name)?;
@@ -610,29 +617,58 @@ async fn resolve_join_ticket(input: &str) -> Result<JoinTicket, Box<dyn Error>> 
 
 /// Print the portable join ticket for a session hosted on this Mac.
 ///
-/// The ticket is the only thing a peer on another machine can act on, so this reads it back off
-/// the session record the coordinator's node wrote. It goes to stdout alone so
-/// `p2pmux ticket | pbcopy` yields something directly pasteable.
+/// Read back off the session record the coordinator's node wrote, and printed to stdout alone
+/// so `p2pmux ticket | pbcopy` yields something directly pasteable.
 fn print_join_ticket(session: Option<String>) -> Result<(), Box<dyn Error>> {
-    let store = crate::session_store::SessionStore::for_current_user()?;
-    let sessions = store.list_live()?;
-    let descriptor = match session {
-        Some(name) => sessions
-            .into_iter()
-            .find(|session| session.name == name)
-            .ok_or(CliError("no live session by that name on this Mac"))?,
-        None => sole_hosted_session(sessions)?,
-    };
+    let descriptor = hosted_session(session)?;
     let ticket = descriptor.ticket.ok_or(CliError(
         "that session was joined, not created here, so this Mac holds no ticket for it",
     ))?;
+    print_invite(&ticket)
+}
+
+/// Print the short join code for a session hosted on this Mac.
+///
+/// The code needs the rendezvous service to have accepted it, so unlike the ticket this can
+/// legitimately not exist for a live session — say which of the two it is rather than making
+/// the caller guess.
+fn print_join_code(session: Option<String>) -> Result<(), Box<dyn Error>> {
+    let descriptor = hosted_session(session)?;
+    if descriptor.ticket.is_none() {
+        return Err(CliError(
+            "that session was joined, not created here, so this Mac holds no code for it",
+        )
+        .into());
+    }
+    let code = descriptor.join_code.ok_or(CliError(
+        "that session has no code; the rendezvous service was unreachable when it started, so share the ticket instead",
+    ))?;
+    print_invite(&code)
+}
+
+/// stdout carries the invite alone; the warning goes to stderr so a pipe stays clean.
+fn print_invite(invite: &str) -> Result<(), Box<dyn Error>> {
     {
         let mut stderr = io::stderr().lock();
         writeln!(stderr, "{TICKET_WARNING}\n")?;
         stderr.flush()?;
     }
-    println!("{ticket}");
+    println!("{invite}");
     Ok(())
+}
+
+fn hosted_session(
+    session: Option<String>,
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    let store = crate::session_store::SessionStore::for_current_user()?;
+    let sessions = store.list_live()?;
+    Ok(match session {
+        Some(name) => sessions
+            .into_iter()
+            .find(|session| session.name == name)
+            .ok_or(CliError("no live session by that name on this Mac"))?,
+        None => sole_hosted_session(sessions)?,
+    })
 }
 
 /// The one session hosted here, when leaving the name off is unambiguous.
