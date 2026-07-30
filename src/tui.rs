@@ -595,6 +595,23 @@ impl MultiPaneTui {
         true
     }
 
+    /// The other members on a tab, in member-list order so the dots never reshuffle.
+    fn tab_watchers(&self, tab_id: TabId) -> Vec<&crate::local_ipc::PresenceRow> {
+        let mut watchers = self
+            .presence
+            .iter()
+            .filter(|row| row.tab_id == tab_id)
+            .collect::<Vec<_>>();
+        watchers.sort_by_key(|row| {
+            self.snapshot
+                .members
+                .iter()
+                .position(|member| member.peer_id == row.peer_id)
+                .unwrap_or(usize::MAX)
+        });
+        watchers
+    }
+
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
         rows.retain_mut(|row| {
             let Some((tab_ordinal, pane_ordinal)) = self.pane_location(row.pane_id) else {
@@ -1232,7 +1249,8 @@ impl MultiPaneTui {
                     index + 1,
                     tab.tab_id == self.current_tab,
                     self.tab_has_unread_agent_pane(tab),
-                ));
+                ))
+                .saturating_add(tab_presence_width(self.tab_watchers(tab.tab_id).len()));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
@@ -2206,6 +2224,20 @@ fn tab_label(title: Option<&str>, index: usize, active: bool, unread: bool) -> S
     if active { format!(" {label} ") } else { label }
 }
 
+/// A dot per other member on the tab: a separator space, then one cell each.
+///
+/// Measured by `tab_label_rects` and drawn by the renderer from this one function, so a
+/// tab's click target can never drift from what is on screen.
+fn tab_presence_width(watchers: usize) -> u16 {
+    match u16::try_from(watchers) {
+        Ok(0) => 0,
+        Ok(watchers) => watchers.saturating_add(1),
+        Err(_) => 0,
+    }
+}
+
+const PRESENCE_WATCHING: &str = "●";
+
 #[allow(clippy::too_many_arguments)]
 fn pane_title(
     custom_title: Option<&str>,
@@ -3177,6 +3209,15 @@ fn render_shared_multi_pane(
                     })
                     .bg(theme.footer_background)
             };
+            let label_rect = geometry.tab_labels[&tab.tab_id];
+            if label_rect.width == 0 {
+                continue;
+            }
+            // Dots first: they are the whole point of glancing at a tab you are not on,
+            // so when the bar runs out of room the tab name gives way, not the presence.
+            let watchers = tui.tab_watchers(tab.tab_id);
+            let presence_width = tab_presence_width(watchers.len()).min(label_rect.width);
+            let name_width = label_rect.width.saturating_sub(presence_width);
             let label = truncate_trailing(
                 &tab_label(
                     tab.title.as_deref(),
@@ -3184,20 +3225,31 @@ fn render_shared_multi_pane(
                     active,
                     tui.tab_has_unread_agent_pane(tab),
                 ),
-                usize::from(geometry.tab_labels[&tab.tab_id].width),
+                usize::from(name_width),
             );
-            let label_rect = geometry.tab_labels[&tab.tab_id];
-            if label_rect.width == 0 {
-                continue;
-            }
-            buffer.set_stringn(
+            let (mut cursor, _) = buffer.set_stringn(
                 label_rect.x,
                 label_rect.y,
                 &label,
-                usize::from(label_rect.width),
+                usize::from(name_width),
                 style,
             );
-            x = x.saturating_add(text_width(&label));
+            if presence_width > 0 {
+                cursor = buffer.set_stringn(cursor, label_rect.y, " ", 1, style).0;
+                for watcher in watchers
+                    .iter()
+                    .take(usize::from(presence_width.saturating_sub(1)))
+                {
+                    let color = member_color(&watcher.peer_id, &tui.snapshot.members, theme)
+                        .unwrap_or(theme.tab_foreground);
+                    cursor = buffer
+                        .set_stringn(cursor, label_rect.y, PRESENCE_WATCHING, 1, style.fg(color))
+                        .0;
+                }
+            }
+            x = x
+                .saturating_add(text_width(&label))
+                .saturating_add(presence_width);
         }
         // `direct 35ms` / `relayed 120ms ×3`, right-aligned. Lives in the tab bar rather
         // than the footer because the footer is transient -- chords, copy feedback and
@@ -7338,16 +7390,16 @@ mod tests {
     use super::{
         AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterMouseInput,
         FooterSegment, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
-        LayoutControlEvent, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState,
-        PendingEscape, RemoteInput, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
-        chord_footer_badge, contextual_footer, copied_line_count, encode_key, encode_mouse,
-        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command, is_chord_navigation,
-        lease_allows_held_input, member_color, member_initial, member_label, mouse_to_screen_cell,
-        pane_border_color, pane_title, pane_wire_id, reconcile_remote_control_attempt,
-        remote_input_decision, render_guest_screen, render_multi_pane,
-        render_multi_pane_with_copy_feedback, render_shared_multi_pane, selection_text, text_width,
-        viewed_screen, visible_leaf_panes,
+        LayoutControlEvent, MultiPaneTui, PRESENCE_WATCHING, PaneMouseProtocol, PaneTextSelection,
+        PaneViewState, PendingEscape, RemoteInput, RemoteSubscriptionState, ScreenCell,
+        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview,
+        area_from_terminal_size, chord_footer_badge, contextual_footer, copied_line_count,
+        encode_key, encode_mouse, encode_paste, grid_for_pane, initial_root_pane_grid,
+        is_chord_command, is_chord_navigation, lease_allows_held_input, member_color,
+        member_initial, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
+        pane_wire_id, reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
+        render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
+        selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
     fn mouse_protocol(
@@ -11385,6 +11437,120 @@ mod tests {
         let footer = terminal.backend().buffer();
         assert_eq!(footer[(0, 3)].bg, theme.footer_background);
         assert_eq!(footer[(0, 3)].fg, theme.footer_orange);
+    }
+
+    fn two_tab_presence_tui() -> MultiPaneTui {
+        let mut snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 10,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 20,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        );
+        snapshot.members.push(crate::layout::Member {
+            peer_id: b"tis".to_vec(),
+            endpoint_addr: b"endpoint-tis".to_vec(),
+            display_name: "tis".into(),
+        });
+        MultiPaneTui::new(snapshot).expect("valid layout")
+    }
+
+    #[test]
+    fn a_tab_shows_a_colored_dot_per_other_member_on_it() {
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(
+            tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2 ●"),
+            "the dot belongs to the tab that member is on: {tab_bar:?}"
+        );
+        let dots = (0..40)
+            .filter(|x| buffer[(*x, 0)].symbol() == PRESENCE_WATCHING)
+            .collect::<Vec<u16>>();
+        assert_eq!(dots.len(), 1, "one member on one tab draws one dot");
+        assert_eq!(
+            buffer[(dots[0], 0)].fg,
+            UiTheme::default().member_colors[1],
+            "a member's dot uses their own slot color"
+        );
+    }
+
+    #[test]
+    fn presence_dots_stay_inside_the_tabs_click_target() {
+        // The tab bar measures click targets from tab_label_rects and draws from the
+        // render path. If the dots were added to only one of them, every tab click after
+        // a member moved would land on the wrong tab.
+        let mut tui = two_tab_presence_tui();
+        let area = Rect::new(0, 0, 40, 4);
+        let before = tui.geometry(area).tab_labels[&20];
+
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 10,
+            pane_id: 1,
+        }]));
+        let after = tui.geometry(area).tab_labels[&20];
+
+        assert_eq!(
+            after.x,
+            before.x.saturating_add(2),
+            "a dot on tab one shifts tab two's click target by the space plus the dot"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let drawn = (after.x..after.right())
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert_eq!(
+            drawn, "Tab #2",
+            "the click target has to cover exactly the label that was drawn"
+        );
+    }
+
+    #[test]
+    fn a_tab_too_narrow_for_both_keeps_the_dot_and_drops_the_name() {
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+        // Wide enough for the brand and the active tab, and then almost nothing.
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..24).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(
+            tab_bar.contains('●'),
+            "presence outranks the tab name when the bar runs out of room: {tab_bar:?}"
+        );
     }
 
     #[test]
