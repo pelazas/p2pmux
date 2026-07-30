@@ -3,8 +3,8 @@ use p2pmux::{
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, MarkPaneExited,
-        NewPanePosition, PaneFailed, PaneGrid, PaneReady, SetPaneLock, SetSplitRatio, SplitAxis,
-        UpdatePaneGrids,
+        NewPanePosition, PaneFailed, PaneGrid, PaneReady, Presence, SetPaneLock, SetSplitRatio,
+        SplitAxis, UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
 };
@@ -242,6 +242,104 @@ fn admission_advances_revision_and_publishes_the_member_endpoint() {
     let state = commit.commit.state.expect("state present");
     assert!(state.members.iter().any(|member| member.peer_id == host_b()
         && member.endpoint_addr == serde_json::to_vec(&addr_b()).unwrap()));
+}
+
+fn presence(peer_id: Vec<u8>, generation: u64, tab_id: u64, pane_id: u64) -> Presence {
+    Presence {
+        peer_id,
+        generation,
+        tab_id,
+        pane_id,
+        attached: true,
+    }
+}
+
+#[test]
+fn presence_is_keyed_by_the_authenticated_peer_and_ignores_stale_generations() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("guest admitted");
+
+    // The claimed peer id never wins: a member cannot move somebody else's marker.
+    let accepted = coordinator
+        .accept_presence(&host_b(), presence(host_a(), 1, 1, 1))
+        .expect("presence accepted");
+    assert_eq!(accepted.peer_id, host_b());
+    assert_eq!(coordinator.presence(), vec![accepted.clone()]);
+    assert_eq!(coordinator.presence_epoch(), 1);
+
+    // A replayed or reordered update is dropped, and costs no epoch.
+    assert_eq!(
+        coordinator.accept_presence(&host_b(), presence(host_b(), 1, 2, 2)),
+        None
+    );
+    assert_eq!(coordinator.presence(), vec![accepted]);
+    assert_eq!(coordinator.presence_epoch(), 1);
+
+    let moved = coordinator
+        .accept_presence(&host_b(), presence(host_b(), 2, 2, 2))
+        .expect("newer generation accepted");
+    assert_eq!((moved.tab_id, moved.pane_id), (2, 2));
+    assert_eq!(coordinator.presence_epoch(), 2);
+}
+
+#[test]
+fn presence_from_a_stranger_is_refused() {
+    let mut coordinator = coordinator();
+
+    assert_eq!(
+        coordinator.accept_presence(&host_b(), presence(host_b(), 1, 1, 1)),
+        None
+    );
+    assert!(coordinator.presence().is_empty());
+    assert_eq!(coordinator.presence_epoch(), 0);
+}
+
+#[test]
+fn detaching_clears_a_location_and_departure_drops_the_member() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("guest admitted");
+    coordinator
+        .accept_presence(&host_b(), presence(host_b(), 1, 1, 1))
+        .expect("presence accepted");
+
+    // A detached member is looking at nothing, whatever location they sent.
+    let detached = coordinator
+        .accept_presence(
+            &host_b(),
+            Presence {
+                attached: false,
+                ..presence(host_b(), 2, 1, 1)
+            },
+        )
+        .expect("detach accepted");
+    assert_eq!((detached.tab_id, detached.pane_id), (0, 0));
+
+    let epoch = coordinator.presence_epoch();
+    coordinator.remove_member(&host_b()).expect("guest removed");
+    assert!(coordinator.presence().is_empty());
+    assert!(
+        coordinator.presence_epoch() > epoch,
+        "a departure has to reach the coordinator's own renderer"
+    );
+}
+
+#[test]
+fn presence_survives_the_pane_it_points_at_being_deleted() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("guest admitted");
+
+    // Focusing a pane in the same breath somebody deletes it must not strand the
+    // member: the location simply draws nothing until their next update.
+    let accepted = coordinator
+        .accept_presence(&host_b(), presence(host_b(), 1, 99, 99))
+        .expect("unknown location accepted");
+    assert_eq!((accepted.tab_id, accepted.pane_id), (99, 99));
 }
 
 #[test]

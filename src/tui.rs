@@ -63,7 +63,7 @@ use crate::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutRequest, MAX_AGENT_CWD_BYTES, MarkPaneExited,
         NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
-        RenamePane, RenameTab, SetPaneLock, SplitAxis,
+        Presence, PresenceRoster, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame, SyncGate},
@@ -562,6 +562,7 @@ pub struct MultiPaneTui {
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
+    presence: Vec<crate::local_ipc::PresenceRow>,
     prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
     /// Start of the working interval last seen for a pane. An idle row carries the `0`
     /// sentinel, so the episode a completion refers to has to be remembered while it runs.
@@ -616,6 +617,7 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
+            presence: Vec::new(),
             prior_agent_states: BTreeMap::new(),
             prior_agent_episodes: BTreeMap::new(),
             notified_agent_episodes: BTreeMap::new(),
@@ -667,6 +669,46 @@ impl MultiPaneTui {
             self.modal,
             ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. } | ModalState::Share
         )
+    }
+
+    /// Replace where the other members are looking. Returns whether anything moved, so a
+    /// presence update that changes nothing never costs a repaint.
+    pub fn set_presence(&mut self, presence: Vec<crate::local_ipc::PresenceRow>) -> bool {
+        if self.presence == presence {
+            return false;
+        }
+        self.presence = presence;
+        true
+    }
+
+    /// The other members watching a pane, in member-list order so chips never reshuffle.
+    fn pane_watchers(&self, pane_id: PaneId) -> Vec<&crate::local_ipc::PresenceRow> {
+        let mut watchers = self
+            .presence
+            .iter()
+            .filter(|row| row.pane_id == pane_id)
+            .collect::<Vec<_>>();
+        watchers.sort_by_key(|row| self.member_slot(&row.peer_id));
+        watchers
+    }
+
+    fn member_slot(&self, peer_id: &[u8]) -> usize {
+        self.snapshot
+            .members
+            .iter()
+            .position(|member| member.peer_id == peer_id)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The other members on a tab, in member-list order so the dots never reshuffle.
+    fn tab_watchers(&self, tab_id: TabId) -> Vec<&crate::local_ipc::PresenceRow> {
+        let mut watchers = self
+            .presence
+            .iter()
+            .filter(|row| row.tab_id == tab_id)
+            .collect::<Vec<_>>();
+        watchers.sort_by_key(|row| self.member_slot(&row.peer_id));
+        watchers
     }
 
     pub fn share_open(&self) -> bool {
@@ -1318,7 +1360,8 @@ impl MultiPaneTui {
                     index + 1,
                     tab.tab_id == self.current_tab,
                     self.tab_has_unread_agent_pane(tab),
-                ));
+                ))
+                .saturating_add(tab_presence_width(self.tab_watchers(tab.tab_id).len()));
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
@@ -2283,6 +2326,67 @@ fn tab_label(title: Option<&str>, index: usize, active: bool, unread: bool) -> S
     if active { format!(" {label} ") } else { label }
 }
 
+/// A dot per other member on the tab: a separator space, then one cell each.
+///
+/// Measured by `tab_label_rects` and drawn by the renderer from this one function, so a
+/// tab's click target can never drift from what is on screen.
+fn tab_presence_width(watchers: usize) -> u16 {
+    match u16::try_from(watchers) {
+        Ok(0) => 0,
+        Ok(watchers) => watchers.saturating_add(1),
+        Err(_) => 0,
+    }
+}
+
+const PRESENCE_WATCHING: &str = "●";
+
+/// Right-aligned chips for the members watching a pane, one initial each.
+///
+/// This lives on the bottom border because the top one is already carrying
+/// `host: … control: …` and a right-aligned `(locked by …)` badge. The border color is
+/// left alone: it encodes focus and control state, one pane can have several watchers,
+/// and recoloring it per member would make watching look like controlling.
+///
+/// The member holding the control lease is drawn reversed rather than in a second glyph,
+/// so "someone is watching" and "someone can type here" differ without costing a column.
+fn pane_presence_chips(
+    watchers: &[&crate::local_ipc::PresenceRow],
+    controller_peer_id: Option<&[u8]>,
+    members: &[crate::layout::Member],
+    theme: &UiTheme,
+    available_width: usize,
+) -> Option<Line<'static>> {
+    if watchers.is_empty() || available_width < 3 {
+        return None;
+    }
+    let mut spans = Vec::new();
+    let mut width = 0;
+    for watcher in watchers {
+        if width + 2 > available_width.saturating_sub(1) {
+            break;
+        }
+        let color = member_color(&watcher.peer_id, members, theme).unwrap_or(theme.footer_muted);
+        let controlling =
+            controller_peer_id.is_some_and(|controller| controller == watcher.peer_id);
+        let style = if controlling {
+            Style::default().fg(theme.footer_background).bg(color)
+        } else {
+            Style::default().fg(color)
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            member_initial(&watcher.peer_id, members).to_string(),
+            style,
+        ));
+        width += 2;
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    spans.push(Span::raw(" "));
+    Some(Line::from(spans).alignment(Alignment::Right))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pane_title(
     custom_title: Option<&str>,
@@ -3183,6 +3287,15 @@ fn render_shared_multi_pane(
                     })
                     .bg(theme.footer_background)
             };
+            let label_rect = geometry.tab_labels[&tab.tab_id];
+            if label_rect.width == 0 {
+                continue;
+            }
+            // Dots first: they are the whole point of glancing at a tab you are not on,
+            // so when the bar runs out of room the tab name gives way, not the presence.
+            let watchers = tui.tab_watchers(tab.tab_id);
+            let presence_width = tab_presence_width(watchers.len()).min(label_rect.width);
+            let name_width = label_rect.width.saturating_sub(presence_width);
             let label = truncate_trailing(
                 &tab_label(
                     tab.title.as_deref(),
@@ -3190,20 +3303,31 @@ fn render_shared_multi_pane(
                     active,
                     tui.tab_has_unread_agent_pane(tab),
                 ),
-                usize::from(geometry.tab_labels[&tab.tab_id].width),
+                usize::from(name_width),
             );
-            let label_rect = geometry.tab_labels[&tab.tab_id];
-            if label_rect.width == 0 {
-                continue;
-            }
-            buffer.set_stringn(
+            let (mut cursor, _) = buffer.set_stringn(
                 label_rect.x,
                 label_rect.y,
                 &label,
-                usize::from(label_rect.width),
+                usize::from(name_width),
                 style,
             );
-            x = x.saturating_add(text_width(&label));
+            if presence_width > 0 {
+                cursor = buffer.set_stringn(cursor, label_rect.y, " ", 1, style).0;
+                for watcher in watchers
+                    .iter()
+                    .take(usize::from(presence_width.saturating_sub(1)))
+                {
+                    let color = member_color(&watcher.peer_id, &tui.snapshot.members, theme)
+                        .unwrap_or(theme.tab_foreground);
+                    cursor = buffer
+                        .set_stringn(cursor, label_rect.y, PRESENCE_WATCHING, 1, style.fg(color))
+                        .0;
+                }
+            }
+            x = x
+                .saturating_add(text_width(&label))
+                .saturating_add(presence_width);
         }
         // `direct 35ms` / `relayed 120ms ×3`, right-aligned. Lives in the tab bar rather
         // than the footer because the footer is transient -- chords, copy feedback and
@@ -3301,6 +3425,15 @@ fn render_shared_multi_pane(
                 Line::from(truncate_trailing(&badge, badge_width)).alignment(Alignment::Right),
             );
         }
+        if let Some(chips) = pane_presence_chips(
+            &tui.pane_watchers(pane_id),
+            view.controller_peer_id.as_deref(),
+            &tui.snapshot.members,
+            theme,
+            title_width,
+        ) {
+            block = block.title_bottom(chips);
+        }
         let content = pane_content_rect(rect);
         frame.render_widget(block, rect);
         // The fixed VT grid may be smaller than this pane after layout reflow. Clear the full
@@ -3368,16 +3501,19 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
         .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
     let content = agents_overlay_content(area);
     frame.render_widget(block, panel);
+    // The overlay is already the place you look to answer "what is happening in this
+    // session". Who is here and where belongs in the same glance, above the agents.
+    let members = presence_overlay_lines(tui);
     if tui.agent_rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "No agents running",
-                Style::default().fg(tui.theme.agent_overlay_muted),
-            )),
-            content,
-        );
+        let mut lines = members;
+        lines.push(Line::styled(
+            "No agents running",
+            Style::default().fg(tui.theme.agent_overlay_muted),
+        ));
+        frame.render_widget(Paragraph::new(lines), content);
     } else {
-        let mut lines = Vec::with_capacity(tui.agent_rows.len().saturating_mul(3));
+        let mut lines = members;
+        lines.reserve(tui.agent_rows.len().saturating_mul(3));
         let animation_phase = agent_overlay_animation_phase(now_unix_ms);
         for (index, row) in tui.agent_rows.iter().enumerate() {
             lines.extend(format_agent_overlay_card(
@@ -3403,6 +3539,50 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
         );
     }
     render_agents_overlay_help(frame.buffer_mut(), &tui.theme, agents_overlay_help(area));
+}
+
+/// One line per other member: their dot, their name, and where they are.
+///
+/// Empty in a solo session, so a single-player overlay gains no header for nobody. The
+/// tab and pane ordinals come from the same lookup the agent rows use, so a member on a
+/// pane this client cannot resolve is reported honestly rather than placed at a guess.
+fn presence_overlay_lines(tui: &MultiPaneTui) -> Vec<Line<'static>> {
+    let watchers = tui.presence.iter().collect::<Vec<_>>();
+    if watchers.is_empty() {
+        return Vec::new();
+    }
+    let mut watchers = watchers;
+    watchers.sort_by_key(|row| tui.member_slot(&row.peer_id));
+    let mut lines = vec![Line::styled(
+        "Members",
+        Style::default()
+            .fg(tui.theme.agent_overlay_muted)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for row in watchers {
+        let color = member_color(&row.peer_id, &tui.snapshot.members, &tui.theme)
+            .unwrap_or(tui.theme.agent_overlay_muted);
+        let location = match tui.pane_location(row.pane_id) {
+            Some((tab_ordinal, pane_ordinal)) => {
+                format!("Tab {tab_ordinal} · Pane {pane_ordinal}")
+            }
+            None => String::from("elsewhere"),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(PRESENCE_WATCHING, Style::default().fg(color)),
+            Span::raw(" "),
+            Span::styled(
+                sanitize_single_line(&member_label(&row.peer_id, &tui.snapshot.members)),
+                Style::default().fg(tui.theme.agent_overlay_foreground),
+            ),
+            Span::styled(
+                format!(" · {location}"),
+                Style::default().fg(tui.theme.agent_overlay_muted),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines
 }
 
 fn agents_overlay_panel(area: Rect) -> Rect {
@@ -4641,21 +4821,47 @@ impl SharedControl {
         }
     }
 
-    fn try_event(&mut self, current_revision: u64) -> Option<LayoutControlEvent> {
+    /// Publishes this member's focus. The coordinator applies it locally and gets the
+    /// resulting full roster back; a member has to wait for the broadcast.
+    fn try_presence(&self, presence: Presence) -> Result<Option<PresenceRoster>, String> {
+        match self {
+            Self::Host(host) => host
+                .publish_local_presence(presence)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_presence(presence)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    fn try_event(
+        &mut self,
+        current_revision: u64,
+        seen_presence_epoch: &mut u64,
+    ) -> Option<LayoutControlEvent> {
         match self {
             // The coordinator is the authority, so it does not receive its own broadcasts. Poll
             // its tiny in-memory snapshot to observe joins, departures, and member-originated
             // commits without adding a second internal control stream.
-            Self::Host(host) => host
-                .session_snapshot()
-                .ok()
-                .filter(|snapshot| {
-                    snapshot
-                        .state
-                        .as_ref()
-                        .is_some_and(|state| state.revision > current_revision)
-                })
-                .map(LayoutControlEvent::Snapshot),
+            Self::Host(host) => {
+                // Presence has its own counter because it deliberately does not touch the
+                // layout revision: focus changes are frequent, and bumping the revision
+                // for one would reject every in-flight layout request as stale.
+                if let Some((epoch, roster)) = host.presence_if_newer(*seen_presence_epoch) {
+                    *seen_presence_epoch = epoch;
+                    return Some(LayoutControlEvent::Presence(roster));
+                }
+                host.session_snapshot()
+                    .ok()
+                    .filter(|snapshot| {
+                        snapshot
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.revision > current_revision)
+                    })
+                    .map(LayoutControlEvent::Snapshot)
+            }
             Self::Member(member) => member.events.try_recv().ok(),
         }
     }
@@ -4780,6 +4986,10 @@ pub struct SharedLayoutRuntime {
     last_local_agent_entries: Vec<AgentRosterEntry>,
     next_agent_roster_heartbeat: Instant,
     last_agent_overlay_animation: Instant,
+    presence_generation: u64,
+    last_local_presence: Option<Presence>,
+    seen_presence_epoch: u64,
+    presence: Vec<Presence>,
 }
 
 impl SharedLayoutRuntime {
@@ -4892,6 +5102,10 @@ impl SharedLayoutRuntime {
             last_local_agent_entries: Vec::new(),
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
+            presence_generation: 0,
+            last_local_presence: None,
+            seen_presence_epoch: 0,
+            presence: Vec::new(),
         };
         value.refresh_local_views();
         Ok(value)
@@ -5079,6 +5293,7 @@ impl SharedLayoutRuntime {
         self.tui
             .set_focus(tab_id, pane_id)
             .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))?;
+        self.maybe_publish_presence();
         self.release_blurred_pane(previous)
     }
 
@@ -5459,10 +5674,15 @@ impl SharedLayoutRuntime {
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = false;
         self.retry_tick = self.retry_tick.saturating_add(1);
-        while let Some(event) = self.control.try_event(self.tui.snapshot().revision) {
+        let mut seen_presence_epoch = self.seen_presence_epoch;
+        while let Some(event) = self
+            .control
+            .try_event(self.tui.snapshot().revision, &mut seen_presence_epoch)
+        {
             self.handle_control_event(event)?;
             changed = true;
         }
+        self.seen_presence_epoch = seen_presence_epoch;
         while let Ok((pane_id, result)) = self.subscription_rx.try_recv() {
             match result {
                 Ok(pane) => {
@@ -5507,6 +5727,9 @@ impl SharedLayoutRuntime {
             });
         }
         changed |= self.publish_local_agent_roster();
+        // Cheap: returns immediately unless the focused pane actually moved since the last
+        // drain, and a keypress cannot move focus more than once per drain.
+        changed |= self.maybe_publish_presence();
         let disconnected = self
             .remote
             .iter_mut()
@@ -5578,6 +5801,52 @@ impl SharedLayoutRuntime {
 
     fn refresh_agent_rows(&mut self) -> bool {
         self.tui.set_agent_rows(self.agent_overlay_rows())
+    }
+
+    /// Tell the session where this member is now looking, if it moved.
+    ///
+    /// Called after anything that can change focus. There is no heartbeat and no timer:
+    /// a human moving is the only thing that produces traffic here, so an idle session
+    /// costs nothing.
+    fn maybe_publish_presence(&mut self) -> bool {
+        let presence = Presence {
+            peer_id: self.control.peer_id(),
+            generation: self.presence_generation.saturating_add(1),
+            tab_id: self.tui.current_tab(),
+            pane_id: self.tui.focused_pane(),
+            attached: true,
+        };
+        if self
+            .last_local_presence
+            .as_ref()
+            .is_some_and(|last| last.tab_id == presence.tab_id && last.pane_id == presence.pane_id)
+        {
+            return false;
+        }
+        match self.control.try_presence(presence.clone()) {
+            // The coordinator never receives its own broadcast, so it applies the roster
+            // its own update produced rather than waiting for one to come back.
+            Ok(Some(roster)) => self.presence = roster.entries,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        self.presence_generation = presence.generation;
+        self.last_local_presence = Some(presence);
+        true
+    }
+
+    /// Presence of every member other than this one, ready for the renderer.
+    pub fn presence_rows(&self) -> Vec<crate::local_ipc::PresenceRow> {
+        let local_peer_id = self.control.peer_id();
+        self.presence
+            .iter()
+            .filter(|entry| entry.attached && entry.peer_id != local_peer_id)
+            .map(|entry| crate::local_ipc::PresenceRow {
+                peer_id: entry.peer_id.clone(),
+                tab_id: entry.tab_id,
+                pane_id: entry.pane_id,
+            })
+            .collect()
     }
 
     pub fn agent_overlay_rows(&self) -> Vec<AgentOverlayRow> {
@@ -5655,6 +5924,7 @@ impl SharedLayoutRuntime {
                 self.agent_rosters
                     .insert(roster.host_peer_id.clone(), roster);
             }
+            LayoutControlEvent::Presence(roster) => self.presence = roster.entries,
             LayoutControlEvent::Commit(commit) => {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }
@@ -7320,6 +7590,41 @@ fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
     }
 }
 
+/// The color identifying a member everywhere presence is drawn.
+///
+/// The slot is the member's position in the authoritative member list, which every
+/// client receives at the same revision, so all of them agree on who is which color
+/// without a wire field to carry it. The cost is that slots shift when a member
+/// leaves; the initial from [`member_initial`] rides alongside every color so an
+/// identity is only ever recolored, never lost.
+pub fn member_color(
+    peer_id: &[u8],
+    members: &[crate::layout::Member],
+    theme: &UiTheme,
+) -> Option<Color> {
+    let slot = members
+        .iter()
+        .position(|member| member.peer_id == peer_id)?;
+    Some(theme.member_colors[slot % theme.member_colors.len()])
+}
+
+/// The one-character stand-in for a member, for terminals and eyes that cannot separate
+/// eight hues. Falls back to the peer id when a display name is missing or unprintable.
+pub fn member_initial(peer_id: &[u8], members: &[crate::layout::Member]) -> char {
+    members
+        .iter()
+        .find(|member| member.peer_id == peer_id)
+        .and_then(|member| {
+            member
+                .display_name
+                .chars()
+                .find(|character| character.is_alphanumeric())
+        })
+        .or_else(|| short_peer(peer_id).chars().next())
+        .map(|character| character.to_ascii_uppercase())
+        .unwrap_or('?')
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7356,16 +7661,17 @@ mod tests {
     use super::{
         AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterSegment,
         HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
-        MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState, PendingEscape,
-        RemoteInput, RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView,
+        MultiPaneTui, PRESENCE_WATCHING, PaneMouseProtocol, PaneTextSelection, PaneViewState,
+        PendingEscape, RemoteInput, RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview,
         area_from_terminal_size, chord_footer_badge, contextual_footer, copied_line_count,
         encode_key, encode_mouse, encode_paste, grid_for_pane, initial_root_pane_grid,
-        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
-        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
-        reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
-        render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
-        selection_text, text_width, viewed_screen, visible_leaf_panes,
+        is_chord_command, is_chord_navigation, lease_allows_held_input, member_color,
+        member_initial, member_label, mouse_to_screen_cell, pane_border_color, pane_presence_chips,
+        pane_title, pane_wire_id, presence_overlay_lines, reconcile_remote_control_attempt,
+        remote_input_decision, render_guest_screen, render_multi_pane,
+        render_multi_pane_with_copy_feedback, render_shared_multi_pane, selection_text, text_width,
+        viewed_screen, visible_leaf_panes,
     };
 
     fn mouse_protocol(
@@ -8506,7 +8812,10 @@ mod tests {
             .host
             .write_input(format!("cd -- {}\n", directory.display()).as_bytes())
             .expect("change source PTY directory");
-        let source_cwd = (0..20).find_map(|_| {
+        // A real shell has to boot and process the `cd` before its cwd moves. Half a
+        // second is enough on an idle Mac and not enough on a loaded CI runner, which
+        // made this fail for reasons that had nothing to do with pane lifecycle.
+        let source_cwd = (0..200).find_map(|_| {
             let cwd = cwd_for_pid(source_pid);
             if cwd
                 .as_ref()
@@ -11165,6 +11474,300 @@ mod tests {
         assert_eq!(footer[(0, 3)].fg, theme.footer_orange);
     }
 
+    fn two_tab_presence_tui() -> MultiPaneTui {
+        let mut snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 10,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 20,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        );
+        snapshot.members.push(crate::layout::Member {
+            peer_id: b"tis".to_vec(),
+            endpoint_addr: b"endpoint-tis".to_vec(),
+            display_name: "tis".into(),
+        });
+        MultiPaneTui::new(snapshot).expect("valid layout")
+    }
+
+    #[test]
+    fn a_tab_shows_a_colored_dot_per_other_member_on_it() {
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(
+            tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2 ●"),
+            "the dot belongs to the tab that member is on: {tab_bar:?}"
+        );
+        let dots = (0..40)
+            .filter(|x| buffer[(*x, 0)].symbol() == PRESENCE_WATCHING)
+            .collect::<Vec<u16>>();
+        assert_eq!(dots.len(), 1, "one member on one tab draws one dot");
+        assert_eq!(
+            buffer[(dots[0], 0)].fg,
+            UiTheme::default().member_colors[1],
+            "a member's dot uses their own slot color"
+        );
+    }
+
+    #[test]
+    fn presence_dots_stay_inside_the_tabs_click_target() {
+        // The tab bar measures click targets from tab_label_rects and draws from the
+        // render path. If the dots were added to only one of them, every tab click after
+        // a member moved would land on the wrong tab.
+        let mut tui = two_tab_presence_tui();
+        let area = Rect::new(0, 0, 40, 4);
+        let before = tui.geometry(area).tab_labels[&20];
+
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 10,
+            pane_id: 1,
+        }]));
+        let after = tui.geometry(area).tab_labels[&20];
+
+        assert_eq!(
+            after.x,
+            before.x.saturating_add(2),
+            "a dot on tab one shifts tab two's click target by the space plus the dot"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let drawn = (after.x..after.right())
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert_eq!(
+            drawn, "Tab #2",
+            "the click target has to cover exactly the label that was drawn"
+        );
+    }
+
+    #[test]
+    fn a_tab_too_narrow_for_both_keeps_the_dot_and_drops_the_name() {
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+        // Wide enough for the brand and the active tab, and then almost nothing.
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..24).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+
+        assert!(
+            tab_bar.contains('●'),
+            "presence outranks the tab name when the bar runs out of room: {tab_bar:?}"
+        );
+    }
+
+    fn watcher(peer_id: &[u8], tab_id: u64, pane_id: u64) -> crate::local_ipc::PresenceRow {
+        crate::local_ipc::PresenceRow {
+            peer_id: peer_id.to_vec(),
+            tab_id,
+            pane_id,
+        }
+    }
+
+    fn named_members() -> Vec<crate::layout::Member> {
+        vec![
+            crate::layout::Member {
+                peer_id: b"host".to_vec(),
+                endpoint_addr: b"endpoint".to_vec(),
+                display_name: "pelazas".into(),
+            },
+            crate::layout::Member {
+                peer_id: b"tis".to_vec(),
+                endpoint_addr: b"endpoint-tis".to_vec(),
+                display_name: "tis".into(),
+            },
+            crate::layout::Member {
+                peer_id: b"ana".to_vec(),
+                endpoint_addr: b"endpoint-ana".to_vec(),
+                display_name: "ana".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn pane_chips_mark_the_controller_apart_from_plain_watchers() {
+        let theme = UiTheme::default();
+        let members = named_members();
+        let rows = [watcher(b"tis", 1, 1), watcher(b"ana", 1, 1)];
+        let watchers = rows.iter().collect::<Vec<_>>();
+
+        let chips = pane_presence_chips(&watchers, Some(b"ana"), &members, &theme, 40)
+            .expect("two watchers draw chips");
+        let initials = chips
+            .spans
+            .iter()
+            .filter(|span| span.content.trim() != "")
+            .collect::<Vec<_>>();
+
+        assert_eq!(initials.len(), 2);
+        assert_eq!(initials[0].content, "T");
+        assert_eq!(initials[1].content, "A");
+        // Watching is foreground-only; holding the lease reverses the chip. Nothing here
+        // may borrow the alert color that means "this pane is under remote control".
+        assert_eq!(initials[0].style.fg, Some(theme.member_colors[1]));
+        assert_eq!(initials[0].style.bg, None);
+        assert_eq!(initials[1].style.bg, Some(theme.member_colors[2]));
+        assert_ne!(initials[1].style.bg, Some(theme.pane_border_remote_control));
+    }
+
+    #[test]
+    fn pane_chips_stand_down_when_the_pane_is_too_narrow() {
+        let theme = UiTheme::default();
+        let members = named_members();
+        let rows = [watcher(b"tis", 1, 1), watcher(b"ana", 1, 1)];
+        let watchers = rows.iter().collect::<Vec<_>>();
+
+        assert!(pane_presence_chips(&watchers, None, &members, &theme, 2).is_none());
+        let cramped = pane_presence_chips(&watchers, None, &members, &theme, 4)
+            .expect("a narrow pane still shows who it can");
+        assert_eq!(
+            cramped
+                .spans
+                .iter()
+                .filter(|span| span.content.trim() != "")
+                .count(),
+            1,
+            "chips are dropped from the end rather than overflowing the border"
+        );
+    }
+
+    #[test]
+    fn the_overlay_lists_who_is_here_and_where() {
+        let mut snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        );
+        snapshot.members = named_members();
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+
+        assert!(
+            presence_overlay_lines(&tui).is_empty(),
+            "a solo session gains no header for nobody"
+        );
+
+        assert!(tui.set_presence(vec![watcher(b"tis", 2, 2), watcher(b"ana", 1, 404)]));
+        let lines = presence_overlay_lines(&tui);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "Members");
+        assert_eq!(rendered[1], "● tis · Tab 2 · Pane 1");
+        assert_eq!(
+            rendered[2], "● ana · elsewhere",
+            "a pane this client cannot resolve is reported, not guessed at"
+        );
+        assert_eq!(
+            rendered[3], "",
+            "the agents below get their own breathing room"
+        );
+    }
+
+    #[test]
+    fn watcher_chips_reach_the_pane_bottom_border() {
+        let mut snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 4, 20)],
+        );
+        snapshot.members = named_members();
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        assert!(tui.set_presence(vec![watcher(b"tis", 1, 1)]));
+        let mut terminal = Terminal::new(TestBackend::new(24, 8)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let bottom = buffer.area.bottom().saturating_sub(2);
+        let border = (0..24)
+            .map(|x| buffer[(x, bottom)].symbol())
+            .collect::<String>();
+
+        assert!(
+            border.contains('T'),
+            "the watcher's initial belongs on the bottom border: {border:?}"
+        );
+        let chip_x = (0..24)
+            .find(|x| buffer[(*x, bottom)].symbol() == "T")
+            .expect("chip column");
+        assert_eq!(
+            buffer[(chip_x, bottom)].fg,
+            UiTheme::default().member_colors[1]
+        );
+    }
+
+    #[test]
+    fn a_pane_border_keeps_its_meaning_when_somebody_watches_it() {
+        // Presence must not repaint the border: it encodes focus and control, and one
+        // pane can have several watchers that a single color could not express.
+        let theme = UiTheme::default();
+        let watched = pane_border_color(
+            &theme,
+            false,
+            Some(&[]),
+            false,
+            true,
+            false,
+            ChordMode::None,
+        );
+
+        assert_eq!(watched, theme.pane_border_free_focused);
+        assert_ne!(watched, theme.pane_border_remote_control);
+    }
+
     #[test]
     fn tab_bar_uses_a_branded_footer_like_strip_and_highlights_the_active_tab() {
         let mut tui = MultiPaneTui::new(layout(
@@ -11245,6 +11848,78 @@ mod tests {
             "sam · aabbccdd"
         );
         assert_eq!(member_label(&members[2].peer_id, &members), "pat");
+    }
+
+    fn presence_members(count: usize) -> Vec<crate::layout::Member> {
+        (0..count)
+            .map(|index| crate::layout::Member {
+                peer_id: vec![index as u8; 4],
+                endpoint_addr: vec![index as u8],
+                display_name: format!("member{index}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn member_colors_are_distinct_per_slot_and_agree_across_clients() {
+        let theme = UiTheme::default();
+        let members = presence_members(crate::config::MEMBER_COLOR_SLOTS);
+
+        let colors = members
+            .iter()
+            .map(|member| member_color(&member.peer_id, &members, &theme))
+            .collect::<Option<Vec<_>>>()
+            .expect("every member has a color");
+        for (slot, color) in colors.iter().enumerate() {
+            assert!(
+                !colors[..slot].contains(color),
+                "a full session must never show two members the same color"
+            );
+        }
+
+        // A second client holding the same authoritative member list derives the same
+        // colors: that agreement is what lets presence ship without a wire color field.
+        let mirrored = members.clone();
+        for member in &members {
+            assert_eq!(
+                member_color(&member.peer_id, &members, &theme),
+                member_color(&member.peer_id, &mirrored, &theme)
+            );
+        }
+    }
+
+    #[test]
+    fn member_colors_avoid_the_reserved_control_and_alert_colors() {
+        let theme = UiTheme::default();
+        for color in theme.member_colors {
+            assert_ne!(
+                color, theme.pane_border_remote_control,
+                "a member color must not read as an actively controlled pane"
+            );
+            assert_ne!(color, theme.tab_active_background);
+            assert_ne!(color, theme.footer_accent);
+        }
+    }
+
+    #[test]
+    fn member_color_is_none_for_a_departed_peer() {
+        let theme = UiTheme::default();
+        let members = presence_members(2);
+
+        assert_eq!(
+            member_color(&[0xff, 0xff, 0xff, 0xff], &members, &theme),
+            None
+        );
+    }
+
+    #[test]
+    fn member_initials_fall_back_to_the_peer_id() {
+        let mut members = presence_members(2);
+        members[1].display_name = "  ".into();
+
+        assert_eq!(member_initial(&members[0].peer_id, &members), 'M');
+        assert_eq!(member_initial(&members[1].peer_id, &members), '0');
+        assert_eq!(member_initial(&[0x9a], &members), '9');
     }
 
     #[test]
