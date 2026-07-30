@@ -5,6 +5,7 @@
 
 mod agents;
 pub(in crate::tui) mod keys;
+mod modal;
 mod mouse;
 mod scrollback;
 
