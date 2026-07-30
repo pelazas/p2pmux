@@ -3171,7 +3171,7 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::input::keys::{ESC_PREFIX_WINDOW, is_chord_command, is_chord_navigation};
-    use super::multi_pane::CHORD_IDLE_TIMEOUT;
+    use super::multi_pane::keys::CHORD_IDLE_TIMEOUT;
     use super::test_support::{agent_overlay_tui, agent_row, layout, mouse_protocol, split_layout};
     use super::{
         AGENT_TOGGLE_WINDOW, ChordMode, HostControlEvent, HostPaneChannels, HostPaneRuntime,
