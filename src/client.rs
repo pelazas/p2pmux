@@ -31,9 +31,9 @@ use crate::{
     screen::{ApplyDelta, GuestScreen},
     session_store::SessionDescriptor,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, FooterMouseInput, KeyHandling,
-        MultiPaneTui, PaneMouseProtocol, PaneViewState, copy_selection_to_clipboard,
-        render_multi_pane_with_copy_feedback,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
+        PaneMouseProtocol, PaneViewState, ShareView, copy_selection_to_clipboard,
+        render_multi_pane_with_copy_feedback, resolve_local_ticket, share_copy_result,
     },
 };
 
@@ -87,27 +87,6 @@ fn copy_attach_selection(
     };
     let text = tui.selected_text(viewport)?;
     copy_selection_to_clipboard(&text).ok()
-}
-
-/// Put the session's full join ticket on the clipboard, and say what the footer should report.
-///
-/// A client shares a Mac with its node, so it reads the same rendezvous record rather than
-/// having a bearer credential travel over the local socket for the sake of one keypress. Only a
-/// coordinator publishes a record, so a guest is told plainly that it has no invite to give.
-fn copy_join_ticket(join_code: Option<&str>) -> String {
-    let Some(code) = join_code else {
-        return String::from("only the session host has a ticket to copy");
-    };
-    let ticket = match crate::rendezvous::LocalRendezvous::for_current_user()
-        .and_then(|store| store.resolve(code))
-    {
-        Ok(ticket) => ticket,
-        Err(error) => return format!("ticket unavailable: {error}"),
-    };
-    match copy_selection_to_clipboard(&ticket.to_string()) {
-        Ok(_) => String::from("copied full ticket"),
-        Err(error) => format!("clipboard copy failed: {error}"),
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +153,10 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
     let mut join_code = None;
+    // Resolved once per snapshot rather than on every open: the record does not change while
+    // the node lives, and reading it is a filesystem hop.
+    let mut share_ticket: Option<String> = None;
+    let mut share_notice: Option<String> = None;
     let mut pending_wake = None;
     let mut next_perf_id = 1_u64;
     let mut draw_perf_id = None;
@@ -245,6 +228,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         }
                         local_peer_id = next_local_peer_id;
                         join_code = next_join_code;
+                        share_ticket = join_code.as_deref().and_then(resolve_local_ticket);
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
                         }
@@ -432,7 +416,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         &visible,
                         copied_lines,
                         footer_notice.as_deref(),
-                        join_code.as_deref(),
+                        ShareView {
+                            code: join_code.as_deref(),
+                            ticket: share_ticket.as_deref(),
+                            notice: share_notice.as_deref(),
+                        },
                         Some(&local_peer_id),
                         link_summary.as_deref(),
                     );
@@ -480,8 +468,16 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     KeyHandling::Consumed(intents) => {
                         send_intents(&mut stream, tui, intents, &mut pending_focus)?;
-                        if tui.take_ticket_copy_request() {
-                            footer_notice = Some(copy_join_ticket(join_code.as_deref()));
+                        if let Some(request) = tui.take_share_copy_request() {
+                            share_notice = Some(share_copy_result(
+                                request,
+                                share_ticket.as_deref(),
+                                join_code.as_deref(),
+                            ));
+                        }
+                        // The notice belongs to one visit to the modal, not to the session.
+                        if !tui.share_open() {
+                            share_notice = None;
                         }
                         dirty = true;
                     }
@@ -538,17 +534,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             matches!(mouse.kind, MouseEventKind::ScrollUp),
                         );
                     } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                        let handling = tui.handle_mouse(
-                            mouse,
-                            area,
-                            FooterMouseInput {
-                                copied_lines,
-                                footer_notice: footer_notice.as_deref(),
-                                join_code: join_code.as_deref(),
-                                ..FooterMouseInput::default()
-                            },
-                            PaneMouseProtocol::default(),
-                        );
+                        let handling = tui.handle_mouse(mouse, area, PaneMouseProtocol::default());
                         send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     }
                 } else if matches!(
@@ -560,9 +546,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     let protocol = focused_pane_mouse_protocol(tui, &screens, &local_peer_id);
                     let forwarded = protocol
                         .reports_mouse()
-                        .then(|| {
-                            tui.handle_mouse(mouse, area, FooterMouseInput::default(), protocol)
-                        })
+                        .then(|| tui.handle_mouse(mouse, area, protocol))
                         .and_then(|handling| handling.forward_bytes);
                     if let Some(bytes) = forwarded {
                         let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
@@ -610,12 +594,6 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     let handling = tui.handle_mouse(
                         mouse,
                         area,
-                        FooterMouseInput {
-                            copied_lines,
-                            footer_notice: footer_notice.as_deref(),
-                            join_code: join_code.as_deref(),
-                            ..FooterMouseInput::default()
-                        },
                         focused_pane_mouse_protocol(tui, &screens, &local_peer_id),
                     );
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -629,12 +607,6 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
                         copied_lines = copy_attach_selection(tui, &screens, &history);
-                    }
-                    if let Some(command) = handling.join_copy_command
-                        && copy_selection_to_clipboard(&command).is_ok()
-                    {
-                        copied_lines = None;
-                        footer_notice = Some(String::from("copied join command"));
                     }
                 }
                 dirty = true;
