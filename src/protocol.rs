@@ -113,7 +113,7 @@ pub struct Envelope {
     pub sender_peer_id: Vec<u8>,
     #[prost(
         oneof = "envelope::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -155,6 +155,8 @@ pub mod envelope {
         ReleaseControl(super::ReleaseControl),
         #[prost(message, tag = "26")]
         AgentRoster(super::AgentRoster),
+        #[prost(message, tag = "27")]
+        Presence(super::Presence),
     }
 }
 
@@ -623,6 +625,34 @@ impl AgentRosterState {
     }
 }
 
+/// Where one member is looking, so the others can see it.
+///
+/// This is deliberately the smallest thing that answers "where is everyone": the pane a
+/// member has focused and whether they are attached at all. It carries no timestamp,
+/// because nothing here decays -- the coordinator caches the latest one per member and
+/// replays it to joiners, so there is no periodic heartbeat to repair a lost update and
+/// no timer anywhere in the presence path.
+///
+/// Watching is not controlling. A member appears here the moment they focus a pane;
+/// whether they may type into it is the control lease's business, and only the lease
+/// paints the alert-colored border.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Presence {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    /// The focused tab and pane. Both are `0` when `attached` is false: a detached node
+    /// keeps its panes alive but its member is looking at nothing, and drawing them
+    /// somewhere would be a ghost.
+    #[prost(uint64, tag = "3")]
+    pub tab_id: u64,
+    #[prost(uint64, tag = "4")]
+    pub pane_id: u64,
+    #[prost(bool, tag = "5")]
+    pub attached: bool,
+}
+
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
     validate_envelope(envelope)?;
 
@@ -902,6 +932,9 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             validate_nonzero("pane_subscribe.pane_id", subscribe.pane_id)?;
         }
         envelope::Body::AgentRoster(roster) => validate_agent_roster(roster)?,
+        envelope::Body::Presence(presence) => {
+            validate_id("presence.peer_id", &presence.peer_id, MAX_PEER_ID_BYTES)?;
+        }
     }
 
     Ok(())

@@ -6,8 +6,9 @@ use p2pmux::protocol::{
     MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
     MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited, MemberDescriptor, NewPanePosition,
     PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation,
-    PaneSubscribe, ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
-    TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
+    PaneSubscribe, Presence, ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot,
+    SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame,
+    envelope,
 };
 use prost::Message;
 
@@ -431,6 +432,65 @@ fn agent_roster_uses_tag_26_and_round_trips() {
         decode_frame(&frame).expect("valid roster decodes"),
         original
     );
+}
+
+#[test]
+fn presence_uses_tag_27_and_round_trips() {
+    let original = envelope(envelope::Body::Presence(Presence {
+        peer_id: b"peer-a".to_vec(),
+        generation: 4,
+        tab_id: 2,
+        pane_id: 9,
+        attached: true,
+    }));
+    let wire = original.encode_to_vec();
+    assert_eq!(
+        field_shape(&parse_fields(&wire)),
+        vec![(1, 0), (2, 2), (27, 2)]
+    );
+    assert_eq!(Envelope::decode(wire.as_slice()).unwrap(), original);
+    let frame = encode_frame(&original).expect("valid presence encodes");
+    assert_eq!(
+        decode_frame(&frame).expect("valid presence decodes"),
+        original
+    );
+}
+
+#[test]
+fn detached_presence_round_trips_as_an_empty_location() {
+    // A detached member has no focus at all. The zero tab/pane is the wire's way of
+    // saying so, and prost elides both fields -- the whole update is a few bytes.
+    let original = envelope(envelope::Body::Presence(Presence {
+        peer_id: b"peer-a".to_vec(),
+        generation: 5,
+        tab_id: 0,
+        pane_id: 0,
+        attached: false,
+    }));
+    let frame = encode_frame(&original).expect("detached presence encodes");
+    assert_eq!(
+        decode_frame(&frame).expect("detached presence decodes"),
+        original
+    );
+}
+
+#[test]
+fn presence_rejects_an_oversized_peer_id() {
+    let presence = Presence {
+        peer_id: vec![0; MAX_PEER_ID_BYTES + 1],
+        generation: 1,
+        tab_id: 1,
+        pane_id: 1,
+        attached: true,
+    };
+
+    assert!(matches!(
+        encode_frame(&envelope(envelope::Body::Presence(presence))),
+        Err(ProtocolError::FieldTooLarge {
+            field: "presence.peer_id",
+            ..
+        })
+    ));
 }
 
 #[test]
