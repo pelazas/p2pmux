@@ -128,6 +128,20 @@ impl AgentKind {
         }
     }
 
+    /// Parse a wire value produced by [`Self::wire_value`]. `None` for anything
+    /// else — a producer naming an agent this build does not know is refused
+    /// rather than coerced, so a typo never files status under the wrong kind.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "cursor" => Some(Self::Cursor),
+            "pi" => Some(Self::Pi),
+            "opencode" => Some(Self::OpenCode),
+            _ => None,
+        }
+    }
+
     /// Human-readable label for the overlay.
     pub const fn display_label(self) -> &'static str {
         match self {
@@ -296,11 +310,47 @@ fn descendant_depth(root_pid: u32, pid: u32, processes: &[ProcessSnapshot]) -> O
 }
 
 /// Coarse activity state shown in the agents overlay.
+///
+/// `Idle`, `Working`, and `Done` are inferable from PTY output timing.
+/// `Pending` and `Error` are not, and never will be: silence looks identical
+/// whether an agent is thinking or waiting on a permission prompt. They only
+/// ever arrive from a producer inside the pane — see
+/// [`PaneAgentTracker::record_pushed_status`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentState {
     Idle,
     Working,
     Done,
+    Pending,
+    Error,
+}
+
+impl AgentState {
+    /// Stable wire value for a pushed status.
+    pub const fn wire_value(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Pending => "pending",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse a pushed status. Strict: an unrecognized token is `None`, never a
+    /// lenient fallback to `Idle`. Leniency here would let a producer's typo
+    /// silently erase the row it meant to update, which is the worst possible
+    /// failure for a status a human is waiting on.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "idle" => Some(Self::Idle),
+            "working" | "running" => Some(Self::Working),
+            "done" => Some(Self::Done),
+            "pending" => Some(Self::Pending),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 /// A just-finished agent retained for the done grace period.
@@ -311,6 +361,20 @@ pub struct DoneAgent {
     pub entered_done_at: Instant,
 }
 
+/// A status reported by a producer running inside the pane — an agent hook,
+/// not an inference. Authoritative while present: the agent said so.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PushedAgent {
+    pub kind: AgentKind,
+    pub cwd: String,
+    pub state: AgentState,
+    /// When this status arrived. The expiry policy reads it.
+    pub at: Instant,
+    /// Start of the current working interval, carried across pushes that stay
+    /// `Working` so a per-tool-call stream of updates does not reset the clock.
+    pub working_since_unix_ms: u64,
+}
+
 /// Per-pane agent state maintained between global sampler snapshots.
 #[derive(Clone, Debug)]
 pub struct PaneAgentTracker {
@@ -319,6 +383,8 @@ pub struct PaneAgentTracker {
     pub done_agent: Option<DoneAgent>,
     pub working_since: Option<Instant>,
     pub working_since_unix_ms: u64,
+    /// Latest producer-pushed status, when one is running in this pane.
+    pub pushed: Option<PushedAgent>,
     tuning: NotificationTuning,
     settle_until: Option<Instant>,
 }
@@ -337,8 +403,64 @@ impl PaneAgentTracker {
             done_agent: None,
             working_since: None,
             working_since_unix_ms: 0,
+            pushed: None,
             tuning,
             settle_until: None,
+        }
+    }
+
+    /// Apply a status pushed by a producer inside the pane.
+    ///
+    /// A push outranks every inference this module makes, because the producer
+    /// is the agent: it knows it is blocked on a permission prompt, and no
+    /// amount of output timing can tell that apart from waiting on a model.
+    ///
+    /// A `Working` push carries its interval start forward from the previous
+    /// `Working` push, so the per-tool-call stream a hooked agent emits shows
+    /// one continuous interval rather than restarting the clock every few
+    /// seconds.
+    pub fn record_pushed_status(
+        &mut self,
+        kind: AgentKind,
+        cwd: String,
+        state: AgentState,
+        now: Instant,
+        unix_ms_now: u64,
+    ) {
+        let continuing = self
+            .pushed
+            .as_ref()
+            .filter(|pushed| pushed.state == AgentState::Working && pushed.kind == kind)
+            .map(|pushed| pushed.working_since_unix_ms);
+        let working_since_unix_ms = match state {
+            AgentState::Working => continuing.unwrap_or(unix_ms_now),
+            _ => 0,
+        };
+        self.pushed = Some(PushedAgent {
+            kind,
+            cwd,
+            state,
+            at: now,
+            working_since_unix_ms,
+        });
+    }
+
+    /// The authoritative pushed status, if a producer currently owns this pane.
+    ///
+    /// An `Idle` push is deliberately not authoritative: it means "no activity"
+    /// (Claude's `/clear`, a session ending), which should hand the pane back to
+    /// process detection rather than blank a row whose agent is still running.
+    fn owning_push(&self) -> Option<&PushedAgent> {
+        self.pushed
+            .as_ref()
+            .filter(|pushed| pushed.state != AgentState::Idle)
+    }
+
+    /// Working-interval start for whichever source currently owns the state.
+    pub fn reported_working_since_unix_ms(&self) -> u64 {
+        match self.owning_push() {
+            Some(pushed) => pushed.working_since_unix_ms,
+            None => self.working_since_unix_ms,
         }
     }
 
@@ -407,6 +529,18 @@ impl PaneAgentTracker {
         unix_ms_now: u64,
     ) -> Option<(DetectedAgent, AgentState)> {
         self.reconcile_working_state(now, unix_ms_now);
+        // A producer inside the pane outranks detection, and stands alone: a
+        // hooked agent this build's process matchers do not recognize still
+        // gets a row, which is the whole point of accepting pushes.
+        if let Some(pushed) = self.owning_push() {
+            return Some((
+                DetectedAgent {
+                    kind: pushed.kind,
+                    cwd: pushed.cwd.clone(),
+                },
+                pushed.state,
+            ));
+        }
         if let Some(agent) = &self.active_agent {
             let state = if self.working_since.is_some() {
                 AgentState::Working
@@ -823,6 +957,143 @@ mod tests {
             tracker.listed_agent(now + Duration::from_secs(3_601), 1_000),
             Some((agent, AgentState::Idle))
         );
+    }
+
+    #[test]
+    fn a_pushed_status_outranks_detection_and_stands_alone() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+
+        // No agent process matched: a hooked agent this build's matchers do not
+        // recognize still gets a row.
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Pending,
+            now,
+            1_000,
+        );
+        assert_eq!(
+            tracker.listed_agent(now, 1_000),
+            Some((
+                DetectedAgent {
+                    kind: AgentKind::Claude,
+                    cwd: "/repo".into(),
+                },
+                AgentState::Pending,
+            ))
+        );
+
+        // Detection says "working" (the pane is chattering); the producer says
+        // the agent is blocked. The producer wins — that is the whole point.
+        tracker.update(
+            Some(DetectedAgent {
+                kind: AgentKind::Claude,
+                cwd: "/detected".into(),
+            }),
+            now,
+            1_000,
+        );
+        tracker.record_output(now, 1_000);
+        assert_eq!(
+            tracker.listed_agent(now, 1_000).map(|(_, state)| state),
+            Some(AgentState::Pending)
+        );
+
+        // An idle push means "no activity", not "blank the row": the pane goes
+        // back to what detection can see rather than losing a live agent.
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Idle,
+            now,
+            1_000,
+        );
+        assert_eq!(
+            tracker.listed_agent(now, 1_000),
+            Some((
+                DetectedAgent {
+                    kind: AgentKind::Claude,
+                    cwd: "/detected".into(),
+                },
+                AgentState::Working,
+            ))
+        );
+    }
+
+    #[test]
+    fn consecutive_working_pushes_keep_one_interval() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+
+        // A hooked agent pushes on every tool call. Those must read as one
+        // continuous interval, or the overlay's elapsed clock resets every few
+        // seconds and never shows how long the turn has really run.
+        tracker.record_pushed_status(
+            AgentKind::Codex,
+            "/repo".into(),
+            AgentState::Working,
+            now,
+            5_000,
+        );
+        assert_eq!(tracker.reported_working_since_unix_ms(), 5_000);
+        tracker.record_pushed_status(
+            AgentKind::Codex,
+            "/repo".into(),
+            AgentState::Working,
+            now + Duration::from_secs(3),
+            8_000,
+        );
+        assert_eq!(tracker.reported_working_since_unix_ms(), 5_000);
+
+        // Finishing drops the interval; the next turn starts a fresh one.
+        tracker.record_pushed_status(
+            AgentKind::Codex,
+            "/repo".into(),
+            AgentState::Done,
+            now + Duration::from_secs(4),
+            9_000,
+        );
+        assert_eq!(tracker.reported_working_since_unix_ms(), 0);
+        tracker.record_pushed_status(
+            AgentKind::Codex,
+            "/repo".into(),
+            AgentState::Working,
+            now + Duration::from_secs(5),
+            10_000,
+        );
+        assert_eq!(tracker.reported_working_since_unix_ms(), 10_000);
+    }
+
+    #[test]
+    fn wire_vocabularies_round_trip_and_refuse_typos() {
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::Pi,
+            AgentKind::OpenCode,
+        ] {
+            assert_eq!(AgentKind::from_wire(kind.wire_value()), Some(kind));
+        }
+        assert_eq!(AgentKind::from_wire("Claude"), None);
+        assert_eq!(AgentKind::from_wire("gemini"), None);
+
+        for state in [
+            AgentState::Idle,
+            AgentState::Working,
+            AgentState::Done,
+            AgentState::Pending,
+            AgentState::Error,
+        ] {
+            assert_eq!(AgentState::from_wire(state.wire_value()), Some(state));
+        }
+        // Producers modelled on Claude's hook vocabulary say "running".
+        assert_eq!(AgentState::from_wire("running"), Some(AgentState::Working));
+        // A typo must never lenient-parse: folding it to idle would silently
+        // erase the row the producer meant to update.
+        assert_eq!(AgentState::from_wire("pendign"), None);
+        assert_eq!(AgentState::from_wire(""), None);
     }
 
     #[test]

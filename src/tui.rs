@@ -49,8 +49,8 @@ use ratatui::{
 
 use crate::{
     agent_detect::{
-        PaneAgentTracker, ProcessSnapshot, SysinfoSampler, classify_pane_tree, cwd_for_pid,
-        sample_global_snapshot,
+        AgentKind, AgentState, PaneAgentTracker, ProcessSnapshot, SysinfoSampler,
+        classify_pane_tree, cwd_for_pid, sample_global_snapshot,
     },
     config::UiTheme,
     kitty_keyboard::KittyKeyboardTracker,
@@ -61,8 +61,9 @@ use crate::{
     local_ipc::AgentOverlaySnapshotRow,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, LayoutRequest, MarkPaneExited, NewPanePosition as ProtocolNewPanePosition,
-        PaneDescriptor, PaneFailed, PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
+        DeleteTab, LayoutRequest, MAX_AGENT_CWD_BYTES, MarkPaneExited,
+        NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
+        RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame, SyncGate},
@@ -3726,6 +3727,18 @@ fn sanitize_single_line(value: &str) -> String {
         .collect()
 }
 
+/// Cut `text` to at most `limit` bytes on a character boundary.
+fn truncate_bytes(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let end = (0..=limit)
+            .rev()
+            .find(|index| text.is_char_boundary(*index))
+            .unwrap_or(0);
+        text.truncate(end);
+    }
+    text
+}
+
 /// One fixed-grid PTY owned by this process. Its watch channels are registered with the pane
 /// service before the layout coordinator is told that the pane is ready.
 pub struct SharedLocalPane {
@@ -3952,9 +3965,11 @@ impl SharedLocalPane {
                 crate::agent_detect::AgentState::Idle => AgentRosterState::Idle as i32,
                 crate::agent_detect::AgentState::Working => AgentRosterState::Working as i32,
                 crate::agent_detect::AgentState::Done => AgentRosterState::Done as i32,
+                crate::agent_detect::AgentState::Pending => AgentRosterState::Pending as i32,
+                crate::agent_detect::AgentState::Error => AgentRosterState::Error as i32,
             },
             working_since_unix_ms: if state == crate::agent_detect::AgentState::Working {
-                self.agent_tracker.working_since_unix_ms
+                self.agent_tracker.reported_working_since_unix_ms()
             } else {
                 0
             },
@@ -4791,6 +4806,44 @@ impl SharedLayoutRuntime {
 
     pub fn node_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
         self.handle_intent(intent)
+    }
+
+    /// Apply a status pushed by a producer running inside one of this node's
+    /// own panes. Returns whether it was accepted.
+    ///
+    /// The pane id is a claim from an unauthenticated local process, so it is
+    /// checked against the panes this node actually hosts. That is the local
+    /// half of the containment `Coordinator::accept_agent_roster` enforces
+    /// between peers: a producer can only ever speak for a pane on the machine
+    /// it runs on, and the roster it feeds is published under this node's own
+    /// peer id.
+    ///
+    /// A kind or status this build does not know is refused rather than
+    /// coerced — a lenient parse would let a typo file status under the wrong
+    /// agent, or blank the row it meant to update.
+    pub fn apply_agent_status(
+        &mut self,
+        pane_id: PaneId,
+        kind: &str,
+        status: &str,
+        cwd: &str,
+    ) -> bool {
+        let (Some(kind), Some(state)) = (AgentKind::from_wire(kind), AgentState::from_wire(status))
+        else {
+            return false;
+        };
+        let Some(pane) = self.local.get_mut(&pane_id) else {
+            return false;
+        };
+        if pane.exited {
+            return false;
+        }
+        // Capped here rather than at publish time: an over-long cwd would fail
+        // `validate_agent_roster` and silently drop this host's whole roster.
+        let cwd = truncate_bytes(sanitize_single_line(cwd), MAX_AGENT_CWD_BYTES);
+        pane.agent_tracker
+            .record_pushed_status(kind, cwd, state, Instant::now(), unix_ms_now());
+        true
     }
 
     pub fn shutdown_node(self) {
@@ -8016,6 +8069,95 @@ mod tests {
             .await
             .expect("loopback endpoint");
         Transport::from_endpoint(endpoint)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pushed_agent_status_is_confined_to_panes_this_node_hosts() {
+        use crate::agent_detect::{AgentKind, AgentState};
+        use crate::protocol::MAX_AGENT_CWD_BYTES;
+
+        let host = SharedLayoutHost::new(
+            HostSession::from_transport(loopback_transport().await).expect("host session"),
+            2,
+            8,
+        )
+        .expect("shared host");
+        let pane_server = host.pane_server();
+        let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_id.clone()).expect("initial pty");
+        pane_server
+            .register_local_pane(
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_id,
+                    grid_rows: 2,
+                    grid_cols: 8,
+                    title: None,
+                    locked: false,
+                    exited: false,
+                },
+                initial.channels(),
+            )
+            .expect("initial pane registered");
+        let state = host
+            .session_snapshot()
+            .expect("snapshot")
+            .state
+            .expect("layout state");
+        let snapshot = layout_snapshot_from_state(&state).expect("render layout");
+        let mut runtime = SharedLayoutRuntime::host(
+            host,
+            pane_server,
+            snapshot,
+            initial,
+            String::from("TESTCODE"),
+            tokio::runtime::Handle::current(),
+        )
+        .expect("runtime");
+
+        assert!(
+            runtime.apply_agent_status(1, "claude", "pending", "/repo"),
+            "a producer may report for a pane this node hosts"
+        );
+        assert_eq!(
+            runtime
+                .local
+                .get_mut(&1)
+                .expect("local pane")
+                .agent_tracker
+                .listed_agent(Instant::now(), 1_000)
+                .map(|(agent, state)| (agent.kind, state)),
+            Some((AgentKind::Claude, AgentState::Pending))
+        );
+
+        // A pane id this node does not host is refused outright. This is the
+        // local half of `Coordinator::accept_agent_roster`: without it, any
+        // process on this machine could publish status for a peer's pane under
+        // this node's authenticated peer id.
+        assert!(
+            !runtime.apply_agent_status(99, "claude", "pending", "/repo"),
+            "a producer may not report for a pane hosted elsewhere"
+        );
+
+        // Unparseable kinds and statuses are refused rather than coerced.
+        assert!(!runtime.apply_agent_status(1, "gemini", "pending", "/repo"));
+        assert!(!runtime.apply_agent_status(1, "claude", "pendign", "/repo"));
+
+        // An over-long cwd is cut at intake: letting it through would fail
+        // `validate_agent_roster` and drop this host's entire roster.
+        assert!(runtime.apply_agent_status(
+            1,
+            "claude",
+            "working",
+            &"/x".repeat(MAX_AGENT_CWD_BYTES)
+        ));
+        let cwd = runtime
+            .local
+            .get(&1)
+            .and_then(|pane| pane.agent_tracker.pushed.as_ref())
+            .map(|pushed| pushed.cwd.clone())
+            .expect("pushed status");
+        assert!(cwd.len() <= MAX_AGENT_CWD_BYTES);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -7,6 +7,39 @@ use p2pmux::{
 };
 
 #[test]
+fn agent_status_is_tagged_and_tolerates_a_producer_that_omits_cwd() {
+    let message = ClientMessage::AgentStatus {
+        pane_id: 4,
+        kind: "claude".into(),
+        status: "pending".into(),
+        cwd: "/repo".into(),
+    };
+    let value = serde_json::to_value(&message).unwrap();
+    assert_eq!(value["type"], "agent_status");
+    assert_eq!(value["pane_id"], 4);
+    assert_eq!(
+        serde_json::from_value::<ClientMessage>(value).unwrap(),
+        message
+    );
+
+    // Producers are separate processes — a shell hook may not have a cwd worth
+    // sending. A missing field must not fail the whole message.
+    let terse: ClientMessage = serde_json::from_str(
+        r#"{"type":"agent_status","pane_id":4,"kind":"claude","status":"done"}"#,
+    )
+    .expect("cwd is optional");
+    assert_eq!(
+        terse,
+        ClientMessage::AgentStatus {
+            pane_id: 4,
+            kind: "claude".into(),
+            status: "done".into(),
+            cwd: String::new(),
+        }
+    );
+}
+
+#[test]
 fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
     let message = NodeMessage::Snapshot {
         room_name: "lisbon".into(),
