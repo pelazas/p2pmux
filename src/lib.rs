@@ -5,6 +5,7 @@ pub mod agent_notify;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod hosted_rendezvous;
 pub mod kitty_keyboard;
 pub mod layout;
 pub mod lease;
