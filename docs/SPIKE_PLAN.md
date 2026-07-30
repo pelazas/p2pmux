@@ -99,6 +99,12 @@ random bytes; v1/v2 still parse and are flagged `secret_is_public()`. The coordi
 admitted roster, which is what the session lock is built on. C is the remainder: bandwidth and
 input-latency behaviour under a relay, and ticket staleness across a network switch.
 
+**Update (2026-07-30).** `scripts/e2e/scenario_p_short_code.py` joins a Mac-hosted session
+from the droplet with nothing but a ten-character code resolved through the deployed
+rendezvous, and lands on `relayed 100ms`. So a relayed cross-machine session is now
+reproducible on demand, which is the fixture Phase C's bandwidth and input-latency
+measurements need — those numbers still have to be taken and written down.
+
 ### Two-Mac checklist (hands-on, ~10 minutes)
 
 Everything below is already automated against the droplet; this is the part only a human can do.
