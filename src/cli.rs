@@ -70,6 +70,12 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Report agent status from an agent hook. Run inside a p2pmux pane; a
+    /// no-op anywhere else, so it is safe to leave registered everywhere.
+    Notify {
+        #[command(subcommand)]
+        agent: NotifyAgent,
+    },
     #[command(name = "__node", hide = true)]
     Node {
         #[arg(long)]
@@ -82,6 +88,18 @@ enum ConfigCommand {
     Set { key: String, value: String },
     Get { key: String },
     Init,
+}
+
+#[derive(Debug, Subcommand)]
+enum NotifyAgent {
+    /// Read a Claude Code hook payload on stdin.
+    Claude {
+        /// The status this hook reports, when the registration knows it
+        /// (`running`, `pending`, `done`, `idle`, `error`). Without it the
+        /// payload's own `hook_event_name` decides.
+        #[arg(long)]
+        status: Option<String>,
+    },
 }
 
 const TRUST_WARNING: &str = "TRUST WARNING: This is a fully trusted shared-shell session. Anyone with the join ticket can see every pane and may obtain interactive control of available terminals (run commands, see output, touch files reachable to that macOS user).
@@ -116,9 +134,27 @@ impl std::fmt::Display for NodeStartupError {
 
 impl Error for NodeStartupError {}
 
-/// Parse process arguments and run a command.
-pub async fn parse_and_run() -> Result<(), Box<dyn Error>> {
-    run(Cli::parse()).await
+/// Parse process arguments.
+pub fn parse() -> Cli {
+    Cli::parse()
+}
+
+/// Run the commands that must not pay for an async runtime, returning `None`
+/// for everything else.
+///
+/// `notify` is spawned by an agent hook, which fires on every tool call. It
+/// writes one line to a unix socket and exits; standing up a multi-threaded
+/// Tokio runtime — a thread per core, created and torn down — to do that would
+/// cost more than the work, on the agent's own critical path.
+pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
+    match &cli.command {
+        Some(Command::Notify { agent }) => Some(match agent {
+            NotifyAgent::Claude { status } => {
+                crate::agent_notify::run(crate::agent_detect::AgentKind::Claude, status.as_deref())
+            }
+        }),
+        _ => None,
+    }
 }
 
 /// Hand this Mac's completion tuning to the detector, once per process.
@@ -136,7 +172,10 @@ fn apply_notification_tuning() {
     });
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    if let Some(result) = run_without_runtime(&cli) {
+        return result;
+    }
     apply_notification_tuning();
     if cli.resume {
         return resume_picker(true);
@@ -156,6 +195,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             result
         }
+        // Already handled by the `run_without_runtime` call above; reaching
+        // here would mean the two dispatches disagreed.
+        Some(Command::Notify { .. }) => Ok(()),
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
             ConfigCommand::Init => {
