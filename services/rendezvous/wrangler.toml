@@ -3,6 +3,11 @@ main = "src/index.js"
 compatibility_date = "2026-07-30"
 workers_dev = true
 
+# Its own subdomain, so an incident here cannot take the landing page down with it.
+[[routes]]
+pattern = "rv.p2pmux.com"
+custom_domain = true
+
 # The blind store. Values are sealed by the client, so a dump of this namespace yields
 # nothing but ciphertext and expiry times.
 [[kv_namespaces]]

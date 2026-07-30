@@ -1,0 +1,9 @@
+# A skeptic should be able to click install.sh and read it. Default handling makes a browser
+# download it instead, which is exactly the wrong instinct to teach for a `curl | sh` script.
+/install.sh
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=300
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
