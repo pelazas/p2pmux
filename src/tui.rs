@@ -8488,7 +8488,10 @@ mod tests {
             .host
             .write_input(format!("cd -- {}\n", directory.display()).as_bytes())
             .expect("change source PTY directory");
-        let source_cwd = (0..20).find_map(|_| {
+        // A real shell has to boot and process the `cd` before its cwd moves. Half a
+        // second is enough on an idle Mac and not enough on a loaded CI runner, which
+        // made this fail for reasons that had nothing to do with pane lifecycle.
+        let source_cwd = (0..200).find_map(|_| {
             let cwd = cwd_for_pid(source_pid);
             if cwd
                 .as_ref()
