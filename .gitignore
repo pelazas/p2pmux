@@ -7,3 +7,7 @@
 .idea/
 .vscode/
 *.swp
+
+# Python bytecode from the e2e harness
+__pycache__/
+*.pyc
