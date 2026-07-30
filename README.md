@@ -18,7 +18,7 @@ Example: Pelazas starts Claude Code in his pane (his subscription). Tis takes co
 
 **Is**
 
-- Lightweight local binary (`brew install …` later)
+- Lightweight local binary (`brew install pelazas/tap/p2pmux`)
 - Zellij-like tabs, panes, and nested splits
 - Real-time multiplayer presence (who’s on which tab/pane)
 - End-to-end encrypted peer-to-peer pane streaming (+ relay when NAT requires it)
@@ -37,6 +37,23 @@ This is a **fully trusted shared-shell** session. Anyone with the join ticket ca
 Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege Mac account and avoid production credentials in shared panes.
 
 Processes and credential *files* stay on the pane host’s Mac (not uploaded to peers). That does **not** stop a controller from using or displaying them via the shared shell.
+
+## Install
+
+```text
+brew install pelazas/tap/p2pmux
+```
+
+or, without Homebrew:
+
+```text
+curl -fsSL https://p2pmux.com/install.sh | sh
+```
+
+Both fetch a signed binary and its SHA256 from GitHub Releases and check the hash before
+installing. The script is served as plain text so you can read it first, and
+`cargo install --git https://github.com/pelazas/p2pmux --locked` is a supported path for anyone
+who would rather not run an installer at all.
 
 ## Status
 
@@ -74,7 +91,7 @@ To dogfood the shared layout on one Mac:
 
 ```text
 Terminal 1: cargo run -- create
-Terminal 2: cargo run -- join <printed 10-character code>
+Terminal 2: cargo run -- join <the code or ticket from Ctrl+S>
 ```
 
 Set a peer-visible display name once with `p2pmux config set name pelazas`; inspect it with
@@ -134,20 +151,30 @@ restart an existing session after upgrading when attach protocol changes are pre
 
 ## Inviting someone
 
-The ticket is the invite. `join` takes nothing else:
+`Ctrl+S` opens the share panel. It shows two things, and `join` takes either:
 
 ```text
-p2pmux ticket            # the one session hosted on this Mac
+p2pmux join 4KP7Q-M2XRW      # the code: short, expires in 6 hours
+p2pmux join p2pmux-v3:...    # the ticket: long, never expires, needs no service
+```
+
+Both are also available from a shell, printed to stdout alone so `p2pmux code | pbcopy` gives
+you something directly pasteable:
+
+```text
+p2pmux code              # the one session hosted on this Mac
 p2pmux ticket <name>     # when several are; the name is the one p2pmux ls shows
 ```
 
-From inside a session, `Ctrl+S` opens the share panel and Enter copies the ticket to the
-clipboard. That panel is local chrome, so unlike running the command in a shared pane it is not
-visible to the other members. Only a coordinator holds a ticket; a guest is told so.
+Treat either as a password. Both grant full shared-shell access to the session, to anyone
+holding them, for as long as the session lives. Only a coordinator holds them; a guest is told so.
 
-The ticket is printed to stdout on its own, so `p2pmux ticket | pbcopy` gives you something
-directly pasteable. Treat it as a password: it grants full shared-shell access to the session, to
-anyone holding it, for as long as the session lives.
+The code is the ticket, stored where a peer can fetch it. Your machine derives two independent
+values from the code: an index to store the record at, and a key to seal it with. Only the index
+reaches `rv.p2pmux.com`, so the service holds an opaque handle and a sealed blob and has nothing
+that would let it join. Terminal traffic never goes near it — that is peer to peer, or over an
+iroh relay when NAT requires it. If the service is unreachable when a session starts, the panel
+says so and the ticket still works; `p2pmux join <ticket>` never contacts it at all.
 
 Tickets are emitted as `p2pmux-v3:`, which carries 32 independent random bytes as the join
 credential. `join` still parses `p2pmux-v1:` and `p2pmux-v2:` tickets, in which the credential
