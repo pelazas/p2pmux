@@ -102,6 +102,7 @@ pub struct Tui;
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
+/// The legacy fixed-grid host/guest footer, which has no chords, agents, or share modal.
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -173,13 +174,17 @@ enum FooterSegment {
     OrangeKey(&'static str),
 }
 
-const NORMAL_FOOTER: &[FooterSegment] = &[
+const NORMAL_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::OrangeKey("Ctrl"),
     FooterSegment::Text("+ <"),
     FooterSegment::Key("p"),
     FooterSegment::Text("> PANE   <"),
     FooterSegment::Key("t"),
     FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("a"),
+    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("s"),
+    FooterSegment::Text("> SHARE   <"),
     FooterSegment::Key("q"),
     FooterSegment::Text("> QUIT   "),
     FooterSegment::OrangeKey("Option"),
@@ -188,7 +193,65 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> + <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
-    FooterSegment::Text("   drag border RESIZE"),
+];
+const NORMAL_FOOTER_NO_FOCUS: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> PANE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("a"),
+    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("s"),
+    FooterSegment::Text("> SHARE   <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text("> QUIT"),
+];
+const NORMAL_FOOTER_NO_SHARE: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> PANE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("a"),
+    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text("> QUIT"),
+];
+const NORMAL_FOOTER_CORE: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> PANE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text("> QUIT"),
+];
+const NORMAL_FOOTER_KEYS_ONLY: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(">"),
+];
+/// Normal-mode help, widest tier first.
+///
+/// The bar sheds whole clauses instead of clipping mid-word, cheapest hint first: the focus
+/// arrows are muscle memory, sharing happens once a session, and the agent overlay is opened
+/// constantly. `Ctrl+P/T/Q` is the floor — nothing else in the mux is reachable without them,
+/// so they outlive every other hint.
+const NORMAL_FOOTER_TIERS: &[&[FooterSegment]] = &[
+    NORMAL_FOOTER_FULL,
+    NORMAL_FOOTER_NO_FOCUS,
+    NORMAL_FOOTER_NO_SHARE,
+    NORMAL_FOOTER_CORE,
+    NORMAL_FOOTER_KEYS_ONLY,
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
@@ -204,8 +267,8 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> CLOSE   <"),
     FooterSegment::Key("k"),
     FooterSegment::Text("> LOCK   <"),
-    FooterSegment::Key("i"),
-    FooterSegment::Text("> INVITE   <"),
+    FooterSegment::Key("L"),
+    FooterSegment::Text("> LOCK SESSION   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
@@ -228,6 +291,22 @@ const AGENT_OVERLAY_HELP: &[FooterSegment] = &[
     FooterSegment::Text("> MOVE   <"),
     FooterSegment::Key("Enter"),
     FooterSegment::Text("> FOCUS"),
+];
+/// Enter takes the ticket: it is the only identifier that reaches another machine, so it is
+/// what the primary key copies.
+const SHARE_HELP: &[FooterSegment] = &[
+    FooterSegment::Text("<"),
+    FooterSegment::Key("Enter"),
+    FooterSegment::Text("> COPY TICKET   <"),
+    FooterSegment::Key("c"),
+    FooterSegment::Text("> COPY CODE   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> CLOSE"),
+];
+const SHARE_HELP_GUEST: &[FooterSegment] = &[
+    FooterSegment::Text("<"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> CLOSE"),
 ];
 
 /// The in-progress multi-pane command prefix, kept entirely local to one terminal.
@@ -329,19 +408,8 @@ pub enum KeyHandling {
 pub struct MouseHandling {
     pub intents: Vec<UiIntent>,
     pub copy_selection_requested: bool,
-    /// A runnable join command requested by a completed footer click.
-    pub join_copy_command: Option<String>,
     /// An xterm mouse report the focused pane's child asked to receive.
     pub forward_bytes: Option<Vec<u8>>,
-}
-
-/// Footer content that determines the visible join command hit target.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FooterMouseInput<'a> {
-    pub status: &'a str,
-    pub footer_notice: Option<&'a str>,
-    pub copied_lines: Option<usize>,
-    pub join_code: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,11 +440,31 @@ struct RenamePrompt {
     error: Option<String>,
 }
 
+/// Which piece of invite material the share modal asked the client to copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShareCopy {
+    Ticket,
+    Code,
+}
+
+/// The host-only invite material the share modal renders.
+///
+/// The ticket is resolved by the attaching process, so a guest — who has no rendezvous record
+/// to resolve — simply arrives here with both fields empty and gets told so.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShareView<'a> {
+    pub code: Option<&'a str>,
+    pub ticket: Option<&'a str>,
+    /// The result of the last copy, shown in the modal rather than the footer.
+    pub notice: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum ModalState {
     #[default]
     None,
     Agents,
+    Share,
     Rename(RenamePrompt),
     ConfirmDeleteTab {
         tab_id: TabId,
@@ -489,12 +577,11 @@ pub struct MultiPaneTui {
     agent_overlay_viewport_lines: u16,
     pending_agent_toggle: Option<Instant>,
     resize_drag: Option<ResizeDrag>,
-    pending_join_click: bool,
     /// Set while a press forwarded to a child owns the drag and release that follow.
     mouse_forwarding: bool,
-    /// A pane-mode invite request. The ticket lives in the node's rendezvous record rather
-    /// than in the layout, so the attached client resolves and copies it.
-    pending_ticket_copy: bool,
+    /// A share-modal copy request. Invite material lives in the node's rendezvous record
+    /// rather than in the layout, so the attached client resolves and copies it.
+    pending_share_copy: Option<ShareCopy>,
     /// Whether the coordinator is refusing new peers. Mirrored from the node rather than
     /// derived, because only the coordinator knows it and any peer may be drawing it.
     session_locked: bool,
@@ -539,10 +626,9 @@ impl MultiPaneTui {
             agent_overlay_viewport_lines: 0,
             pending_agent_toggle: None,
             resize_drag: None,
-            pending_join_click: false,
             session_locked: false,
             mouse_forwarding: false,
-            pending_ticket_copy: false,
+            pending_share_copy: None,
         })
     }
 
@@ -579,8 +665,20 @@ impl MultiPaneTui {
     pub fn modal_open(&self) -> bool {
         matches!(
             self.modal,
-            ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. }
+            ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. } | ModalState::Share
         )
+    }
+
+    pub fn share_open(&self) -> bool {
+        matches!(self.modal, ModalState::Share)
+    }
+
+    /// Takes the clipboard write the share modal asked for, if any.
+    ///
+    /// The mux never touches the clipboard itself — the attaching process owns it, exactly as
+    /// it already does for selection copies.
+    pub fn take_share_copy_request(&mut self) -> Option<ShareCopy> {
+        self.pending_share_copy.take()
     }
 
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
@@ -1248,6 +1346,20 @@ impl MultiPaneTui {
         if matches!(self.modal, ModalState::ConfirmDeleteTab { .. }) {
             return self.handle_confirm_delete_tab_key(key);
         }
+        // Ctrl+S is claimed before the pane sees it, so a pane never receives XOFF from this
+        // binding — the same trade already made for Ctrl+A.
+        if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
+            self.modal = if self.share_open() {
+                ModalState::None
+            } else {
+                ModalState::Share
+            };
+            self.exit_chord_mode();
+            return KeyHandling::Consumed(vec![]);
+        }
+        if self.share_open() {
+            return self.handle_share_key(key);
+        }
         if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
             if self.overlay_open() {
                 let forward = self
@@ -1334,11 +1446,9 @@ impl MultiPaneTui {
         &mut self,
         mouse: crossterm::event::MouseEvent,
         area: Rect,
-        footer: FooterMouseInput<'_>,
         protocol: PaneMouseProtocol,
     ) -> MouseHandling {
         if self.modal_open() {
-            self.pending_join_click = false;
             self.mouse_forwarding = false;
             return MouseHandling::default();
         }
@@ -1356,12 +1466,6 @@ impl MultiPaneTui {
                         intents: self.handle_agent_overlay_click(mouse.column, mouse.row, area),
                         ..MouseHandling::default()
                     };
-                }
-                self.pending_join_click = self
-                    .footer_join_rect(area, footer)
-                    .is_some_and(|rect| rect_contains_mouse(rect, mouse.column, mouse.row));
-                if self.pending_join_click {
-                    return MouseHandling::default();
                 }
                 self.clear_selection();
                 if self.begin_resize_drag(mouse.column, mouse.row, area) {
@@ -1386,27 +1490,12 @@ impl MultiPaneTui {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self.pending_join_click {
-                    self.pending_join_click = false;
-                    return MouseHandling::default();
-                }
                 if !self.extend_resize_drag(mouse.column, mouse.row) {
                     self.extend_selection_at(mouse.column, mouse.row, area);
                 }
                 MouseHandling::default()
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if std::mem::take(&mut self.pending_join_click) {
-                    let join_copy_command = self
-                        .footer_join_rect(area, footer)
-                        .filter(|rect| rect_contains_mouse(*rect, mouse.column, mouse.row))
-                        .zip(footer.join_code)
-                        .map(|(_, code)| format!("p2pmux join {code}"));
-                    return MouseHandling {
-                        join_copy_command,
-                        ..MouseHandling::default()
-                    };
-                }
                 self.end_selection_drag();
                 let resize_intent = self.end_resize_drag(mouse.column, mouse.row);
                 MouseHandling {
@@ -1485,18 +1574,6 @@ impl MultiPaneTui {
             pane.grid_rows,
             pane.grid_cols,
         ))
-    }
-
-    fn footer_join_rect(&self, area: Rect, footer: FooterMouseInput<'_>) -> Option<Rect> {
-        footer_layout(
-            self.geometry(area).footer,
-            self.chord_mode,
-            footer.status,
-            footer.footer_notice,
-            footer.copied_lines,
-            footer.join_code,
-        )
-        .join_rect
     }
 
     /// Aligns a reattached client's local selection with the node-owned focus.
@@ -1603,6 +1680,27 @@ impl MultiPaneTui {
             }
             _ => KeyHandling::Consumed(vec![]),
         }
+    }
+
+    /// Keys for the share modal.
+    ///
+    /// Enter takes the ticket because that is the only thing a peer on another machine can
+    /// use; the code is the secondary key precisely because it only resolves on this Mac.
+    /// Every key is consumed so no invite material leaks into the focused pane.
+    fn handle_share_key(&mut self, key: KeyEvent) -> KeyHandling {
+        match key.code {
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                self.pending_share_copy = Some(ShareCopy::Ticket);
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                self.pending_share_copy = Some(ShareCopy::Code);
+            }
+            KeyCode::Esc if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+            }
+            _ => {}
+        }
+        KeyHandling::Consumed(vec![])
     }
 
     fn confirm_delete_tab(&mut self, tab_id: TabId, pane_count: usize) {
@@ -1724,10 +1822,6 @@ impl MultiPaneTui {
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeletePane {
                 pane_id: self.focused_pane,
             }),
-            KeyCode::Char('i') if key.modifiers.is_empty() => {
-                self.pending_ticket_copy = true;
-                None
-            }
             KeyCode::Char('k') if key.modifiers.is_empty() => self
                 .snapshot
                 .panes
@@ -1758,11 +1852,6 @@ impl MultiPaneTui {
 
     pub fn session_locked(&self) -> bool {
         self.session_locked
-    }
-
-    /// Claim a pending invite request, if the last key asked for one.
-    pub fn take_ticket_copy_request(&mut self) -> bool {
-        std::mem::take(&mut self.pending_ticket_copy)
     }
 
     fn create_pane(&self, axis: Axis, position: NewPanePosition, area: Rect) -> Option<UiIntent> {
@@ -2607,7 +2696,16 @@ pub fn render_multi_pane(
     tui: &MultiPaneTui,
     screens: &BTreeMap<PaneId, &vt100::Screen>,
 ) {
-    render_shared_multi_pane(frame, tui, screens, "", None, None, None, None);
+    render_shared_multi_pane(
+        frame,
+        tui,
+        screens,
+        "",
+        None,
+        None,
+        ShareView::default(),
+        None,
+    );
 }
 
 /// Renders the local attachment footer with its own copy feedback.
@@ -2618,7 +2716,7 @@ pub fn render_multi_pane_with_copy_feedback(
     screens: &BTreeMap<PaneId, &vt100::Screen>,
     copied_lines: Option<usize>,
     footer_notice: Option<&str>,
-    join_code: Option<&str>,
+    share: ShareView<'_>,
     local_peer_id: Option<&[u8]>,
     link: Option<&str>,
 ) {
@@ -2641,22 +2739,24 @@ pub fn render_multi_pane_with_copy_feedback(
         "",
         copied_lines,
         footer_notice.or(exited_notice),
-        join_code,
+        share,
         link,
     );
 }
 
-fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
+/// The help segments for a chord mode, narrowed to the widest tier `width` can hold.
+///
+/// Only normal mode has tiers. The chord footers already fall back atomically through
+/// `chord_footer_badge`, which hides the whole bar rather than showing half a chord.
+fn contextual_footer(chord_mode: ChordMode, width: u16) -> &'static [FooterSegment] {
     match chord_mode {
-        ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
-        ChordMode::Pane => (
-            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <i> INVITE   <Esc> BACK",
-            PANE_FOOTER,
-        ),
-        ChordMode::Tab => (
-            "  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
-            TAB_FOOTER,
-        ),
+        ChordMode::None => NORMAL_FOOTER_TIERS
+            .iter()
+            .copied()
+            .find(|tier| footer_segments_width(tier) <= width)
+            .unwrap_or(NORMAL_FOOTER_KEYS_ONLY),
+        ChordMode::Pane => PANE_FOOTER,
+        ChordMode::Tab => TAB_FOOTER,
     }
 }
 
@@ -2755,17 +2855,6 @@ fn render_copy_feedback(
     );
 }
 
-fn footer_suffix(text: &str, width: usize) -> &str {
-    if width == 0 {
-        return "";
-    }
-    let start = text
-        .char_indices()
-        .nth(text.chars().count().saturating_sub(width))
-        .map_or(0, |(index, _)| index);
-    &text[start..]
-}
-
 fn mid_footer_flash_width(copied_lines: Option<usize>, footer_notice: Option<&str>) -> u16 {
     if let Some(notice) = footer_notice {
         return u16::try_from(notice.chars().count().saturating_add(2)).unwrap_or(u16::MAX);
@@ -2793,16 +2882,15 @@ enum FooterFlash {
     CopyFeedback { lines: usize, rect: Rect },
 }
 
-/// The shared placement authority for footer content, including the join command.
+/// The shared placement authority for footer content.
 struct FooterLayout {
     badge: Option<&'static str>,
+    /// The help tier that fits, chosen once so measuring and drawing cannot disagree.
+    help: &'static [FooterSegment],
     help_start: u16,
     help_end: u16,
     status: Option<FooterText>,
     flash: Option<FooterFlash>,
-    join_x: u16,
-    join_text: Option<String>,
-    join_rect: Option<Rect>,
 }
 
 fn footer_layout(
@@ -2811,25 +2899,21 @@ fn footer_layout(
     status: &str,
     footer_notice: Option<&str>,
     copied_lines: Option<usize>,
-    join_code: Option<&str>,
 ) -> FooterLayout {
     let end_x = area.right();
-    let join = join_code.map(|code| format!("join: p2pmux join {code}"));
 
     if chord_mode != ChordMode::None {
         let badge = chord_footer_badge(chord_mode, area.width);
         let mut x = area.x.saturating_add(badge.map_or(0, text_width));
-        let (_, segments) = contextual_footer(chord_mode);
+        let segments = contextual_footer(chord_mode, end_x.saturating_sub(x));
         if badge.is_none() || end_x.saturating_sub(x) < footer_segments_width(segments) {
             return FooterLayout {
                 badge,
+                help: segments,
                 help_start: x,
                 help_end: end_x,
                 status: None,
                 flash: None,
-                join_x: end_x,
-                join_text: None,
-                join_rect: None,
             };
         }
 
@@ -2856,20 +2940,13 @@ fn footer_layout(
                 FooterFlash::Notice(FooterText { text, rect })
             })
         });
-        let join_text = join.filter(|text| end_x.saturating_sub(x) >= text_width(text));
-        let join_rect = join_text
-            .as_ref()
-            .map(|text| Rect::new(x, area.y, text_width(text), 1));
-
         return FooterLayout {
             badge,
+            help: segments,
             help_start: area.x.saturating_add(badge.map_or(0, text_width)),
             help_end,
             status,
             flash,
-            join_x: join_rect.map_or(end_x, |rect| rect.x),
-            join_text,
-            join_rect,
         };
     }
 
@@ -2881,21 +2958,6 @@ fn footer_layout(
         x = x.saturating_add(width);
         FooterText { text, rect }
     });
-    let join_text = join.as_deref().and_then(|text| {
-        let text = footer_suffix(text, usize::from(end_x.saturating_sub(x)));
-        (!text.is_empty()).then(|| text.to_owned())
-    });
-    let join_x = join_text.as_ref().map_or(end_x, |text| {
-        end_x.saturating_sub(u16::try_from(text.chars().count()).unwrap_or(u16::MAX))
-    });
-    let join_rect = join_text.as_ref().map(|text| {
-        Rect::new(
-            join_x,
-            area.y,
-            u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
-            1,
-        )
-    });
     let flash_width = if footer_notice.is_some() {
         mid_footer_flash_width(None, footer_notice)
     } else if status.is_none() {
@@ -2903,9 +2965,12 @@ fn footer_layout(
     } else {
         0
     };
-    let help_end = join_x.saturating_sub(flash_width);
+    let help_end = end_x.saturating_sub(flash_width);
+    // The help tier is chosen against the span left once status and any flash are placed, so a
+    // long notice narrows the hints rather than overwriting them.
+    let segments = contextual_footer(chord_mode, help_end.saturating_sub(x));
     let flash_start = x.max(help_end);
-    let flash_rect = Rect::new(flash_start, area.y, join_x.saturating_sub(flash_start), 1);
+    let flash_rect = Rect::new(flash_start, area.y, end_x.saturating_sub(flash_start), 1);
     let flash = footer_notice
         .map(|notice| {
             FooterFlash::Notice(FooterText {
@@ -2926,27 +2991,15 @@ fn footer_layout(
 
     FooterLayout {
         badge: None,
+        help: segments,
         help_start: x,
         help_end,
         status,
         flash,
-        join_x,
-        join_text,
-        join_rect,
     }
 }
 
-fn rect_contains_mouse(rect: Rect, column: u16, row: u16) -> bool {
-    (rect.x..rect.right()).contains(&column) && (rect.y..rect.bottom()).contains(&row)
-}
-
-fn render_chord_footer(
-    buffer: &mut Buffer,
-    theme: &UiTheme,
-    area: Rect,
-    chord_mode: ChordMode,
-    layout: &FooterLayout,
-) {
+fn render_chord_footer(buffer: &mut Buffer, theme: &UiTheme, area: Rect, layout: &FooterLayout) {
     let Some(badge) = layout.badge else {
         return;
     };
@@ -2960,14 +3013,13 @@ fn render_chord_footer(
             .bg(theme.footer_background)
             .add_modifier(Modifier::BOLD),
     );
-    let (_, segments) = contextual_footer(chord_mode);
     render_footer_segments(
         buffer,
         theme,
         layout.help_start,
         area.y,
         layout.help_end,
-        segments,
+        layout.help,
     );
 
     if let Some(status) = &layout.status {
@@ -2993,21 +3045,8 @@ fn render_chord_footer(
                 .add_modifier(Modifier::BOLD),
         );
     }
-    if let (Some(join), Some(join_rect)) = (&layout.join_text, layout.join_rect) {
-        buffer.set_stringn(
-            layout.join_x,
-            area.y,
-            join,
-            usize::from(join_rect.width),
-            Style::default()
-                .fg(theme.footer_muted)
-                .bg(theme.footer_background)
-                .add_modifier(Modifier::UNDERLINED),
-        );
-    }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_contextual_footer(
     buffer: &mut Buffer,
     theme: &UiTheme,
@@ -3015,17 +3054,9 @@ fn render_contextual_footer(
     status: &str,
     copied_lines: Option<usize>,
     footer_notice: Option<&str>,
-    join_code: Option<&str>,
     chord_mode: ChordMode,
 ) {
-    let layout = footer_layout(
-        area,
-        chord_mode,
-        status,
-        footer_notice,
-        copied_lines,
-        join_code,
-    );
+    let layout = footer_layout(area, chord_mode, status, footer_notice, copied_lines);
     buffer.set_stringn(
         area.x,
         area.y,
@@ -3035,7 +3066,7 @@ fn render_contextual_footer(
     );
 
     if chord_mode != ChordMode::None {
-        render_chord_footer(buffer, theme, area, chord_mode, &layout);
+        render_chord_footer(buffer, theme, area, &layout);
         return;
     }
 
@@ -3050,16 +3081,15 @@ fn render_contextual_footer(
                 .bg(theme.footer_background),
         );
     }
-    let (_, segments) = contextual_footer(chord_mode);
     render_footer_segments(
         buffer,
         theme,
         layout.help_start,
         area.y,
         layout.help_end,
-        segments,
+        layout.help,
     );
-    // Mid-bar flash messages sit after chord help and before the join code.
+    // Mid-bar flash messages sit after the help, filling the bar's right end.
     match &layout.flash {
         Some(FooterFlash::Notice(notice)) => {
             buffer.set_stringn(
@@ -3078,18 +3108,6 @@ fn render_contextual_footer(
         }
         None => {}
     }
-    if let (Some(text), Some(join_rect)) = (&layout.join_text, layout.join_rect) {
-        buffer.set_stringn(
-            layout.join_x,
-            area.y,
-            text,
-            usize::from(join_rect.width),
-            Style::default()
-                .fg(theme.footer_muted)
-                .bg(theme.footer_background)
-                .add_modifier(Modifier::UNDERLINED),
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3100,7 +3118,7 @@ fn render_shared_multi_pane(
     status: &str,
     copied_lines: Option<usize>,
     footer_notice: Option<&str>,
-    join_code: Option<&str>,
+    share: ShareView<'_>,
     link: Option<&str>,
 ) {
     let theme = &tui.theme;
@@ -3222,7 +3240,6 @@ fn render_shared_multi_pane(
             status,
             copied_lines,
             footer_notice,
-            join_code,
             tui.chord_mode,
         );
     }
@@ -3319,6 +3336,9 @@ fn render_shared_multi_pane(
     }
     if tui.overlay_open() {
         render_agents_overlay(frame, tui, unix_ms_now());
+    }
+    if tui.share_open() {
+        render_share_modal(frame, &tui.theme, share);
     }
     if let ModalState::Rename(prompt) = &tui.modal {
         render_rename_prompt(frame, prompt, &tui.theme);
@@ -3445,6 +3465,158 @@ fn render_agents_overlay_help(buffer: &mut Buffer, theme: &UiTheme, help: Option
         help.y,
         help.right(),
         AGENT_OVERLAY_HELP,
+    );
+}
+
+/// Read the full ticket the local rendezvous record holds for a join code.
+///
+/// Only a coordinator publishes a record, so a guest resolves nothing and the share modal
+/// says so rather than offering an invite it cannot make.
+pub(crate) fn resolve_local_ticket(join_code: &str) -> Option<String> {
+    crate::rendezvous::LocalRendezvous::for_current_user()
+        .and_then(|store| store.resolve(join_code))
+        .ok()
+        .map(|ticket| ticket.to_string())
+}
+
+/// Run one share-modal copy and report the result back into the modal.
+pub(crate) fn share_copy_result(
+    request: ShareCopy,
+    ticket: Option<&str>,
+    join_code: Option<&str>,
+) -> String {
+    let (what, text) = match request {
+        ShareCopy::Ticket => ("ticket", ticket),
+        ShareCopy::Code => ("code", join_code),
+    };
+    let Some(text) = text else {
+        return format!("no {what} to copy");
+    };
+    match copy_selection_to_clipboard(text) {
+        Ok(_) => format!("✓ copied {what}"),
+        Err(error) => format!("clipboard copy failed: {error}"),
+    }
+}
+
+/// Break a ticket across lines by character count.
+///
+/// A ticket is one unbroken base32-ish run, so ratatui's word wrapping would leave most of
+/// every line empty and make the thing look longer than it is.
+fn wrap_fixed(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+/// The invite panel behind Ctrl+S.
+///
+/// Both identifiers are shown with what they actually reach, because the difference is the
+/// whole point: only the ticket travels to another machine.
+fn render_share_modal(frame: &mut Frame<'_>, theme: &UiTheme, share: ShareView<'_>) {
+    let area = frame.area();
+    let label = Style::default().fg(theme.agent_overlay_muted);
+    let value = Style::default()
+        .fg(theme.agent_overlay_foreground)
+        .add_modifier(Modifier::BOLD);
+
+    let width = area.width.saturating_sub(4).clamp(28, 72).min(area.width);
+    let content_width = usize::from(width.saturating_sub(4)).max(1);
+    let mut lines: Vec<Line> = Vec::new();
+    match share.ticket {
+        Some(ticket) => {
+            lines.push(Line::styled("TICKET — works from any Mac", label));
+            lines.extend(
+                wrap_fixed(ticket, content_width)
+                    .into_iter()
+                    .map(|chunk| Line::styled(chunk, value)),
+            );
+            if let Some(code) = share.code {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("CODE — this Mac only", label));
+                lines.push(Line::styled(code.to_owned(), value));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Anyone with the ticket can join this session.",
+                Style::default().fg(theme.agent_overlay_warm),
+            ));
+        }
+        None => lines.push(Line::styled(
+            "Only the host can share this session.",
+            Style::default().fg(theme.agent_overlay_muted),
+        )),
+    }
+    if let Some(notice) = share.notice {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            notice.to_owned(),
+            Style::default().fg(theme.copy_feedback_accent),
+        ));
+    }
+
+    // Two border rows, a leading blank, the body, a blank, then the help row.
+    let height = u16::try_from(lines.len().saturating_add(5))
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, panel);
+    let block = Block::bordered()
+        .title(Line::styled(
+            " Share this session ",
+            Style::default()
+                .fg(theme.agent_overlay_chrome)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.agent_overlay_chrome));
+    let inner = block.inner(panel);
+    frame.render_widget(block, panel);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let body = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y.saturating_add(1),
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(3).max(1),
+    );
+    frame.render_widget(Paragraph::new(lines), body);
+
+    let help = Rect::new(
+        inner.x,
+        inner.y.saturating_add(inner.height.saturating_sub(1)),
+        inner.width,
+        1,
+    );
+    let buffer = frame.buffer_mut();
+    buffer.set_stringn(
+        help.x,
+        help.y,
+        " ".repeat(usize::from(help.width)),
+        usize::from(help.width),
+        Style::default().bg(theme.footer_background),
+    );
+    render_footer_segments(
+        buffer,
+        theme,
+        help.x.saturating_add(1),
+        help.y,
+        help.right(),
+        if share.ticket.is_some() {
+            SHARE_HELP
+        } else {
+            SHARE_HELP_GUEST
+        },
     );
 }
 
@@ -4600,6 +4772,8 @@ pub struct SharedLayoutRuntime {
     copied_lines: Option<usize>,
     footer_notice: Option<String>,
     join_code: Option<String>,
+    share_ticket: Option<String>,
+    share_notice: Option<String>,
     agent_sampler: AgentSamplingWorker,
     agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     agent_roster_generation: u64,
@@ -4707,7 +4881,11 @@ impl SharedLayoutRuntime {
             status: String::new(),
             copied_lines: None,
             footer_notice: None,
+            // Resolved once at startup: the record is written before the runtime exists and
+            // does not change while it lives.
+            share_ticket: join_code.as_deref().and_then(resolve_local_ticket),
             join_code,
+            share_notice: None,
             agent_sampler: AgentSamplingWorker::spawn(),
             agent_rosters: BTreeMap::new(),
             agent_roster_generation: 0,
@@ -4958,6 +5136,17 @@ impl SharedLayoutRuntime {
                 for intent in intents {
                     self.handle_intent(intent)?;
                 }
+                if let Some(request) = self.tui.take_share_copy_request() {
+                    self.share_notice = Some(share_copy_result(
+                        request,
+                        self.share_ticket.as_deref(),
+                        self.join_code.as_deref(),
+                    ));
+                }
+                // The notice belongs to one visit to the modal, not to the session.
+                if !self.tui.share_open() {
+                    self.share_notice = None;
+                }
                 Ok(false)
             }
             KeyHandling::Forward => {
@@ -5058,7 +5247,11 @@ impl SharedLayoutRuntime {
                         self.footer_notice
                             .as_deref()
                             .or_else(|| self.exited_footer_notice()),
-                        self.join_code.as_deref(),
+                        ShareView {
+                            code: self.join_code.as_deref(),
+                            ticket: self.share_ticket.as_deref(),
+                            notice: self.share_notice.as_deref(),
+                        },
                         link.as_deref(),
                     );
                 })?;
@@ -5132,17 +5325,7 @@ impl SharedLayoutRuntime {
                     let area = Rect::new(0, 0, *cols, *rows);
                     let protocol = self.focused_pane_mouse_protocol();
                     if protocol.reports_mouse() {
-                        let handling = self.tui.handle_mouse(
-                            mouse,
-                            area,
-                            FooterMouseInput {
-                                status: &self.status,
-                                footer_notice: self.footer_notice.as_deref(),
-                                copied_lines: self.copied_lines,
-                                join_code: self.join_code.as_deref(),
-                            },
-                            protocol,
-                        );
+                        let handling = self.tui.handle_mouse(mouse, area, protocol);
                         if let Some(bytes) = handling.forward_bytes {
                             self.forward_mouse(bytes)?;
                         }
@@ -5162,43 +5345,18 @@ impl SharedLayoutRuntime {
                 let area = Rect::new(0, 0, *cols, *rows);
                 let previously_focused = self.tui.focused_pane();
                 let protocol = self.focused_pane_mouse_protocol();
-                let handling = self.tui.handle_mouse(
-                    mouse,
-                    area,
-                    FooterMouseInput {
-                        status: &self.status,
-                        footer_notice: self.footer_notice.as_deref(),
-                        copied_lines: self.copied_lines,
-                        join_code: self.join_code.as_deref(),
-                    },
-                    protocol,
-                );
+                let handling = self.tui.handle_mouse(mouse, area, protocol);
                 if let Some(bytes) = handling.forward_bytes {
                     self.forward_mouse(bytes)?;
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.copied_lines = None;
-                    if self.footer_notice.as_deref() == Some("copied join command") {
-                        self.footer_notice = None;
-                    }
                 }
                 for intent in handling.intents {
                     self.handle_intent(intent)?;
                 }
                 if handling.copy_selection_requested {
                     self.copy_selection_to_clipboard();
-                }
-                if let Some(command) = handling.join_copy_command {
-                    match copy_selection_to_clipboard(&command) {
-                        Ok(_) => {
-                            self.status.clear();
-                            self.copied_lines = None;
-                            self.footer_notice = Some(String::from("copied join command"));
-                        }
-                        Err(error) => {
-                            self.status = format!("clipboard copy failed: {error}");
-                        }
-                    }
                 }
                 self.release_blurred_pane(previously_focused)?;
                 *dirty = true;
@@ -5223,10 +5381,7 @@ impl SharedLayoutRuntime {
                 // would otherwise hide the wheel from it.
                 let protocol = self.focused_pane_mouse_protocol();
                 if protocol.reports_mouse()
-                    && let Some(bytes) = self
-                        .tui
-                        .handle_mouse(mouse, area, FooterMouseInput::default(), protocol)
-                        .forward_bytes
+                    && let Some(bytes) = self.tui.handle_mouse(mouse, area, protocol).forward_bytes
                 {
                     self.forward_mouse(bytes)?;
                     *dirty = true;
@@ -7199,15 +7354,16 @@ mod tests {
     use iroh::{Endpoint, RelayMode, endpoint::presets};
 
     use super::{
-        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterMouseInput,
-        FooterSegment, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
-        LayoutControlEvent, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState,
-        PendingEscape, RemoteInput, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
-        chord_footer_badge, contextual_footer, copied_line_count, encode_key, encode_mouse,
-        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command, is_chord_navigation,
-        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
+        AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterSegment,
+        HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent,
+        MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState, PendingEscape,
+        RemoteInput, RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView,
+        SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview,
+        area_from_terminal_size, chord_footer_badge, contextual_footer, copied_line_count,
+        encode_key, encode_mouse, encode_paste, grid_for_pane, initial_root_pane_grid,
+        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
+        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
         render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
         selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
@@ -8567,7 +8723,7 @@ mod tests {
                     "",
                     None,
                     Some("layout request 5 rejected"),
-                    Some("TESTCODE"),
+                    ShareView::default(),
                     None,
                 );
             })
@@ -8579,9 +8735,7 @@ mod tests {
         let notice = footer
             .find("layout request 5 rejected")
             .expect("rejection notice rendered");
-        let join = footer.find("join:").expect("join code rendered");
         assert!(help < notice, "notice sits after helper text");
-        assert!(notice < join, "notice sits before join code");
         assert_eq!(
             terminal.backend().buffer()[(notice as u16, 4)].fg,
             UiTheme::default().footer_orange
@@ -8622,7 +8776,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_renderer_draws_status_before_join_code_in_the_footer() {
+    fn shared_renderer_keeps_join_commands_out_of_the_footer() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -8643,7 +8797,11 @@ mod tests {
                     "waiting for current pane reservation",
                     None,
                     None,
-                    Some("TESTCODE"),
+                    ShareView {
+                        code: Some("TESTCODE"),
+                        ticket: Some("p2pmux-v1:TICKET"),
+                        notice: None,
+                    },
                     None,
                 );
             })
@@ -8652,21 +8810,15 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
             .collect::<String>();
         assert!(footer.contains("waiting for current pane reservation"));
-        assert!(footer.contains("join: p2pmux join TESTCODE"));
-        let join = "join: p2pmux join TESTCODE";
-        let join_x = footer.find(join).expect("join code rendered") as u16;
-        for x in join_x..160 {
-            assert!(
-                terminal.backend().buffer()[(x, 4)]
-                    .modifier
-                    .contains(Modifier::UNDERLINED),
-                "join cell at x={x} is underlined"
-            );
-        }
+        // Invite material lives behind Ctrl+S; a same-Mac-only command in the corner read as
+        // something a peer could run, and it never was.
+        assert!(!footer.contains("p2pmux join"));
+        assert!(!footer.contains("TESTCODE"));
+        assert!(footer.contains("SHARE"));
     }
 
     #[test]
-    fn attach_renderer_draws_join_code_in_the_footer() {
+    fn share_modal_shows_the_ticket_and_the_code_with_their_reach() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -8675,8 +8827,9 @@ mod tests {
             }],
             &[(1, 1, 1)],
         );
-        let tui = MultiPaneTui::new(snapshot).expect("layout");
-        let mut terminal = Terminal::new(TestBackend::new(160, 5)).expect("terminal");
+        let mut tui = MultiPaneTui::new(snapshot).expect("layout");
+        tui.modal = super::ModalState::Share;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
         terminal
             .draw(|frame| {
                 render_multi_pane_with_copy_feedback(
@@ -8684,8 +8837,12 @@ mod tests {
                     &tui,
                     &BTreeMap::new(),
                     None,
-                    Some("copied join command"),
-                    Some("TESTCODE"),
+                    None,
+                    ShareView {
+                        code: Some("TESTCODE"),
+                        ticket: Some("p2pmux-v1:TICKETVALUE"),
+                        notice: Some("✓ copied ticket"),
+                    },
                     None,
                     None,
                 );
@@ -8698,8 +8855,13 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("join: p2pmux join TESTCODE"));
-        assert!(rendered.contains("copied join command"));
+        assert!(rendered.contains("Share this session"));
+        assert!(rendered.contains("TICKET — works from any Mac"));
+        assert!(rendered.contains("p2pmux-v1:TICKETVALUE"));
+        assert!(rendered.contains("CODE — this Mac only"));
+        assert!(rendered.contains("TESTCODE"));
+        assert!(rendered.contains("✓ copied ticket"));
+        assert!(rendered.contains("COPY TICKET"));
     }
 
     #[test]
@@ -8724,7 +8886,7 @@ mod tests {
                     "",
                     Some(3),
                     None,
-                    None,
+                    ShareView::default(),
                     None,
                 );
             })
@@ -9137,13 +9299,6 @@ mod tests {
         assert!(tui.selection().is_some());
     }
 
-    fn join_footer_input() -> FooterMouseInput<'static> {
-        FooterMouseInput {
-            join_code: Some("TESTCODE"),
-            ..FooterMouseInput::default()
-        }
-    }
-
     fn left_mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
         crossterm::event::MouseEvent {
             kind,
@@ -9151,213 +9306,6 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
-    }
-
-    #[test]
-    fn mouse_down_on_visible_join_command_arms_join_copy() {
-        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
-        let area = Rect::new(0, 0, 80, 24);
-        let footer = join_footer_input();
-        let join_rect = tui
-            .footer_join_rect(area, footer)
-            .expect("visible join command");
-
-        let handling = tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-
-        assert_eq!(handling, super::MouseHandling::default());
-        assert!(tui.pending_join_click);
-        assert_eq!(tui.focused_pane(), 1);
-        assert!(tui.resize_drag.is_none());
-    }
-
-    #[test]
-    fn join_click_cancels_on_drag_away_or_release_outside() {
-        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
-        let area = Rect::new(0, 0, 80, 24);
-        let footer = join_footer_input();
-        let join_rect = tui
-            .footer_join_rect(area, footer)
-            .expect("visible join command");
-        let outside_x = join_rect.x.saturating_sub(1);
-
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Drag(MouseButton::Left),
-                outside_x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        let handling = tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        assert!(!tui.pending_join_click);
-        assert!(handling.join_copy_command.is_none());
-
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        let handling = tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                outside_x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        assert!(!tui.pending_join_click);
-        assert!(handling.join_copy_command.is_none());
-    }
-
-    #[test]
-    fn join_click_requests_runnable_join_command() {
-        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
-        let area = Rect::new(0, 0, 80, 24);
-        let footer = join_footer_input();
-        let join_rect = tui
-            .footer_join_rect(area, footer)
-            .expect("visible join command");
-
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        let handling = tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-
-        assert_eq!(
-            handling.join_copy_command.as_deref(),
-            Some("p2pmux join TESTCODE")
-        );
-        assert!(!handling.copy_selection_requested);
-    }
-
-    #[test]
-    fn mouse_down_on_footer_help_does_not_arm_join_copy() {
-        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
-        let area = Rect::new(0, 0, 80, 24);
-        let footer = join_footer_input();
-        let layout = super::footer_layout(
-            tui.geometry(area).footer,
-            tui.chord_mode(),
-            footer.status,
-            footer.footer_notice,
-            footer.copied_lines,
-            footer.join_code,
-        );
-        assert!(layout.help_start < layout.help_end);
-
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                layout.help_start,
-                tui.geometry(area).footer.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        let handling = tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                layout.help_start,
-                tui.geometry(area).footer.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-
-        assert!(!tui.pending_join_click);
-        assert!(handling.join_copy_command.is_none());
-    }
-
-    #[test]
-    fn join_click_preserves_existing_pane_selection() {
-        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
-        let area = Rect::new(0, 0, 80, 24);
-        let footer = join_footer_input();
-        assert!(tui.begin_selection_at(2, 3, area));
-        assert!(tui.extend_selection_at(3, 3, area));
-        assert!(tui.end_selection_drag());
-        let selection = tui.selection();
-        let join_rect = tui
-            .footer_join_rect(area, footer)
-            .expect("visible join command");
-
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-        tui.handle_mouse(
-            left_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                join_rect.x,
-                join_rect.y,
-            ),
-            area,
-            footer,
-            PaneMouseProtocol::default(),
-        );
-
-        assert_eq!(tui.selection(), selection);
     }
 
     fn reporting_child() -> PaneMouseProtocol {
@@ -9375,7 +9323,6 @@ mod tests {
         let handling = tui.handle_mouse(
             left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
             area,
-            FooterMouseInput::default(),
             reporting_child(),
         );
 
@@ -9393,19 +9340,16 @@ mod tests {
         tui.handle_mouse(
             left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
         let drag = tui.handle_mouse(
             left_mouse(MouseEventKind::Drag(MouseButton::Left), 4, 3),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
         let up = tui.handle_mouse(
             left_mouse(MouseEventKind::Up(MouseButton::Left), 4, 3),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
 
@@ -9424,13 +9368,11 @@ mod tests {
         tui.handle_mouse(
             left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
         let drag = tui.handle_mouse(
             left_mouse(MouseEventKind::Drag(MouseButton::Left), 70, 20),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
 
@@ -9449,12 +9391,7 @@ mod tests {
             modifiers: KeyModifiers::SHIFT,
         };
 
-        let handling = tui.handle_mouse(
-            shift_down,
-            area,
-            FooterMouseInput::default(),
-            reporting_child(),
-        );
+        let handling = tui.handle_mouse(shift_down, area, reporting_child());
 
         assert_eq!(handling.forward_bytes, None);
         assert!(tui.selection_dragging);
@@ -9469,7 +9406,6 @@ mod tests {
         let handling = tui.handle_mouse(
             left_mouse(MouseEventKind::Down(MouseButton::Left), 45, 3),
             area,
-            FooterMouseInput::default(),
             reporting_child(),
         );
 
@@ -9490,7 +9426,6 @@ mod tests {
         let handling = tui.handle_mouse(
             left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
             area,
-            FooterMouseInput::default(),
             reporting_child(),
         );
 
@@ -9506,7 +9441,6 @@ mod tests {
         let handling = tui.handle_mouse(
             left_mouse(MouseEventKind::ScrollUp, 2, 3),
             area,
-            FooterMouseInput::default(),
             reporting_child(),
         );
 
@@ -9521,7 +9455,6 @@ mod tests {
         let handling = tui.handle_mouse(
             left_mouse(MouseEventKind::ScrollDown, 45, 3),
             area,
-            FooterMouseInput::default(),
             reporting_child(),
         );
 
@@ -9537,7 +9470,6 @@ mod tests {
         let handling = tui.handle_mouse(
             left_mouse(MouseEventKind::ScrollDown, 2, 3),
             area,
-            FooterMouseInput::default(),
             reporting_child(),
         );
 
@@ -9553,19 +9485,16 @@ mod tests {
         let down = tui.handle_mouse(
             left_mouse(MouseEventKind::Down(MouseButton::Left), 39, 5),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
         tui.handle_mouse(
             left_mouse(MouseEventKind::Drag(MouseButton::Left), 49, 5),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
         let up = tui.handle_mouse(
             left_mouse(MouseEventKind::Up(MouseButton::Left), 49, 5),
             area,
-            FooterMouseInput::default(),
             protocol,
         );
 
@@ -9600,27 +9529,12 @@ mod tests {
         };
 
         assert!(
-            tui.handle_mouse(
-                down,
-                area,
-                FooterMouseInput::default(),
-                PaneMouseProtocol::default()
-            )
-            .intents
-            .is_empty()
+            tui.handle_mouse(down, area, PaneMouseProtocol::default())
+                .intents
+                .is_empty()
         );
-        tui.handle_mouse(
-            drag,
-            area,
-            FooterMouseInput::default(),
-            PaneMouseProtocol::default(),
-        );
-        let handling = tui.handle_mouse(
-            up,
-            area,
-            FooterMouseInput::default(),
-            PaneMouseProtocol::default(),
-        );
+        tui.handle_mouse(drag, area, PaneMouseProtocol::default());
+        let handling = tui.handle_mouse(up, area, PaneMouseProtocol::default());
         assert!(handling.intents.is_empty());
         assert!(handling.copy_selection_requested);
 
@@ -9642,24 +9556,9 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        tui.handle_mouse(
-            resize_down,
-            area,
-            FooterMouseInput::default(),
-            PaneMouseProtocol::default(),
-        );
-        tui.handle_mouse(
-            resize_drag,
-            area,
-            FooterMouseInput::default(),
-            PaneMouseProtocol::default(),
-        );
-        let handling = tui.handle_mouse(
-            resize_up,
-            area,
-            FooterMouseInput::default(),
-            PaneMouseProtocol::default(),
-        );
+        tui.handle_mouse(resize_down, area, PaneMouseProtocol::default());
+        tui.handle_mouse(resize_drag, area, PaneMouseProtocol::default());
+        let handling = tui.handle_mouse(resize_up, area, PaneMouseProtocol::default());
         assert!(matches!(
             handling.intents.as_slice(),
             [UiIntent::SetSplitRatio { .. }]
@@ -10066,12 +9965,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(
-            tui.handle_mouse(
-                mouse,
-                area,
-                FooterMouseInput::default(),
-                PaneMouseProtocol::default()
-            ),
+            tui.handle_mouse(mouse, area, PaneMouseProtocol::default()),
             super::MouseHandling::default()
         );
         assert_eq!(tui.focused_pane(), 1);
@@ -10754,7 +10648,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_mode_invite_requests_a_ticket_copy_once_and_leaves_the_mode() {
+    fn ctrl_s_toggles_the_share_modal_and_leaves_any_chord_mode() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
@@ -10763,29 +10657,57 @@ mod tests {
             area,
         );
         assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), area),
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                area
+            ),
             KeyHandling::Consumed(vec![]),
-            "invite is a mux command and never reaches the PTY"
+            "share is a mux command and never reaches the PTY"
         );
+        assert!(tui.share_open());
         assert_eq!(tui.chord_mode(), ChordMode::None);
 
-        assert!(tui.take_ticket_copy_request());
-        assert!(
-            !tui.take_ticket_copy_request(),
-            "a claimed request must not copy again on the next key"
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            area,
         );
+        assert!(!tui.share_open(), "Ctrl+S closes what it opened");
     }
 
     #[test]
-    fn plain_invite_key_reaches_the_pty_outside_pane_mode() {
+    fn share_modal_claims_each_copy_once_and_closes_on_escape() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area);
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Ticket));
+        assert_eq!(
+            tui.take_share_copy_request(),
+            None,
+            "a claimed request must not copy again on the next key"
+        );
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), area);
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Code));
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
+        assert!(!tui.share_open());
+    }
+
+    #[test]
+    fn plain_share_key_reaches_the_pty_without_control() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
         assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), area),
+            tui.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), area),
             KeyHandling::Forward
         );
-        assert!(!tui.take_ticket_copy_request());
+        assert!(!tui.share_open());
     }
 
     #[test]
@@ -11040,11 +10962,11 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
+                "Ctrl+ <p> PANE   <t> TAB   <a> AGENTS   <s> SHARE   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
             ),
             (
                 ChordMode::Pane,
-                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <i> INVITE   <Esc> BACK",
+                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
@@ -11062,9 +10984,6 @@ mod tests {
                 footer.starts_with(expected),
                 "mode: {mode:?}, footer: {footer}"
             );
-            if mode == ChordMode::None {
-                assert!(footer.contains("drag border RESIZE"), "footer: {footer}");
-            }
         }
     }
 
@@ -11090,7 +11009,7 @@ mod tests {
                 .expect("render");
             let footer = terminal.backend().buffer();
             assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
-            let (_, segments) = contextual_footer(mode);
+            let segments = contextual_footer(mode, 120);
             let mut x = 0;
             if let Some(badge) = chord_footer_badge(mode, 120) {
                 for character in badge.chars() {
