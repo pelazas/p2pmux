@@ -155,13 +155,47 @@ shells: Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `ag
 Pi (including Node-based launches), and OpenCode (`opencode`). Each agent is a two-line card: the
 first line shows its kind and best-effort working directory; the second shows its state, chrome
 location (`Tab #N · Pane #M`), host, and control holder. Working cards have an animated spinner
-and live duration, while idle and done cards use distinct `○` and `✓` visuals. Press `Esc` to
+and live duration; `○ idle`, `✓ done`, `◆ needs you`, and `✗ error` use distinct visuals. The
+panel title counts the agents blocked on a human (`Agents · 2 need you`). Press `Esc` to
 close, use arrows or `j`/`k` to select, and press Enter or left-click a card to jump to that pane
 (including on another tab). Scroll the overlay with the mouse wheel while it is open. To retain
 readline's beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A to
 the focused PTY instead. Working directories are shared with every member as part of the existing
 trusted shared-shell model, so do not use a session with people who should not see repository
 paths.
+
+`idle`, `working`, and `done` are inferred from PTY output timing, so they need no setup and work
+for every agent above. `needs you` and `error` cannot be inferred at all — silence looks identical
+whether an agent is thinking or waiting on a permission prompt — so they only appear for an agent
+that reports its own state through a hook.
+
+To wire that up for Claude Code, add this to `~/.claude/settings.json`. Each hook pipes its
+payload to `p2pmux notify`, which writes one line to the pane's session and exits. Outside a
+p2pmux pane it is a silent no-op, so it is safe to leave registered everywhere.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status running", "timeout": 5 }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "p2pmux notify claude --status running", "timeout": 5 }] }],
+    "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "p2pmux notify claude --status running", "timeout": 5 }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status pending", "timeout": 5 }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status done", "timeout": 5 }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status idle", "timeout": 5 }] }]
+  }
+}
+```
+
+A turn that ends by asking a question reports `needs you` rather than `done`, since a green card
+on a turn that is actually waiting reads as safe to ignore. A hook only ever reports for the pane
+it runs in, on the machine it runs on; the node refuses a pane it does not host itself. The
+agent's messages and your prompts are read to decide the status but never leave the machine — only
+the state, the agent kind, and the working directory are shared with the session. A pushed state
+is dropped 20 seconds after its pane returns to a shell prompt, so an agent killed mid-turn stops
+asking for attention.
+
+Hooks also make the mux cheaper: the process scan that infers state drops from every second to
+every five when no pane needs inference.
 
 Clicking a pane focuses it locally without taking control or sending input. When p2pmux runs
 inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
