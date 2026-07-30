@@ -12,6 +12,11 @@ __pycache__/
 .vscode/
 *.swp
 
-# Python bytecode from the e2e harness
-__pycache__/
-*.pyc
+# Launch material — kept local, never published with the repo
+docs/LAUNCH_KIT.md
+scripts/launch-research/winners.json
+scripts/launch-research/winners.md
+scripts/launch-research/candidates.md
+scripts/launch-research/SWIPE_FILE.md
+scripts/launch-research/accounts.txt
+scripts/launch-research/candidates.txt
