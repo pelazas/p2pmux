@@ -1,25 +1,27 @@
 //! The fixed-grid local terminal renderer and input loop.
 
+mod clock;
+mod debug_log;
+mod text;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     error::Error,
-    fmt,
     fs::OpenOptions,
     io,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self as sync_mpsc, Receiver},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +78,13 @@ use crate::{
     transport::Transport,
 };
 
+use clock::unix_ms_now;
+pub(crate) use debug_log::ui_debug_log;
+use text::{
+    copied_line_count, sanitize_single_line, text_width, truncate_bytes, truncate_leading,
+    truncate_trailing, wrap_fixed,
+};
+
 pub(crate) enum NodeScreenSnapshot {
     Local {
         frame: ScreenFrame,
@@ -108,12 +117,6 @@ const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const PANE_SCROLL_WHEEL_STEP: usize = 3;
 
-fn unix_ms_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
 /// Scan cadence while any pane's agent state is being inferred from output
 /// timing. Inference has to notice silence promptly, so this is the floor.
 const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -125,48 +128,6 @@ const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_OVERLAY_CARD_LINES: usize = 3;
-
-struct UiDebugLog {
-    path: Option<PathBuf>,
-    start: Instant,
-    write_lock: Mutex<()>,
-}
-
-pub(crate) fn ui_debug_log(event: &str, fields: fmt::Arguments<'_>) {
-    static UI_DEBUG_LOG: OnceLock<UiDebugLog> = OnceLock::new();
-    let debug_log = UI_DEBUG_LOG.get_or_init(|| {
-        let path = env::var("P2PMUX_DEBUG_UI").ok().and_then(|value| {
-            if value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false") {
-                None
-            } else if value.contains('/') || value.starts_with('.') {
-                Some(PathBuf::from(value))
-            } else {
-                Some(PathBuf::from("/tmp/p2pmux-ui.log"))
-            }
-        });
-        UiDebugLog {
-            path,
-            start: Instant::now(),
-            write_lock: Mutex::new(()),
-        }
-    });
-    let Some(path) = &debug_log.path else {
-        return;
-    };
-    let line = format!(
-        "p2pmux ui: {} {} {}\n",
-        debug_log.start.elapsed().as_millis(),
-        event,
-        fields
-    );
-    let Ok(_write_lock) = debug_log.write_lock.lock() else {
-        return;
-    };
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
-    let _ = file.write_all(line.as_bytes());
-}
 
 enum FooterSegment {
     Text(&'static str),
@@ -2250,33 +2211,6 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && u32::from(row) < u32::from(rect.y) + u32::from(rect.height)
 }
 
-fn text_width(text: &str) -> u16 {
-    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
-}
-
-fn truncate_trailing(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.into();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".into();
-    }
-    let mut result = String::new();
-    for character in value.chars() {
-        if UnicodeWidthStr::width(result.as_str()).saturating_add(character.width().unwrap_or(0))
-            > width - 1
-        {
-            break;
-        }
-        result.push(character);
-    }
-    result.push('…');
-    result
-}
-
 fn tab_label(title: Option<&str>, index: usize, active: bool, unread: bool) -> String {
     let label = title.map_or_else(|| format!("Tab #{index}"), str::to_owned);
     let label = if unread { format!("* {label}") } else { label };
@@ -2684,10 +2618,6 @@ fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
     } else {
         Err(io::Error::other("pbcopy failed"))
     }
-}
-
-fn copied_line_count(text: &str) -> usize {
-    text.split('\n').count().max(1)
 }
 
 /// Renders layout chrome plus any currently available fixed-size VT screens.
@@ -3498,21 +3428,6 @@ pub(crate) fn share_copy_result(
     }
 }
 
-/// Break a ticket across lines by character count.
-///
-/// A ticket is one unbroken base32-ish run, so ratatui's word wrapping would leave most of
-/// every line empty and make the thing look longer than it is.
-fn wrap_fixed(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return Vec::new();
-    }
-    text.chars()
-        .collect::<Vec<_>>()
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
-}
-
 /// The invite panel behind Ctrl+S.
 ///
 /// Both identifiers are shown with what they actually reach, because the difference is the
@@ -3875,47 +3790,6 @@ fn format_agent_elapsed(working_since_unix_ms: u64, now_unix_ms: u64) -> String 
     } else {
         format!("{elapsed_seconds}s")
     }
-}
-
-fn truncate_leading(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.into();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".into();
-    }
-    let mut result = String::new();
-    for character in value.chars().rev() {
-        if UnicodeWidthStr::width(result.as_str()).saturating_add(character.width().unwrap_or(0))
-            > width - 1
-        {
-            break;
-        }
-        result.insert(0, character);
-    }
-    format!("…{result}")
-}
-
-fn sanitize_single_line(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect()
-}
-
-/// Cut `text` to at most `limit` bytes on a character boundary.
-fn truncate_bytes(mut text: String, limit: usize) -> String {
-    if text.len() > limit {
-        let end = (0..=limit)
-            .rev()
-            .find(|index| text.is_char_boundary(*index))
-            .unwrap_or(0);
-        text.truncate(end);
-    }
-    text
 }
 
 /// One fixed-grid PTY owned by this process. Its watch channels are registered with the pane
@@ -7359,11 +7233,10 @@ mod tests {
         MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState, PendingEscape,
         RemoteInput, RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView,
         SharedLayoutRuntime, SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview,
-        area_from_terminal_size, chord_footer_badge, contextual_footer, copied_line_count,
-        encode_key, encode_mouse, encode_paste, grid_for_pane, initial_root_pane_grid,
-        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
-        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
-        reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
+        area_from_terminal_size, chord_footer_badge, contextual_footer, encode_key, encode_mouse,
+        encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command, is_chord_navigation,
+        lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
+        pane_wire_id, reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
         render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
         selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
@@ -10292,13 +10165,6 @@ mod tests {
         };
 
         assert_eq!(selection_text(parser.screen(), selection), None);
-    }
-
-    #[test]
-    fn copied_line_count_reports_newline_separated_lines() {
-        assert_eq!(copied_line_count("one line"), 1);
-        assert_eq!(copied_line_count("first\nsecond\nthird"), 3);
-        assert_eq!(copied_line_count(""), 1);
     }
 
     #[test]
