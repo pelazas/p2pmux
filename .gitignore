@@ -6,6 +6,10 @@
 __pycache__/
 *.py[cod]
 
+# Cloudflare Wrangler local state
+.wrangler/
+node_modules/
+
 # macOS and local editor metadata
 .DS_Store
 .idea/
