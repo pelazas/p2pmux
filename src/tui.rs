@@ -2,6 +2,7 @@
 
 mod clock;
 mod debug_log;
+mod geometry;
 mod input;
 #[cfg(test)]
 mod test_support;
@@ -59,9 +60,7 @@ use crate::{
     },
     config::UiTheme,
     kitty_keyboard::KittyKeyboardTracker,
-    layout::{
-        Axis, LayoutError, LayoutSnapshot, NewPanePosition, Node, PaneId, TabId, normalize_title,
-    },
+    layout::{Axis, LayoutError, LayoutSnapshot, NewPanePosition, PaneId, TabId, normalize_title},
     lease::{IDLE_AFTER, LeaseDecision, LeaseManager, LeaseState},
     local_ipc::AgentOverlaySnapshotRow,
     protocol::{
@@ -83,6 +82,13 @@ use crate::{
 
 use clock::unix_ms_now;
 pub(crate) use debug_log::ui_debug_log;
+use geometry::{
+    allocate_node_with_preview, area_from_terminal_size, clamp_to_viewport, contains_leaf,
+    direction_distance, first_leaf, fixed_grid_viewport, is_in_direction, mouse_to_screen_cell,
+    nearest_split_for_pane, pane_at, pane_content_rect, rect_center, rect_contains,
+    resize_border_hit, resize_proposed_share, visible_leaf_panes,
+};
+pub(crate) use geometry::{grid_for_pane, initial_root_pane_grid};
 pub use input::mouse::PaneMouseProtocol;
 use input::{
     events::{
@@ -1982,80 +1988,6 @@ impl MultiPaneTui {
     }
 }
 
-fn first_leaf(node: &Node) -> Option<PaneId> {
-    match node {
-        Node::Leaf { pane_id } => Some(*pane_id),
-        Node::Split { first, .. } => first_leaf(first),
-    }
-}
-
-fn visible_leaf_panes(node: &Node) -> Vec<PaneId> {
-    match node {
-        Node::Leaf { pane_id } => vec![*pane_id],
-        Node::Split { first, second, .. } => {
-            let mut panes = visible_leaf_panes(first);
-            panes.extend(visible_leaf_panes(second));
-            panes
-        }
-    }
-}
-
-fn pane_at(panes: &BTreeMap<PaneId, Rect>, column: u16, row: u16) -> Option<PaneId> {
-    panes
-        .iter()
-        .find_map(|(pane_id, rect)| rect_contains(*rect, column, row).then_some(*pane_id))
-}
-
-fn resize_border_hit(
-    panes: &BTreeMap<PaneId, Rect>,
-    column: u16,
-    row: u16,
-) -> Option<(PaneId, bool, bool)> {
-    panes.iter().find_map(|(pane_id, rect)| {
-        if !rect_contains(*rect, column, row)
-            || rect_contains(pane_content_rect(*rect), column, row)
-        {
-            return None;
-        }
-        let vertical = (rect.width > 0
-            && column == rect.x
-            && panes.iter().any(|(other_id, other)| {
-                other_id != pane_id
-                    && other.right() == rect.x
-                    && rect_contains(*other, other.x, row)
-            }))
-            || (rect.width > 0
-                && column == rect.right().saturating_sub(1)
-                && panes.iter().any(|(other_id, other)| {
-                    other_id != pane_id
-                        && other.x == rect.right()
-                        && rect_contains(*other, other.x, row)
-                }));
-        let horizontal = (rect.height > 0
-            && row == rect.y
-            && panes.iter().any(|(other_id, other)| {
-                other_id != pane_id
-                    && other.bottom() == rect.y
-                    && rect_contains(*other, column, other.y)
-            }))
-            || (rect.height > 0
-                && row == rect.bottom().saturating_sub(1)
-                && panes.iter().any(|(other_id, other)| {
-                    other_id != pane_id
-                        && other.y == rect.bottom()
-                        && rect_contains(*other, column, other.y)
-                }));
-        (vertical || horizontal).then_some((*pane_id, vertical, horizontal))
-    })
-}
-
-fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
-    u32::from(column) >= u32::from(rect.x)
-        && u32::from(column) < u32::from(rect.x) + u32::from(rect.width)
-        && u32::from(row) >= u32::from(rect.y)
-        && u32::from(row) < u32::from(rect.y) + u32::from(rect.height)
-}
-
 fn tab_label(title: Option<&str>, index: usize, active: bool, unread: bool) -> String {
     let label = title.map_or_else(|| format!("Tab #{index}"), str::to_owned);
     let label = if unread { format!("* {label}") } else { label };
@@ -2123,288 +2055,6 @@ fn pane_border_color(
         Some([]) | None => theme.pane_border_idle,
         Some(_) => theme.pane_border_remote_control,
     }
-}
-
-fn resize_proposed_share(drag: ResizeDrag, column: u16, row: u16) -> u16 {
-    let delta = match drag.axis.expect("locked resize drag has an axis") {
-        Axis::LeftRight => i32::from(column) - i32::from(drag.origin_column),
-        Axis::TopBottom => i32::from(row) - i32::from(drag.origin_row),
-    };
-    (i32::from(drag.original_share_bps) + delta * 10_000 / i32::from(drag.span.max(1)))
-        .clamp(1, 9_999) as u16
-}
-
-fn contains_leaf(node: &Node, pane_id: PaneId) -> bool {
-    match node {
-        Node::Leaf { pane_id: candidate } => *candidate == pane_id,
-        Node::Split { first, second, .. } => {
-            contains_leaf(first, pane_id) || contains_leaf(second, pane_id)
-        }
-    }
-}
-
-fn nearest_split_for_pane(
-    node: &Node,
-    pane_id: PaneId,
-    axis: Axis,
-    area: Rect,
-) -> Option<SplitTarget> {
-    let Node::Split {
-        axis: split_axis,
-        first_share_bps,
-        first,
-        second,
-    } = node
-    else {
-        return None;
-    };
-    let (first_area, second_area) = split_areas(*split_axis, *first_share_bps, first, second, area);
-    if contains_leaf(first, pane_id) {
-        nearest_split_for_pane(first, pane_id, axis, first_area).or_else(|| {
-            (*split_axis == axis).then_some(SplitTarget {
-                first_share_bps: *first_share_bps,
-                span: match axis {
-                    Axis::LeftRight => area.width,
-                    Axis::TopBottom => area.height,
-                },
-            })
-        })
-    } else if contains_leaf(second, pane_id) {
-        nearest_split_for_pane(second, pane_id, axis, second_area).or_else(|| {
-            (*split_axis == axis).then_some(SplitTarget {
-                first_share_bps: *first_share_bps,
-                span: match axis {
-                    Axis::LeftRight => area.width,
-                    Axis::TopBottom => area.height,
-                },
-            })
-        })
-    } else {
-        None
-    }
-}
-
-fn node_minimum(node: &Node) -> (u16, u16) {
-    match node {
-        Node::Leaf { .. } => (3, 3),
-        Node::Split {
-            axis,
-            first,
-            second,
-            ..
-        } => {
-            let (first_width, first_height) = node_minimum(first);
-            let (second_width, second_height) = node_minimum(second);
-            match axis {
-                Axis::LeftRight => (
-                    first_width.saturating_add(second_width),
-                    first_height.max(second_height),
-                ),
-                Axis::TopBottom => (
-                    first_width.max(second_width),
-                    first_height.saturating_add(second_height),
-                ),
-            }
-        }
-    }
-}
-
-fn allocated_first_span(span: u16, share_bps: u16, first_min: u16, second_min: u16) -> u16 {
-    let unconstrained = ((u32::from(span) * u32::from(share_bps)) / 10_000) as u16;
-    if span >= first_min.saturating_add(second_min) {
-        unconstrained.clamp(first_min, span.saturating_sub(second_min))
-    } else {
-        unconstrained.min(span)
-    }
-}
-
-fn split_areas(
-    axis: Axis,
-    first_share_bps: u16,
-    first: &Node,
-    second: &Node,
-    area: Rect,
-) -> (Rect, Rect) {
-    match axis {
-        Axis::LeftRight => {
-            let (first_min, _) = node_minimum(first);
-            let (second_min, _) = node_minimum(second);
-            let first_width =
-                allocated_first_span(area.width, first_share_bps, first_min, second_min);
-            (
-                Rect::new(area.x, area.y, first_width, area.height),
-                Rect::new(
-                    area.x.saturating_add(first_width),
-                    area.y,
-                    area.width - first_width,
-                    area.height,
-                ),
-            )
-        }
-        Axis::TopBottom => {
-            let (_, first_min) = node_minimum(first);
-            let (_, second_min) = node_minimum(second);
-            let first_height =
-                allocated_first_span(area.height, first_share_bps, first_min, second_min);
-            (
-                Rect::new(area.x, area.y, area.width, first_height),
-                Rect::new(
-                    area.x,
-                    area.y.saturating_add(first_height),
-                    area.width,
-                    area.height - first_height,
-                ),
-            )
-        }
-    }
-}
-
-fn allocate_node_with_preview(
-    node: &Node,
-    area: Rect,
-    panes: &mut BTreeMap<PaneId, Rect>,
-    preview: Option<ResizePreview>,
-) {
-    match node {
-        Node::Leaf { pane_id } => {
-            panes.insert(*pane_id, area);
-        }
-        Node::Split {
-            axis,
-            first_share_bps,
-            first,
-            second,
-        } => {
-            let share = preview
-                .filter(|preview| {
-                    preview.axis == *axis
-                        && split_is_nearest_for_pane(node, preview.pane_id, preview.axis)
-                })
-                .map_or(*first_share_bps, |preview| preview.first_share_bps);
-            let (first_area, second_area) = split_areas(*axis, share, first, second, area);
-            allocate_node_with_preview(first, first_area, panes, preview);
-            allocate_node_with_preview(second, second_area, panes, preview);
-        }
-    }
-}
-
-fn split_is_nearest_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> bool {
-    let Node::Split {
-        axis: split_axis,
-        first,
-        second,
-        ..
-    } = node
-    else {
-        return false;
-    };
-    if *split_axis != axis {
-        return false;
-    }
-    let child = if contains_leaf(first, pane_id) {
-        first
-    } else if contains_leaf(second, pane_id) {
-        second
-    } else {
-        return false;
-    };
-    !contains_split_for_pane(child, pane_id, axis)
-}
-
-fn contains_split_for_pane(node: &Node, pane_id: PaneId, axis: Axis) -> bool {
-    let Node::Split {
-        axis: split_axis,
-        first,
-        second,
-        ..
-    } = node
-    else {
-        return false;
-    };
-    if contains_leaf(first, pane_id) {
-        *split_axis == axis || contains_split_for_pane(first, pane_id, axis)
-    } else if contains_leaf(second, pane_id) {
-        *split_axis == axis || contains_split_for_pane(second, pane_id, axis)
-    } else {
-        false
-    }
-}
-
-pub(crate) fn grid_for_pane(rect: Rect) -> (u16, u16) {
-    let content = pane_content_rect(rect);
-    (content.height.max(1), content.width.max(1))
-}
-
-pub(crate) fn initial_root_pane_grid(cols: u16, rows: u16) -> (u16, u16) {
-    grid_for_pane(Rect::new(0, 0, cols, rows.saturating_sub(2)))
-}
-
-fn rect_center(rect: Rect) -> (u32, u32) {
-    (
-        u32::from(rect.x) * 2 + u32::from(rect.width),
-        u32::from(rect.y) * 2 + u32::from(rect.height),
-    )
-}
-
-fn is_in_direction(source: (u32, u32), target: (u32, u32), direction: KeyCode) -> bool {
-    match direction {
-        KeyCode::Left => target.0 < source.0,
-        KeyCode::Right => target.0 > source.0,
-        KeyCode::Up => target.1 < source.1,
-        KeyCode::Down => target.1 > source.1,
-        _ => false,
-    }
-}
-
-fn direction_distance(
-    source: (u32, u32),
-    target: (u32, u32),
-    direction: KeyCode,
-    pane_id: PaneId,
-) -> (u32, u32, u32, PaneId) {
-    match direction {
-        KeyCode::Left | KeyCode::Right => {
-            let primary = source.0.abs_diff(target.0);
-            let secondary = source.1.abs_diff(target.1);
-            (primary + secondary, secondary, primary, pane_id)
-        }
-        KeyCode::Up | KeyCode::Down => {
-            let primary = source.1.abs_diff(target.1);
-            let secondary = source.0.abs_diff(target.0);
-            (primary + secondary, secondary, primary, pane_id)
-        }
-        _ => (u32::MAX, u32::MAX, u32::MAX, pane_id),
-    }
-}
-
-fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
-    let width = inner.width.min(cols);
-    let height = inner.height.min(rows);
-    Rect::new(inner.x, inner.y, width, height)
-}
-
-fn pane_content_rect(pane_rect: Rect) -> Rect {
-    Block::bordered().inner(pane_rect)
-}
-
-/// Pins a pointer that wandered off the pane to the nearest cell inside it.
-fn clamp_to_viewport(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
-    if viewport.width == 0 || viewport.height == 0 {
-        return None;
-    }
-    let last_column = viewport.x + viewport.width - 1;
-    let last_row = viewport.y + viewport.height - 1;
-    Some(ScreenCell {
-        row: row.clamp(viewport.y, last_row) - viewport.y,
-        col: column.clamp(viewport.x, last_column) - viewport.x,
-    })
-}
-
-fn mouse_to_screen_cell(viewport: Rect, column: u16, row: u16) -> Option<ScreenCell> {
-    rect_contains(viewport, column, row).then_some(ScreenCell {
-        row: row.saturating_sub(viewport.y),
-        col: column.saturating_sub(viewport.x),
-    })
 }
 
 fn selection_text(screen: &vt100::Screen, selection: PaneTextSelection) -> Option<String> {
@@ -6049,11 +5699,6 @@ impl SharedLayoutRuntime {
     }
 }
 
-fn area_from_terminal_size(size: io::Result<(u16, u16)>) -> Option<Rect> {
-    size.ok()
-        .map(|(width, height)| Rect::new(0, 0, width, height))
-}
-
 pub struct HostPaneRuntime {
     host: PtyHost,
     screen: HostScreen,
@@ -6777,7 +6422,7 @@ fn member_label(peer_id: &[u8], members: &[crate::layout::Member]) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
-        fs, io,
+        fs,
         net::Ipv4Addr,
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -6811,10 +6456,9 @@ mod tests {
         HostPaneChannels, HostPaneRuntime, KeyHandling, LayoutControlEvent, MultiPaneTui,
         PaneMouseProtocol, PaneTextSelection, PaneViewState, PendingEscape, RemoteInput,
         RemoteSubscriptionState, ScreenCell, ShareCopy, ShareView, SharedLayoutRuntime,
-        SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
-        chord_footer_badge, contextual_footer, grid_for_pane, initial_root_pane_grid,
-        is_chord_command, is_chord_navigation, lease_allows_held_input, member_label,
-        mouse_to_screen_cell, pane_border_color, pane_title, pane_wire_id,
+        SharedLocalPane, UiIntent, VtScreen, chord_footer_badge, contextual_footer, grid_for_pane,
+        initial_root_pane_grid, is_chord_command, is_chord_navigation, lease_allows_held_input,
+        member_label, pane_border_color, pane_title, pane_wire_id,
         reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
         render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
         selection_text, text_width, viewed_screen, visible_leaf_panes,
@@ -7537,14 +7181,6 @@ mod tests {
         assert_eq!(super::agent_overlay_working_glyph(0), "◐");
         assert_eq!(super::agent_overlay_working_glyph(1), "◓");
         assert_eq!(super::agent_overlay_working_glyph(4), "◐");
-    }
-
-    #[test]
-    fn terminal_area_is_absent_when_terminal_size_is_unavailable() {
-        assert_eq!(
-            area_from_terminal_size(Err(io::Error::from(io::ErrorKind::WouldBlock))),
-            None
-        );
     }
 
     #[test]
@@ -8495,30 +8131,6 @@ mod tests {
     }
 
     #[test]
-    fn ratio_allocation_respects_recursive_minima_and_small_areas() {
-        let node = Node::Split {
-            axis: Axis::LeftRight,
-            first_share_bps: 7_500,
-            first: Box::new(Node::Leaf { pane_id: 1 }),
-            second: Box::new(Node::Split {
-                axis: Axis::LeftRight,
-                first_share_bps: 5_000,
-                first: Box::new(Node::Leaf { pane_id: 2 }),
-                second: Box::new(Node::Leaf { pane_id: 3 }),
-            }),
-        };
-        let mut panes = BTreeMap::new();
-        allocate_node_with_preview(&node, Rect::new(0, 0, 12, 9), &mut panes, None);
-        assert_eq!(panes[&1].width, 6, "nested sibling needs six columns");
-        assert_eq!(panes[&2].width, 3);
-        assert_eq!(panes[&3].width, 3);
-
-        panes.clear();
-        allocate_node_with_preview(&node, Rect::new(0, 0, 2, 2), &mut panes, None);
-        assert_eq!(panes[&1].width + panes[&2].width + panes[&3].width, 2);
-    }
-
-    #[test]
     fn content_drag_keeps_the_selection_path() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -9409,18 +9021,6 @@ mod tests {
         assert!(tui.hover_pane_at(10, 0, area));
         assert_eq!(tui.hovered_pane, None);
         assert_eq!(tui.focused_pane(), 1);
-    }
-
-    #[test]
-    fn mouse_coordinates_map_to_visible_screen_cells_only() {
-        let viewport = Rect::new(10, 5, 3, 2);
-
-        assert_eq!(
-            mouse_to_screen_cell(viewport, 12, 6),
-            Some(ScreenCell { row: 1, col: 2 })
-        );
-        assert_eq!(mouse_to_screen_cell(viewport, 9, 5), None);
-        assert_eq!(mouse_to_screen_cell(viewport, 13, 6), None);
     }
 
     #[test]
