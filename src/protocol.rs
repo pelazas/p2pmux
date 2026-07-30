@@ -565,6 +565,22 @@ pub enum AgentRosterState {
     Done = 2,
 }
 
+impl AgentRosterState {
+    /// Decode a wire state, folding anything this build does not recognize into
+    /// `Idle`.
+    ///
+    /// A peer on a newer build may publish a state this binary has no variant
+    /// for. Refusing it is not an option: `validate_agent_roster` runs inside
+    /// `validate_envelope`, so a rejection fails `decode_frame`, and
+    /// `FrameReader::read_next` turns that into a transport error that drops the
+    /// whole peer stream. One unknown enum value would disconnect the session
+    /// rather than dim one overlay row, so unknown states degrade to the
+    /// quietest state instead.
+    pub fn from_wire(raw: i32) -> Self {
+        Self::try_from(raw).unwrap_or(Self::Idle)
+    }
+}
+
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
     validate_envelope(envelope)?;
 
@@ -873,10 +889,7 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
             entry.agent_kind.len(),
             MAX_AGENT_KIND_BYTES,
         )?;
-        if !matches!(
-            entry.agent_kind.as_str(),
-            "claude" | "codex" | "cursor" | "pi" | "opencode"
-        ) {
+        if !is_agent_kind_token(&entry.agent_kind) {
             return Err(ProtocolError::InvalidLayout(
                 "agent_roster.entry.agent_kind",
             ));
@@ -886,10 +899,26 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
             entry.cwd.len(),
             MAX_AGENT_CWD_BYTES,
         )?;
-        AgentRosterState::try_from(entry.state)
-            .map_err(|_| ProtocolError::InvalidLayout("agent_roster.entry.state"))?;
+        // `entry.state` is deliberately not checked against the known variants:
+        // see `AgentRosterState::from_wire`. Readers fold an unknown state to
+        // `Idle` instead of failing the frame.
     }
     Ok(())
+}
+
+/// Whether an agent kind is a well-formed slug: non-empty lowercase ASCII
+/// letters, digits, and dashes.
+///
+/// This checks the shape rather than a closed set of known agents on purpose.
+/// The shape check is what actually protects the overlay — it keeps control
+/// characters, ANSI, and newlines out of a rendered cell — while a closed set
+/// would additionally make every newly supported agent a connection-tearing
+/// protocol break, for the same reason unknown states cannot be rejected.
+fn is_agent_kind_token(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn validate_id(field: &'static str, bytes: &[u8], limit: usize) -> Result<(), ProtocolError> {

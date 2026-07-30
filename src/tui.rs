@@ -5291,7 +5291,7 @@ impl SharedLayoutRuntime {
                             .unwrap_or_else(|| format!("Pane #{pane_ordinal}")),
                         kind: sanitize_single_line(&entry.agent_kind),
                         cwd: sanitize_single_line(&entry.cwd),
-                        state: AgentRosterState::try_from(entry.state).ok()?,
+                        state: AgentRosterState::from_wire(entry.state),
                         working_since_unix_ms: entry.working_since_unix_ms,
                         host,
                         controller,

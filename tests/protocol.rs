@@ -454,16 +454,52 @@ fn agent_roster_allows_zero_working_since_while_working() {
 }
 
 #[test]
+fn agent_roster_survives_states_and_kinds_from_a_newer_peer() {
+    // Both fields are open vocabularies. A peer on a newer build may name an
+    // agent this binary has never heard of, or report a state it has no variant
+    // for; neither may fail the frame, because `decode_frame` failing drops the
+    // whole peer stream in `FrameReader::read_next`. An unknown state reads as
+    // `Idle` rather than vanishing from the overlay.
+    let roster = agent_roster(vec![AgentRosterEntry {
+        agent_kind: String::from("some-future-agent"),
+        state: 99,
+        ..agent_entry(9)
+    }]);
+    let original = envelope(envelope::Body::AgentRoster(roster));
+
+    let frame = encode_frame(&original).expect("an unknown kind and state still encode");
+    assert_eq!(
+        decode_frame(&frame).expect("an unknown kind and state still decode"),
+        original
+    );
+    assert_eq!(AgentRosterState::from_wire(99), AgentRosterState::Idle);
+    assert_eq!(
+        AgentRosterState::from_wire(AgentRosterState::Done as i32),
+        AgentRosterState::Done
+    );
+}
+
+#[test]
 fn agent_roster_validation_rejects_bad_entries() {
     let cases = [
         agent_roster(vec![agent_entry(0)]),
         agent_roster(vec![agent_entry(1), agent_entry(1)]),
+        // A kind is still shape-checked, so nothing that would corrupt a
+        // rendered cell gets through: empty, uppercase, spaces, control chars.
         agent_roster(vec![AgentRosterEntry {
-            agent_kind: String::from("unknown"),
+            agent_kind: String::new(),
             ..agent_entry(1)
         }]),
         agent_roster(vec![AgentRosterEntry {
-            state: 99,
+            agent_kind: String::from("Claude"),
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            agent_kind: String::from("claude code"),
+            ..agent_entry(1)
+        }]),
+        agent_roster(vec![AgentRosterEntry {
+            agent_kind: String::from("claude\u{1b}[2J"),
             ..agent_entry(1)
         }]),
         agent_roster(vec![AgentRosterEntry {
