@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     layout::{Axis, LayoutSnapshot, Node, Pane, Tab},
-    tui::PaneMouseProtocol,
+    tui::{AgentOverlayRow, ModalState, MultiPaneTui, PaneMouseProtocol},
 };
 
 pub(in crate::tui) fn mouse_protocol(
@@ -67,4 +67,45 @@ pub(in crate::tui) fn split_layout() -> LayoutSnapshot {
         }],
         &[(1, 4, 10), (2, 4, 10), (3, 4, 10)],
     )
+}
+
+pub(in crate::tui) fn agent_row(
+    pane_id: u64,
+    tab_ordinal: usize,
+    pane_ordinal: usize,
+) -> AgentOverlayRow {
+    AgentOverlayRow {
+        pane_id,
+        tab_ordinal,
+        pane_ordinal,
+        tab_label: format!("Tab #{tab_ordinal}"),
+        pane_label: format!("Pane #{pane_ordinal}"),
+        kind: String::from("codex"),
+        cwd: String::from("/very/long/repository/path"),
+        state: crate::protocol::AgentRosterState::Working,
+        working_since_unix_ms: 1_725_000_000_123,
+        host: String::from("Host"),
+        controller: String::from("free"),
+    }
+}
+
+pub(in crate::tui) fn agent_overlay_tui(count: u64) -> MultiPaneTui {
+    let tabs = (1..=count)
+        .map(|pane_id| Tab {
+            tab_id: pane_id,
+            root: Node::Leaf { pane_id },
+            title: None,
+        })
+        .collect();
+    let panes = (1..=count)
+        .map(|pane_id| (pane_id, 2, 8))
+        .collect::<Vec<_>>();
+    let mut tui = MultiPaneTui::new(layout(tabs, &panes)).expect("valid layout");
+    tui.set_agent_rows(
+        (1..=count)
+            .map(|pane_id| agent_row(pane_id, pane_id as usize, 1))
+            .collect(),
+    );
+    tui.modal = ModalState::Agents;
+    tui
 }
