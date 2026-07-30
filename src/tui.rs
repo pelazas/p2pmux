@@ -3324,11 +3324,17 @@ fn render_agents_overlay(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms:
     let area = frame.area();
     let panel = agents_overlay_panel(area);
     frame.render_widget(Clear, panel);
+    let needs_you = tui.agent_rows.iter().any(|row| row.state.needs_you());
+    let title_color = if needs_you {
+        tui.theme.agent_overlay_attention
+    } else {
+        tui.theme.agent_overlay_chrome
+    };
     let block = Block::bordered()
         .title(Line::styled(
-            " Agents ",
+            agents_overlay_title(&tui.agent_rows),
             Style::default()
-                .fg(tui.theme.agent_overlay_chrome)
+                .fg(title_color)
                 .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
@@ -3506,6 +3512,30 @@ fn render_delete_tab_confirmation(frame: &mut Frame<'_>, pane_count: usize, them
     );
 }
 
+/// Colour for a state's glyph and label. `Working` keeps the chrome accent it
+/// has always had; the two states that want a human get their own roles so a
+/// blocked or failed agent never reads as ordinary muted text.
+fn agent_overlay_state_color(state: AgentRosterState, theme: &UiTheme) -> Color {
+    match state {
+        AgentRosterState::Working => theme.agent_overlay_chrome,
+        AgentRosterState::Pending => theme.agent_overlay_attention,
+        AgentRosterState::Error => theme.agent_overlay_error,
+        AgentRosterState::Idle | AgentRosterState::Done => theme.agent_overlay_muted,
+    }
+}
+
+/// Overlay title, carrying a count of agents blocked on a human when there are
+/// any. The whole point of opening the overlay is finding those, so the count
+/// belongs where it is readable before the eye reaches the cards.
+fn agents_overlay_title(rows: &[AgentOverlayRow]) -> String {
+    let needs_you = rows.iter().filter(|row| row.state.needs_you()).count();
+    match needs_you {
+        0 => String::from(" Agents "),
+        1 => String::from(" Agents · 1 needs you "),
+        count => format!(" Agents · {count} need you "),
+    }
+}
+
 fn format_agent_overlay_card(
     row: &AgentOverlayRow,
     selected: bool,
@@ -3552,7 +3582,10 @@ fn format_agent_overlay_card(
         ),
         AgentRosterState::Idle => ("○", "idle", None),
         AgentRosterState::Done => ("✓", "done", None),
+        AgentRosterState::Pending => ("◆", "needs you", None),
+        AgentRosterState::Error => ("✗", "error", None),
     };
+    let state_color = agent_overlay_state_color(row.state, theme);
     let location = format!(
         " · {} · {} · host: {}",
         truncate_trailing(&row.tab_label, usize::from(width / 3)),
@@ -3571,24 +3604,16 @@ fn format_agent_overlay_card(
     );
     let controller = (controller_width > 0)
         .then(|| truncate_trailing(&row.controller, usize::from(controller_width)));
+    let mut state_style = Style::default().fg(state_color);
+    if row.state.needs_you() {
+        // A blocked agent is the one row in the overlay that is costing someone
+        // time right now, so it gets the only weight in the state column.
+        state_style = state_style.add_modifier(Modifier::BOLD);
+    }
     let mut second_spans = vec![
-        Span::styled(
-            glyph,
-            Style::default().fg(if row.state == AgentRosterState::Working {
-                theme.agent_overlay_chrome
-            } else {
-                theme.agent_overlay_muted
-            }),
-        ),
+        Span::styled(glyph, Style::default().fg(state_color)),
         Span::raw(" "),
-        Span::styled(
-            state,
-            Style::default().fg(if row.state == AgentRosterState::Working {
-                theme.agent_overlay_foreground
-            } else {
-                theme.agent_overlay_muted
-            }),
-        ),
+        Span::styled(state, state_style),
     ];
     if let Some(elapsed) = elapsed {
         second_spans.push(Span::raw(" "));
@@ -7608,6 +7633,77 @@ mod tests {
             &UiTheme::default(),
         );
         assert!(future[1].to_string().starts_with("◐ working 0s"));
+    }
+
+    #[test]
+    fn agents_overlay_cards_mark_blocked_and_failed_agents() {
+        use crate::protocol::AgentRosterState;
+
+        let theme = UiTheme::default();
+        let mut row = agent_row(2, 2, 1);
+
+        row.state = AgentRosterState::Pending;
+        let pending =
+            super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
+        assert!(pending[1].to_string().starts_with("◆ needs you"));
+        // A blocked agent is the one row costing someone time, so it carries
+        // the attention colour and the only weight in the state column.
+        let state_span = &pending[1].spans[2];
+        assert_eq!(state_span.style.fg, Some(theme.agent_overlay_attention));
+        assert!(state_span.style.add_modifier.contains(Modifier::BOLD));
+
+        row.state = AgentRosterState::Error;
+        let error =
+            super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
+        assert!(error[1].to_string().starts_with("✗ error"));
+        assert_eq!(error[1].spans[2].style.fg, Some(theme.agent_overlay_error));
+
+        // Working keeps the chrome accent and stays unweighted.
+        row.state = AgentRosterState::Working;
+        let working =
+            super::format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
+        assert_eq!(
+            working[1].spans[2].style.fg,
+            Some(theme.agent_overlay_chrome)
+        );
+        assert!(
+            !working[1].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn agents_overlay_title_counts_agents_blocked_on_a_human() {
+        use crate::protocol::AgentRosterState;
+
+        let working = agent_row(1, 1, 1);
+        assert_eq!(super::agents_overlay_title(&[]), " Agents ");
+        assert_eq!(
+            super::agents_overlay_title(std::slice::from_ref(&working)),
+            " Agents "
+        );
+
+        let mut pending = agent_row(2, 1, 2);
+        pending.state = AgentRosterState::Pending;
+        assert_eq!(
+            super::agents_overlay_title(&[working.clone(), pending.clone()]),
+            " Agents · 1 needs you "
+        );
+
+        // Errors count too: a failed turn is blocking whoever asked for it.
+        let mut failed = agent_row(3, 1, 3);
+        failed.state = AgentRosterState::Error;
+        assert_eq!(
+            super::agents_overlay_title(&[working.clone(), pending, failed]),
+            " Agents · 2 need you "
+        );
+
+        // A finished agent is worth a glance but is not holding anyone up.
+        let mut done = agent_row(4, 1, 4);
+        done.state = AgentRosterState::Done;
+        assert_eq!(super::agents_overlay_title(&[working, done]), " Agents ");
     }
 
     #[test]

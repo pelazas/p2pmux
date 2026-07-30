@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n#\n# An agent counts as finished after this many seconds of silence. Agents pause for a\n# long time mid-task (waiting on a model response, running a quiet tool), so a small\n# value reports unfinished work as finished. Clamped to 5-3600.\n# quiet_seconds = 20\n#\n# Only finish on an explicit signal from the agent (a terminal bell) and never on the\n# silence timer above. Removes every false notification, but an agent that does not\n# ring will show as working until it exits.\n# require_bell = false\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n\n[ui.notifications]\n# Set false to keep agent-completion stars without playing a sound.\nsound_enabled = true\n# sound_path = \"/path/to/custom.aiff\"\n#\n# An agent counts as finished after this many seconds of silence. Agents pause for a\n# long time mid-task (waiting on a model response, running a quiet tool), so a small\n# value reports unfinished work as finished. Clamped to 5-3600.\n# quiet_seconds = 20\n#\n# Only finish on an explicit signal from the agent (a terminal bell) and never on the\n# silence timer above. Removes every false notification, but an agent that does not\n# ring will show as working until it exits.\n# require_bell = false\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -91,6 +91,8 @@ pub struct UiTheme {
     pub agent_overlay_selected_background: Color,
     pub agent_overlay_muted: Color,
     pub agent_overlay_warm: Color,
+    pub agent_overlay_attention: Color,
+    pub agent_overlay_error: Color,
     pub agent_overlay_foreground: Color,
     pub agent_overlay_secondary: Color,
     pub pane_border_free_focused: Color,
@@ -116,6 +118,8 @@ impl Default for UiTheme {
             agent_overlay_selected_background: Color::Rgb(42, 42, 42),
             agent_overlay_muted: Color::Rgb(145, 157, 180),
             agent_overlay_warm: Color::Rgb(255, 184, 77),
+            agent_overlay_attention: Color::Rgb(255, 176, 0),
+            agent_overlay_error: Color::Rgb(220, 50, 47),
             agent_overlay_foreground: Color::White,
             agent_overlay_secondary: Color::Gray,
             pane_border_free_focused: Color::White,
@@ -165,6 +169,8 @@ struct UiThemeFile {
     agent_overlay_selected_background: Option<String>,
     agent_overlay_muted: Option<String>,
     agent_overlay_warm: Option<String>,
+    agent_overlay_attention: Option<String>,
+    agent_overlay_error: Option<String>,
     agent_overlay_foreground: Option<String>,
     agent_overlay_secondary: Option<String>,
     pane_border_free_focused: Option<String>,
@@ -276,6 +282,16 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         &mut theme.agent_overlay_warm,
         config.ui.theme.agent_overlay_warm,
         "agent_overlay_warm",
+    )?;
+    apply_color(
+        &mut theme.agent_overlay_attention,
+        config.ui.theme.agent_overlay_attention,
+        "agent_overlay_attention",
+    )?;
+    apply_color(
+        &mut theme.agent_overlay_error,
+        config.ui.theme.agent_overlay_error,
+        "agent_overlay_error",
     )?;
     apply_color(
         &mut theme.agent_overlay_foreground,

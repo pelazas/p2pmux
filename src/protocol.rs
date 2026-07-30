@@ -563,9 +563,51 @@ pub enum AgentRosterState {
     Idle = 0,
     Working = 1,
     Done = 2,
+    /// The agent is blocked on a human: a permission prompt, an elicitation
+    /// dialog, or a turn that ended by asking a question. Only a producer that
+    /// hooks the agent can report this — no amount of output-timing inference
+    /// distinguishes "waiting on you" from "waiting on the model".
+    Pending = 3,
+    /// The agent's turn failed.
+    Error = 4,
 }
 
 impl AgentRosterState {
+    /// Rank for aggregation and ordering: `Error > Pending > Working > Done >
+    /// Idle`. Failures outrank everything so they never hide behind a spinner,
+    /// and a blocked agent outranks a busy one because only the first needs a
+    /// human.
+    ///
+    /// Severity is a method rather than the enum's own `Ord` because the
+    /// discriminants are wire values that predate these variants and cannot be
+    /// renumbered — `Working = 1` and `Done = 2` are already on the wire, so
+    /// declaration order and severity order are permanently divorced.
+    pub fn severity(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Done => 1,
+            Self::Working => 2,
+            Self::Pending => 3,
+            Self::Error => 4,
+        }
+    }
+
+    /// States that are actively blocked on a human. Drives the overlay's
+    /// needs-you badge. Distinct from [`Self::needs_attention`]: a finished
+    /// agent is worth a glance, but it is not holding anyone up.
+    pub fn needs_you(self) -> bool {
+        matches!(self, Self::Pending | Self::Error)
+    }
+
+    /// States worth putting a human's eyes on, including a finished turn.
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::Pending | Self::Error | Self::Done)
+    }
+
+    /// A turn that ended, either way.
+    pub fn is_completion(self) -> bool {
+        matches!(self, Self::Done | Self::Error)
+    }
     /// Decode a wire state, folding anything this build does not recognize into
     /// `Idle`.
     ///
