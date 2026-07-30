@@ -102,6 +102,7 @@ pub struct Tui;
 const TOP_BAR_BRAND: &str = "p2pmux";
 const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 const TAB_BAR_SEPARATOR: &str = " · ";
+/// The legacy fixed-grid host/guest footer, which has no chords, agents, or share modal.
 const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
 const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
 const CHORD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -173,13 +174,15 @@ enum FooterSegment {
     OrangeKey(&'static str),
 }
 
-const NORMAL_FOOTER: &[FooterSegment] = &[
+const NORMAL_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::OrangeKey("Ctrl"),
     FooterSegment::Text("+ <"),
     FooterSegment::Key("p"),
     FooterSegment::Text("> PANE   <"),
     FooterSegment::Key("t"),
     FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("a"),
+    FooterSegment::Text("> AGENTS   <"),
     FooterSegment::Key("q"),
     FooterSegment::Text("> QUIT   "),
     FooterSegment::OrangeKey("Option"),
@@ -188,7 +191,49 @@ const NORMAL_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> + <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
-    FooterSegment::Text("   drag border RESIZE"),
+];
+const NORMAL_FOOTER_NO_FOCUS: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> PANE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("a"),
+    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text("> QUIT"),
+];
+const NORMAL_FOOTER_CORE: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> PANE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TAB   <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text("> QUIT"),
+];
+const NORMAL_FOOTER_KEYS_ONLY: &[FooterSegment] = &[
+    FooterSegment::OrangeKey("Ctrl"),
+    FooterSegment::Text("+ <"),
+    FooterSegment::Key("p"),
+    FooterSegment::Text("> <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> <"),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(">"),
+];
+/// Normal-mode help, widest tier first.
+///
+/// The bar sheds whole clauses instead of clipping mid-word, cheapest hint first: the focus
+/// arrows are muscle memory and the agent overlay is opened constantly. `Ctrl+P/T/Q` is the
+/// floor — nothing else in the mux is reachable without them, so they outlive every other hint.
+const NORMAL_FOOTER_TIERS: &[&[FooterSegment]] = &[
+    NORMAL_FOOTER_FULL,
+    NORMAL_FOOTER_NO_FOCUS,
+    NORMAL_FOOTER_CORE,
+    NORMAL_FOOTER_KEYS_ONLY,
 ];
 const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
@@ -2646,17 +2691,19 @@ pub fn render_multi_pane_with_copy_feedback(
     );
 }
 
-fn contextual_footer(chord_mode: ChordMode) -> (&'static str, &'static [FooterSegment]) {
+/// The help segments for a chord mode, narrowed to the widest tier `width` can hold.
+///
+/// Only normal mode has tiers. The chord footers already fall back atomically through
+/// `chord_footer_badge`, which hides the whole bar rather than showing half a chord.
+fn contextual_footer(chord_mode: ChordMode, width: u16) -> &'static [FooterSegment] {
     match chord_mode {
-        ChordMode::None => (CONTROL_HELP, NORMAL_FOOTER),
-        ChordMode::Pane => (
-            "  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <i> INVITE   <Esc> BACK",
-            PANE_FOOTER,
-        ),
-        ChordMode::Tab => (
-            "  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK",
-            TAB_FOOTER,
-        ),
+        ChordMode::None => NORMAL_FOOTER_TIERS
+            .iter()
+            .copied()
+            .find(|tier| footer_segments_width(tier) <= width)
+            .unwrap_or(NORMAL_FOOTER_KEYS_ONLY),
+        ChordMode::Pane => PANE_FOOTER,
+        ChordMode::Tab => TAB_FOOTER,
     }
 }
 
@@ -2796,6 +2843,8 @@ enum FooterFlash {
 /// The shared placement authority for footer content, including the join command.
 struct FooterLayout {
     badge: Option<&'static str>,
+    /// The help tier that fits, chosen once so measuring and drawing cannot disagree.
+    help: &'static [FooterSegment],
     help_start: u16,
     help_end: u16,
     status: Option<FooterText>,
@@ -2819,10 +2868,11 @@ fn footer_layout(
     if chord_mode != ChordMode::None {
         let badge = chord_footer_badge(chord_mode, area.width);
         let mut x = area.x.saturating_add(badge.map_or(0, text_width));
-        let (_, segments) = contextual_footer(chord_mode);
+        let segments = contextual_footer(chord_mode, end_x.saturating_sub(x));
         if badge.is_none() || end_x.saturating_sub(x) < footer_segments_width(segments) {
             return FooterLayout {
                 badge,
+                help: segments,
                 help_start: x,
                 help_end: end_x,
                 status: None,
@@ -2863,6 +2913,7 @@ fn footer_layout(
 
         return FooterLayout {
             badge,
+            help: segments,
             help_start: area.x.saturating_add(badge.map_or(0, text_width)),
             help_end,
             status,
@@ -2904,6 +2955,9 @@ fn footer_layout(
         0
     };
     let help_end = join_x.saturating_sub(flash_width);
+    // The help tier is chosen against the span left once status, any flash and the join code
+    // are placed, so a long notice narrows the hints rather than overwriting them.
+    let segments = contextual_footer(chord_mode, help_end.saturating_sub(x));
     let flash_start = x.max(help_end);
     let flash_rect = Rect::new(flash_start, area.y, join_x.saturating_sub(flash_start), 1);
     let flash = footer_notice
@@ -2926,6 +2980,7 @@ fn footer_layout(
 
     FooterLayout {
         badge: None,
+        help: segments,
         help_start: x,
         help_end,
         status,
@@ -2940,13 +2995,7 @@ fn rect_contains_mouse(rect: Rect, column: u16, row: u16) -> bool {
     (rect.x..rect.right()).contains(&column) && (rect.y..rect.bottom()).contains(&row)
 }
 
-fn render_chord_footer(
-    buffer: &mut Buffer,
-    theme: &UiTheme,
-    area: Rect,
-    chord_mode: ChordMode,
-    layout: &FooterLayout,
-) {
+fn render_chord_footer(buffer: &mut Buffer, theme: &UiTheme, area: Rect, layout: &FooterLayout) {
     let Some(badge) = layout.badge else {
         return;
     };
@@ -2960,14 +3009,13 @@ fn render_chord_footer(
             .bg(theme.footer_background)
             .add_modifier(Modifier::BOLD),
     );
-    let (_, segments) = contextual_footer(chord_mode);
     render_footer_segments(
         buffer,
         theme,
         layout.help_start,
         area.y,
         layout.help_end,
-        segments,
+        layout.help,
     );
 
     if let Some(status) = &layout.status {
@@ -3035,7 +3083,7 @@ fn render_contextual_footer(
     );
 
     if chord_mode != ChordMode::None {
-        render_chord_footer(buffer, theme, area, chord_mode, &layout);
+        render_chord_footer(buffer, theme, area, &layout);
         return;
     }
 
@@ -3050,14 +3098,13 @@ fn render_contextual_footer(
                 .bg(theme.footer_background),
         );
     }
-    let (_, segments) = contextual_footer(chord_mode);
     render_footer_segments(
         buffer,
         theme,
         layout.help_start,
         area.y,
         layout.help_end,
-        segments,
+        layout.help,
     );
     // Mid-bar flash messages sit after chord help and before the join code.
     match &layout.flash {
@@ -11040,7 +11087,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
+                "Ctrl+ <p> PANE   <t> TAB   <a> AGENTS   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
             ),
             (
                 ChordMode::Pane,
@@ -11062,9 +11109,6 @@ mod tests {
                 footer.starts_with(expected),
                 "mode: {mode:?}, footer: {footer}"
             );
-            if mode == ChordMode::None {
-                assert!(footer.contains("drag border RESIZE"), "footer: {footer}");
-            }
         }
     }
 
@@ -11090,7 +11134,7 @@ mod tests {
                 .expect("render");
             let footer = terminal.backend().buffer();
             assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
-            let (_, segments) = contextual_footer(mode);
+            let segments = contextual_footer(mode, 120);
             let mut x = 0;
             if let Some(badge) = chord_footer_badge(mode, 120) {
                 for character in badge.chars() {
