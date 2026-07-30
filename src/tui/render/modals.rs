@@ -206,3 +206,65 @@ pub(in crate::tui) fn render_delete_tab_confirmation(
         inner,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use crate::{
+        layout::{Node, Tab},
+        tui::{
+            ModalState, MultiPaneTui, ShareView, render_multi_pane_with_copy_feedback,
+            test_support::layout,
+        },
+    };
+
+    #[test]
+    fn share_modal_shows_the_ticket_and_the_code_with_their_reach() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("layout");
+        tui.modal = ModalState::Share;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_multi_pane_with_copy_feedback(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    None,
+                    None,
+                    ShareView {
+                        code: Some("TESTCODE"),
+                        ticket: Some("p2pmux-v1:TICKETVALUE"),
+                        notice: Some("✓ copied ticket"),
+                    },
+                    None,
+                    None,
+                );
+            })
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Share this session"));
+        assert!(rendered.contains("TICKET — works from any Mac"));
+        assert!(rendered.contains("p2pmux-v1:TICKETVALUE"));
+        assert!(rendered.contains("CODE — this Mac only"));
+        assert!(rendered.contains("TESTCODE"));
+        assert!(rendered.contains("✓ copied ticket"));
+        assert!(rendered.contains("COPY TICKET"));
+    }
+}
