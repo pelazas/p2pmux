@@ -443,3 +443,225 @@ impl MultiPaneTui {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use ratatui::layout::Rect;
+
+    use crate::{
+        layout::{LayoutError, Node, Tab},
+        tui::{
+            MultiPaneTui, PaneViewState,
+            test_support::{layout, split_layout},
+        },
+    };
+
+    #[test]
+    fn pane_view_activity_transition_reports_a_redraw() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("layout");
+        let active = PaneViewState {
+            ready: true,
+            controller_peer_id: Some(b"controller".to_vec()),
+            controller_active: true,
+            scrollback: 0,
+        };
+        assert!(tui.set_pane_view(1, active.clone()));
+        assert!(!tui.set_pane_view(1, active));
+        assert!(tui.set_pane_view(
+            1,
+            PaneViewState {
+                controller_active: false,
+                ..tui.pane_view(1).expect("pane view").clone()
+            },
+        ));
+    }
+
+    #[test]
+    fn same_revision_snapshot_preserves_resize_preview_and_selection() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let initial = tui.geometry(area);
+
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        assert_ne!(tui.geometry(area), initial);
+
+        tui.apply_snapshot(tui.snapshot().clone())
+            .expect("valid snapshot");
+        assert!(tui.resize_drag.is_some());
+        assert!(tui.selection().is_some());
+        assert_ne!(tui.geometry(area), initial);
+    }
+
+    #[test]
+    fn same_revision_different_snapshot_is_rejected() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let mut conflicting = tui.snapshot().clone();
+        conflicting.tabs[0].title = Some("conflict".into());
+
+        assert_eq!(
+            tui.apply_snapshot(conflicting),
+            Err(LayoutError::ConflictingSnapshotRevision { revision: 1 })
+        );
+    }
+
+    #[test]
+    fn higher_revision_snapshot_cancels_resize_preview_and_selection() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        let mut newer = tui.snapshot().clone();
+        newer.revision += 1;
+
+        tui.apply_snapshot(newer).expect("valid snapshot");
+        assert!(tui.resize_drag.is_none());
+        assert!(tui.selection().is_none());
+    }
+
+    #[test]
+    fn multi_pane_geometry_recursively_splits_the_content_area() {
+        let tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let geometry = tui.geometry(Rect::new(0, 0, 80, 24));
+
+        assert_eq!(geometry.tab_bar, Rect::new(0, 0, 80, 1));
+        assert_eq!(geometry.footer, Rect::new(0, 23, 80, 1));
+        assert_eq!(geometry.content, Rect::new(0, 1, 80, 22));
+        assert_eq!(geometry.panes[&1], Rect::new(0, 1, 40, 22));
+        assert_eq!(geometry.panes[&2], Rect::new(40, 1, 40, 11));
+        assert_eq!(geometry.panes[&3], Rect::new(40, 12, 40, 11));
+    }
+
+    #[test]
+    fn tiny_terminal_geometry_stays_in_bounds() {
+        let tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let geometry = tui.geometry(Rect::new(u16::MAX, u16::MAX, 1, 1));
+
+        assert_eq!(geometry.tab_bar, Rect::new(u16::MAX, u16::MAX, 1, 1));
+        assert_eq!(geometry.footer, Rect::new(u16::MAX, u16::MAX, 1, 0));
+        assert_eq!(geometry.content, Rect::new(u16::MAX, u16::MAX, 1, 0));
+        assert!(
+            geometry
+                .panes
+                .values()
+                .all(|rect| rect.x == u16::MAX && rect.y == u16::MAX)
+        );
+    }
+
+    #[test]
+    fn snapshot_commit_repairs_removed_tab_and_pane_selection() {
+        let initial = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        );
+        let mut tui = MultiPaneTui::new(initial).expect("valid layout");
+        tui.select_tab(2).expect("select second tab");
+
+        let mut committed = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        );
+        committed.revision = 2;
+        tui.apply_snapshot(committed).expect("valid commit");
+
+        assert_eq!(tui.current_tab(), 1);
+        assert_eq!(tui.focused_pane(), 1);
+    }
+
+    #[test]
+    fn creator_selects_only_its_explicitly_reserved_tab_after_that_tab_commits() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+
+        tui.select_created_tab(2);
+        let mut unrelated = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 3,
+                    root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (3, 2, 2)],
+        );
+        unrelated.revision = 2;
+        tui.apply_snapshot(unrelated).expect("unrelated commit");
+        assert_eq!(tui.current_tab(), 1);
+
+        let mut targeted = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 3,
+                    root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
+        );
+        targeted.revision = 3;
+        tui.apply_snapshot(targeted).expect("targeted tab commit");
+
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+    }
+}

@@ -402,7 +402,15 @@ mod tests {
         tui::ScreenCell,
     };
 
-    use super::{allocate_node_with_preview, area_from_terminal_size, mouse_to_screen_cell};
+    use crate::{
+        layout::Tab,
+        tui::{MultiPaneTui, test_support::layout},
+    };
+
+    use super::{
+        allocate_node_with_preview, area_from_terminal_size, grid_for_pane, initial_root_pane_grid,
+        mouse_to_screen_cell,
+    };
 
     #[test]
     fn terminal_area_is_absent_when_terminal_size_is_unavailable() {
@@ -446,5 +454,28 @@ mod tests {
         );
         assert_eq!(mouse_to_screen_cell(viewport, 9, 5), None);
         assert_eq!(mouse_to_screen_cell(viewport, 13, 6), None);
+    }
+
+    #[test]
+    fn initial_root_pane_grid_matches_its_bordered_viewport() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        ))
+        .expect("valid layout");
+
+        let pane = tui
+            .geometry(Rect::new(0, 0, 80, 24))
+            .panes
+            .get(&1)
+            .copied()
+            .expect("root pane");
+        assert_eq!(grid_for_pane(pane), (20, 78));
+        assert_eq!(initial_root_pane_grid(80, 24), (20, 78));
     }
 }

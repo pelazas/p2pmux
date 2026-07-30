@@ -258,3 +258,334 @@ impl MultiPaneTui {
         self.ensure_agent_selection_visible();
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+
+    use crate::{
+        config::UiTheme,
+        layout::{Axis, Node, Tab},
+        tui::{
+            KeyHandling, MultiPaneTui, UiIntent,
+            render::agents::{
+                agents_overlay_content, agents_overlay_help, agents_overlay_inner,
+                format_agent_overlay_card,
+            },
+            test_support::{agent_overlay_tui, agent_row, layout},
+        },
+    };
+
+    #[test]
+    fn attached_agent_rows_mark_only_unfocused_working_to_idle_transitions_unread() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![working.clone()]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(tui.update_attached_agent_rows(vec![idle.clone()]), vec![2]);
+        assert!(tui.unread_agent_panes.contains(&2));
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![idle]),
+            Vec::<u64>::new()
+        );
+
+        let mut focused_working = working;
+        focused_working.pane_id = 1;
+        focused_working.pane_ordinal = 1;
+        let mut focused_idle = focused_working.clone();
+        focused_idle.state = crate::protocol::AgentRosterState::Idle;
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![focused_working]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![focused_idle]),
+            Vec::<u64>::new()
+        );
+        assert!(!tui.unread_agent_panes.contains(&1));
+    }
+
+    #[test]
+    fn focusing_a_pane_does_not_re_announce_the_same_work_episode() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+        // A real host sends the `0` sentinel on a non-working row, so the episode a completion
+        // refers to is only ever visible on the working row that preceded it.
+        idle.working_since_unix_ms = 0;
+
+        tui.update_attached_agent_rows(vec![working.clone()]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle.clone()]), vec![2]);
+
+        // Looking at the pane clears the unread marker. That must not re-arm the sound: the
+        // user has already been told about this episode.
+        tui.set_focus(1, 2).expect("known pane");
+        tui.set_focus(1, 1).expect("known pane");
+        assert!(!tui.unread_agent_panes.contains(&2));
+
+        tui.update_attached_agent_rows(vec![working.clone()]);
+        assert_eq!(
+            tui.update_attached_agent_rows(vec![idle.clone()]),
+            Vec::<u64>::new(),
+            "the same work episode must only be announced once"
+        );
+
+        // A genuinely new working interval is a new episode and does announce again.
+        let mut next_working = working;
+        next_working.working_since_unix_ms += 1;
+        tui.update_attached_agent_rows(vec![next_working]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle]), vec![2]);
+    }
+
+    #[test]
+    fn attached_agent_rows_preserve_state_and_unread_when_rows_vanish() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        let working = agent_row(2, 1, 2);
+        let mut idle = working.clone();
+        idle.state = crate::protocol::AgentRosterState::Idle;
+
+        tui.update_attached_agent_rows(vec![working]);
+        assert_eq!(tui.update_attached_agent_rows(vec![idle]), vec![2]);
+        tui.update_attached_agent_rows(Vec::new());
+        assert_eq!(
+            tui.prior_agent_states[&2],
+            crate::protocol::AgentRosterState::Idle
+        );
+        assert!(tui.unread_agent_panes.contains(&2));
+    }
+
+    #[test]
+    fn focus_routes_clear_unread_agent_markers() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+
+        tui.unread_agent_panes.insert(2);
+        tui.select_tab(2).expect("known tab");
+        assert!(!tui.unread_agent_panes.contains(&2));
+
+        tui.unread_agent_panes.insert(1);
+        tui.set_focus(1, 1).expect("known pane");
+        assert!(!tui.unread_agent_panes.contains(&1));
+
+        tui.unread_agent_panes.insert(2);
+        assert_eq!(
+            tui.jump_to_agent_pane(2, "test"),
+            vec![UiIntent::FocusPane { pane_id: 2 }]
+        );
+        assert!(!tui.unread_agent_panes.contains(&2));
+    }
+
+    #[test]
+    fn agents_overlay_rows_use_chrome_locations_and_sort_by_them() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 10,
+                    root: Node::Split {
+                        axis: Axis::LeftRight,
+                        first_share_bps: 5_000,
+                        first: Box::new(Node::Leaf { pane_id: 8 }),
+                        second: Box::new(Node::Leaf { pane_id: 6 }),
+                    },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 20,
+                    root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
+                },
+            ],
+            &[(8, 2, 8), (6, 2, 8), (3, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).unwrap();
+
+        tui.set_agent_rows(vec![
+            agent_row(3, 99, 99),
+            agent_row(6, 99, 99),
+            agent_row(8, 99, 99),
+        ]);
+
+        assert_eq!(
+            tui.agent_rows
+                .iter()
+                .map(|row| (row.pane_id, row.tab_ordinal, row.pane_ordinal))
+                .collect::<Vec<_>>(),
+            vec![(8, 1, 1), (6, 1, 2), (3, 2, 1)]
+        );
+        assert!(
+            format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0, 0, &UiTheme::default(),)
+                [1]
+            .to_string()
+            .contains("Tab #2 · Pane #1")
+        );
+    }
+
+    #[test]
+    fn agents_overlay_click_jumps_to_the_clicked_row_and_ignores_outside_clicks() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).unwrap();
+        tui.set_agent_rows(vec![agent_row(1, 1, 1), agent_row(2, 2, 1)]);
+        let area = Rect::new(0, 0, 80, 24);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        tui.handle_key(ctrl_a, area);
+
+        assert_eq!(tui.handle_agent_overlay_click(0, 0, area), Vec::new());
+        assert!(tui.overlay_open());
+        let inner = agents_overlay_inner(area);
+        let content = agents_overlay_content(area);
+        let help = agents_overlay_help(area).expect("help row");
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x.saturating_sub(1), content.y, area),
+            None
+        );
+        assert_eq!(tui.agent_overlay_row_at(content.x, inner.y, area), None);
+        assert_eq!(tui.agent_overlay_row_at(help.x, help.y, area), None);
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y, area),
+            Some(1)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(1), area),
+            Some(1)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(3), area),
+            Some(2)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(4), area),
+            Some(2)
+        );
+        assert_eq!(
+            tui.handle_agent_overlay_click(content.x, content.y.saturating_add(3), area),
+            vec![UiIntent::FocusPane { pane_id: 2 }]
+        );
+        assert!(!tui.overlay_open());
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
+    }
+
+    #[test]
+    fn agents_overlay_hit_test_accounts_for_terminal_line_scroll() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut tui = agent_overlay_tui(3);
+        let content = agents_overlay_content(area);
+
+        assert!(tui.scroll_agent_overlay(area, false));
+        assert_eq!(tui.agent_overlay_scroll_line, 3);
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y, area),
+            Some(2)
+        );
+        assert_eq!(
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(2), area),
+            None
+        );
+    }
+
+    #[test]
+    fn agents_overlay_selection_auto_scrolls_to_keep_cards_visible() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut tui = agent_overlay_tui(4);
+
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
+        assert_eq!(tui.agent_selected_pane, Some(2));
+        assert_eq!(tui.agent_overlay_scroll_line, 3);
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
+        assert_eq!(tui.agent_selected_pane, Some(3));
+        assert_eq!(tui.agent_overlay_scroll_line, 6);
+    }
+
+    #[test]
+    fn agents_overlay_scroll_clamps_when_roster_shrinks() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut tui = agent_overlay_tui(4);
+
+        assert!(tui.scroll_agent_overlay(area, false));
+        assert!(tui.scroll_agent_overlay(area, false));
+        assert_eq!(tui.agent_overlay_scroll_line, 6);
+        tui.set_agent_rows(vec![agent_row(1, 1, 1)]);
+        assert_eq!(tui.agent_overlay_scroll_line, 0);
+    }
+}

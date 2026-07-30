@@ -458,3 +458,997 @@ impl MultiPaneTui {
         Some(UiIntent::SwitchTab { tab_id })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    use crate::{
+        layout::{Axis, NewPanePosition, Node, Tab},
+        tui::{
+            AGENT_TOGGLE_WINDOW, ChordMode, KeyHandling, MouseHandling, MultiPaneTui,
+            PaneMouseProtocol, ShareCopy, UiIntent,
+            input::keys::{
+                ESC_PREFIX_WINDOW, PendingEscape, is_chord_command, is_chord_navigation,
+            },
+            render::panes::render_multi_pane,
+            test_support::{agent_row, layout, split_layout},
+        },
+    };
+
+    use super::CHORD_IDLE_TIMEOUT;
+
+    #[test]
+    fn agents_overlay_opens_immediately_and_double_tap_forwards_ctrl_a() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.overlay_open());
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Forward
+        );
+        assert!(!tui.overlay_open());
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.overlay_open());
+        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
+        assert!(!tui.expire_agent_toggle(Instant::now()));
+        assert!(tui.overlay_open());
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(!tui.overlay_open());
+    }
+
+    #[test]
+    fn agents_overlay_is_modal_and_enter_jumps_to_another_tab() {
+        let snapshot = layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 2, 8), (2, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).unwrap();
+        tui.set_agent_rows(vec![agent_row(2, 2, 1)]);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                Rect::new(0, 0, 80, 24)
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Rect::new(0, 0, 80, 24)
+            ),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.overlay_open());
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                Rect::new(0, 0, 80, 24)
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.pending_agent_toggle, None);
+        assert_eq!(
+            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
+            KeyHandling::Consumed(vec![])
+        );
+    }
+
+    #[test]
+    fn rename_prompt_captures_chord_target_edits_and_consumes_modal_input() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        tui.snapshot.panes.get_mut(&1).unwrap().title = Some(String::from("old"));
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(matches!(
+            &tui.modal,
+            super::ModalState::Rename(prompt) if prompt.value == "old"
+        ));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('🙂'), KeyModifiers::SHIFT),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::RenamePane {
+                pane_id: 1,
+                title: String::from("old"),
+            }])
+        );
+        assert!(!tui.overlay_open());
+    }
+
+    #[test]
+    fn rename_prompt_rejects_invalid_input_and_ctrl_q_wins() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        tui.open_rename(super::RenameTarget::Tab(1));
+        for character in "x".repeat(33).chars() {
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                area,
+            );
+        }
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(matches!(tui.modal, super::ModalState::Rename(_)));
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Quit
+        );
+        assert!(matches!(tui.modal, super::ModalState::None));
+    }
+
+    #[test]
+    fn multi_pane_tab_delete_requires_confirmation_and_blocks_pane_input() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(tui.modal_open());
+        assert!(matches!(
+            &tui.modal,
+            super::ModalState::ConfirmDeleteTab {
+                tab_id: 1,
+                pane_count: 3
+            }
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let mut rendered = String::new();
+        for row in 0..24 {
+            for column in 0..80 {
+                rendered.push_str(terminal.backend().buffer()[(column, row)].symbol());
+            }
+        }
+        assert!(rendered.contains("Delete tab?"));
+        assert!(rendered.contains("3 panes"));
+        assert!(rendered.contains("Enter/y yes · Esc/n no"));
+
+        let mouse = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 60,
+            row: 17,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            tui.handle_mouse(mouse, area, PaneMouseProtocol::default()),
+            MouseHandling::default()
+        );
+        assert_eq!(tui.focused_pane(), 1);
+        assert!(!tui.scroll_mouse_pane(60, 17, area, 10, true));
+        assert!(tui.resize_drag.is_none());
+        assert!(tui.selection.is_none());
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.modal_open());
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(!tui.modal_open());
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 1 }])
+        );
+        assert!(!tui.modal_open());
+    }
+
+    #[test]
+    fn single_pane_tab_delete_is_immediate() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .expect("layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 1 }])
+        );
+        assert!(!tui.modal_open());
+    }
+
+    #[test]
+    fn pane_chord_consumes_commands_and_uses_focused_rect_aspect() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::LeftRight,
+                position: NewPanePosition::Second,
+                grid_rows: 20,
+                grid_cols: 38,
+            }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn option_arrows_focus_in_normal_and_pane_modes_without_forwarding_at_edges() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), area),
+            KeyHandling::Consumed(vec![]),
+            "an edge Option-arrow is still consumed"
+        );
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+    }
+
+    #[test]
+    fn ctrl_s_toggles_the_share_modal_and_leaves_any_chord_mode() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Consumed(vec![]),
+            "share is a mux command and never reaches the PTY"
+        );
+        assert!(tui.share_open());
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert!(!tui.share_open(), "Ctrl+S closes what it opened");
+    }
+
+    #[test]
+    fn share_modal_claims_each_copy_once_and_closes_on_escape() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area);
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Ticket));
+        assert_eq!(
+            tui.take_share_copy_request(),
+            None,
+            "a claimed request must not copy again on the next key"
+        );
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), area);
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Code));
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
+        assert!(!tui.share_open());
+    }
+
+    #[test]
+    fn plain_share_key_reaches_the_pty_without_control() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert!(!tui.share_open());
+    }
+
+    #[test]
+    fn option_arrows_accept_extra_modifiers_but_not_control() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
+                area,
+            ),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Forward
+        );
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn esc_then_arrow_uses_option_focus_and_expired_esc_keeps_its_prior_behavior() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let now = Instant::now();
+        let mut pending_escape = PendingEscape::default();
+
+        pending_escape.start(now);
+        let option_arrow = pending_escape
+            .take_option_arrow(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .expect("Esc followed by an arrow becomes Option-arrow focus");
+        assert_eq!(
+            tui.handle_key(option_arrow, area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        pending_escape.start(now);
+        assert!(pending_escape.take_if_expired(now + ESC_PREFIX_WINDOW));
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn pane_chord_directional_splits_select_axis_and_child_position() {
+        let area = Rect::new(0, 0, 80, 24);
+        for (key, axis, position) in [
+            ('r', Axis::LeftRight, NewPanePosition::Second),
+            ('l', Axis::LeftRight, NewPanePosition::First),
+            ('d', Axis::TopBottom, NewPanePosition::Second),
+            ('u', Axis::TopBottom, NewPanePosition::First),
+        ] {
+            let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+            let _ = tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            );
+            assert_eq!(
+                tui.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), area),
+                KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                    target_pane_id: 1,
+                    axis,
+                    position,
+                    grid_rows: 20,
+                    grid_cols: 38,
+                }]),
+                "key: {key}"
+            );
+            assert_eq!(tui.focused_pane(), 1, "key: {key}");
+            assert_eq!(tui.chord_mode(), ChordMode::None, "key: {key}");
+        }
+    }
+
+    #[test]
+    fn pane_lock_chord_toggles_lock_and_exits_mode() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SetPaneLock {
+                pane_id: 1,
+                locked: true,
+            }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(is_chord_command(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+        assert!(!is_chord_navigation(
+            ChordMode::Pane,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn pane_commands_exit_mode_even_when_no_intent_is_available() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        tui.snapshot.panes.clear();
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn sticky_pane_mode_moves_focus_across_multiple_arrows() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+    }
+
+    #[test]
+    fn escape_clears_sticky_chord_mode_without_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn sticky_chord_mode_expires_two_seconds_after_last_key() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let now = Instant::now();
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        tui.chord_last_activity = now.checked_sub(CHORD_IDLE_TIMEOUT);
+        assert!(tui.expire_chord_mode(now));
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+        assert!(tui.chord_last_activity.is_none());
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        tui.chord_last_activity = now.checked_sub(Duration::from_millis(1_999));
+        assert!(!tui.expire_chord_mode(now));
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        tui.chord_last_activity = now.checked_sub(CHORD_IDLE_TIMEOUT);
+        assert!(tui.expire_chord_mode(now));
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn forwarding_key_exits_sticky_pane_mode_once() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn paste_exits_sticky_chord_mode_before_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        tui.exit_chord_mode();
+
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn square_pane_create_chord_splits_top_to_bottom_without_a_tab_bar_gap() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 12, 14);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::TopBottom,
+                position: NewPanePosition::Second,
+                grid_rows: 10,
+                grid_cols: 10,
+            }])
+        );
+    }
+
+    #[test]
+    fn pane_delete_chord_targets_the_focused_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        assert_eq!(tui.focused_pane(), 2);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 2 }])
+        );
+    }
+
+    #[test]
+    fn tall_pane_create_chord_uses_a_top_bottom_split_and_usable_grid() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 20, 40);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreatePane {
+                target_pane_id: 1,
+                axis: Axis::TopBottom,
+                position: NewPanePosition::Second,
+                grid_rows: 36,
+                grid_cols: 18,
+            }])
+        );
+    }
+
+    #[test]
+    fn forwarding_keys_exit_a_chord_mode_and_are_forwarded() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        for prefix in ['p', 't'] {
+            assert_eq!(
+                tui.handle_key(
+                    KeyEvent::new(KeyCode::Char(prefix), KeyModifiers::CONTROL),
+                    area
+                ),
+                KeyHandling::Consumed(vec![])
+            );
+            assert_eq!(
+                tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+                KeyHandling::Forward
+            );
+            assert_eq!(tui.chord_mode(), ChordMode::None);
+        }
+    }
+
+    #[test]
+    fn pane_focus_uses_the_nearest_directional_leaf_and_stops_at_edges() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
+        );
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 1 }])
+        );
+        assert_eq!(tui.focused_pane(), 1);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.focused_pane(), 2);
+
+        let mut edge_tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let _ = edge_tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            edge_tui.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(edge_tui.focused_pane(), 1);
+
+        let _ = edge_tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = edge_tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area);
+        assert_eq!(edge_tui.focused_pane(), 2);
+        let _ = edge_tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = edge_tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
+        assert_eq!(edge_tui.focused_pane(), 3);
+        for key in [KeyCode::Down, KeyCode::Right] {
+            let _ = edge_tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            );
+            assert_eq!(
+                edge_tui.handle_key(KeyEvent::new(key, KeyModifiers::NONE), area),
+                KeyHandling::Consumed(vec![])
+            );
+            assert_eq!(edge_tui.focused_pane(), 3);
+        }
+    }
+
+    #[test]
+    fn tab_chord_switches_and_creates_or_deletes_tabs_without_forwarding_keys() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 12, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SwitchTab { tab_id: 2 }])
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::CreateTab {
+                grid_rows: 4,
+                grid_cols: 10,
+            }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
+    #[test]
+    fn sticky_tab_mode_switches_tabs_repeatedly() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 3,
+                    root: Node::Leaf { pane_id: 3 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2), (3, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 12, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SwitchTab { tab_id: 2 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::SwitchTab { tab_id: 3 }])
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+    }
+
+    #[test]
+    fn normal_keys_escape_and_function_keys_leave_f9_and_f10_for_the_pty() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE), area),
+            KeyHandling::Forward
+        );
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Quit
+        );
+    }
+
+    #[test]
+    fn shift_l_toggles_the_session_lock_from_whatever_state_it_is_in() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT), area),
+            KeyHandling::Consumed(vec![UiIntent::SetSessionLock { locked: true }]),
+            "Shift+L should offer to lock a session that is currently open"
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+
+        tui.set_session_locked(true);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT), area),
+            KeyHandling::Consumed(vec![UiIntent::SetSessionLock { locked: false }]),
+            "and to unlock one that is locked"
+        );
+    }
+}

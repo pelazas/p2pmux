@@ -67,3 +67,52 @@ fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
         Err(io::Error::other("pbcopy failed"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tui::{PaneTextSelection, ScreenCell, render::vt::viewed_screen};
+
+    use super::selection_text;
+
+    #[test]
+    fn selection_text_uses_stream_semantics_in_document_order() {
+        let mut parser = vt100::Parser::new(3, 4, 0);
+        parser.process(b"abcd\r\nefgh\r\nijkl");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 2, col: 1 },
+            cursor: ScreenCell { row: 0, col: 2 },
+        };
+
+        assert_eq!(
+            selection_text(parser.screen(), selection),
+            Some("cd\nefgh\nij".to_owned())
+        );
+    }
+
+    #[test]
+    fn selection_text_uses_the_scrolled_view_cells() {
+        let mut parser = vt100::Parser::new(1, 3, 10);
+        parser.process(b"one\r\ntwo");
+        let screen = viewed_screen(parser.screen(), 1);
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 1 },
+        };
+
+        assert_eq!(selection_text(&screen, selection), Some("on".to_owned()));
+    }
+
+    #[test]
+    fn empty_selection_has_no_clipboard_text() {
+        let parser = vt100::Parser::new(1, 1, 0);
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: ScreenCell { row: 0, col: 0 },
+            cursor: ScreenCell { row: 0, col: 0 },
+        };
+
+        assert_eq!(selection_text(parser.screen(), selection), None);
+    }
+}

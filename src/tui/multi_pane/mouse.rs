@@ -354,3 +354,463 @@ impl MultiPaneTui {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ratatui::layout::Rect;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+    use crate::{
+        layout::{Axis, Node, Tab},
+        tui::{
+            ChordMode, MultiPaneTui, PaneMouseProtocol, ScreenCell, UiIntent,
+            test_support::{layout, mouse_protocol, split_layout},
+        },
+    };
+
+    #[test]
+    fn content_drag_keeps_the_selection_path() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(!tui.begin_resize_drag(2, 3, area));
+        assert!(tui.resize_drag.is_none());
+        assert!(tui.begin_selection_at(2, 3, area));
+        assert!(tui.extend_selection_at(3, 3, area));
+        assert!(tui.end_selection_drag());
+        assert!(tui.selection().is_some());
+    }
+
+    fn left_mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn reporting_child() -> PaneMouseProtocol {
+        mouse_protocol(
+            vt100::MouseProtocolMode::ButtonMotion,
+            vt100::MouseProtocolEncoding::Sgr,
+        )
+    }
+
+    #[test]
+    fn clicking_a_focused_reporting_pane_forwards_instead_of_selecting() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, Some(b"\x1b[<0;2;2M".to_vec()));
+        assert!(handling.intents.is_empty());
+        assert_eq!(tui.selection(), None);
+    }
+
+    #[test]
+    fn a_forwarded_press_keeps_the_drag_and_release_away_from_selection() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            protocol,
+        );
+        let drag = tui.handle_mouse(
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), 4, 3),
+            area,
+            protocol,
+        );
+        let up = tui.handle_mouse(
+            left_mouse(MouseEventKind::Up(MouseButton::Left), 4, 3),
+            area,
+            protocol,
+        );
+
+        assert_eq!(drag.forward_bytes, Some(b"\x1b[<32;4;2M".to_vec()));
+        assert_eq!(up.forward_bytes, Some(b"\x1b[<0;4;2m".to_vec()));
+        assert!(!up.copy_selection_requested);
+        assert_eq!(tui.selection(), None);
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_pane_still_reports_inside_its_edge() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            protocol,
+        );
+        let drag = tui.handle_mouse(
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), 70, 20),
+            area,
+            protocol,
+        );
+
+        // The 10x4 grid clamps the report to its last cell rather than dropping it.
+        assert_eq!(drag.forward_bytes, Some(b"\x1b[<32;10;4M".to_vec()));
+    }
+
+    #[test]
+    fn shift_click_selects_even_when_the_child_reports_mouse() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let shift_down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::SHIFT,
+        };
+
+        let handling = tui.handle_mouse(shift_down, area, reporting_child());
+
+        assert_eq!(handling.forward_bytes, None);
+        assert!(tui.selection_dragging);
+    }
+
+    #[test]
+    fn clicking_an_unfocused_reporting_pane_only_moves_focus() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(tui.focused_pane(), 1);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 45, 3),
+            area,
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+        assert_eq!(tui.focused_pane(), 2);
+        assert!(matches!(
+            handling.intents.as_slice(),
+            [UiIntent::FocusPane { pane_id: 2 }]
+        ));
+    }
+
+    #[test]
+    fn a_scrolled_back_pane_selects_history_instead_of_forwarding() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.set_pane_scrollback_offset(1, 5));
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+        assert!(tui.selection_dragging);
+    }
+
+    #[test]
+    fn the_wheel_reaches_a_reporting_child_over_its_own_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::ScrollUp, 2, 3),
+            area,
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, Some(b"\x1b[<64;2;2M".to_vec()));
+    }
+
+    #[test]
+    fn the_wheel_stays_local_over_a_pane_the_reporting_child_does_not_own() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::ScrollDown, 45, 3),
+            area,
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+    }
+
+    #[test]
+    fn the_wheel_stays_local_while_a_reporting_pane_shows_history() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.set_pane_scrollback_offset(1, 3));
+
+        let handling = tui.handle_mouse(
+            left_mouse(MouseEventKind::ScrollDown, 2, 3),
+            area,
+            reporting_child(),
+        );
+
+        assert_eq!(handling.forward_bytes, None);
+    }
+
+    #[test]
+    fn a_reporting_child_never_takes_a_border_drag_from_the_mux() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        let down = tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 39, 5),
+            area,
+            protocol,
+        );
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), 49, 5),
+            area,
+            protocol,
+        );
+        let up = tui.handle_mouse(
+            left_mouse(MouseEventKind::Up(MouseButton::Left), 49, 5),
+            area,
+            protocol,
+        );
+
+        assert_eq!(down.forward_bytes, None);
+        assert!(matches!(
+            up.intents.as_slice(),
+            [UiIntent::SetSplitRatio { .. }]
+        ));
+    }
+
+    #[test]
+    fn mouse_up_requests_copy_only_for_a_nonempty_selection_without_resize_commit() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(
+            tui.handle_mouse(down, area, PaneMouseProtocol::default())
+                .intents
+                .is_empty()
+        );
+        tui.handle_mouse(drag, area, PaneMouseProtocol::default());
+        let handling = tui.handle_mouse(up, area, PaneMouseProtocol::default());
+        assert!(handling.intents.is_empty());
+        assert!(handling.copy_selection_requested);
+
+        let resize_down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let resize_drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 49,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let resize_up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 49,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        tui.handle_mouse(resize_down, area, PaneMouseProtocol::default());
+        tui.handle_mouse(resize_drag, area, PaneMouseProtocol::default());
+        let handling = tui.handle_mouse(resize_up, area, PaneMouseProtocol::default());
+        assert!(matches!(
+            handling.intents.as_slice(),
+            [UiIntent::SetSplitRatio { .. }]
+        ));
+        assert!(!handling.copy_selection_requested);
+    }
+
+    #[test]
+    fn dragging_a_shared_vertical_border_resizes_its_split() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+        assert!(matches!(
+            tui.end_resize_drag(49, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 1,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+        assert!(tui.end_resize_drag(49, 5).is_none());
+
+        assert!(tui.begin_resize_drag(40, 5, area));
+        assert!(tui.extend_resize_drag(50, 5));
+        assert!(matches!(
+            tui.end_resize_drag(50, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 2,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn resize_drag_previews_geometry_without_mutating_the_snapshot() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let snapshot = tui.snapshot().clone();
+        let initial = tui.geometry(area);
+
+        assert!(tui.begin_resize_drag(39, 5, area));
+        assert!(tui.extend_resize_drag(49, 5));
+
+        let preview = tui.geometry(area);
+        assert_eq!(initial.panes[&1], Rect::new(0, 1, 40, 22));
+        assert_eq!(preview.panes[&1], Rect::new(0, 1, 50, 22));
+        assert_eq!(tui.snapshot(), &snapshot);
+        assert!(matches!(
+            tui.end_resize_drag(49, 5),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 1,
+                axis: Axis::LeftRight,
+                first_share_bps: 6_250,
+                base_revision: 1,
+            })
+        ));
+        assert_eq!(tui.snapshot(), &snapshot);
+        assert_eq!(tui.geometry(area), initial);
+    }
+
+    #[test]
+    fn dragging_a_shared_horizontal_border_resizes_its_split() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let initial = tui.geometry(area);
+        assert!(tui.begin_resize_drag(60, 11, area));
+        assert!(tui.extend_resize_drag(60, 11));
+        assert_eq!(tui.geometry(area), initial);
+        assert!(tui.extend_resize_drag(60, 16));
+        assert_eq!(tui.geometry(area).panes[&2], Rect::new(40, 1, 40, 15));
+        assert!(matches!(
+            tui.end_resize_drag(60, 16),
+            Some(UiIntent::SetSplitRatio {
+                pane_id: 2,
+                axis: Axis::TopBottom,
+                first_share_bps: 7_272,
+                base_revision: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn mouse_hit_testing_focuses_the_clicked_pane_and_ignores_misses() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        assert!(tui.focus_pane_at(60, 17, area));
+        assert_eq!(tui.focused_pane(), 3);
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        assert!(!tui.focus_pane_at(10, 0, area));
+        assert_eq!(tui.focused_pane(), 3);
+    }
+
+    #[test]
+    fn hovering_an_unfocused_pane_does_not_move_focus() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert!(tui.hover_pane_at(60, 17, area));
+        assert_eq!(tui.hovered_pane, Some(3));
+        assert_eq!(tui.focused_pane(), 1);
+        assert!(tui.hover_pane_at(10, 0, area));
+        assert_eq!(tui.hovered_pane, None);
+        assert_eq!(tui.focused_pane(), 1);
+    }
+
+    #[test]
+    fn selection_hit_testing_uses_the_bordered_pane_content_area() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 19, 78)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(tui.screen_cell_at(0, 1, area), None);
+        assert_eq!(
+            tui.screen_cell_at(1, 2, area),
+            Some((1, ScreenCell { row: 0, col: 0 }))
+        );
+    }
+
+    #[test]
+    fn tab_hit_testing_switches_the_clicked_rendered_label_without_exiting_tab_mode() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 32, 8);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+
+        let second_tab = tui.geometry(area).tab_labels[&2];
+        assert_eq!(
+            tui.switch_tab_at(second_tab.x, 0, area),
+            Some(UiIntent::SwitchTab { tab_id: 2 })
+        );
+        assert_eq!(tui.current_tab(), 2);
+        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.chord_mode(), ChordMode::Tab);
+        assert_eq!(tui.switch_tab_at(0, 0, area), None);
+    }
+}

@@ -101,3 +101,50 @@ impl MultiPaneTui {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use ratatui::layout::Rect;
+
+    use crate::tui::{MultiPaneTui, test_support::split_layout};
+
+    #[test]
+    fn mouse_wheel_adjusts_the_hovered_pane_scrollback_with_clamping() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let pane_id = tui.pane_at_or_focused(60, 17, area);
+        assert_eq!(pane_id, 3);
+
+        assert!(tui.scroll_pane(pane_id, 10, true));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 3);
+        assert!(tui.scroll_pane(pane_id, 4, true));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 4);
+        assert!(!tui.scroll_pane(pane_id, 4, true));
+        assert!(tui.scroll_pane(pane_id, 4, false));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 1);
+        assert!(tui.scroll_pane(pane_id, 4, false));
+        assert!(!tui.scroll_pane(pane_id, 4, false));
+        assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 0);
+    }
+
+    #[test]
+    fn input_resets_the_pane_scrollback_to_the_live_edge() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 4, true));
+        assert!(tui.reset_scrollback(1));
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 0);
+        assert!(!tui.reset_scrollback(1));
+    }
+
+    #[test]
+    fn appended_local_history_pins_a_scrolled_back_viewport() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 10, true));
+        assert!(tui.scroll_pane(1, 10, true));
+        assert!(tui.pin_scrollback_after_output(1, 3, 10));
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 9);
+        tui.reset_scrollback(1);
+        assert!(!tui.pin_scrollback_after_output(1, 3, 10));
+    }
+}
