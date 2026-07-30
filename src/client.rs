@@ -192,6 +192,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         screens: next_screens,
                         leases,
                         rosters,
+                        presence,
                         local_peer_id: next_local_peer_id,
                         tab_id,
                         pane_id,
@@ -216,6 +217,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             &mut history_refresh,
                         )?;
                         apply_leases(view, leases);
+                        view.set_presence(presence);
                         apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
                         announce_agent_completions(
                             apply_rosters(view, rosters),
@@ -372,6 +374,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         if let Some(view) = tui.as_mut() {
                             apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
                             dirty = true;
+                        }
+                    }
+                    NodeMessage::Presence { presence } => {
+                        if let Some(view) = tui.as_mut() {
+                            dirty |= view.set_presence(presence);
                         }
                     }
                     _ => {}

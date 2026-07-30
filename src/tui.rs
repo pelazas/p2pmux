@@ -63,7 +63,7 @@ use crate::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
         DeleteTab, LayoutRequest, MAX_AGENT_CWD_BYTES, MarkPaneExited,
         NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
-        RenamePane, RenameTab, SetPaneLock, SplitAxis,
+        Presence, PresenceRoster, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     pty_host::PtyHost,
     screen::{GuestScreen, HostScreen, SCROLLBACK_LINES, ScreenFrame, SyncGate},
@@ -474,6 +474,7 @@ pub struct MultiPaneTui {
     selection: Option<PaneTextSelection>,
     selection_dragging: bool,
     agent_rows: Vec<AgentOverlayRow>,
+    presence: Vec<crate::local_ipc::PresenceRow>,
     prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
     /// Start of the working interval last seen for a pane. An idle row carries the `0`
     /// sentinel, so the episode a completion refers to has to be remembered while it runs.
@@ -529,6 +530,7 @@ impl MultiPaneTui {
             selection: None,
             selection_dragging: false,
             agent_rows: Vec::new(),
+            presence: Vec::new(),
             prior_agent_states: BTreeMap::new(),
             prior_agent_episodes: BTreeMap::new(),
             notified_agent_episodes: BTreeMap::new(),
@@ -581,6 +583,16 @@ impl MultiPaneTui {
             self.modal,
             ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. }
         )
+    }
+
+    /// Replace where the other members are looking. Returns whether anything moved, so a
+    /// presence update that changes nothing never costs a repaint.
+    pub fn set_presence(&mut self, presence: Vec<crate::local_ipc::PresenceRow>) -> bool {
+        if self.presence == presence {
+            return false;
+        }
+        self.presence = presence;
+        true
     }
 
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
@@ -4469,21 +4481,47 @@ impl SharedControl {
         }
     }
 
-    fn try_event(&mut self, current_revision: u64) -> Option<LayoutControlEvent> {
+    /// Publishes this member's focus. The coordinator applies it locally and gets the
+    /// resulting full roster back; a member has to wait for the broadcast.
+    fn try_presence(&self, presence: Presence) -> Result<Option<PresenceRoster>, String> {
+        match self {
+            Self::Host(host) => host
+                .publish_local_presence(presence)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_presence(presence)
+                .map(|()| None)
+                .map_err(layout_queue_message),
+        }
+    }
+
+    fn try_event(
+        &mut self,
+        current_revision: u64,
+        seen_presence_epoch: &mut u64,
+    ) -> Option<LayoutControlEvent> {
         match self {
             // The coordinator is the authority, so it does not receive its own broadcasts. Poll
             // its tiny in-memory snapshot to observe joins, departures, and member-originated
             // commits without adding a second internal control stream.
-            Self::Host(host) => host
-                .session_snapshot()
-                .ok()
-                .filter(|snapshot| {
-                    snapshot
-                        .state
-                        .as_ref()
-                        .is_some_and(|state| state.revision > current_revision)
-                })
-                .map(LayoutControlEvent::Snapshot),
+            Self::Host(host) => {
+                // Presence has its own counter because it deliberately does not touch the
+                // layout revision: focus changes are frequent, and bumping the revision
+                // for one would reject every in-flight layout request as stale.
+                if let Some((epoch, roster)) = host.presence_if_newer(*seen_presence_epoch) {
+                    *seen_presence_epoch = epoch;
+                    return Some(LayoutControlEvent::Presence(roster));
+                }
+                host.session_snapshot()
+                    .ok()
+                    .filter(|snapshot| {
+                        snapshot
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.revision > current_revision)
+                    })
+                    .map(LayoutControlEvent::Snapshot)
+            }
             Self::Member(member) => member.events.try_recv().ok(),
         }
     }
@@ -4606,6 +4644,10 @@ pub struct SharedLayoutRuntime {
     last_local_agent_entries: Vec<AgentRosterEntry>,
     next_agent_roster_heartbeat: Instant,
     last_agent_overlay_animation: Instant,
+    presence_generation: u64,
+    last_local_presence: Option<Presence>,
+    seen_presence_epoch: u64,
+    presence: Vec<Presence>,
 }
 
 impl SharedLayoutRuntime {
@@ -4714,6 +4756,10 @@ impl SharedLayoutRuntime {
             last_local_agent_entries: Vec::new(),
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
+            presence_generation: 0,
+            last_local_presence: None,
+            seen_presence_epoch: 0,
+            presence: Vec::new(),
         };
         value.refresh_local_views();
         Ok(value)
@@ -4901,6 +4947,7 @@ impl SharedLayoutRuntime {
         self.tui
             .set_focus(tab_id, pane_id)
             .map_err(|error| io::Error::other(format!("invalid node focus: {error:?}")))?;
+        self.maybe_publish_presence();
         self.release_blurred_pane(previous)
     }
 
@@ -5304,10 +5351,15 @@ impl SharedLayoutRuntime {
     fn drain(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = false;
         self.retry_tick = self.retry_tick.saturating_add(1);
-        while let Some(event) = self.control.try_event(self.tui.snapshot().revision) {
+        let mut seen_presence_epoch = self.seen_presence_epoch;
+        while let Some(event) = self
+            .control
+            .try_event(self.tui.snapshot().revision, &mut seen_presence_epoch)
+        {
             self.handle_control_event(event)?;
             changed = true;
         }
+        self.seen_presence_epoch = seen_presence_epoch;
         while let Ok((pane_id, result)) = self.subscription_rx.try_recv() {
             match result {
                 Ok(pane) => {
@@ -5352,6 +5404,9 @@ impl SharedLayoutRuntime {
             });
         }
         changed |= self.publish_local_agent_roster();
+        // Cheap: returns immediately unless the focused pane actually moved since the last
+        // drain, and a keypress cannot move focus more than once per drain.
+        changed |= self.maybe_publish_presence();
         let disconnected = self
             .remote
             .iter_mut()
@@ -5423,6 +5478,52 @@ impl SharedLayoutRuntime {
 
     fn refresh_agent_rows(&mut self) -> bool {
         self.tui.set_agent_rows(self.agent_overlay_rows())
+    }
+
+    /// Tell the session where this member is now looking, if it moved.
+    ///
+    /// Called after anything that can change focus. There is no heartbeat and no timer:
+    /// a human moving is the only thing that produces traffic here, so an idle session
+    /// costs nothing.
+    fn maybe_publish_presence(&mut self) -> bool {
+        let presence = Presence {
+            peer_id: self.control.peer_id(),
+            generation: self.presence_generation.saturating_add(1),
+            tab_id: self.tui.current_tab(),
+            pane_id: self.tui.focused_pane(),
+            attached: true,
+        };
+        if self
+            .last_local_presence
+            .as_ref()
+            .is_some_and(|last| last.tab_id == presence.tab_id && last.pane_id == presence.pane_id)
+        {
+            return false;
+        }
+        match self.control.try_presence(presence.clone()) {
+            // The coordinator never receives its own broadcast, so it applies the roster
+            // its own update produced rather than waiting for one to come back.
+            Ok(Some(roster)) => self.presence = roster.entries,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        self.presence_generation = presence.generation;
+        self.last_local_presence = Some(presence);
+        true
+    }
+
+    /// Presence of every member other than this one, ready for the renderer.
+    pub fn presence_rows(&self) -> Vec<crate::local_ipc::PresenceRow> {
+        let local_peer_id = self.control.peer_id();
+        self.presence
+            .iter()
+            .filter(|entry| entry.attached && entry.peer_id != local_peer_id)
+            .map(|entry| crate::local_ipc::PresenceRow {
+                peer_id: entry.peer_id.clone(),
+                tab_id: entry.tab_id,
+                pane_id: entry.pane_id,
+            })
+            .collect()
     }
 
     pub fn agent_overlay_rows(&self) -> Vec<AgentOverlayRow> {
@@ -5500,6 +5601,7 @@ impl SharedLayoutRuntime {
                 self.agent_rosters
                     .insert(roster.host_peer_id.clone(), roster);
             }
+            LayoutControlEvent::Presence(roster) => self.presence = roster.entries,
             LayoutControlEvent::Commit(commit) => {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }

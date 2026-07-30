@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
-        PaneScreenSnapshot, ScreenUpdate, SessionSummary,
+        PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
     },
     rendezvous::LocalRendezvous,
     session::{
@@ -766,6 +766,7 @@ fn write_snapshot(
     publish.leases = Some(leases);
     publish.rosters = Some(rosters);
     publish.focus = Some(node.local_focus());
+    publish.presence = Some(node.presence_rows());
     update_screen_sequences(&mut publish.screen_sequences, &screens);
     publish.last_screen_publish = Some(Instant::now());
     publish.force_screens = false;
@@ -852,6 +853,7 @@ fn snapshot_message(
         screens: screens.clone(),
         leases: leases.clone(),
         rosters: rosters.clone(),
+        presence: node.presence_rows(),
         local_peer_id,
         tab_id,
         pane_id,
@@ -901,6 +903,7 @@ struct AttachmentPublishState {
     paths: Option<Vec<crate::transport::PeerPath>>,
     session_locked: Option<bool>,
     focus: Option<(u64, u64)>,
+    presence: Option<Vec<PresenceRow>>,
     screen_sequences: BTreeMap<u64, u64>,
     last_screen_publish: Option<Instant>,
     pending_screens: bool,
@@ -922,6 +925,7 @@ impl AttachmentPublishState {
         self.paths = None;
         self.session_locked = None;
         self.focus = None;
+        self.presence = None;
         self.screen_sequences.clear();
         self.pending_screens = true;
         self.force_screens = true;
@@ -1032,6 +1036,20 @@ fn queue_updates(
             return Ok(published);
         }
         publish.rosters = Some(rosters);
+        published = true;
+    }
+    let presence = node.presence_rows();
+    if publish.presence.as_ref() != Some(&presence) {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::Presence {
+                presence: presence.clone(),
+            },
+        )? {
+            return Ok(published);
+        }
+        publish.presence = Some(presence);
         published = true;
     }
     if publish.focus != Some(focus) {
@@ -1259,6 +1277,11 @@ impl SharedLayoutNode {
     }
     pub fn local_focus(&self) -> (u64, u64) {
         self.runtime.local_focus()
+    }
+
+    /// Where the other members are looking, for the attached client to draw.
+    pub fn presence_rows(&self) -> Vec<PresenceRow> {
+        self.runtime.presence_rows()
     }
     pub(crate) fn status(&self) -> String {
         self.runtime.status().to_owned()
@@ -1732,6 +1755,7 @@ mod tests {
                 }],
                 leases: vec![],
                 rosters: vec![],
+                presence: vec![],
                 local_peer_id: vec![],
                 tab_id: 1,
                 pane_id: 1,
