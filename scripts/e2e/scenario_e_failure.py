@@ -72,9 +72,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
     with Harness(f"e-fail-{index}") as harness:
-        host, code = harness.create_room("host")
-        g1 = harness.join_room("g1", code)
-        g2 = harness.join_room("g2", code)
+        host, ticket = harness.create_room("host")
+        g1 = harness.join_room("g1", ticket)
+        g2 = harness.join_room("g2", ticket)
         time.sleep(1.5)
 
         marker = f"BASE{index}"

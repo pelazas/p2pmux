@@ -116,7 +116,7 @@ and so on to avoid a collision. Automatically chosen create names avoid live loc
 the same way.
 
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
-Ctrl+Q detaches that client without stopping shells, Iroh, rendezvous, or hosted panes. It prints
+Ctrl+Q detaches that client without stopping shells, Iroh, or hosted panes. It prints
 the exact `--resume`, `attach`, and `kill` commands needed to return. Use `p2pmux --resume` for
 the live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <old> <new>`
 to rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator
@@ -131,31 +131,28 @@ scroll freezes a host-authored viewport for that browse session, so output can c
 live edge without changing what is being read; resize, alternate-screen changes, and reconnects
 discard that frozen history. Local IPC is intentionally versioned as an implementation detail, so
 restart an existing session after upgrading when attach protocol changes are present.
-Short join codes resolve through a restrictive local cache on the same Mac, so they are for current
-dogfooding only; they work while the corresponding `create` process is alive and are removed when
-it exits. A peer on another machine cannot resolve one.
 
-To invite someone on another Mac, use the full `p2pmux-v2:` ticket, which `join` also accepts:
+## Inviting someone
+
+The ticket is the invite. `join` takes nothing else:
 
 ```text
-p2pmux ticket            # the one session live on this Mac
-p2pmux ticket <code>     # when several are live; the code is in the session footer
+p2pmux ticket            # the one session hosted on this Mac
+p2pmux ticket <name>     # when several are; the name is the one p2pmux ls shows
 ```
 
-From inside a session, `Ctrl+P`, then `i` copies the same ticket straight to the clipboard and
-flashes `copied full ticket` in the footer. That overlay text is local chrome, so unlike running
-the command in a shared pane it is not visible to the other members. Only a coordinator has a
-ticket to copy; a guest is told so.
+From inside a session, `Ctrl+S` opens the share panel and Enter copies the ticket to the
+clipboard. That panel is local chrome, so unlike running the command in a shared pane it is not
+visible to the other members. Only a coordinator holds a ticket; a guest is told so.
 
 The ticket is printed to stdout on its own, so `p2pmux ticket | pbcopy` gives you something
 directly pasteable. Treat it as a password: it grants full shared-shell access to the session, to
-anyone holding it, for as long as the session lives. There is no hosted rendezvous yet, so this is
-the portable invite until one exists.
+anyone holding it, for as long as the session lives.
 
-Tickets are emitted as `p2pmux-v2:` — roughly 66 characters for a typical session, against about
-370 for the original `p2pmux-v1:` form, which restated the session ID as a JSON array of 32
-decimal numbers even though it is required to equal the endpoint ID. `join` still accepts v1
-tickets, so a peer one release behind can be invited without upgrading first.
+Tickets are emitted as `p2pmux-v3:`, which carries 32 independent random bytes as the join
+credential. `join` still parses `p2pmux-v1:` and `p2pmux-v2:` tickets, in which the credential
+*was* the coordinator's endpoint public key — a value published to discovery, so those tickets
+grant a session no secret ever protected.
 
 Only one peer controls a pane while they are actively typing. After about thirty seconds without
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key

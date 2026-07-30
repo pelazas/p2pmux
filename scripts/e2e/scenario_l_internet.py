@@ -62,24 +62,6 @@ def check(label: str, passed: bool, detail: str = "") -> None:
     print(f"  [{mark}] {label}{(' -- ' + detail) if detail else ''}", flush=True)
 
 
-def full_ticket(harness: Harness, code: str) -> str:
-    """Ask the local binary for the pasteable ticket behind a short join code.
-
-    The short code is a same-Mac rendezvous file, so it is meaningless on the droplet;
-    the ticket is the thing that travels.
-    """
-    result = subprocess.run(
-        [str(BINARY), "ticket", code],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        env={"HOME": str(harness.home), "PATH": "/usr/bin:/bin"},
-    )
-    if result.returncode != 0:
-        raise AssertionError(f"`p2pmux ticket {code}` failed:\n{result.stderr.strip()}")
-    return result.stdout.strip()
-
-
 def main() -> int:
     remote = RemoteHost()
     force_relay = "--force-relay" in sys.argv
@@ -109,10 +91,8 @@ def main() -> int:
 
     try:
         with Harness("scenario_l_internet") as harness:
-            host, code = harness.create_room("mac")
-            check("mac created a session", bool(code), f"join code {code}")
-
-            ticket = full_ticket(harness, code)
+            host, ticket = harness.create_room("mac")
+            check("mac created a session", bool(ticket), f"{len(ticket)} chars")
             check("ticket minted for transport", len(ticket) > 20, f"{len(ticket)} chars")
 
             guest = harness.spawn(

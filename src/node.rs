@@ -26,7 +26,6 @@ use crate::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
     },
-    rendezvous::LocalRendezvous,
     session::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
         layout_snapshot_from_state,
@@ -104,14 +103,14 @@ pub fn read_bootstrap(path: &std::path::Path) -> io::Result<NodeBootstrap> {
     Ok(bootstrap)
 }
 
-/// Private child entrypoint. It owns the descriptor, rendezvous record, socket and every PTY.
+/// Private child entrypoint. It owns the descriptor, socket and every PTY.
 pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Error>> {
     let mut descriptor = bootstrap.descriptor.clone();
     descriptor.node_pid = std::process::id();
     // Before the first pane spawns: every PTY this node opens inherits the
     // socket path from here, and pane 1 is created a few lines below.
     crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
-    let (mut node, dispatcher_task, rendezvous) = match bootstrap.kind {
+    let (mut node, dispatcher_task) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -145,19 +144,17 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     .map_err(|error| io::Error::other(format!("invalid host layout: {error:?}")))?;
             let dispatcher = host.incoming_dispatcher(panes.clone())?;
             let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
-            let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
-            let join_code = rendezvous.code().to_owned();
+            // The descriptor is the only out-of-process copy, so `p2pmux ticket <name>` and
+            // the attaching client both read it from there rather than minting their own.
+            let ticket = host.ticket().to_string();
+            descriptor.ticket = Some(ticket.clone());
             let session_id = host.ticket().session_id().to_vec();
             let handle = tokio::runtime::Handle::current();
             let mut runtime = crate::tui::SharedLayoutRuntime::host(
-                host, panes, layout, initial, join_code, handle,
+                host, panes, layout, initial, ticket, handle,
             )?;
             runtime.set_session_id(session_id);
-            (
-                SharedLayoutNode::new(runtime),
-                dispatcher_task,
-                Some(rendezvous),
-            )
+            (SharedLayoutNode::new(runtime), dispatcher_task)
         }
         NodeBootstrapKind::Join {
             ticket,
@@ -202,7 +199,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                 state,
                 tokio::runtime::Handle::current(),
             )?;
-            (SharedLayoutNode::new(runtime), dispatcher_task, None)
+            (SharedLayoutNode::new(runtime), dispatcher_task)
         }
     };
     let store = SessionStore::for_current_user()?;
@@ -216,9 +213,6 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     tokio::task::block_in_place(|| node.shutdown());
     dispatcher_task.abort();
     let _ = dispatcher_task.await;
-    if let Some(rendezvous) = rendezvous {
-        let _ = rendezvous.remove();
-    }
     let _ = fs::remove_file(&descriptor.socket_path);
     let _ = store.remove(&descriptor.id);
     result.map_err(Into::into)
@@ -857,7 +851,7 @@ fn snapshot_message(
         local_peer_id,
         tab_id,
         pane_id,
-        join_code: node.runtime.join_code().map(str::to_owned),
+        ticket: node.runtime.share_ticket().map(str::to_owned),
     };
     Ok((message, layout, leases, rosters, screens, updates))
 }
@@ -1759,7 +1753,7 @@ mod tests {
                 local_peer_id: vec![],
                 tab_id: 1,
                 pane_id: 1,
-                join_code: None,
+                ticket: None,
             },
         )
         .unwrap();

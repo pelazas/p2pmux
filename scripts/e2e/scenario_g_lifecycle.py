@@ -2,7 +2,7 @@
 """Category C: room lifecycle -- bad codes, dead rooms, simultaneous joins, the cap.
 
 Scenario-bank entries covered:
-  C. "join with a bad/expired code, join a dead room"
+  C. "join with a bad/expired ticket, join a dead room"
   C. "two peers joining simultaneously"
   C. "a guest reattaching after quitting"
   C. "joining at the 8-member cap and one over it"
@@ -14,7 +14,7 @@ worse than one that exits with an error.
 `MAX_MEMBERS` is 8 and the host counts as a member (src/layout.rs:30,361), so the cap is
 host + 7 guests, and the 9th peer must be refused with `LayoutError::MemberLimit`.
 
-Each phase gets its own Harness -- and therefore its own sandbox HOME -- so join codes
+Each phase gets its own Harness -- and therefore its own sandbox HOME -- so tickets
 cannot leak between phases and cleanup happens incrementally.
 
 Run: python3 scripts/e2e/scenario_g_lifecycle.py [repeats]
@@ -49,22 +49,23 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         if verbose or not ok:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
-    # --- Phase 1: a join code that was never valid.
-    with Harness(f"g-badcode-{index}") as harness:
+    # --- Phase 1: an argument that was never a ticket.
+    with Harness(f"g-badticket-{index}") as harness:
         bad = harness.spawn("bad", ["join", "ZZZZZZZZZZ", "--name", "bad"])
         code = wait_exit(bad, timeout=30)
-        check("a bad join code exits instead of hanging", code is not None,
+        check("a bad join ticket exits instead of hanging", code is not None,
               "still running after 30s")
-        check("a bad join code exits non-zero", code not in (0, None), f"exit={code}")
+        check("a bad join ticket exits non-zero", code not in (0, None), f"exit={code}")
         check(
-            "a bad join code explains itself",
-            "not found" in bad.raw_text().lower() or "invalid" in bad.raw_text().lower(),
+            "a bad join ticket explains itself",
+            any(word in bad.raw_text().lower()
+                for word in ("expected a join ticket", "invalid ticket")),
             f"output tail: {bad.raw_text()[-300:]!r}",
         )
 
-    # --- Phase 2: a well-formed code whose room is dead.
+    # --- Phase 2: a well-formed ticket whose room is dead.
     with Harness(f"g-deadroom-{index}") as harness:
-        host, room_code = harness.create_room("host")
+        host, room_ticket = harness.create_room("host")
         node = harness.node_pid_for_role("coordinator")
         host.close()
         if node is not None:
@@ -74,7 +75,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
                 pass
         time.sleep(2.0)
 
-        latecomer = harness.spawn("late", ["join", room_code, "--name", "late"])
+        latecomer = harness.spawn("late", ["join", room_ticket, "--name", "late"])
         code = wait_exit(latecomer, timeout=90)
         check("joining a dead room terminates instead of hanging forever",
               code is not None,
@@ -93,9 +94,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
 
     # --- Phase 3: two peers joining at the same instant.
     with Harness(f"g-simul-{index}") as harness:
-        host, room_code = harness.create_room("host")
-        a = harness.spawn("a", ["join", room_code, "--name", "aaa"])
-        b = harness.spawn("b", ["join", room_code, "--name", "bbb"])
+        host, room_ticket = harness.create_room("host")
+        a = harness.spawn("a", ["join", room_ticket, "--name", "aaa"])
+        b = harness.spawn("b", ["join", room_ticket, "--name", "bbb"])
         joined = []
         for peer in (a, b):
             try:
@@ -120,10 +121,10 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
 
     # --- Phase 4: the 8-member cap, and one over it.
     with Harness(f"g-cap-{index}") as harness:
-        host, room_code = harness.create_room("host")
+        host, room_ticket = harness.create_room("host")
         guests = []
         for n in range(1, 8):  # host + 7 guests == MAX_MEMBERS (8)
-            guest = harness.spawn(f"g{n}", ["join", room_code, "--name", f"g{n}"])
+            guest = harness.spawn(f"g{n}", ["join", room_ticket, "--name", f"g{n}"])
             guests.append(guest)
             time.sleep(1.2)  # stagger so the coordinator admits them in order
 
@@ -139,7 +140,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
               f"only {admitted}/7 guests got in")
 
         # The 9th member (8th guest) must be refused, not admitted and not hung.
-        over = harness.spawn("over", ["join", room_code, "--name", "over"])
+        over = harness.spawn("over", ["join", room_ticket, "--name", "over"])
         over_code = wait_exit(over, timeout=60)
         got_in = False
         if over_code is None:

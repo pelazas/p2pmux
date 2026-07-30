@@ -11,7 +11,6 @@ use std::{
 use clap::{Parser, Subcommand};
 
 use crate::{
-    rendezvous::{LocalRendezvous, RendezvousError},
     session::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
         layout_snapshot_from_state,
@@ -50,10 +49,11 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Print the full reusable join ticket for a live local session.
+    /// Print the full reusable join ticket for a session hosted on this Mac.
     Ticket {
-        /// The join code shown in the session footer. Omit it when one session is live.
-        code: Option<String>,
+        /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
+        /// is hosted here.
+        session: Option<String>,
     },
     /// Attach a live local session by memorable name.
     Attach { name: String },
@@ -272,14 +272,13 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     .map_err(|error| io::Error::other(format!("invalid host layout: {error:?}")))?;
             let dispatcher = host.incoming_dispatcher(pane_server.clone())?;
             let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
-            let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
-            let join_code = rendezvous.code().to_string();
+            let ticket = host.ticket().to_string();
             {
                 let mut stdout = io::stdout().lock();
-                writeln!(stdout, "Join with: p2pmux join {join_code}")?;
+                writeln!(stdout, "Join with: p2pmux join {ticket}")?;
                 writeln!(
                     stdout,
-                    "This code stays visible in the host status bar after you continue."
+                    "The ticket stays available behind Ctrl+S after you continue."
                 )?;
                 if !host.address_ready() {
                     writeln!(
@@ -301,7 +300,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     pane_server,
                     layout,
                     initial,
-                    join_code,
+                    ticket,
                     handle,
                 )
                 .map_err(|error| error.to_string())?;
@@ -311,7 +310,6 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .await?;
             dispatcher_task.abort();
             let _ = dispatcher_task.await;
-            rendezvous.remove()?;
             result.map_err(io::Error::other)?;
             Ok(())
         }
@@ -373,7 +371,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             guest_result.map_err(io::Error::other)?;
             Ok(())
         }
-        Some(Command::Ticket { code }) => print_join_ticket(code),
+        Some(Command::Ticket { session }) => print_join_ticket(session),
         Some(Command::Attach { name }) => crate::client::run(&find_live(&name)?),
         Some(Command::Kill { name, yes }) => {
             let descriptor = find_live(&name)?;
@@ -590,27 +588,32 @@ fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn
 }
 
 fn resolve_join_ticket(input: &str) -> Result<JoinTicket, CliError> {
-    if looks_like_ticket(input) {
-        return JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"));
+    if !looks_like_ticket(input) {
+        return Err(CliError(
+            "expected a join ticket; the host gets one from the session's Ctrl+S panel or p2pmux ticket",
+        ));
     }
-    LocalRendezvous::for_current_user()
-        .and_then(|store| store.resolve(input))
-        .map_err(rendezvous_error)
+    JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"))
 }
 
-/// Print the portable join ticket for a session created on this Mac.
+/// Print the portable join ticket for a session hosted on this Mac.
 ///
-/// The short code only resolves through this Mac's local cache, so it is useless to a peer on
-/// another machine. The ticket is the portable form, and until a hosted rendezvous exists this
-/// command is the only way to obtain one. It goes to stdout alone so `p2pmux ticket | pbcopy`
-/// yields something directly pasteable.
-fn print_join_ticket(code: Option<String>) -> Result<(), Box<dyn Error>> {
-    let store = LocalRendezvous::for_current_user().map_err(rendezvous_error)?;
-    let code = match code {
-        Some(code) => code,
-        None => sole_local_code(&store)?,
+/// The ticket is the only thing a peer on another machine can act on, so this reads it back off
+/// the session record the coordinator's node wrote. It goes to stdout alone so
+/// `p2pmux ticket | pbcopy` yields something directly pasteable.
+fn print_join_ticket(session: Option<String>) -> Result<(), Box<dyn Error>> {
+    let store = crate::session_store::SessionStore::for_current_user()?;
+    let sessions = store.list_live()?;
+    let descriptor = match session {
+        Some(name) => sessions
+            .into_iter()
+            .find(|session| session.name == name)
+            .ok_or(CliError("no live session by that name on this Mac"))?,
+        None => sole_hosted_session(sessions)?,
     };
-    let ticket = store.resolve(&code).map_err(rendezvous_error)?;
+    let ticket = descriptor.ticket.ok_or(CliError(
+        "that session was joined, not created here, so this Mac holds no ticket for it",
+    ))?;
     {
         let mut stderr = io::stderr().lock();
         writeln!(stderr, "{TICKET_WARNING}\n")?;
@@ -620,28 +623,25 @@ fn print_join_ticket(code: Option<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The one code published here, when leaving it off is unambiguous.
-fn sole_local_code(store: &LocalRendezvous) -> Result<String, CliError> {
-    let mut codes = store.codes().map_err(rendezvous_error)?;
-    match codes.len() {
+/// The one session hosted here, when leaving the name off is unambiguous.
+///
+/// Only coordinators hold a ticket, so sessions joined from elsewhere are not candidates and
+/// never make the choice ambiguous.
+fn sole_hosted_session(
+    sessions: Vec<crate::session_store::SessionDescriptor>,
+) -> Result<crate::session_store::SessionDescriptor, CliError> {
+    let mut hosted: Vec<_> = sessions
+        .into_iter()
+        .filter(|session| session.ticket.is_some())
+        .collect();
+    match hosted.len() {
         0 => Err(CliError(
             "no session was created on this Mac; run p2pmux create first",
         )),
-        1 => Ok(codes.remove(0)),
+        1 => Ok(hosted.remove(0)),
         _ => Err(CliError(
-            "several sessions are live on this Mac; pass the join code from the session footer",
+            "several sessions are hosted on this Mac; pass the session name, as listed by p2pmux ls",
         )),
-    }
-}
-
-/// Describe a rendezvous failure without ever echoing the code that caused it.
-fn rendezvous_error(error: RendezvousError) -> CliError {
-    match error {
-        RendezvousError::NotFound => CliError("join code was not found on this Mac"),
-        RendezvousError::InvalidCode | RendezvousError::InvalidRecord => {
-            CliError("invalid ticket format")
-        }
-        _ => CliError("local rendezvous store is unavailable"),
     }
 }
 

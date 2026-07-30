@@ -292,14 +292,11 @@ const AGENT_OVERLAY_HELP: &[FooterSegment] = &[
     FooterSegment::Key("Enter"),
     FooterSegment::Text("> FOCUS"),
 ];
-/// Enter takes the ticket: it is the only identifier that reaches another machine, so it is
-/// what the primary key copies.
+/// The ticket is the only invite material, so both copy keys land on it.
 const SHARE_HELP: &[FooterSegment] = &[
     FooterSegment::Text("<"),
     FooterSegment::Key("Enter"),
     FooterSegment::Text("> COPY TICKET   <"),
-    FooterSegment::Key("c"),
-    FooterSegment::Text("> COPY CODE   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> CLOSE"),
 ];
@@ -444,16 +441,14 @@ struct RenamePrompt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShareCopy {
     Ticket,
-    Code,
 }
 
 /// The host-only invite material the share modal renders.
 ///
-/// The ticket is resolved by the attaching process, so a guest — who has no rendezvous record
-/// to resolve — simply arrives here with both fields empty and gets told so.
+/// Only the coordinator's node holds a ticket, so a guest arrives here with an empty field
+/// and gets told so rather than being offered an invite it cannot make.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShareView<'a> {
-    pub code: Option<&'a str>,
     pub ticket: Option<&'a str>,
     /// The result of the last copy, shown in the modal rather than the footer.
     pub notice: Option<&'a str>,
@@ -1727,16 +1722,13 @@ impl MultiPaneTui {
 
     /// Keys for the share modal.
     ///
-    /// Enter takes the ticket because that is the only thing a peer on another machine can
-    /// use; the code is the secondary key precisely because it only resolves on this Mac.
-    /// Every key is consumed so no invite material leaks into the focused pane.
+    /// Enter and `c` both copy the ticket — it is the only invite material there is, and a
+    /// muscle-memory `c` should not fall through. Every key is consumed so no invite
+    /// material leaks into the focused pane.
     fn handle_share_key(&mut self, key: KeyEvent) -> KeyHandling {
         match key.code {
-            KeyCode::Enter if key.modifiers.is_empty() => {
+            KeyCode::Enter | KeyCode::Char('c') if key.modifiers.is_empty() => {
                 self.pending_share_copy = Some(ShareCopy::Ticket);
-            }
-            KeyCode::Char('c') if key.modifiers.is_empty() => {
-                self.pending_share_copy = Some(ShareCopy::Code);
             }
             KeyCode::Esc if key.modifiers.is_empty() => {
                 self.modal = ModalState::None;
@@ -3648,32 +3640,13 @@ fn render_agents_overlay_help(buffer: &mut Buffer, theme: &UiTheme, help: Option
     );
 }
 
-/// Read the full ticket the local rendezvous record holds for a join code.
-///
-/// Only a coordinator publishes a record, so a guest resolves nothing and the share modal
-/// says so rather than offering an invite it cannot make.
-pub(crate) fn resolve_local_ticket(join_code: &str) -> Option<String> {
-    crate::rendezvous::LocalRendezvous::for_current_user()
-        .and_then(|store| store.resolve(join_code))
-        .ok()
-        .map(|ticket| ticket.to_string())
-}
-
 /// Run one share-modal copy and report the result back into the modal.
-pub(crate) fn share_copy_result(
-    request: ShareCopy,
-    ticket: Option<&str>,
-    join_code: Option<&str>,
-) -> String {
-    let (what, text) = match request {
-        ShareCopy::Ticket => ("ticket", ticket),
-        ShareCopy::Code => ("code", join_code),
+pub(crate) fn share_copy_result(ticket: Option<&str>) -> String {
+    let Some(ticket) = ticket else {
+        return "no ticket to copy".to_owned();
     };
-    let Some(text) = text else {
-        return format!("no {what} to copy");
-    };
-    match copy_selection_to_clipboard(text) {
-        Ok(_) => format!("✓ copied {what}"),
+    match copy_selection_to_clipboard(ticket) {
+        Ok(_) => "✓ copied ticket".to_owned(),
         Err(error) => format!("clipboard copy failed: {error}"),
     }
 }
@@ -3694,9 +3667,6 @@ fn wrap_fixed(text: &str, width: usize) -> Vec<String> {
 }
 
 /// The invite panel behind Ctrl+S.
-///
-/// Both identifiers are shown with what they actually reach, because the difference is the
-/// whole point: only the ticket travels to another machine.
 fn render_share_modal(frame: &mut Frame<'_>, theme: &UiTheme, share: ShareView<'_>) {
     let area = frame.area();
     let label = Style::default().fg(theme.agent_overlay_muted);
@@ -3715,11 +3685,6 @@ fn render_share_modal(frame: &mut Frame<'_>, theme: &UiTheme, share: ShareView<'
                     .into_iter()
                     .map(|chunk| Line::styled(chunk, value)),
             );
-            if let Some(code) = share.code {
-                lines.push(Line::raw(""));
-                lines.push(Line::styled("CODE — this Mac only", label));
-                lines.push(Line::styled(code.to_owned(), value));
-            }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 "Anyone with the ticket can join this session.",
@@ -4977,7 +4942,7 @@ pub struct SharedLayoutRuntime {
     status: String,
     copied_lines: Option<usize>,
     footer_notice: Option<String>,
-    join_code: Option<String>,
+    /// The coordinator's printable ticket. A member runtime has none.
     share_ticket: Option<String>,
     share_notice: Option<String>,
     agent_sampler: AgentSamplingWorker,
@@ -4998,7 +4963,7 @@ impl SharedLayoutRuntime {
         panes: PaneServer,
         snapshot: LayoutSnapshot,
         initial: SharedLocalPane,
-        join_code: String,
+        ticket: String,
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, Box<dyn Error>> {
         let transport = host.transport();
@@ -5008,7 +4973,7 @@ impl SharedLayoutRuntime {
             transport,
             snapshot,
             Some(initial),
-            Some(join_code),
+            Some(ticket),
             runtime,
         )
     }
@@ -5057,7 +5022,7 @@ impl SharedLayoutRuntime {
         transport: Transport,
         snapshot: LayoutSnapshot,
         initial: Option<SharedLocalPane>,
-        join_code: Option<String>,
+        share_ticket: Option<String>,
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, Box<dyn Error>> {
         let (subscription_tx, subscription_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5091,10 +5056,7 @@ impl SharedLayoutRuntime {
             status: String::new(),
             copied_lines: None,
             footer_notice: None,
-            // Resolved once at startup: the record is written before the runtime exists and
-            // does not change while it lives.
-            share_ticket: join_code.as_deref().and_then(resolve_local_ticket),
-            join_code,
+            share_ticket,
             share_notice: None,
             agent_sampler: AgentSamplingWorker::spawn(),
             agent_rosters: BTreeMap::new(),
@@ -5155,8 +5117,8 @@ impl SharedLayoutRuntime {
         self.control.peer_id()
     }
 
-    pub(crate) fn join_code(&self) -> Option<&str> {
-        self.join_code.as_deref()
+    pub(crate) fn share_ticket(&self) -> Option<&str> {
+        self.share_ticket.as_deref()
     }
 
     /// Current operator-facing status, empty when there is nothing to report.
@@ -5351,12 +5313,8 @@ impl SharedLayoutRuntime {
                 for intent in intents {
                     self.handle_intent(intent)?;
                 }
-                if let Some(request) = self.tui.take_share_copy_request() {
-                    self.share_notice = Some(share_copy_result(
-                        request,
-                        self.share_ticket.as_deref(),
-                        self.join_code.as_deref(),
-                    ));
+                if self.tui.take_share_copy_request().is_some() {
+                    self.share_notice = Some(share_copy_result(self.share_ticket.as_deref()));
                 }
                 // The notice belongs to one visit to the modal, not to the session.
                 if !self.tui.share_open() {
@@ -5463,7 +5421,6 @@ impl SharedLayoutRuntime {
                             .as_deref()
                             .or_else(|| self.exited_footer_notice()),
                         ShareView {
-                            code: self.join_code.as_deref(),
                             ticket: self.share_ticket.as_deref(),
                             notice: self.share_notice.as_deref(),
                         },
@@ -6613,7 +6570,6 @@ pub struct HostPaneRuntime {
     screen_tx: watch::Sender<ScreenFrame>,
     lease_tx: watch::Sender<LeaseState>,
     control_rx: mpsc::Receiver<HostControlEvent>,
-    join_code: String,
 }
 
 impl HostPaneRuntime {
@@ -6623,7 +6579,6 @@ impl HostPaneRuntime {
         screen_tx: watch::Sender<ScreenFrame>,
         lease_tx: watch::Sender<LeaseState>,
         control_rx: mpsc::Receiver<HostControlEvent>,
-        join_code: String,
     ) -> Result<Self, Box<dyn Error>> {
         let screen = HostScreen::new(size.rows, size.cols)?;
         let lease = LeaseManager::new(Vec::new(), Instant::now());
@@ -6636,7 +6591,6 @@ impl HostPaneRuntime {
             screen_tx,
             lease_tx,
             control_rx,
-            join_code,
         })
     }
 }
@@ -7205,7 +7159,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
-    let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
+    let footer = CONTROL_HELP.to_owned();
     let mut dirty = true;
     let mut last_draw: Option<Instant> = None;
     let mut sync_gate = SyncGate::default();
@@ -9107,8 +9061,7 @@ mod tests {
                     None,
                     None,
                     ShareView {
-                        code: Some("TESTCODE"),
-                        ticket: Some("p2pmux-v1:TICKET"),
+                        ticket: Some("p2pmux-v3:TICKET"),
                         notice: None,
                     },
                     None,
@@ -9119,15 +9072,15 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
             .collect::<String>();
         assert!(footer.contains("waiting for current pane reservation"));
-        // Invite material lives behind Ctrl+S; a same-Mac-only command in the corner read as
-        // something a peer could run, and it never was.
+        // Invite material lives behind Ctrl+S; a join command in the corner read as something
+        // a peer could run, and with a ticket that long it never fit anyway.
         assert!(!footer.contains("p2pmux join"));
-        assert!(!footer.contains("TESTCODE"));
+        assert!(!footer.contains("p2pmux-v3:TICKET"));
         assert!(footer.contains("SHARE"));
     }
 
     #[test]
-    fn share_modal_shows_the_ticket_and_the_code_with_their_reach() {
+    fn share_modal_shows_the_ticket_and_its_reach() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -9148,8 +9101,7 @@ mod tests {
                     None,
                     None,
                     ShareView {
-                        code: Some("TESTCODE"),
-                        ticket: Some("p2pmux-v1:TICKETVALUE"),
+                        ticket: Some("p2pmux-v3:TICKETVALUE"),
                         notice: Some("✓ copied ticket"),
                     },
                     None,
@@ -9166,11 +9118,11 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Share this session"));
         assert!(rendered.contains("TICKET — works from any Mac"));
-        assert!(rendered.contains("p2pmux-v1:TICKETVALUE"));
-        assert!(rendered.contains("CODE — this Mac only"));
-        assert!(rendered.contains("TESTCODE"));
+        assert!(rendered.contains("p2pmux-v3:TICKETVALUE"));
         assert!(rendered.contains("✓ copied ticket"));
         assert!(rendered.contains("COPY TICKET"));
+        // The same-Mac code is gone; nothing in the modal should imply a second identifier.
+        assert!(!rendered.contains("CODE — this Mac only"));
     }
 
     #[test]
@@ -9472,7 +9424,6 @@ mod tests {
             screen_tx,
             lease_tx,
             control_rx,
-            String::from("TESTCODE"),
         )
         .expect("host runtime");
 
@@ -11000,8 +10951,9 @@ mod tests {
             "a claimed request must not copy again on the next key"
         );
 
+        // `c` is muscle memory for copy and must not fall through to the pane.
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), area);
-        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Code));
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Ticket));
 
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
         assert!(!tui.share_open());

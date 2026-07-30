@@ -46,8 +46,8 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
     with Harness(f"h-fid-{index}") as harness:
-        host, code = harness.create_room("host", cols=100, rows=28)
-        guest = harness.join_room("guest", code, cols=100, rows=28)
+        host, ticket = harness.create_room("host", cols=100, rows=28)
+        guest = harness.join_room("guest", ticket, cols=100, rows=28)
         time.sleep(1.0)
 
         # --- D: a full-screen TUI in a shared pane.

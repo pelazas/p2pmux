@@ -49,8 +49,8 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
     with Harness(f"f-mouse-{index}") as harness:
         # Deliberately mismatched terminal sizes: the pane grid is host-owned, so a much
         # smaller guest must still track the host's stream without corrupting it.
-        host, code = harness.create_room("host", cols=120, rows=40)
-        guest = harness.join_room("guest", code, cols=64, rows=20)
+        host, ticket = harness.create_room("host", cols=120, rows=40)
+        guest = harness.join_room("guest", ticket, cols=64, rows=20)
         time.sleep(1.5)
 
         # --- D: unicode, wide chars and emoji must survive the trip to the guest.

@@ -60,8 +60,8 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         return f"host={owners(peer_a.snapshot())} guest={owners(peer_b.snapshot())}"
 
     with Harness(f"b-own-{index}") as harness:
-        host, code = harness.create_room("host")
-        guest = harness.join_room("guest", code)
+        host, ticket = harness.create_room("host")
+        guest = harness.join_room("guest", ticket)
         time.sleep(1.0)
 
         # Guest creates a pane of its own, so the tab holds one pane per owner.

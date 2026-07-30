@@ -14,7 +14,6 @@ pub mod notify_sound;
 mod perf;
 pub mod protocol;
 pub mod pty_host;
-pub mod rendezvous;
 pub mod screen;
 pub mod session;
 pub mod session_store;

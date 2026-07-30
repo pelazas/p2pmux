@@ -57,8 +57,8 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
     with Harness(f"c-lease-{index}") as harness:
-        host, code = harness.create_room("host")
-        guest = harness.join_room("guest", code)
+        host, ticket = harness.create_room("host")
+        guest = harness.join_room("guest", ticket)
         time.sleep(1.0)
 
         # Give the guest a pane so the layout is two-column and columns are separable.
