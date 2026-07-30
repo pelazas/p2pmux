@@ -4109,6 +4109,62 @@ fn reconcile_remote_control_attempt(
     }
 }
 
+/// What a guest should do with one keystroke aimed at a pane hosted by someone else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteInput {
+    /// Send it now, stamped with the lease epoch this guest currently knows.
+    Send,
+    /// Append it to `held_input`: a lease change of ours is already in flight, and
+    /// anything sent before the answer arrives would be stamped with a dead epoch.
+    Hold,
+    /// Ask the host for the pane, then hold this keystroke until it answers.
+    Request,
+    /// Somebody else is actively typing here. Their pane is protected.
+    Ignore,
+}
+
+/// The guest-side input rule, in one place because two loops need it and they had
+/// drifted apart.
+///
+/// The subtle case is `controller_peer_id` being empty -- a free pane, claimed by
+/// typing into it. That claim is not free: the host bumps the lease epoch the moment it
+/// accepts the first byte, so every keystroke typed during the round trip that follows
+/// arrives stamped with an epoch the host has already left behind and is rejected as
+/// stale. On loopback the window is under a millisecond and no scenario ever caught it;
+/// across an 85ms internet path it silently swallows the next five characters, so
+/// `echo N-CROSS` reaches the shell as `e-CROSS`. Holding the rest of the burst until
+/// the new lease lands costs nothing and keeps the line intact.
+fn remote_input_decision(
+    controller_peer_id: &[u8],
+    peer_id: &[u8],
+    pending_control: bool,
+    held_input_empty: bool,
+    controller_idle: bool,
+) -> RemoteInput {
+    if controller_peer_id == peer_id {
+        return if held_input_empty {
+            RemoteInput::Send
+        } else {
+            RemoteInput::Hold
+        };
+    }
+    if controller_peer_id.is_empty() {
+        return if pending_control {
+            RemoteInput::Hold
+        } else {
+            RemoteInput::Send
+        };
+    }
+    if controller_idle {
+        return if pending_control {
+            RemoteInput::Hold
+        } else {
+            RemoteInput::Request
+        };
+    }
+    RemoteInput::Ignore
+}
+
 impl SharedRemotePane {
     fn new(pane: GuestPane) -> Self {
         Self {
@@ -4228,20 +4284,30 @@ impl SharedRemotePane {
         let Some(lease) = self.lease.as_ref() else {
             return;
         };
-        if lease.controller_peer_id == self.pane.controls.peer_id() {
-            if self.held_input.is_empty() {
-                let _ = self.pane.controls.try_input(lease.epoch, bytes);
-            } else {
+        let claiming_free_pane = lease.controller_peer_id.is_empty();
+        match remote_input_decision(
+            &lease.controller_peer_id,
+            self.pane.controls.peer_id(),
+            self.pending_control,
+            self.held_input.is_empty(),
+            self.last_lease.elapsed() >= IDLE_AFTER,
+        ) {
+            RemoteInput::Send => {
+                if self.pane.controls.try_input(lease.epoch, bytes).is_ok() && claiming_free_pane {
+                    // The host will answer this byte with a new epoch; hold the rest of
+                    // the burst until it does.
+                    self.pending_control = true;
+                }
+            }
+            RemoteInput::Hold => self.held_input.extend_from_slice(&bytes),
+            RemoteInput::Request => {
                 self.held_input.extend_from_slice(&bytes);
+                self.pending_control = self.pane.controls.try_take_control(lease.epoch).is_ok();
+                if !self.pending_control {
+                    self.held_input.clear();
+                }
             }
-        } else if lease.controller_peer_id.is_empty() {
-            let _ = self.pane.controls.try_input(lease.epoch, bytes);
-        } else if self.last_lease.elapsed() >= IDLE_AFTER && !self.pending_control {
-            self.held_input.extend_from_slice(&bytes);
-            self.pending_control = self.pane.controls.try_take_control(lease.epoch).is_ok();
-            if !self.pending_control {
-                self.held_input.clear();
-            }
+            RemoteInput::Ignore => {}
         }
     }
 
@@ -6880,46 +6946,62 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                     if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen())
                         && let Some(bytes) = encode_key(key, screen, remote.kitty_keyboard_active())
                     {
-                        if state.controller_peer_id == pane.controls.peer_id() {
-                            if held_input.is_empty() {
-                                let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                            } else {
-                                held_input.extend_from_slice(&bytes);
+                        let claiming_free_pane = state.controller_peer_id.is_empty();
+                        match remote_input_decision(
+                            &state.controller_peer_id,
+                            pane.controls.peer_id(),
+                            pending_control,
+                            held_input.is_empty(),
+                            last_lease.elapsed() >= IDLE_AFTER,
+                        ) {
+                            RemoteInput::Send => {
+                                if pane.controls.try_input(state.lease_epoch, bytes).is_ok()
+                                    && claiming_free_pane
+                                {
+                                    pending_control = true;
+                                }
                             }
-                        } else if state.controller_peer_id.is_empty() {
-                            let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                        } else if last_lease.elapsed() >= IDLE_AFTER {
-                            held_input.extend_from_slice(&bytes);
-                            if !pending_control {
+                            RemoteInput::Hold => held_input.extend_from_slice(&bytes),
+                            RemoteInput::Request => {
+                                held_input.extend_from_slice(&bytes);
                                 pending_control = true;
                                 if pane.controls.try_take_control(state.lease_epoch).is_err() {
                                     pending_control = false;
                                     held_input.clear();
                                 }
                             }
+                            RemoteInput::Ignore => {}
                         }
                     }
                 }
                 Event::Paste(text) => {
                     if let (Some(state), Some(screen)) = (lease.as_ref(), remote.screen()) {
                         let bytes = encode_paste(&text, screen.bracketed_paste());
-                        if state.controller_peer_id == pane.controls.peer_id() {
-                            if held_input.is_empty() {
-                                let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                            } else {
-                                held_input.extend_from_slice(&bytes);
+                        let claiming_free_pane = state.controller_peer_id.is_empty();
+                        match remote_input_decision(
+                            &state.controller_peer_id,
+                            pane.controls.peer_id(),
+                            pending_control,
+                            held_input.is_empty(),
+                            last_lease.elapsed() >= IDLE_AFTER,
+                        ) {
+                            RemoteInput::Send => {
+                                if pane.controls.try_input(state.lease_epoch, bytes).is_ok()
+                                    && claiming_free_pane
+                                {
+                                    pending_control = true;
+                                }
                             }
-                        } else if state.controller_peer_id.is_empty() {
-                            let _ = pane.controls.try_input(state.lease_epoch, bytes);
-                        } else if last_lease.elapsed() >= IDLE_AFTER {
-                            held_input.extend_from_slice(&bytes);
-                            if !pending_control {
+                            RemoteInput::Hold => held_input.extend_from_slice(&bytes),
+                            RemoteInput::Request => {
+                                held_input.extend_from_slice(&bytes);
                                 pending_control = true;
                                 if pane.controls.try_take_control(state.lease_epoch).is_err() {
                                     pending_control = false;
                                     held_input.clear();
                                 }
                             }
+                            RemoteInput::Ignore => {}
                         }
                     }
                 }
@@ -6997,14 +7079,14 @@ mod tests {
         AGENT_TOGGLE_WINDOW, CHORD_IDLE_TIMEOUT, ChordMode, ESC_PREFIX_WINDOW, FooterMouseInput,
         FooterSegment, HostControlEvent, HostPaneChannels, HostPaneRuntime, KeyHandling,
         LayoutControlEvent, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, PaneViewState,
-        PendingEscape, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime, SharedLocalPane,
-        UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
+        PendingEscape, RemoteInput, RemoteSubscriptionState, ScreenCell, SharedLayoutRuntime,
+        SharedLocalPane, UiIntent, VtScreen, allocate_node_with_preview, area_from_terminal_size,
         chord_footer_badge, contextual_footer, copied_line_count, encode_key, encode_mouse,
         encode_paste, grid_for_pane, initial_root_pane_grid, is_chord_command, is_chord_navigation,
         lease_allows_held_input, member_label, mouse_to_screen_cell, pane_border_color, pane_title,
-        pane_wire_id, reconcile_remote_control_attempt, render_guest_screen, render_multi_pane,
-        render_multi_pane_with_copy_feedback, render_shared_multi_pane, selection_text, text_width,
-        viewed_screen, visible_leaf_panes,
+        pane_wire_id, reconcile_remote_control_attempt, remote_input_decision, render_guest_screen,
+        render_multi_pane, render_multi_pane_with_copy_feedback, render_shared_multi_pane,
+        selection_text, text_width, viewed_screen, visible_leaf_panes,
     };
 
     fn mouse_protocol(
@@ -8662,6 +8744,55 @@ mod tests {
         assert!(
             held_input.is_empty(),
             "a later controller wins and discards stale input"
+        );
+    }
+
+    #[test]
+    fn claiming_a_free_remote_pane_holds_the_rest_of_the_burst() {
+        let peer = b"typist";
+
+        // The first keystroke goes out and claims the pane.
+        assert_eq!(
+            remote_input_decision(b"", peer, false, true, false),
+            RemoteInput::Send
+        );
+        // Everything typed during the round trip has to wait: the host has already
+        // bumped the epoch, so sending now means the host drops those bytes as stale.
+        // This is the whole bug -- invisible on loopback, five lost characters at 85ms.
+        assert_eq!(
+            remote_input_decision(b"", peer, true, true, false),
+            RemoteInput::Hold
+        );
+    }
+
+    #[test]
+    fn remote_input_respects_the_controller_lease() {
+        let peer = b"typist";
+
+        assert_eq!(
+            remote_input_decision(peer, peer, false, true, false),
+            RemoteInput::Send,
+            "the controller types straight through"
+        );
+        assert_eq!(
+            remote_input_decision(peer, peer, false, false, false),
+            RemoteInput::Hold,
+            "queued input keeps its place in line"
+        );
+        assert_eq!(
+            remote_input_decision(b"other", peer, false, true, false),
+            RemoteInput::Ignore,
+            "an active controller is protected from takeover"
+        );
+        assert_eq!(
+            remote_input_decision(b"other", peer, false, true, true),
+            RemoteInput::Request,
+            "an idle controller can be displaced"
+        );
+        assert_eq!(
+            remote_input_decision(b"other", peer, true, true, true),
+            RemoteInput::Hold,
+            "one request at a time; the rest of the burst waits for the answer"
         );
     }
 
