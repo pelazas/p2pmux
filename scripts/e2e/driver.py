@@ -13,12 +13,16 @@ Design rules (non-negotiable, see docs/e2e-stress-log.md):
 Why the node reaping matters: `p2pmux create` / `p2pmux join` fork a background
 "node" process with its own process group (see cli.rs launch_background_node), which
 owns the PTYs and outlives the foreground client. Killing the peer we spawned does
-*not* kill it. Orphans between iterations would poison later runs, so the harness
-snapshots the pre-existing p2pmux pids and kills anything new at teardown.
+*not* kill it. Orphans between iterations would poison later runs, so at teardown the
+harness kills the nodes it can trace back to its own peers -- by the `node_pid` each
+one recorded in this run's scratch session store, and by the parent link captured
+before the peers die.
 
 Isolation: p2pmux resolves its session store, config file and join-code rendezvous
 directory from $HOME. Each Harness gets a private scratch HOME, so a run can never
-see, disturb, or kill the developer's real p2pmux sessions.
+see, disturb, or kill the developer's real p2pmux sessions -- including one started
+*during* the run, which "anything that is not in the starting pid snapshot" would
+have swept up.
 """
 
 from __future__ import annotations
@@ -478,11 +482,16 @@ def rss_kb(pid: int, include_children: bool = True) -> int:
 
 
 def p2pmux_pids() -> set[int]:
-    """Every live p2pmux process (foreground clients and detached __node workers)."""
+    """Every live p2pmux process (foreground clients and detached __node workers).
+
+    Keyed on the executable, not on "p2pmux" appearing anywhere in the command line:
+    the repo path is `.../p2pmux`, so every `cargo` and `rustc` process building it --
+    plus the developer's editor, grep, and shell -- matches a substring test.
+    """
     return {
         pid
         for pid, _, command in _ps_table()
-        if "p2pmux" in command and "ps -Ao" not in command
+        if command and os.path.basename(command.split(None, 1)[0]) == "p2pmux"
     }
 
 
@@ -620,21 +629,59 @@ class Harness:
     def total_rss_kb(self) -> int:
         return sum(rss_kb(peer.pid) for peer in self.peers if peer.alive)
 
+    def _own_node_pids(self) -> set[int]:
+        """Node pids this harness's peers created, from their scratch session store.
+
+        Every peer runs with `HOME=self.home`, so this store lists exactly the sessions
+        this run is responsible for, and each descriptor records its detached node's pid.
+        """
+        store = self.home / "Library" / "Application Support" / "p2pmux" / "sessions"
+        pids: set[int] = set()
+        for path in store.glob("*.json"):
+            try:
+                node_pid = json.loads(path.read_text()).get("node_pid")
+            except (OSError, ValueError):
+                continue  # a descriptor being written right now is not worth failing on
+            if isinstance(node_pid, int) and node_pid > 0:
+                pids.add(node_pid)
+        return pids
+
     def __exit__(self, exc_type, exc, tb) -> bool:
+        # Snapshot what we own *before* closing anything: once a foreground client dies
+        # its detached node is reparented, and the parent link that identifies it is gone.
+        owned = self._own_node_pids()
+        for peer in self.peers:
+            if peer.process is not None:
+                owned.add(peer.pid)
+                owned.update(descendants(peer.pid))
+
         for peer in reversed(self.peers):
             try:
                 peer.close()
             except Exception as cleanup_error:  # never mask the scenario's failure
                 print(f"[harness] closing {peer.name} failed: {cleanup_error}", file=sys.stderr)
 
-        # Detached `p2pmux __node` workers survive their foreground client by design.
-        # Anything that appeared after we started is ours; the developer's real
-        # sessions were in the baseline and are left strictly alone.
+        # Detached `p2pmux __node` workers survive their foreground client by design, so
+        # they need an explicit kill. Only pids traced back to this run's own peers are
+        # touched: a session the developer starts in another terminal *while* a scenario
+        # is running is also absent from the baseline, and killing it makes p2pmux look
+        # like it died on its own.
         deadline = time.monotonic() + 5.0
+        clean_passes = 0
         while time.monotonic() < deadline:
-            orphans = p2pmux_pids() - self._baseline_pids
+            # Re-read the store every pass: a node still starting when the scenario blew
+            # up registers itself a moment later, and one snapshot would miss it. The
+            # store lives in this run's scratch HOME, so it can only ever name our own.
+            # Two clean passes in a row before leaving, for the same reason.
+            owned |= self._own_node_pids()
+            orphans = owned & p2pmux_pids()
             if not orphans:
-                break
+                clean_passes += 1
+                if clean_passes >= 2:
+                    break
+                time.sleep(0.25)
+                continue
+            clean_passes = 0
             for pid in orphans:
                 self.killed_orphans.append(pid)
                 for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -649,9 +696,20 @@ class Harness:
                         break
             time.sleep(0.2)
 
-        leaked = p2pmux_pids() - self._baseline_pids
+        live = p2pmux_pids()
+        leaked = owned & live
         if leaked:
             print(f"[harness] WARNING leaked p2pmux pids: {sorted(leaked)}", file=sys.stderr)
+
+        # Reported, never killed -- most likely the developer's own session, but if a
+        # scenario really does leak a node we cannot trace, this is where it shows up.
+        strays = live - self._baseline_pids - owned
+        if strays:
+            print(
+                f"[harness] note: p2pmux pids appeared during this run that are not "
+                f"ours; left running: {sorted(strays)}",
+                file=sys.stderr,
+            )
 
         if not self.keep_home:
             shutil.rmtree(self.home, ignore_errors=True)
