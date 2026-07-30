@@ -233,6 +233,24 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     result.map_err(Into::into)
 }
 
+/// Apply this node's timeouts to a freshly accepted connection.
+///
+/// `None` means the connection is not worth keeping, never that the node is in trouble.
+/// That distinction is the whole point: `SessionStore::sweep_dead_sockets` probes liveness by
+/// opening a connection and dropping it at once, and on macOS these calls answer EINVAL for a
+/// peer that is already gone. Propagating that ended the socket loop and tore down the
+/// session, so any `p2pmux attach`, `ls`, `ticket` or `--resume` — every caller of
+/// `list_live` — killed every live session on the machine.
+fn configure_accepted(stream: UnixStream) -> Option<UnixStream> {
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT)).ok()?;
+    // Prevent stalled clients from wedging the node on large Snapshot writes.
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    Some(stream)
+}
+
 fn run_socket_loop(
     node: &mut SharedLayoutNode,
     listener: UnixListener,
@@ -250,10 +268,9 @@ fn run_socket_loop(
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT))?;
-                    // Prevent stalled clients from wedging the node on large Snapshot writes.
-                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    let Some(stream) = configure_accepted(stream) else {
+                        continue;
+                    };
                     let mut reader = BufReader::new(stream);
                     match read_message(&mut reader) {
                         // Probes and shutdowns are control requests. They must not consume or
@@ -1362,6 +1379,38 @@ mod tests {
         },
         thread,
     };
+
+    #[test]
+    fn a_peer_that_hung_up_before_being_accepted_costs_only_its_connection() {
+        // `SessionStore::sweep_dead_sockets` tests liveness by connecting and dropping at
+        // once, so this is what every `p2pmux attach`, `ticket` or `--resume` does to a live
+        // node. macOS answers EINVAL when the timeouts are applied to a peer that is already
+        // gone; propagating that ended the socket loop, and the node tore its own session
+        // down. One dead connection must never be able to do that.
+        let directory = std::env::temp_dir().join(format!("p2pmux-accept-{}", std::process::id()));
+        let _ = fs::create_dir_all(&directory);
+        let path = directory.join("node.sock");
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("listener should bind");
+
+        drop(UnixStream::connect(&path).expect("sweep-style probe should connect"));
+        let (accepted, _) = listener.accept().expect("accept should succeed");
+        // Whether the platform refuses this one is its business; the signature is the fix,
+        // because an `Option` cannot be `?`-propagated into ending the session.
+        let _: Option<UnixStream> = configure_accepted(accepted);
+
+        // What must hold is that the dead peer left nothing behind: the next real client
+        // still gets a usable stream from the same listener.
+        let live = UnixStream::connect(&path).expect("live peer should connect");
+        let (accepted, _) = listener.accept().expect("accept should succeed");
+        assert!(
+            configure_accepted(accepted).is_some(),
+            "a hung-up peer poisoned the listener for the next client"
+        );
+        drop(live);
+
+        let _ = fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn reads_concatenated_client_frames_from_one_reader() {
