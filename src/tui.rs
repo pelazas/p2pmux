@@ -3769,9 +3769,11 @@ impl SharedLocalPane {
             pixel_height: 0,
         };
         let cwd = cwd.filter(|path| path.is_dir());
-        let host = match PtyHost::spawn_default_shell_with_cwd(size, cwd) {
+        let host = match PtyHost::spawn_default_shell_with_cwd(size, cwd, Some(pane_id)) {
             Ok(host) => host,
-            Err(_) if cwd.is_some_and(|path| !path.is_dir()) => PtyHost::spawn_default_shell(size)?,
+            Err(_) if cwd.is_some_and(|path| !path.is_dir()) => {
+                PtyHost::spawn_default_shell_with_cwd(size, None, Some(pane_id))?
+            }
             Err(error) => return Err(error),
         };
         let screen = HostScreen::new(grid_rows, grid_cols)?;

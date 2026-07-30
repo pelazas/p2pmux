@@ -108,6 +108,9 @@ pub fn read_bootstrap(path: &std::path::Path) -> io::Result<NodeBootstrap> {
 pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Error>> {
     let mut descriptor = bootstrap.descriptor.clone();
     descriptor.node_pid = std::process::id();
+    // Before the first pane spawns: every PTY this node opens inherits the
+    // socket path from here, and pane 1 is created a few lines below.
+    crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
     let (mut node, dispatcher_task, rendezvous) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
