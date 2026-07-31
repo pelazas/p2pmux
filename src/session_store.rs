@@ -260,8 +260,15 @@ impl SessionStore {
         }
     }
 
-    /// Returns only connectable descriptors. Failed probes are the sole condition under which a
-    /// finder record is removed, avoiding accidental deletion of a node that is merely starting.
+    /// Returns only connectable descriptors. A refused connection is the sole condition under
+    /// which a finder record is removed, avoiding accidental deletion of a node that is merely
+    /// starting -- or merely busy.
+    ///
+    /// A node that accepts the connection but does not answer within [`PROBE_ACK_TIMEOUT`] is
+    /// still listed and, above all, still kept: it is alive and loaded, and deleting its record
+    /// would strand a running session with no way to `attach` or `kill` it by name. Load spikes
+    /// long enough to blow that deadline are ordinary on a machine building software, which is
+    /// exactly when a shared session is most likely to be open.
     pub fn list_live(&self) -> io::Result<Vec<SessionDescriptor>> {
         let entries = match fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
@@ -280,11 +287,13 @@ impl SessionStore {
                 None => continue,
             };
             match self.read(id) {
-                Ok(descriptor) if probe(&descriptor.socket_path) => sessions.push(descriptor),
-                Ok(descriptor) => {
-                    let _ = fs::remove_file(&descriptor.socket_path);
-                    let _ = fs::remove_file(path);
-                }
+                Ok(descriptor) => match probe(&descriptor.socket_path) {
+                    Liveness::Acked | Liveness::Listening => sessions.push(descriptor),
+                    Liveness::Gone => {
+                        let _ = fs::remove_file(&descriptor.socket_path);
+                        let _ = fs::remove_file(path);
+                    }
+                },
                 Err(_) => {
                     let _ = fs::remove_file(path);
                 }
@@ -428,23 +437,45 @@ fn now_secs() -> u64 {
         .unwrap_or(Duration::ZERO)
         .as_secs()
 }
-fn probe(path: &Path) -> bool {
+/// What a liveness probe learned about a session socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Liveness {
+    /// The node answered the probe. Live, beyond doubt.
+    Acked,
+    /// The connection was accepted but no ack arrived in time. A unix socket refuses
+    /// connections once its listener is gone, so something is still holding this one --
+    /// it is a busy node, not a dead one.
+    Listening,
+    /// Nobody is on the other end: the socket is missing, or connecting was refused.
+    Gone,
+}
+
+/// How long a node gets to answer before it is merely `Listening` rather than `Acked`.
+///
+/// Short on purpose: `p2pmux ls` waits this out once per session, and missing it is no
+/// longer expensive now that only [`Liveness::Gone`] deletes anything.
+const PROBE_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn probe(path: &Path) -> Liveness {
     let Ok(mut stream) = UnixStream::connect(path) else {
-        return false;
+        return Liveness::Gone;
     };
     if stream.write_all(b"{\"type\":\"probe\"}\n").is_err()
-        || stream
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .is_err()
+        || stream.set_read_timeout(Some(PROBE_ACK_TIMEOUT)).is_err()
     {
-        return false;
+        return Liveness::Listening;
     }
     // Read one newline-delimited ack. Do not use read_to_string: the node keeps the
-    // connection open, so waiting for EOF falsely marks live sessions as dead and
-    // list_live would delete their descriptors.
+    // connection open, so waiting for EOF would never see one.
     let mut reader = io::BufReader::new(stream);
     let mut response = String::new();
-    matches!(reader.read_line(&mut response), Ok(n) if n > 0) && response.contains("\"probe_ack\"")
+    if matches!(reader.read_line(&mut response), Ok(n) if n > 0)
+        && response.contains("\"probe_ack\"")
+    {
+        Liveness::Acked
+    } else {
+        Liveness::Listening
+    }
 }
 
 fn current_uid() -> io::Result<String> {
@@ -589,6 +620,48 @@ mod tests {
         assert_eq!(live[0].id, id);
         server.join().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_node_too_busy_to_answer_keeps_its_record() {
+        use std::os::unix::net::UnixListener;
+
+        // The node is bound but never gets around to accepting -- a machine under enough
+        // load to starve its accept loop past the ack deadline. Deleting the record here
+        // is how a live session used to lose its name: `attach`, `kill` and `ls` all go
+        // through the finder, and the node itself keeps running with no way back to it.
+        // CI reproduced this on its own, at random, as a red `tests/cli.rs`.
+        let root = PathBuf::from(format!("/tmp/p2pmux-busy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = SessionStore::at(root.join("s"), root.join("k"));
+        let id = generate_id().unwrap();
+        fs::create_dir_all(root.join("k")).unwrap();
+        let socket = root.join("k").join(format!("{}.s", &id[..8]));
+        let listener = UnixListener::bind(&socket).unwrap();
+        store
+            .write(&SessionDescriptor::new(
+                id.clone(),
+                "lisbon".into(),
+                socket.clone(),
+                42,
+                SessionRole::Coordinator,
+            ))
+            .unwrap();
+
+        assert_eq!(probe(&socket), Liveness::Listening);
+        let live = store.list_live().unwrap();
+
+        assert_eq!(live.len(), 1, "a busy node is still a live one");
+        assert_eq!(live[0].id, id);
+        assert!(store.read(&id).is_ok(), "its record must survive");
+        assert!(socket.exists(), "and so must its socket");
+
+        // Once the listener is gone the connection is refused, and only then is it swept.
+        drop(listener);
+        assert_eq!(probe(&socket), Liveness::Gone);
+        assert!(store.list_live().unwrap().is_empty());
+        assert!(store.read(&id).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
