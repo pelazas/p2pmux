@@ -312,7 +312,10 @@ impl SharedLayoutRuntime {
                 let scrollback_len = self
                     .local
                     .get(&pane_id)
-                    .map(|pane| available_scrollback(pane.screen.screen()))
+                    // A local pane owns a `HostScreen`, which already counts its retained
+                    // rows; `available_scrollback` would clone the whole buffer to learn
+                    // the same number, once per wheel notch.
+                    .map(|pane| pane.screen.retained_scrollback())
                     .or_else(|| {
                         self.remote
                             .get(&pane_id)
