@@ -19,7 +19,7 @@ userA's pane and runs a command in it. Both windows are real clients; the pane t
 hosts what.*
 
 ```sh
-brew tap pelazas/tap && brew trust pelazas/tap && brew install p2pmux
+curl -fsSL https://p2pmux.com/install.sh | sh
 
 p2pmux create        # then Ctrl+S for the join code
 p2pmux join 4KP7Q-M2XRW
@@ -64,24 +64,11 @@ coordinator that dies ends the session.
 ## Install
 
 ```sh
-brew tap pelazas/tap
-brew trust pelazas/tap
-brew install p2pmux
-```
-
-Tapping once is what buys the short name. `brew trust` is Homebrew 6 and newer: it refuses to load
-a formula from a third-party tap until you say you trust that tap, so without it the install stops
-with `Refusing to load formula … from untrusted tap`. On Homebrew 5 the command does not exist and
-is not needed — skip that line.
-
-Or, without Homebrew:
-
-```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
 ```
 
-Both fetch a binary and its SHA256 from GitHub Releases and check the hash before installing. The
-script is served as plain text so you can read it first, and
+The script fetches a binary and its SHA256 from GitHub Releases and checks the hash before
+installing. It is served as plain text so you can read it first, and
 `cargo install --git https://github.com/pelazas/p2pmux --locked` is a supported path for anyone
 who would rather not run an installer at all.
 
