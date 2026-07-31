@@ -18,7 +18,7 @@ Example: Pelazas starts Claude Code in his pane (his subscription). Tis takes co
 
 **Is**
 
-- Lightweight local binary (`brew install pelazas/tap/p2pmux`)
+- Lightweight local binary (`brew tap pelazas/tap && brew install p2pmux`)
 - Zellij-like tabs, panes, and nested splits
 - Real-time multiplayer presence (who’s on which tab/pane)
 - End-to-end encrypted peer-to-peer pane streaming (+ relay when NAT requires it)
@@ -41,8 +41,12 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 ## Install
 
 ```text
-brew install pelazas/tap/p2pmux
+brew tap pelazas/tap
+brew install p2pmux
 ```
+
+Tapping once is what buys the short name; `brew install pelazas/tap/p2pmux` is the same thing in
+one line for anyone who would rather not tap.
 
 or, without Homebrew:
 

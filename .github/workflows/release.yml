@@ -101,7 +101,8 @@ jobs:
             or
 
             ```sh
-            brew install pelazas/tap/p2pmux
+            brew tap pelazas/tap
+            brew install p2pmux
             ```
 
             Prefer to build it yourself:
