@@ -95,6 +95,23 @@ struct PendingScroll {
     target: usize,
 }
 
+/// Claims the outstanding request for `pane_id` only when this reply answers it.
+///
+/// The obvious spelling — remove, then compare — throws away a live request every
+/// time a stale reply lands first, and the reply that would have satisfied it then
+/// finds nothing to claim. A wheel burst is exactly the case that produces stale
+/// replies, so scrolling would stall precisely when it was asked to move most.
+fn take_matching_pending(
+    pending: &mut BTreeMap<u64, PendingScroll>,
+    pane_id: u64,
+    request_id: u64,
+) -> Option<PendingScroll> {
+    if pending.get(&pane_id)?.request_id != request_id {
+        return None;
+    }
+    pending.remove(&pane_id)
+}
+
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::config::config_path()?;
     let config = crate::config::load_config_from(&config_path).map_err(|error| {
@@ -291,12 +308,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         snapshot,
                         unavailable,
                     } => {
-                        let Some(pending) = pending_scroll.remove(&pane_id) else {
+                        let Some(pending) =
+                            take_matching_pending(&mut pending_scroll, pane_id, request_id)
+                        else {
                             continue;
                         };
-                        if pending.request_id != request_id {
-                            continue;
-                        }
                         let Some(snapshot) = snapshot else {
                             footer_notice = unavailable;
                             dirty = true;
@@ -1308,6 +1324,36 @@ mod tests {
             client_key_bytes(KeyCode::Enter, KeyModifiers::CONTROL, true),
             Some(b"\r".to_vec())
         );
+    }
+
+    /// A wheel burst leaves older replies in flight behind the newest request. Those
+    /// stale replies have to pass through without disturbing the request still waiting,
+    /// or the pane stops moving for as long as the user keeps scrolling.
+    #[test]
+    fn a_stale_scroll_reply_leaves_the_live_request_waiting() {
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            1,
+            PendingScroll {
+                request_id: 4,
+                target: 12,
+            },
+        );
+
+        assert!(take_matching_pending(&mut pending, 1, 1).is_none());
+        assert!(take_matching_pending(&mut pending, 1, 3).is_none());
+        assert!(take_matching_pending(&mut pending, 2, 4).is_none());
+        assert_eq!(
+            pending.get(&1).map(|pending| pending.request_id),
+            Some(4),
+            "stale and cross-pane replies must not consume the live request"
+        );
+
+        let claimed = take_matching_pending(&mut pending, 1, 4).expect("live reply claims");
+        assert_eq!(claimed.target, 12);
+        assert!(pending.is_empty());
+        // The answer is claimed once; a duplicate must not re-apply it.
+        assert!(take_matching_pending(&mut pending, 1, 4).is_none());
     }
 
     #[test]
