@@ -606,10 +606,11 @@ async fn resolve_join_ticket(input: &str) -> Result<JoinTicket, Box<dyn Error>> 
     if looks_like_ticket(input) {
         return Ok(JoinTicket::from_str(input).map_err(|_| CliError("invalid ticket format"))?);
     }
+    // Points at the host rather than describing the two shapes: whoever hits this has been
+    // sent something malformed, and the fix is a fresh invite, not a lesson in what a code
+    // looks like.
     let code = JoinCode::parse(input).map_err(|_| {
-        CliError(
-            "expected a join code or ticket; the host finds both in the session's Ctrl+S panel",
-        )
+        CliError("that is not a join code; ask the host for the line their Ctrl+S panel shows")
     })?;
     let ticket = HostedRendezvous::new()?.resolve(&code).await?;
     Ok(JoinTicket::from_str(&ticket).map_err(|_| CliError("invalid ticket format"))?)

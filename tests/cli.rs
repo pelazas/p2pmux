@@ -42,7 +42,7 @@ fn join_rejects_an_invalid_ticket_without_echoing_it() {
     assert!(stdout.contains("TRUST WARNING"));
     assert!(stdout.contains("fully trusted shared-shell session"));
     // Neither a ticket nor a code by shape, so it is refused without a network round trip.
-    assert!(stderr.contains("expected a join code or ticket"));
+    assert!(stderr.contains("that is not a join code"));
     assert!(!stdout.contains("not-a-ticket"));
     assert!(!stderr.contains("not-a-ticket"));
 }
