@@ -62,9 +62,10 @@ pub(in crate::tui) const PRESENCE_WATCHING: &str = "●";
 /// Right-aligned chips for the members watching a pane, one initial each.
 ///
 /// This lives on the bottom border because the top one is already carrying
-/// `host: … control: …` and a right-aligned `(locked by …)` badge. The border color is
-/// left alone: it encodes focus and control state, one pane can have several watchers,
-/// and recoloring it per member would make watching look like controlling.
+/// `host: … control: …` and a right-aligned `(locked by …)` badge. Watchers never reach
+/// the border color: that is reserved for the one member holding the pane (see
+/// [`pane_border_color`]), and a pane can have several watchers at once, which a single
+/// color could not express anyway.
 ///
 /// The member holding the control lease is drawn reversed rather than in a second glyph,
 /// so "someone is watching" and "someone can type here" differ without costing a column.
@@ -143,11 +144,22 @@ pub(in crate::tui) fn pane_title(
         Span::raw(truncate_trailing(&metadata, metadata_width)),
     ])
 }
+/// The border color for one pane, from this client's point of view.
+///
+/// A held pane is drawn in its controller's member color, the same color that member
+/// gets on every tab dot and presence marker. Control is authoritative shared state, so
+/// every client colors that pane identically and the border answers *who is driving
+/// this* rather than only *somebody is*. Focus is local and stays neutral: white when
+/// the pane is free, since your own focus means nothing to anyone else's screen.
+///
+/// [`UiTheme::pane_border_remote_control`] is the fallback for a controller who is no
+/// longer in the member list -- a peer that left mid-hold has no slot and so no color,
+/// and the pane still has to read as held.
 pub(in crate::tui) fn pane_border_color(
     theme: &UiTheme,
+    members: &[crate::layout::Member],
     exited: bool,
     controller_peer_id: Option<&[u8]>,
-    _controller_active: bool,
     focused: bool,
     hovered: bool,
     chord_mode: ChordMode,
@@ -164,7 +176,9 @@ pub(in crate::tui) fn pane_border_color(
         None if focused => theme.pane_border_unknown_focused,
         Some([]) | None if hovered => theme.pane_border_hovered,
         Some([]) | None => theme.pane_border_idle,
-        Some(_) => theme.pane_border_remote_control,
+        Some(peer_id) => {
+            member_color(peer_id, members, theme).unwrap_or(theme.pane_border_remote_control)
+        }
     }
 }
 /// Renders layout chrome plus any currently available fixed-size VT screens.
@@ -415,9 +429,9 @@ pub(in crate::tui) fn render_shared_multi_pane(
         title.spans.push(Span::raw(" "));
         let border_color = pane_border_color(
             theme,
+            &tui.snapshot.members,
             pane.exited,
             view.controller_peer_id.as_deref(),
-            view.controller_active,
             focused,
             tui.hovered_pane == Some(pane_id),
             tui.chord_mode,
@@ -509,8 +523,8 @@ mod tests {
     };
 
     use super::{
-        PRESENCE_WATCHING, pane_border_color, pane_presence_chips, pane_title, render_multi_pane,
-        render_shared_multi_pane,
+        PRESENCE_WATCHING, member_color, pane_border_color, pane_presence_chips, pane_title,
+        render_multi_pane, render_shared_multi_pane,
     };
 
     #[test]
@@ -796,12 +810,13 @@ mod tests {
     #[test]
     fn free_panes_use_a_mid_gray_border_when_hovered_unfocused() {
         let theme = UiTheme::default();
+        let nobody: &[crate::layout::Member] = &[];
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b""),
-                false,
                 true,
                 false,
                 ChordMode::None
@@ -811,9 +826,9 @@ mod tests {
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b""),
-                false,
                 false,
                 true,
                 ChordMode::None
@@ -823,9 +838,9 @@ mod tests {
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b""),
-                false,
                 false,
                 false,
                 ChordMode::None
@@ -833,23 +848,23 @@ mod tests {
             Color::DarkGray
         );
         assert_eq!(
-            pane_border_color(&theme, false, None, false, true, false, ChordMode::None),
+            pane_border_color(&theme, nobody, false, None, true, false, ChordMode::None),
             Color::Yellow
         );
         assert_eq!(
-            pane_border_color(&theme, false, None, false, false, true, ChordMode::None),
+            pane_border_color(&theme, nobody, false, None, false, true, ChordMode::None),
             Color::Gray
         );
         assert_eq!(
-            pane_border_color(&theme, false, None, false, false, false, ChordMode::None),
+            pane_border_color(&theme, nobody, false, None, false, false, ChordMode::None),
             Color::DarkGray
         );
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b"guest"),
-                true,
                 true,
                 true,
                 ChordMode::None
@@ -859,9 +874,9 @@ mod tests {
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b"guest"),
-                false,
                 false,
                 true,
                 ChordMode::None
@@ -876,38 +891,81 @@ mod tests {
         assert_eq!(
             pane_border_color(
                 &themed,
+                nobody,
                 false,
                 Some(b"guest"),
                 false,
                 false,
-                false,
-                ChordMode::None,
+                ChordMode::None
             ),
             Color::Rgb(1, 2, 3)
         );
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b"guest"),
                 true,
                 true,
-                true,
-                ChordMode::Pane,
+                ChordMode::Pane
             ),
             theme.pane_border_chord_focused
         );
         assert_eq!(
             pane_border_color(
                 &theme,
+                nobody,
                 false,
                 Some(b"guest"),
                 true,
                 true,
-                true,
-                ChordMode::Tab,
+                ChordMode::Tab
             ),
             theme.pane_border_remote_control
+        );
+    }
+
+    #[test]
+    fn a_held_pane_borrows_its_controllers_member_color() {
+        let theme = UiTheme::default();
+        let members = crate::tui::test_support::presence_members(3);
+
+        // Every member gets their own border, and it is the same color that member is
+        // drawn with everywhere else, so the border names the holder without a legend.
+        for member in &members {
+            let expected =
+                member_color(&member.peer_id, &members, &theme).expect("member has a slot");
+            assert_ne!(expected, theme.pane_border_remote_control);
+            for focused in [false, true] {
+                assert_eq!(
+                    pane_border_color(
+                        &theme,
+                        &members,
+                        false,
+                        Some(&member.peer_id),
+                        focused,
+                        false,
+                        ChordMode::None
+                    ),
+                    expected,
+                );
+            }
+        }
+
+        // A controller who has left the member list has no slot and so no color; the
+        // pane still has to read as held rather than as free.
+        assert_eq!(
+            pane_border_color(
+                &theme,
+                &members,
+                false,
+                Some(b"departed"),
+                false,
+                false,
+                ChordMode::None
+            ),
+            theme.pane_border_remote_control,
         );
     }
 
@@ -1402,13 +1460,16 @@ mod tests {
     #[test]
     fn a_pane_border_keeps_its_meaning_when_somebody_watches_it() {
         // Presence must not repaint the border: it encodes focus and control, and one
-        // pane can have several watchers that a single color could not express.
+        // pane can have several watchers that a single color could not express. A member
+        // color on the border means that member *holds* the pane, not that they are
+        // looking at it.
         let theme = UiTheme::default();
+        let members = crate::tui::test_support::presence_members(2);
         let watched = pane_border_color(
             &theme,
+            &members,
             false,
             Some(&[]),
-            false,
             true,
             false,
             ChordMode::None,

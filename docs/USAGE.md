@@ -122,10 +122,12 @@ peer is connected — the number shown is always the worst path, since one peer 
 the thing worth noticing. `locked · direct 55ms` when the session is locked.
 
 Nested ratio-controlled splits go four deep, at most 8 panes per tab and at most 9 tabs. Each pane
-title shows `Pane #N host: <name> control: free|<name>|…`; free focused panes use a white border
-and actively controlled panes use red-orange. Pane mode gives the locally focused pane a
-soft-green border; Tab mode dims inactive tab labels. Click tab labels to switch tabs without
-claiming control or sending input.
+title shows `Pane #N host: <name> control: free|<name>|…`. A pane being driven by a member is
+drawn in that member's own color — the same color as their tab dot — so the border says who
+holds it, and every member sees that pane the same color. A free pane you are focused on is
+white; red-orange is left for a controller who has since dropped out of the session. Pane mode
+gives the locally focused pane a red border; Tab mode dims inactive tab labels. Click tab labels
+to switch tabs without claiming control or sending input.
 
 The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`;
@@ -137,10 +139,10 @@ tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc
 
 Presence shows where every other member is looking. Each member gets a color from their slot in
 the session's member list, and that color identifies them everywhere: a dot per member on each tab
-they are on, their initial on the bottom border of the pane they are watching, and a members block
-in the agents overlay listing everyone with their tab and pane. Watching is not controlling — the
-pane border keeps meaning focus and control state, and the member holding the control lease is
-drawn as a reversed chip.
+they are on, their initial on the bottom border of the pane they are watching, the border of any
+pane they are driving, and a members block in the agents overlay listing everyone with their tab
+and pane. Watching is not controlling — a watcher only ever leaves an initial on the bottom
+border, and the member holding the control lease is drawn as a reversed chip.
 
 Presence is silent when nobody moves. A member publishes their focus only when it changes, the
 coordinator caches the latest one per member and replays it to joiners, and there is no heartbeat

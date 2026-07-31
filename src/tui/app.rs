@@ -655,9 +655,13 @@ mod tests {
     fn member_colors_avoid_the_reserved_control_and_alert_colors() {
         let theme = UiTheme::default();
         for color in theme.member_colors {
+            // A held pane borrows its controller's color, so this one is the *fallback*
+            // for a controller with no slot left -- someone who dropped out mid-hold. It
+            // has to stay outside the palette, or that pane would claim a live member's
+            // identity.
             assert_ne!(
                 color, theme.pane_border_remote_control,
-                "a member color must not read as an actively controlled pane"
+                "the departed-controller border must not read as a member's own color"
             );
             assert_ne!(color, theme.tab_active_background);
             assert_ne!(color, theme.footer_accent);
