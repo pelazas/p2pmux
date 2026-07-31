@@ -57,6 +57,10 @@ ESCAPE = b"\x1b"
 # works too, but pane mode paints the focused border chord-red on the way, and a red
 # frame between two green ones reads as three states when only one thing happened.
 ALT_SHIFT_LEFT = b"\x1b[1;4D"
+# Ctrl+U, spent to claim a pane. Any keystroke claims one, but the keystroke that wins
+# the lease is consumed by the claim, so it has to be one that costs nothing if it does
+# reach the shell: kill-line on an already-empty prompt draws nothing either way.
+CLAIM = b"\x15"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_DIR = REPO_ROOT / "target" / "release"
@@ -106,8 +110,10 @@ class Member:
     # itself gives each member.
     color: str
     prompt: str
-    # What `ls` in this member's home would show. Each member gets a private HOME, so
-    # the two panes are looking at genuinely different directories.
+    # Dressing for this member's private HOME, so the two panes are looking at genuinely
+    # different directories. Trailing slash means directory. Nothing on camera lists the
+    # home itself: p2pmux keeps its session store under `~/Library`, and a demo that
+    # shows its own scaffolding in the `ls` output is a demo about the recorder.
     files: tuple[str, ...]
 
 
@@ -124,7 +130,7 @@ MEMBERS = {
         "· guest",
         "#7ed67e",
         "userB@desktop %%",
-        ("Desktop/", "code/", "todo.txt"),
+        ("Desktop/", "code/api/", "code/web/", "code/README.md", "todo.txt"),
     ),
 }
 
@@ -346,10 +352,12 @@ def member_home(harness: Harness, member: Member, display_name: str | None = Non
             f'display_name = "{display_name}"\n'
         )
     for entry in member.files:
+        target = home / entry.rstrip("/")
         if entry.endswith("/"):
-            (home / entry.rstrip("/")).mkdir(exist_ok=True)
+            target.mkdir(parents=True, exist_ok=True)
         else:
-            (home / entry).write_text(f"{member.name}\n")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"{member.name}\n")
     return home
 
 
@@ -419,13 +427,13 @@ def build_scene(harness: Harness) -> tuple[object, object, str]:
 
 
 def claim(guest, host, title: str) -> None:
-    """Take the focused pane with one Return, and wait until both clients agree.
+    """Take the focused pane, and wait until both clients agree that it is taken.
 
     Control is authoritative shared state, so the assertion that matters is not "the
     guest thinks it holds this" but "both windows draw the same title" -- which is also
     exactly the frame the GIF needs before the next command starts typing.
     """
-    guest.send(ENTER)
+    guest.send(CLAIM)
     for peer in (host, guest):
         peer.wait_for(title, timeout=10)
 
@@ -485,10 +493,10 @@ def perform(host, guest, code: str) -> None:
     # arrives whole. From here the border is userB's green on both screens, the same
     # green as their name on the card.
     claim(guest, host, r"Pane #2 host: userB control: userB")
-    guest.type("ls", per_key_delay=0.1)
+    guest.type("ls ~/code", per_key_delay=0.1)
     pause(0.25)
     guest.send(ENTER)
-    guest.wait_for(r"todo\.txt", timeout=10)
+    guest.wait_for(r"README\.md", timeout=10)
     pause(1.3)
 
     # 5. Focus crosses to userA's pane. No chord, so no red on the way.
