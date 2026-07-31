@@ -315,6 +315,15 @@ impl HostScreen {
         self.kitty_keyboard.active()
     }
 
+    /// Rows the parser is holding, tracked as output arrives.
+    ///
+    /// Callers used to read this by cloning the screen and clamping the offset, which
+    /// copies every retained row — milliseconds per call once history fills. The count
+    /// is already maintained by `process_pty`, so hand it over directly.
+    pub fn retained_scrollback(&self) -> usize {
+        self.retained_scrollback
+    }
+
     /// Number of audible bells since the last call. An agent that rings when it finishes gives
     /// a far better completion signal than inferring one from how long the pane stayed quiet.
     pub fn take_bell_count(&mut self) -> u64 {
@@ -560,6 +569,30 @@ mod tests {
             }
         }
         batches
+    }
+
+    #[test]
+    /// Locks `retained_scrollback` to the clone-and-clamp reading the wheel handler used
+    /// to do, across the two paths that touch the parser: output and resize.
+    fn retained_scrollback_matches_a_clone_and_clamp_reading() {
+        let clone_and_clamp = |screen: &vt100::Screen| {
+            let mut screen = screen.clone();
+            screen.set_scrollback(super::SCROLLBACK_LINES);
+            screen.scrollback()
+        };
+        let mut host = HostScreen::new(24, 80).expect("valid dimensions");
+        assert_eq!(host.retained_scrollback(), 0);
+        for (index, batch) in agent_like_batches(400).into_iter().enumerate() {
+            host.process_pty(&batch).expect("processed");
+            assert_eq!(
+                host.retained_scrollback(),
+                clone_and_clamp(host.screen()),
+                "retained rows diverged at batch {index}",
+            );
+        }
+        assert!(host.retained_scrollback() > 0, "expected retained history");
+        host.resize(30, 100).expect("valid dimensions");
+        assert_eq!(host.retained_scrollback(), clone_and_clamp(host.screen()));
     }
 
     #[test]

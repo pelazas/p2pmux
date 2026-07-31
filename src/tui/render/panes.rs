@@ -448,7 +448,7 @@ pub(in crate::tui) fn render_shared_multi_pane(
             let viewport = fixed_grid_viewport(content, pane.grid_rows, pane.grid_cols);
             let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
             frame.render_widget(
-                VtScreen::new(&screen).with_selection(
+                VtScreen::new(screen.as_ref()).with_selection(
                     tui.selection()
                         .filter(|selection| selection.pane_id == pane_id),
                 ),

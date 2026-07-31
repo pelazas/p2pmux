@@ -95,6 +95,46 @@ struct PendingScroll {
     target: usize,
 }
 
+/// Claims the outstanding request for `pane_id` only when this reply answers it.
+///
+/// The obvious spelling — remove, then compare — throws away a live request every
+/// time a stale reply lands first, and the reply that would have satisfied it then
+/// finds nothing to claim. A wheel burst is exactly the case that produces stale
+/// replies, so scrolling would stall precisely when it was asked to move most.
+fn take_matching_pending(
+    pending: &mut BTreeMap<u64, PendingScroll>,
+    pane_id: u64,
+    request_id: u64,
+) -> Option<PendingScroll> {
+    if pending.get(&pane_id)?.request_id != request_id {
+        return None;
+    }
+    pending.remove(&pane_id)
+}
+
+const PANE_SCROLL_WHEEL_STEP: usize = 3;
+
+/// Where one wheel notch should land, measured from the furthest point already asked
+/// for rather than from what is on screen.
+///
+/// Reaching history costs a round trip to the node, so mid-burst the visible offset is
+/// always several notches behind the wheel. Stepping from it made every notch of a
+/// flick ask for the same row, so a gesture worth sixty rows travelled three — and each
+/// of those identical queries still cost the node a full scrollback viewport.
+fn next_scroll_target(
+    visible: usize,
+    requested: Option<usize>,
+    max_rows: usize,
+    up: bool,
+) -> usize {
+    let base = requested.unwrap_or(visible);
+    if up {
+        base.saturating_add(PANE_SCROLL_WHEEL_STEP).min(max_rows)
+    } else {
+        base.saturating_sub(PANE_SCROLL_WHEEL_STEP)
+    }
+}
+
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::config::config_path()?;
     let config = crate::config::load_config_from(&config_path).map_err(|error| {
@@ -139,6 +179,10 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut screens = BTreeMap::new();
     let mut history = BTreeMap::new();
     let mut pending_scroll: BTreeMap<u64, PendingScroll> = BTreeMap::new();
+    // Where the wheel has reached for panes whose query is still out. Holding it here
+    // keeps one query per pane in flight, so a burst costs the node one viewport
+    // instead of one per notch.
+    let mut desired_scroll: BTreeMap<u64, usize> = BTreeMap::new();
     let mut next_scrollback_request_id = 1_u64;
     let mut copied_lines = None;
     let mut footer_notice = None;
@@ -296,13 +340,15 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         snapshot,
                         unavailable,
                     } => {
-                        let Some(pending) = pending_scroll.remove(&pane_id) else {
+                        let Some(pending) =
+                            take_matching_pending(&mut pending_scroll, pane_id, request_id)
+                        else {
                             continue;
                         };
-                        if pending.request_id != request_id {
-                            continue;
-                        }
                         let Some(snapshot) = snapshot else {
+                            // No history to reach, so anything the burst queued behind this
+                            // is unreachable too.
+                            desired_scroll.remove(&pane_id);
                             footer_notice = unavailable;
                             dirty = true;
                             continue;
@@ -324,6 +370,29 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             );
                         }
                         dirty = true;
+                        // Notches that arrived while this query was out were folded into a
+                        // single desired offset. Settle it now: one follow-up for wherever
+                        // the wheel actually ended up, not one per notch.
+                        if let Some(target) = desired_scroll.remove(&pane_id) {
+                            let target = target.min(total_rows as usize);
+                            if history
+                                .get(&pane_id)
+                                .is_some_and(|cache| cache.viewports.contains_key(&target))
+                            {
+                                if let Some(view) = tui.as_mut() {
+                                    view.set_pane_scrollback_offset(pane_id, target);
+                                }
+                            } else {
+                                request_scrollback(
+                                    &mut stream,
+                                    pane_id,
+                                    target,
+                                    &history,
+                                    &mut pending_scroll,
+                                    &mut next_scrollback_request_id,
+                                )?;
+                            }
+                        }
                     }
                     NodeMessage::Leases { leases } => {
                         if let Some(view) = tui.as_mut() {
@@ -515,6 +584,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
                             history.remove(&tui.focused_pane());
                             pending_scroll.remove(&tui.focused_pane());
+                            desired_scroll.remove(&tui.focused_pane());
                             tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
                         }
                     }
@@ -535,6 +605,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     )?;
                     history.remove(&tui.focused_pane());
                     pending_scroll.remove(&tui.focused_pane());
+                    desired_scroll.remove(&tui.focused_pane());
                     tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
                 }
                 dirty = true;
@@ -578,16 +649,31 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             .get(&pane_id)
                             .map(HistoryCache::available_rows)
                             .unwrap_or(1_000);
-                        let current = tui.pane_scrollback_offset(pane_id);
-                        let target = if up {
-                            current.saturating_add(3)
+                        let target = next_scroll_target(
+                            tui.pane_scrollback_offset(pane_id),
+                            desired_scroll.get(&pane_id).copied().or_else(|| {
+                                pending_scroll.get(&pane_id).map(|pending| pending.target)
+                            }),
+                            scrollback_len,
+                            up,
+                        );
+                        let held = target == 0
+                            || history
+                                .get(&pane_id)
+                                .is_some_and(|history| history.viewports.contains_key(&target));
+                        if held {
+                            // The rows are already here, or the wheel is back at the live
+                            // edge. Move now and abandon whatever the burst had queued.
+                            desired_scroll.remove(&pane_id);
+                            pending_scroll.remove(&pane_id);
+                            tui.set_pane_scrollback_offset(pane_id, target);
+                            if target == 0 {
+                                history.remove(&pane_id);
+                            }
+                        } else if pending_scroll.contains_key(&pane_id) {
+                            desired_scroll.insert(pane_id, target);
                         } else {
-                            current.saturating_sub(3)
-                        };
-                        let cached = history
-                            .get(&pane_id)
-                            .is_some_and(|history| history.viewports.contains_key(&target));
-                        if target > 0 && !cached {
+                            desired_scroll.remove(&pane_id);
                             request_scrollback(
                                 &mut stream,
                                 pane_id,
@@ -596,17 +682,6 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                                 &mut pending_scroll,
                                 &mut next_scrollback_request_id,
                             )?;
-                        } else {
-                            tui.scroll_mouse_pane(
-                                mouse.column,
-                                mouse.row,
-                                area,
-                                scrollback_len,
-                                up,
-                            );
-                            if !up && tui.pane_scrollback_offset(pane_id) == 0 {
-                                history.remove(&pane_id);
-                            }
                         }
                     }
                 } else {
@@ -637,6 +712,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
                     history.clear();
                     pending_scroll.clear();
+                    desired_scroll.clear();
                     write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
                 }
                 dirty = true;
@@ -1320,6 +1396,62 @@ mod tests {
             client_key_bytes(KeyCode::Enter, KeyModifiers::CONTROL, true),
             Some(b"\r".to_vec())
         );
+    }
+
+    /// A wheel burst leaves older replies in flight behind the newest request. Those
+    /// stale replies have to pass through without disturbing the request still waiting,
+    /// or the pane stops moving for as long as the user keeps scrolling.
+    #[test]
+    fn a_stale_scroll_reply_leaves_the_live_request_waiting() {
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            1,
+            PendingScroll {
+                request_id: 4,
+                target: 12,
+            },
+        );
+
+        assert!(take_matching_pending(&mut pending, 1, 1).is_none());
+        assert!(take_matching_pending(&mut pending, 1, 3).is_none());
+        assert!(take_matching_pending(&mut pending, 2, 4).is_none());
+        assert_eq!(
+            pending.get(&1).map(|pending| pending.request_id),
+            Some(4),
+            "stale and cross-pane replies must not consume the live request"
+        );
+
+        let claimed = take_matching_pending(&mut pending, 1, 4).expect("live reply claims");
+        assert_eq!(claimed.target, 12);
+        assert!(pending.is_empty());
+        // The answer is claimed once; a duplicate must not re-apply it.
+        assert!(take_matching_pending(&mut pending, 1, 4).is_none());
+    }
+
+    /// A burst has to accumulate. Stepping from the visible offset made every notch ask
+    /// for the same row, because the visible offset cannot move until a reply lands.
+    #[test]
+    fn a_wheel_burst_accumulates_instead_of_asking_for_the_same_row() {
+        // Nothing outstanding: step from what is on screen.
+        assert_eq!(next_scroll_target(0, None, 1_000, true), 3);
+        assert_eq!(next_scroll_target(9, None, 1_000, false), 6);
+
+        // Mid-burst the visible offset lags, so each notch steps from the request.
+        let mut requested = None;
+        for expected in [3, 6, 9, 12] {
+            let target = next_scroll_target(0, requested, 1_000, true);
+            assert_eq!(target, expected);
+            requested = Some(target);
+        }
+
+        // Reversing mid-burst walks the same accumulated position back down.
+        assert_eq!(next_scroll_target(0, Some(12), 1_000, false), 9);
+
+        // Bounds: never past the retained history, never below the live edge.
+        assert_eq!(next_scroll_target(0, Some(9), 10, true), 10);
+        assert_eq!(next_scroll_target(0, Some(10), 10, true), 10);
+        assert_eq!(next_scroll_target(0, Some(2), 10, false), 0);
+        assert_eq!(next_scroll_target(0, Some(0), 10, false), 0);
     }
 
     #[test]

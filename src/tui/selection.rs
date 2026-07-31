@@ -101,7 +101,10 @@ mod tests {
             cursor: ScreenCell { row: 0, col: 1 },
         };
 
-        assert_eq!(selection_text(&screen, selection), Some("on".to_owned()));
+        assert_eq!(
+            selection_text(screen.as_ref(), selection),
+            Some("on".to_owned())
+        );
     }
 
     #[test]
