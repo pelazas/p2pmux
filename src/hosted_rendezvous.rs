@@ -16,8 +16,9 @@
 //! still leaves an attacker with the original problem: guess the code.
 //!
 //! What this buys is UX, not capability. Connectivity already works without it — iroh
-//! provides relays and node discovery, and a pasted ticket dials fine. The code exists so
-//! an invite is ten characters instead of two hundred.
+//! provides relays and node discovery, and a pasted ticket dials fine. The code exists so an
+//! invite is ten characters instead of the ~170 a ticket runs to once it carries a relay URL
+//! and a couple of direct addresses.
 
 use std::{fmt, time::Duration};
 

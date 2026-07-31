@@ -1,9 +1,9 @@
 /**
  * p2pmux hosted rendezvous — a blind store mapping an opaque index to an opaque blob.
  *
- * This service exists so an invite is ten characters instead of two hundred. It is not on
- * the connectivity path: iroh already provides relays and discovery, and a pasted ticket
- * dials without help from here. Terminal bytes never touch this Worker.
+ * This service exists so an invite is ten characters rather than the ~170 a ticket runs to.
+ * It is not on the connectivity path: iroh already provides relays and discovery, and a
+ * pasted ticket dials without help from here. Terminal bytes never touch this Worker.
  *
  * It cannot read what it stores. The client derives the index from the join code and seals
  * the ticket under a separate key derived from the same code, so this code sees a hex handle
@@ -33,7 +33,7 @@ const MAX_TTL_SECONDS = 24 * 60 * 60;
 const LANDING = `p2pmux hosted rendezvous.
 
 This service maps an opaque index to an opaque blob so that joining a p2pmux session
-takes a short code rather than a 200-character ticket.
+takes a short code rather than a ticket some 170 characters long.
 
 It cannot read what it stores. The join code never reaches this server: the client
 derives the storage index from it, and seals the ticket under a separate key derived
