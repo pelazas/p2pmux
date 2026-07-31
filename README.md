@@ -1,22 +1,44 @@
-# p2pmux
+<div align="center">
 
-[![CI](https://img.shields.io/github/actions/workflow/status/pelazas/p2pmux/ci.yml?branch=main&label=ci)](https://github.com/pelazas/p2pmux/actions)
-[![Release](https://img.shields.io/github/v/release/pelazas/p2pmux)](https://github.com/pelazas/p2pmux/releases)
-[![License: MIT](https://img.shields.io/github/license/pelazas/p2pmux)](LICENSE)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-wordmark-dark.svg">
+  <img src="docs/assets/logo-wordmark-light.svg" alt="p2pmux" width="340">
+</picture>
+
+<p>
+  <a href="https://github.com/pelazas/p2pmux/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/pelazas/p2pmux/ci.yml?branch=main&label=ci"></a>
+  <a href="https://github.com/pelazas/p2pmux/releases"><img alt="Release" src="https://img.shields.io/github/v/release/pelazas/p2pmux"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/pelazas/p2pmux"></a>
+</p>
+
+<p>
+  <a href="https://p2pmux.com">Website</a> ·
+  <a href="#install">Install</a> ·
+  <a href="./docs/USAGE.md">Usage</a> ·
+  <a href="#trust">Trust model</a> ·
+  <a href="./CONTRIBUTING.md">Contributing</a>
+</p>
+
+</div>
 
 A terminal multiplexer for two or more people, where **every pane runs on the machine of whoever
 opened it**. Two developers, two AI subscriptions, one terminal — and neither holds the other's
 keys.
 
+<p align="center">
+  <img src="docs/assets/demo.gif" width="820"
+       alt="userB joins with a code, opens a pane on their own machine, then types into a pane hosted by userA">
+</p>
+
+<p align="center">
+  <em>userB joins with the ten-character code, opens a pane of their own, then takes control of
+  userA's pane and runs a command in it. Both windows are real clients; the pane titles say who
+  hosts what.</em>
+</p>
+
 **A shared control surface, not a shared computer.** Your processes and credential files never
 leave your Mac. But whoever holds a pane has a real shell on the machine hosting it — both halves
 are true at once, and [the trust model](#trust) says exactly what that means.
-
-![userB joins with a code, opens a pane on their own machine, then types into a pane hosted by userA](docs/assets/demo.gif)
-
-*userB joins with the ten-character code, opens a pane of their own, then takes control of
-userA's pane and runs a command in it. Both windows are real clients; the pane titles say who
-hosts what.*
 
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
