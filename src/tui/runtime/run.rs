@@ -355,14 +355,17 @@ impl SharedLayoutRuntime {
             .local
             .get(&selection.pane_id)
             .and_then(|pane| {
-                selection_text(&viewed_screen(pane.screen.screen(), scrollback), selection)
+                selection_text(
+                    viewed_screen(pane.screen.screen(), scrollback).as_ref(),
+                    selection,
+                )
             })
             .or_else(|| {
                 self.remote
                     .get(&selection.pane_id)
                     .and_then(|pane| pane.screen.screen())
                     .and_then(|screen| {
-                        selection_text(&viewed_screen(screen, scrollback), selection)
+                        selection_text(viewed_screen(screen, scrollback).as_ref(), selection)
                     })
             });
         let Some(text) = text else {
