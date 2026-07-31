@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 256" fill="none" role="img" aria-label="p2pmux">
+  <title>p2pmux</title>
+  <mask id="p2pmux-weave-light">
+    <rect width="680" height="256" fill="#fff"/>
+    <rect x="134" y="78" width="44" height="44" fill="#000"/>
+  </mask>
+  <rect x="30" y="58" width="126" height="110" rx="20" stroke="#FF4A1C" stroke-width="14"/>
+  <rect x="56" y="82" width="20" height="20" rx="3" fill="#FF4A1C"/>
+  <g mask="url(#p2pmux-weave-light)">
+    <rect x="100" y="100" width="126" height="110" rx="20" stroke="#4FC3F7" stroke-width="14"/>
+    <rect x="186" y="166" width="20" height="20" rx="3" fill="#4FC3F7"/>
+  </g>
+  <text x="288" y="134" fill="#16161A" font-size="106" font-weight="700" letter-spacing="-3"
+        dominant-baseline="central"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">p2pmux</text>
+</svg>

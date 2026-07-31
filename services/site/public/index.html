@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>p2pmux — a terminal room where every pane runs on its owner's machine</title>
 <meta name="description" content="A macOS terminal multiplexer for two or more people. Each pane's process runs on its host's Mac, under its host's credentials.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://p2pmux.com/">
+<meta property="og:title" content="p2pmux — every pane runs on the machine of whoever opened it">
+<meta property="og:description" content="A macOS terminal multiplexer for two or more people. Each pane's process runs on its host's Mac, under its host's credentials.">
+<meta property="og:image" content="https://p2pmux.com/og.png">
+<meta name="twitter:card" content="summary_large_image">
 <style>
   :root {
     color-scheme: light dark;
@@ -24,6 +32,7 @@
     -webkit-text-size-adjust: 100%;
   }
   main { max-width: 42rem; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+  .logo { display: block; width: 190px; height: auto; margin: 0 0 2.25rem; }
   h1 { font-size: 1.9rem; line-height: 1.25; letter-spacing: -0.02em; margin: 0 0 .5rem; }
   h2 { font-size: 1.05rem; letter-spacing: .04em; text-transform: uppercase;
        color: var(--muted); margin: 3rem 0 .75rem; font-weight: 600; }
@@ -48,6 +57,11 @@
 </head>
 <body>
 <main>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="/logo-wordmark-dark.svg">
+    <img class="logo" src="/logo-wordmark-light.svg" alt="p2pmux" width="190" height="72">
+  </picture>
+
   <h1>Every pane runs on its owner's machine.</h1>
   <p class="lede">
     p2pmux is a terminal multiplexer for two or more people. You share a layout, not a computer:
