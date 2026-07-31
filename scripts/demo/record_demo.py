@@ -1,8 +1,12 @@
 """Record the README demo: two real p2pmux members, one shared session, one GIF.
 
-The story, in about ten seconds: userA is hosting and has the share panel open; userB
+The story, in about twelve seconds: userA is hosting and has the share panel open; userB
 types `p2pmux join <code>` into their own shell, lands in the same layout, opens a pane
-of their own, then focuses userA's pane and runs a command in it.
+of their own and runs a command in it, then crosses to userA's pane and runs one there.
+
+Both commands are the same beat told twice, and that is deliberate: a pane held by userB
+is drawn in userB's member color wherever it is hosted, so the second half of the GIF is
+green on userA's machine for exactly the same reason the first half was green on userB's.
 
 Both members are real `target/release/p2pmux` processes on their own PTYs, started inside
 the e2e harness's sandbox (so this can never touch a developer's live sessions). Their
@@ -49,6 +53,10 @@ LEFT = b"\x1b[D"
 RIGHT = b"\x1b[C"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
+# Option+Shift+Left moves focus without entering pane mode. Going through `Ctrl+P ← Esc`
+# works too, but pane mode paints the focused border chord-red on the way, and a red
+# frame between two green ones reads as three states when only one thing happened.
+ALT_SHIFT_LEFT = b"\x1b[1;4D"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_DIR = REPO_ROOT / "target" / "release"
@@ -277,17 +285,16 @@ def draw_chrome(
         radius=8,
         fill=CHROME_BG,
     )
-    for index, dot in enumerate(("#ff6159", "#ffbd2e", "#28c941")):
-        cx = ox + 16 + index * 15
-        cy = oy + CHROME_H // 2
-        draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=dot)
-    # The member's own presence color, the same one the session draws on their tab
-    # dot and pane marker, so a viewer can tell the two windows apart at a glance.
+    # No macOS traffic lights. They are three more colors in a frame whose entire job is
+    # to make two member colors legible, and one of them is the same green the session
+    # gives userB. The only dot on the card is the member's own presence color -- the one
+    # the session draws on their tab dot and pane marker -- and the name is tinted to
+    # match, so "userA is blue, userB is green" survives a glance at a looping GIF.
     cy = oy + CHROME_H // 2
-    draw.ellipse([ox + 74, cy - 4, ox + 82, cy + 4], fill=member.color)
-    draw.text((ox + 92, oy + 8), member.name, font=fonts[1], fill=LABEL_TEXT)
+    draw.ellipse([ox + 18, cy - 4, ox + 26, cy + 4], fill=member.color)
+    draw.text((ox + 36, oy + 8), member.name, font=fonts[1], fill=member.color)
     draw.text(
-        (ox + 92 + 9 * (len(member.name) + 2), oy + 8),
+        (ox + 36 + 9 * (len(member.name) + 2), oy + 8),
         member.role,
         font=fonts[0],
         fill=CHROME_TEXT,
@@ -411,6 +418,18 @@ def build_scene(harness: Harness) -> tuple[object, object, str]:
     return host, guest, code
 
 
+def claim(guest, host, title: str) -> None:
+    """Take the focused pane with one Return, and wait until both clients agree.
+
+    Control is authoritative shared state, so the assertion that matters is not "the
+    guest thinks it holds this" but "both windows draw the same title" -- which is also
+    exactly the frame the GIF needs before the next command starts typing.
+    """
+    guest.send(ENTER)
+    for peer in (host, guest):
+        peer.wait_for(title, timeout=10)
+
+
 def perform(host, guest, code: str) -> None:
     """The recorded ten seconds.
 
@@ -435,30 +454,56 @@ def perform(host, guest, code: str) -> None:
     )
     pause(0.7)
 
-    # 3. userB opens a pane of their own, hosted on userB's machine.
+    # 3. userB opens a pane of their own, hosted on userB's machine. Pane mode is sticky,
+    # so leave it before typing -- otherwise `l` is read as the lock command.
     guest.send(CTRL_P)
     pause(0.4)
     guest.send(b"r")
     for peer in (host, guest):
         peer.wait_for(r"Pane #2 host: userB", timeout=15)
-    pause(0.9)
-
-    # 4. userB focuses userA's pane. Pane mode is sticky, so leave it before typing --
-    # otherwise `e` is read as the rename command instead of as a keystroke.
-    guest.send(CTRL_P)
-    pause(0.35)
-    guest.send(LEFT)
-    pause(0.4)
     guest.send(ESCAPE)
-    pause(0.4)
+    guest.wait_until(
+        lambda screen: "PANE MODE" not in screen,
+        timeout=5,
+        what="pane mode to exit",
+    )
+    # A pane's control state starts unknown on the client that created it and settles a
+    # beat later, once the coordinator's view comes back. Nothing is wrong with showing
+    # that, but it paints the border `unknown_focused` yellow, and a yellow that means
+    # "still asking" is indistinguishable on a GIF from a yellow that means something.
+    # Wait it out before rolling on.
+    guest.wait_until(
+        lambda screen: "control: …" not in screen,
+        timeout=10,
+        what="pane #2's control state to settle",
+    )
+    pause(0.5)
 
-    # 5. Typing claims the free pane: userB is now driving a shell userA hosts.
+    # 4. userB takes their own pane and runs something in it. Typing is what claims a
+    # pane, and the keystroke that wins the lease is spent on the claim rather than
+    # reaching the shell -- so spend a bare Return on it and the command that follows
+    # arrives whole. From here the border is userB's green on both screens, the same
+    # green as their name on the card.
+    claim(guest, host, r"Pane #2 host: userB control: userB")
+    guest.type("ls", per_key_delay=0.1)
+    pause(0.25)
+    guest.send(ENTER)
+    guest.wait_for(r"todo\.txt", timeout=10)
+    pause(1.3)
+
+    # 5. Focus crosses to userA's pane. No chord, so no red on the way.
+    guest.send(ALT_SHIFT_LEFT)
+    pause(0.6)
+
+    # 6. The same claim, on a pane userA hosts: userB is now driving a shell on the other
+    # machine, and both screens draw that border in the same green.
+    claim(guest, host, r"Pane #1 host: userA control: userB")
     guest.type("echo userB", per_key_delay=0.085)
     pause(0.3)
     guest.send(ENTER)
     for peer in (host, guest):
         peer.wait_for(r"│userB\s", timeout=10)
-    pause(1.6)
+    pause(1.8)
 
 
 def encode(frames_dir: Path, output: Path) -> None:
