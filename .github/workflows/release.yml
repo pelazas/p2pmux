@@ -102,6 +102,7 @@ jobs:
 
             ```sh
             brew tap pelazas/tap
+            brew trust pelazas/tap   # Homebrew 6+ refuses untrusted third-party taps
             brew install p2pmux
             ```
 

@@ -42,11 +42,14 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 
 ```text
 brew tap pelazas/tap
+brew trust pelazas/tap
 brew install p2pmux
 ```
 
-Tapping once is what buys the short name; `brew install pelazas/tap/p2pmux` is the same thing in
-one line for anyone who would rather not tap.
+Tapping once is what buys the short name. `brew trust` is Homebrew 6 and newer: it refuses to
+load a formula from a third-party tap until you say you trust that tap, so without it the
+install stops with `Refusing to load formula … from untrusted tap`. On Homebrew 5 the command
+does not exist and is not needed — skip that line.
 
 or, without Homebrew:
 

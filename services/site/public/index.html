@@ -64,7 +64,12 @@
   </p>
   <p class="note">Or with Homebrew:</p>
   <pre><code>brew tap pelazas/tap
+brew trust pelazas/tap
 brew install p2pmux</code></pre>
+  <p class="note">
+    Homebrew 6 will not load a formula from a third-party tap until you trust it, so the middle
+    line is not optional there. On Homebrew 5 that command does not exist — skip it.
+  </p>
 
   <p class="note">Or build it yourself:</p>
   <pre><code>cargo install --git https://github.com/pelazas/p2pmux --locked</code></pre>
