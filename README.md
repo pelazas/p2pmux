@@ -12,17 +12,11 @@ keys.
 leave your Mac. But whoever holds a pane has a real shell on the machine hosting it — both halves
 are true at once, and [the trust model](#trust) says exactly what that means.
 
-<!-- ─────────────────────────────────────────────────────────────────────────────
-     DEMO GIF GOES HERE.
+![userB joins with a code, opens a pane on their own machine, then types into a pane hosted by userA](docs/assets/demo.gif)
 
-     1. Save the file as docs/assets/demo.gif
-     2. Delete this comment block and uncomment the line below it.
-
-     Shoot the 0:00–0:06 cold open from docs/LAUNCH_KIT.md §4: your terminal grid,
-     a second cursor that is not yours appears in a pane and starts typing. No
-     caption before 0:03, no intro. Loop it, keep it under ~6s and ~5MB.
-     ───────────────────────────────────────────────────────────────────────── -->
-<!-- ![A teammate's cursor typing into a pane hosted on my Mac](docs/assets/demo.gif) -->
+*userB joins with the ten-character code, opens a pane of their own, then takes control of
+userA's pane and runs a command in it. Both windows are real clients; the pane titles say who
+hosts what.*
 
 ```sh
 brew tap pelazas/tap && brew trust pelazas/tap && brew install p2pmux
