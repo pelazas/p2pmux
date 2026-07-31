@@ -101,7 +101,9 @@ jobs:
             or
 
             ```sh
-            brew install pelazas/tap/p2pmux
+            brew tap pelazas/tap
+            brew trust pelazas/tap   # Homebrew 6+ refuses untrusted third-party taps
+            brew install p2pmux
             ```
 
             Prefer to build it yourself:

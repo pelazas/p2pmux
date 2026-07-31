@@ -18,7 +18,7 @@ Example: Pelazas starts Claude Code in his pane (his subscription). Tis takes co
 
 **Is**
 
-- Lightweight local binary (`brew install pelazas/tap/p2pmux`)
+- Lightweight local binary (`brew tap pelazas/tap && brew install p2pmux`)
 - Zellij-like tabs, panes, and nested splits
 - Real-time multiplayer presence (who’s on which tab/pane)
 - End-to-end encrypted peer-to-peer pane streaming (+ relay when NAT requires it)
@@ -41,8 +41,15 @@ Processes and credential *files* stay on the pane host’s Mac (not uploaded to 
 ## Install
 
 ```text
-brew install pelazas/tap/p2pmux
+brew tap pelazas/tap
+brew trust pelazas/tap
+brew install p2pmux
 ```
+
+Tapping once is what buys the short name. `brew trust` is Homebrew 6 and newer: it refuses to
+load a formula from a third-party tap until you say you trust that tap, so without it the
+install stops with `Refusing to load formula … from untrusted tap`. On Homebrew 5 the command
+does not exist and is not needed — skip that line.
 
 or, without Homebrew:
 
