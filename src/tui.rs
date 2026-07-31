@@ -40,7 +40,7 @@ use std::time::Duration;
 use app::member_label;
 pub use app::{run_guest, run_host, run_local};
 pub(crate) use debug_log::ui_debug_log;
-pub(crate) use geometry::initial_root_pane_grid;
+pub(crate) use geometry::{initial_root_pane_grid, missed_resize, resize_recheck_due};
 pub use host::HostPaneRuntime;
 pub use input::mouse::PaneMouseProtocol;
 pub use multi_pane::MultiPaneTui;

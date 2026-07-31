@@ -1,7 +1,11 @@
 //! Rect and layout-tree math: where panes land, what a drag hits, how a
 //! split divides its span.
 
-use std::{collections::BTreeMap, io};
+use std::{
+    collections::BTreeMap,
+    io,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::KeyCode;
 use ratatui::{layout::Rect, widgets::Block};
@@ -365,6 +369,28 @@ pub(in crate::tui) fn area_from_terminal_size(size: io::Result<(u16, u16)>) -> O
         .map(|(width, height)| Rect::new(0, 0, width, height))
 }
 
+/// How often a run loop re-reads the true terminal size.
+const RESIZE_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+pub(crate) fn resize_recheck_due(last_checked: Option<Instant>, now: Instant) -> bool {
+    last_checked.is_none_or(|checked| now.duration_since(checked) >= RESIZE_RECHECK_INTERVAL)
+}
+
+/// The size to adopt when the one the UI is drawing at has gone stale.
+///
+/// Resizes normally arrive as events, but one can go missing: attaching a
+/// display resizes the window out from under us and the resize never reaches
+/// the app, so the panes keep the old geometry until the window is resized by
+/// hand. Re-reading the real size on a slow tick heals that without the event
+/// path having to be perfect.
+pub(crate) fn missed_resize(
+    drawn_at: (u16, u16),
+    actual: io::Result<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    let (cols, rows) = actual.ok()?;
+    (cols > 0 && rows > 0 && (cols, rows) != drawn_at).then_some((cols, rows))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::tui) struct ResizeDrag {
     pub(in crate::tui) pane_id: PaneId,
@@ -408,8 +434,9 @@ mod tests {
     };
 
     use super::{
-        allocate_node_with_preview, area_from_terminal_size, grid_for_pane, initial_root_pane_grid,
-        mouse_to_screen_cell,
+        RESIZE_RECHECK_INTERVAL, allocate_node_with_preview, area_from_terminal_size,
+        grid_for_pane, initial_root_pane_grid, missed_resize, mouse_to_screen_cell,
+        resize_recheck_due,
     };
 
     #[test]
@@ -418,6 +445,41 @@ mod tests {
             area_from_terminal_size(Err(io::Error::from(io::ErrorKind::WouldBlock))),
             None
         );
+    }
+
+    #[test]
+    fn a_window_that_grew_without_an_event_is_still_noticed() {
+        assert_eq!(missed_resize((100, 30), Ok((160, 50))), Some((160, 50)));
+    }
+
+    #[test]
+    fn a_size_that_still_matches_what_was_drawn_is_not_a_resize() {
+        assert_eq!(missed_resize((100, 30), Ok((100, 30))), None);
+    }
+
+    #[test]
+    fn an_unreadable_or_empty_size_never_resizes_the_ui() {
+        assert_eq!(
+            missed_resize((100, 30), Err(io::Error::from(io::ErrorKind::WouldBlock))),
+            None
+        );
+        assert_eq!(missed_resize((100, 30), Ok((0, 50))), None);
+        assert_eq!(missed_resize((100, 30), Ok((160, 0))), None);
+    }
+
+    #[test]
+    fn the_size_recheck_runs_once_per_interval() {
+        let start = std::time::Instant::now();
+        assert!(resize_recheck_due(None, start));
+        assert!(!resize_recheck_due(Some(start), start));
+        assert!(!resize_recheck_due(
+            Some(start),
+            start + RESIZE_RECHECK_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        assert!(resize_recheck_due(
+            Some(start),
+            start + RESIZE_RECHECK_INTERVAL
+        ));
     }
 
     #[test]

@@ -26,6 +26,7 @@ use crate::{
             },
             keys::PendingEscape,
         },
+        missed_resize,
         pane::{
             local::{AGENT_SAMPLE_INTERVAL, AGENT_WATCH_INTERVAL},
             remote::{RemotePaneDrain, SharedRemotePane},
@@ -34,6 +35,7 @@ use crate::{
             panes::render_shared_multi_pane,
             vt::{available_scrollback, viewed_screen},
         },
+        resize_recheck_due,
         selection::{copy_selection_to_clipboard, selection_text},
         share::share_copy_result,
     },
@@ -119,6 +121,10 @@ impl SharedLayoutRuntime {
         let mut dirty = true;
         let mut last_draw: Option<Instant> = None;
         let mut pending_escape = PendingEscape::default();
+        // The viewport is fixed, so ratatui never resizes it for us: the drawn
+        // size only follows the window because of the call below.
+        let mut viewport = (cols, rows);
+        let mut last_size_check: Option<Instant> = None;
         loop {
             dirty |= self.drain()?;
             if self.tui.expire_chord_mode(Instant::now()) {
@@ -142,6 +148,11 @@ impl SharedLayoutRuntime {
                 )? {
                     break;
                 }
+                dirty = true;
+            }
+            if viewport != (cols, rows) {
+                viewport = (cols, rows);
+                terminal.resize(Rect::new(0, 0, cols, rows))?;
                 dirty = true;
             }
             if dirty && frame_due(last_draw) {
@@ -179,6 +190,18 @@ impl SharedLayoutRuntime {
                 end_synchronized_output()?;
                 dirty = false;
                 last_draw = Some(Instant::now());
+            }
+            if resize_recheck_due(last_size_check, Instant::now()) {
+                last_size_check = Some(Instant::now());
+                if let Some((width, height)) = missed_resize((cols, rows), terminal::size()) {
+                    self.handle_terminal_event(
+                        Event::Resize(width, height),
+                        &mut cols,
+                        &mut rows,
+                        &mut pending_escape,
+                        &mut dirty,
+                    )?;
+                }
             }
             if !event::poll(event_poll_timeout(dirty, last_draw))? {
                 continue;

@@ -32,8 +32,8 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneMouseProtocol, PaneViewState, ShareView, copy_selection_to_clipboard,
-        render_multi_pane_with_copy_feedback, share_copy_result,
+        PaneMouseProtocol, PaneViewState, ShareView, copy_selection_to_clipboard, missed_resize,
+        render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
     },
 };
 
@@ -160,6 +160,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut pending_wake = None;
     let mut next_perf_id = 1_u64;
     let mut draw_perf_id = None;
+    // The viewport is fixed, so what is drawn only follows the window because
+    // the resize arm below resizes it. Tracked here to spot a resize that never
+    // arrived as an event.
+    let mut viewport = (initial_cols, initial_rows);
+    let mut last_size_check: Option<Instant> = None;
 
     'attached: loop {
         for _ in 0..IPC_BATCH_PER_WAKE {
@@ -447,6 +452,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
             dirty = false;
         }
+        if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
+            last_size_check = Some(Instant::now());
+            if let Some((cols, rows)) = missed_resize(viewport, terminal::size()) {
+                pending_wake = Some(WakeEvent::Terminal(Event::Resize(cols, rows)));
+            }
+        }
         let event = match pending_wake.take() {
             Some(WakeEvent::Terminal(event)) => event,
             Some(wake) => {
@@ -621,6 +632,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             }
             Event::Resize(cols, rows) => {
                 terminal.resize(Rect::new(0, 0, cols, rows))?;
+                viewport = (cols, rows);
                 if !tui.modal_open() {
                     tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
                     history.clear();
