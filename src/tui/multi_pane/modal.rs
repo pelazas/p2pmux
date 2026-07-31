@@ -105,10 +105,11 @@ impl MultiPaneTui {
 
     /// Keys for the share modal.
     ///
-    /// Enter and `c` take the code, `t` takes the ticket. The client resolves Enter to the
-    /// ticket when there is no code, so the primary key always copies something usable rather
-    /// than reporting nothing to copy. Every key is consumed so no invite material leaks into
-    /// the focused pane.
+    /// Enter and `c` take the code, `t` takes the ticket; either way the clipboard gets a
+    /// runnable `p2pmux join` line rather than the bare invite. The client resolves Enter to
+    /// the ticket when there is no code, so the primary key always copies something usable
+    /// rather than reporting nothing to copy. Every key is consumed so no invite material
+    /// leaks into the focused pane.
     pub(in crate::tui) fn handle_share_key(&mut self, key: KeyEvent) -> KeyHandling {
         match key.code {
             KeyCode::Enter | KeyCode::Char('c') if key.modifiers.is_empty() => {

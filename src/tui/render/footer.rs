@@ -142,17 +142,18 @@ pub(in crate::tui) const AGENT_OVERLAY_HELP: &[FooterSegment] = &[
 pub(in crate::tui) const SHARE_HELP: &[FooterSegment] = &[
     FooterSegment::Text("<"),
     FooterSegment::Key("Enter"),
-    FooterSegment::Text("> COPY CODE   <"),
+    FooterSegment::Text("> COPY   <"),
     FooterSegment::Key("t"),
-    FooterSegment::Text("> COPY TICKET   <"),
+    FooterSegment::Text("> TICKET, WORKS OFFLINE   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> CLOSE"),
 ];
-/// When the rendezvous was unreachable there is no code to offer, so Enter falls back.
+/// When the rendezvous was unreachable there is no code to offer, so Enter falls back to the
+/// ticket and `t` would be the same key twice. Say COPY rather than naming either one.
 pub(in crate::tui) const SHARE_HELP_NO_CODE: &[FooterSegment] = &[
     FooterSegment::Text("<"),
     FooterSegment::Key("Enter"),
-    FooterSegment::Text("> COPY TICKET   <"),
+    FooterSegment::Text("> COPY   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> CLOSE"),
 ];

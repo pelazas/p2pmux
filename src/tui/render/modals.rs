@@ -16,14 +16,18 @@ use crate::{
         render::footer::{
             SHARE_HELP, SHARE_HELP_GUEST, SHARE_HELP_NO_CODE, render_footer_segments,
         },
+        share::join_command,
         text::{truncate_trailing, wrap_fixed},
     },
 };
 
 /// The invite panel behind Ctrl+S.
 ///
-/// Both identifiers are shown with what they actually reach, because the difference is the
-/// whole point: only the ticket travels to another machine.
+/// One join line, shown as the command the guest actually types. The code and the ticket are
+/// not two invites to choose between — the code *resolves to* the ticket, so offering both
+/// with equal billing only asks the host to make a decision that has no wrong answer. The
+/// ticket therefore stays one keypress away rather than on screen, and is rendered only when
+/// it is the invite that has to travel: a rendezvous outage leaves no code to send.
 pub(in crate::tui) fn render_share_modal(
     frame: &mut Frame<'_>,
     theme: &UiTheme,
@@ -38,35 +42,45 @@ pub(in crate::tui) fn render_share_modal(
     let width = area.width.saturating_sub(4).clamp(28, 72).min(area.width);
     let content_width = usize::from(width.saturating_sub(4)).max(1);
     let mut lines: Vec<Line> = Vec::new();
-    match share.ticket {
-        Some(ticket) => {
-            // The code first, because it is the one a person can read down a phone line.
-            // Each carries what it actually costs: the code is short but expires and needs
-            // our service to be up; the ticket is unwieldy but depends on nothing.
-            match share.code {
-                Some(code) => {
-                    lines.push(Line::styled("CODE — p2pmux join, expires in 6h", label));
-                    lines.push(Line::styled(code.to_owned(), value));
-                }
-                None => lines.push(Line::styled(
-                    "CODE — unavailable, rendezvous unreachable",
-                    Style::default().fg(theme.agent_overlay_warm),
-                )),
-            }
+    match (share.ticket, share.code) {
+        (Some(_), Some(code)) => {
+            lines.push(Line::styled("Have them run:", label));
             lines.push(Line::raw(""));
-            lines.push(Line::styled("TICKET — never expires, no service", label));
             lines.extend(
-                wrap_fixed(ticket, content_width)
+                wrap_fixed(&join_command(code), content_width)
                     .into_iter()
                     .map(|chunk| Line::styled(chunk, value)),
             );
             lines.push(Line::raw(""));
+            lines.push(Line::styled("Expires in 6h.", label));
             lines.push(Line::styled(
-                "Anyone with the ticket can join this session.",
+                "Anyone who runs it gets a full shell here.",
                 Style::default().fg(theme.agent_overlay_warm),
             ));
         }
-        None => lines.push(Line::styled(
+        // No code means the rendezvous was unreachable when the session started. The ticket
+        // is then the only invite, so it earns the space the code would have had.
+        (Some(ticket), None) => {
+            lines.push(Line::styled(
+                "No short code — rendezvous unreachable.",
+                Style::default().fg(theme.agent_overlay_warm),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Have them run:", label));
+            lines.push(Line::raw(""));
+            lines.extend(
+                wrap_fixed(&join_command(ticket), content_width)
+                    .into_iter()
+                    .map(|chunk| Line::styled(chunk, value)),
+            );
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Never expires.", label));
+            lines.push(Line::styled(
+                "Anyone who runs it gets a full shell here.",
+                Style::default().fg(theme.agent_overlay_warm),
+            ));
+        }
+        (None, _) => lines.push(Line::styled(
             "Only the host can share this session.",
             Style::default().fg(theme.agent_overlay_muted),
         )),
@@ -233,7 +247,7 @@ mod tests {
     };
 
     #[test]
-    fn share_modal_shows_both_invites_with_what_each_costs() {
+    fn share_modal_shows_one_runnable_join_line_and_keeps_the_ticket_off_screen() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -256,7 +270,7 @@ mod tests {
                     ShareView {
                         code: Some("4KP7Q-M2XRW"),
                         ticket: Some("p2pmux-v3:TICKETVALUE"),
-                        notice: Some("✓ copied code"),
+                        notice: Some("✓ copied join command"),
                     },
                     None,
                     None,
@@ -271,15 +285,15 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Share this session"));
-        // Each identifier is shown with what it actually costs, because the difference is the
-        // whole point: the code is readable but expires and needs our service up.
-        assert!(rendered.contains("CODE — p2pmux join, expires in 6h"));
-        assert!(rendered.contains("4KP7Q-M2XRW"));
-        assert!(rendered.contains("TICKET — never expires, no service"));
-        assert!(rendered.contains("p2pmux-v3:TICKETVALUE"));
-        assert!(rendered.contains("✓ copied code"));
-        assert!(rendered.contains("COPY CODE"));
-        assert!(rendered.contains("COPY TICKET"));
+        // The whole invite, as the guest will type it. Not a bare code the host then has to
+        // explain, and not two identifiers presented as a choice.
+        assert!(rendered.contains("p2pmux join 4KP7Q-M2XRW"));
+        assert!(rendered.contains("Expires in 6h."));
+        // The ticket is one keypress away, but showing 200 characters beside an 11-character
+        // code is what made the panel read as a decision rather than an instruction.
+        assert!(!rendered.contains("p2pmux-v3:TICKETVALUE"));
+        assert!(rendered.contains("✓ copied join command"));
+        assert!(rendered.contains("TICKET, WORKS OFFLINE"));
     }
 
     #[test]
@@ -323,10 +337,13 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("CODE — unavailable, rendezvous unreachable"));
-        assert!(rendered.contains("p2pmux-v3:TICKETVALUE"));
-        // Enter has to fall back to the ticket, so the help row must not promise a code.
-        assert!(!rendered.contains("COPY CODE"));
-        assert!(rendered.contains("COPY TICKET"));
+        assert!(rendered.contains("No short code — rendezvous unreachable."));
+        // With no code the ticket is the only invite, so it comes back on screen — still as a
+        // line the guest runs unedited rather than a labelled identifier.
+        assert!(rendered.contains("p2pmux join p2pmux-v3:TICKETVALUE"));
+        assert!(rendered.contains("Never expires."));
+        // Enter already falls back to the ticket here, so offering `t` as well would be the
+        // same key twice.
+        assert!(!rendered.contains("TICKET, WORKS OFFLINE"));
     }
 }
