@@ -1,22 +1,32 @@
 """Record the README demo: two real p2pmux members, one shared session, one GIF.
 
-Both members are real `target/release/p2pmux` processes on their own PTYs, started
-inside the e2e harness's sandbox HOME (so this can never touch a developer's live
-sessions). Their screens are parsed with pyte, rendered cell-by-cell with PIL into
-two stacked terminal cards, and encoded to a GIF with ffmpeg.
+The story, in about ten seconds: userA is hosting and has the share panel open; userB
+types `p2pmux join <code>` into their own shell, lands in the same layout, opens a pane
+of their own, then focuses userA's pane and runs a command in it.
 
-Nothing here is staged output: every glyph in the GIF was drawn by the binary.
+Both members are real `target/release/p2pmux` processes on their own PTYs, started inside
+the e2e harness's sandbox (so this can never touch a developer's live sessions). Their
+screens are parsed with pyte, rendered cell-by-cell with PIL into two stacked terminal
+cards, and encoded to a GIF with ffmpeg. Every glyph in the GIF was drawn by the binary.
+
+One thing in the frame is dressed, and only one: each member gets a private HOME with its
+own `.zshrc`, so the two panes show `userA@mac %` and `userB@desktop %`. The homes really
+are different directories, but both shells run on this one Mac -- the honest evidence of
+ownership is the pane title (`Pane #2 host: userB`), which the session maintains itself.
 
 Run:
-    python3 scripts/demo/record_demo.py            # full GIF
-    python3 scripts/demo/record_demo.py --still    # one PNG of the final frame, fast
+    python3 scripts/demo/record_demo.py                    # full GIF
+    python3 scripts/demo/record_demo.py --still            # first/last PNG, no encode
+    python3 scripts/demo/record_demo.py --replay CAP.pkl   # re-render a capture
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -34,9 +44,14 @@ from wcwidth import wcwidth  # noqa: E402
 from driver import Harness  # noqa: E402
 
 CTRL_P = b"\x10"
+CTRL_S = b"\x13"
 LEFT = b"\x1b[D"
 RIGHT = b"\x1b[C"
+ENTER = b"\r"
 ESCAPE = b"\x1b"
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RELEASE_DIR = REPO_ROOT / "target" / "release"
 
 COLS, ROWS = 96, 14
 FPS = 12
@@ -82,11 +97,27 @@ class Member:
     # config.rs DEFAULT_MEMBER_COLORS, by join order: this is the color the session
     # itself gives each member.
     color: str
+    prompt: str
+    # What `ls` in this member's home would show. Each member gets a private HOME, so
+    # the two panes are looking at genuinely different directories.
+    files: tuple[str, ...]
 
 
 MEMBERS = {
-    "pelazas": Member("pelazas", "· hosting", "#4fc3f7"),
-    "tis": Member("tis", "· joined", "#7ed67e"),
+    "userA": Member(
+        "userA",
+        "· session host",
+        "#4fc3f7",
+        "userA@mac %%",
+        ("Desktop/", "Documents/", "Projects/", "notes.md"),
+    ),
+    "userB": Member(
+        "userB",
+        "· guest",
+        "#7ed67e",
+        "userB@desktop %%",
+        ("Desktop/", "code/", "todo.txt"),
+    ),
 }
 
 
@@ -290,23 +321,35 @@ def pause(seconds: float) -> None:
 SESSION = "demo"
 
 
-def member_home(harness: Harness, name: str) -> Path:
-    """A private HOME per member.
+def member_home(harness: Harness, member: Member, display_name: str | None = None) -> Path:
+    """A private HOME per member: session store, shell prompt, and some files.
 
-    Both members share one Mac here, but they must not share a session store: a second
-    record for the same name is deduplicated to `demo-2`, and the tab bar would then
-    show the two members a different session name for the same session.
+    Separate stores matter for more than tidiness. Two records of the same session name
+    in one store are deduplicated to `demo-2`, and the tab bar would then show the two
+    members a different name for the same session.
     """
-    home = harness.home / name
+    home = harness.home / member.name
     (home / "Library" / "Application Support" / "p2pmux").mkdir(parents=True, exist_ok=True)
     (home / ".config" / "p2pmux").mkdir(parents=True, exist_ok=True)
+    # zsh reads /etc/zshrc first, which sets the stock macOS prompt, so this has to be
+    # the user's own rc file to win.
+    (home / ".zshrc").write_text(f"PROMPT='{member.prompt} '\n")
+    if display_name:
+        (home / ".config" / "p2pmux" / "config.toml").write_text(
+            f'display_name = "{display_name}"\n'
+        )
+    for entry in member.files:
+        if entry.endswith("/"):
+            (home / entry.rstrip("/")).mkdir(exist_ok=True)
+        else:
+            (home / entry).write_text(f"{member.name}\n")
     return home
 
 
-def wait_for_ticket(home: Path, timeout: float = 25.0) -> str:
-    """The join ticket the coordinator published, read off its own session record.
+def wait_for_join_code(home: Path, timeout: float = 25.0) -> str:
+    """The short code the coordinator published, read off its own session record.
 
-    Not `Harness.create_room`: that looks the ticket up by the *display* name, while a
+    Not `Harness.create_room`: that looks a ticket up by the *display* name, while a
     record is keyed by the session's memorable name, so it only ever matched by luck.
     """
     store = home / "Library" / "Application Support" / "p2pmux" / "sessions"
@@ -317,78 +360,105 @@ def wait_for_ticket(home: Path, timeout: float = 25.0) -> str:
                 descriptor = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            if descriptor.get("ticket"):
-                return descriptor["ticket"]
+            if descriptor.get("join_code"):
+                return descriptor["join_code"]
         time.sleep(0.1)
-    raise AssertionError(f"no ticket appeared in {store} within {timeout}s")
+    raise AssertionError(f"no join code appeared in {store} within {timeout}s")
 
 
-def build_scene(harness: Harness) -> tuple[object, object]:
-    """Everything that happens before the camera rolls: a session with two members,
-    each hosting one pane."""
-    host_home = member_home(harness, "pelazas")
-    guest_home = member_home(harness, "tis")
+def build_scene(harness: Harness) -> tuple[object, object, str]:
+    """Everything that happens before the camera rolls: userA hosting, share panel open,
+    and userB sitting at their own shell prompt with nothing but the code to type."""
+    host_member, guest_member = MEMBERS["userA"], MEMBERS["userB"]
+    host_home = member_home(harness, host_member)
+    # userB's name comes from their config, so the command they type on camera is just
+    # `p2pmux join <code>` -- no --name flag padding out the line.
+    guest_home = member_home(harness, guest_member, display_name=guest_member.name)
 
     host = harness.spawn(
-        "pelazas",
-        ["create", "--name", "pelazas", "--session-name", SESSION],
+        host_member.name,
+        ["create", "--name", host_member.name, "--session-name", SESSION],
         cols=COLS,
         rows=ROWS,
-        env={"HOME": str(host_home)},
+        env={"HOME": str(host_home), "SHELL": "/bin/zsh"},
     )
-    host.wait_ready(timeout=25)
-    ticket = wait_for_ticket(host_home)
-    guest = harness.spawn(
-        "tis",
-        ["join", ticket, "--name", "tis"],
-        cols=COLS,
-        rows=ROWS,
-        env={"HOME": str(guest_home)},
-    )
-    guest.wait_for(r"Pane #1", timeout=30)
+    host.wait_for(r"userA@mac %", timeout=25)
+    code = wait_for_join_code(host_home)
 
-    host.settle(quiet_for=0.5, timeout=8)
-    # tis opens their own pane, hosted on tis's Mac, beside pelazas's.
+    # userA has the share panel up, which is where the code on screen comes from.
+    host.send(CTRL_S)
+    host.wait_for(r"Share this session", timeout=10)
+    host.wait_for(re.escape(code), timeout=10)
+
+    # userB's window is a plain login shell, not the binary: the recording has to show
+    # the join being typed, so there has to be somewhere to type it.
+    guest = harness.spawn(
+        guest_member.name,
+        [],
+        cols=COLS,
+        rows=ROWS,
+        env={
+            "HOME": str(guest_home),
+            "SHELL": "/bin/zsh",
+            "PATH": f"{RELEASE_DIR}:{os.environ['PATH']}",
+        },
+        launcher=["/bin/zsh", "-i"],
+    )
+    guest.wait_for(r"userB@desktop %", timeout=15)
+
+    host.settle(quiet_for=0.4, timeout=5)
+    guest.settle(quiet_for=0.4, timeout=5)
+    return host, guest, code
+
+
+def perform(host, guest, code: str) -> None:
+    """The recorded ten seconds.
+
+    Every wait for a state change is a real deadline-bounded wait, not a sleep sized to
+    what the last run happened to take: the pauses are pacing, the waits are the product.
+    """
+    pause(0.8)
+
+    # 1. userB joins from their own shell, with the ten characters on userA's screen.
+    guest.type(f"p2pmux join {code}", per_key_delay=0.055)
+    pause(0.3)
+    guest.send(ENTER)
+    guest.wait_for(r"Pane #1 host: userA", timeout=30)
+    pause(0.7)
+
+    # 2. userA sees someone arrive and closes the share panel.
+    host.send(ESCAPE)
+    host.wait_until(
+        lambda screen: "Share this session" not in screen,
+        timeout=5,
+        what="the share panel to close",
+    )
+    pause(0.7)
+
+    # 3. userB opens a pane of their own, hosted on userB's machine.
     guest.send(CTRL_P)
     pause(0.4)
     guest.send(b"r")
-    guest.wait_for(r"Pane #2", timeout=15)
-    host.wait_for(r"Pane #2", timeout=15)
-    pause(0.8)
-    guest.run_in_shell("uname -sm")
-    pause(0.8)
-
-    # Give each pane something on screen, so the recording does not open empty.
-    host.run_in_shell('echo "hey tis, grab pane 1"')
-    pause(1.0)
-
-    # pelazas typing took the control lease on his own pane, and a lease only clears
-    # after ~30 idle seconds (lease::IDLE_AFTER). The recording is about tis claiming a
-    # *free* pane, so wait the lease out rather than filming a rejected keystroke.
-    print("waiting for pane #1's control lease to expire ...", flush=True)
     for peer in (host, guest):
-        peer.wait_for(r"Pane #1 host: pelazas control: free", timeout=60)
-    host.settle(quiet_for=0.4, timeout=5)
-    guest.settle(quiet_for=0.4, timeout=5)
-    return host, guest
+        peer.wait_for(r"Pane #2 host: userB", timeout=15)
+    pause(0.9)
 
-
-def perform(host, guest) -> None:
-    """The recorded five seconds."""
-    pause(0.4)
-    # tis moves focus onto pelazas's pane. Pane mode is sticky, so leave it before
-    # typing -- otherwise `e` is read as the rename command, not as a keystroke.
+    # 4. userB focuses userA's pane. Pane mode is sticky, so leave it before typing --
+    # otherwise `e` is read as the rename command instead of as a keystroke.
     guest.send(CTRL_P)
-    pause(0.3)
+    pause(0.35)
     guest.send(LEFT)
-    pause(0.45)
+    pause(0.4)
     guest.send(ESCAPE)
-    pause(0.35)
-    # Typing claims the free pane: tis is now driving a shell on pelazas's Mac.
-    guest.type('echo "on it"', per_key_delay=0.09)
-    pause(0.35)
-    guest.send(b"\r")
-    pause(1.4)
+    pause(0.4)
+
+    # 5. Typing claims the free pane: userB is now driving a shell userA hosts.
+    guest.type("echo userB", per_key_delay=0.085)
+    pause(0.3)
+    guest.send(ENTER)
+    for peer in (host, guest):
+        peer.wait_for(r"│userB\s", timeout=10)
+    pause(1.6)
 
 
 def encode(frames_dir: Path, output: Path) -> None:
@@ -426,7 +496,7 @@ def render_gif(frames: list[dict], output: Path, frames_dir: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--still", action="store_true", help="render two PNGs, no GIF")
-    parser.add_argument("--out", default="docs/media/p2pmux-demo.gif")
+    parser.add_argument("--out", default="docs/assets/demo.gif")
     parser.add_argument("--frames-dir", default=None)
     parser.add_argument(
         "--replay",
@@ -451,23 +521,25 @@ def main() -> int:
         return 0
 
     with Harness("demo") as harness:
-        host, guest = build_scene(harness)
+        host, guest, code = build_scene(harness)
 
         if args.still:
             fonts = load_fonts()
-            before = {"pelazas": grab(host), "tis": grab(guest)}
-            perform(host, guest)
-            after = {"pelazas": grab(host), "tis": grab(guest)}
+            before = {"userA": grab(host), "userB": grab(guest)}
+            perform(host, guest, code)
+            after = {"userA": grab(host), "userB": grab(guest)}
             render_frame(before, fonts, MEMBERS).save(output.with_suffix(".before.png"))
             render_frame(after, fonts, MEMBERS).save(output.with_suffix(".after.png"))
             print(output.with_suffix(".before.png"))
             print(output.with_suffix(".after.png"))
             return 0
 
-        recorder = Recorder({"pelazas": host, "tis": guest})
+        recorder = Recorder({"userA": host, "userB": guest})
         recorder.start()
-        perform(host, guest)
+        started = time.monotonic()
+        perform(host, guest, code)
         recorder.stop()
+        print(f"performance took {time.monotonic() - started:.1f}s")
 
     capture = Path(tempfile.gettempdir()) / "p2pmux-demo.capture.pkl"
     with open(capture, "wb") as handle:
