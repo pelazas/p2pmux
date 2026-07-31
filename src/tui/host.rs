@@ -20,7 +20,6 @@ pub struct HostPaneRuntime {
     pub(in crate::tui) screen_tx: watch::Sender<ScreenFrame>,
     pub(in crate::tui) lease_tx: watch::Sender<LeaseState>,
     pub(in crate::tui) control_rx: mpsc::Receiver<HostControlEvent>,
-    pub(in crate::tui) join_code: String,
 }
 impl HostPaneRuntime {
     pub fn new(
@@ -29,7 +28,6 @@ impl HostPaneRuntime {
         screen_tx: watch::Sender<ScreenFrame>,
         lease_tx: watch::Sender<LeaseState>,
         control_rx: mpsc::Receiver<HostControlEvent>,
-        join_code: String,
     ) -> Result<Self, Box<dyn Error>> {
         let screen = HostScreen::new(size.rows, size.cols)?;
         let lease = LeaseManager::new(Vec::new(), Instant::now());
@@ -42,7 +40,6 @@ impl HostPaneRuntime {
             screen_tx,
             lease_tx,
             control_rx,
-            join_code,
         })
     }
 }
@@ -80,7 +77,6 @@ mod tests {
             screen_tx,
             lease_tx,
             control_rx,
-            String::from("TESTCODE"),
         )
         .expect("host runtime");
 

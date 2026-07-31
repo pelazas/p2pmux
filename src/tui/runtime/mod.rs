@@ -21,13 +21,12 @@ use crate::{
     },
     transport::Transport,
     tui::{
-        MultiPaneTui,
+        Invite, MultiPaneTui,
         pane::{
             control::{PendingCreate, RemoteSubscriptionState, SharedControl},
             local::{AgentSamplingWorker, SharedLocalPane},
             remote::SharedRemotePane,
         },
-        share::resolve_local_ticket,
     },
 };
 
@@ -58,8 +57,7 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) status: String,
     pub(in crate::tui) copied_lines: Option<usize>,
     pub(in crate::tui) footer_notice: Option<String>,
-    pub(in crate::tui) join_code: Option<String>,
-    pub(in crate::tui) share_ticket: Option<String>,
+    pub(in crate::tui) invite: Invite,
     pub(in crate::tui) share_notice: Option<String>,
     pub(in crate::tui) agent_sampler: AgentSamplingWorker,
     pub(in crate::tui) agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
@@ -78,7 +76,8 @@ impl SharedLayoutRuntime {
         panes: PaneServer,
         snapshot: LayoutSnapshot,
         initial: SharedLocalPane,
-        join_code: String,
+        ticket: String,
+        code: Option<String>,
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, Box<dyn Error>> {
         let transport = host.transport();
@@ -88,7 +87,10 @@ impl SharedLayoutRuntime {
             transport,
             snapshot,
             Some(initial),
-            Some(join_code),
+            Invite {
+                ticket: Some(ticket),
+                code,
+            },
             runtime,
         )
     }
@@ -107,7 +109,7 @@ impl SharedLayoutRuntime {
             transport,
             snapshot,
             None,
-            None,
+            Invite::default(),
             runtime,
         )?;
         value.session_id = session_id;
@@ -137,7 +139,7 @@ impl SharedLayoutRuntime {
         transport: Transport,
         snapshot: LayoutSnapshot,
         initial: Option<SharedLocalPane>,
-        join_code: Option<String>,
+        invite: Invite,
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, Box<dyn Error>> {
         let (subscription_tx, subscription_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -171,10 +173,7 @@ impl SharedLayoutRuntime {
             status: String::new(),
             copied_lines: None,
             footer_notice: None,
-            // Resolved once at startup: the record is written before the runtime exists and
-            // does not change while it lives.
-            share_ticket: join_code.as_deref().and_then(resolve_local_ticket),
-            join_code,
+            invite,
             share_notice: None,
             agent_sampler: AgentSamplingWorker::spawn(),
             agent_rosters: BTreeMap::new(),
@@ -203,8 +202,12 @@ impl SharedLayoutRuntime {
         self.control.peer_id()
     }
 
-    pub(crate) fn join_code(&self) -> Option<&str> {
-        self.join_code.as_deref()
+    pub(crate) fn share_ticket(&self) -> Option<&str> {
+        self.invite.ticket.as_deref()
+    }
+
+    pub(crate) fn share_code(&self) -> Option<&str> {
+        self.invite.code.as_deref()
     }
 
     /// Current operator-facing status, empty when there is nothing to report.
@@ -353,6 +356,7 @@ mod tests {
             snapshot,
             initial,
             String::from("TESTCODE"),
+            None,
             tokio::runtime::Handle::current(),
         )
         .expect("runtime");
@@ -449,6 +453,7 @@ mod tests {
             snapshot,
             initial,
             String::from("TESTCODE"),
+            None,
             tokio::runtime::Handle::current(),
         )
         .expect("runtime");

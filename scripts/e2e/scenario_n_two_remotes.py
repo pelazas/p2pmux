@@ -210,9 +210,8 @@ def main() -> int:
                 print(alpha.snapshot(), flush=True)
                 return 1
 
-            # The ticket has to be minted where the coordinator lives. A short join code
-            # would be useless here: it resolves through a cache on the machine that
-            # created it, and beta is on another continent.
+            # The ticket has to be read where the coordinator lives: only that machine's
+            # session record holds one, and beta is on another continent.
             ticket = alpha_host.cli("ticket").strip().splitlines()[-1].strip()
             check(
                 "coordinator minted a portable ticket",

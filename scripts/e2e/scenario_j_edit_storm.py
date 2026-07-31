@@ -58,9 +58,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
     with Harness(f"j-storm-{index}") as harness:
-        host, code = harness.create_room("host", cols=140, rows=40)
-        g1 = harness.join_room("g1", code, cols=140, rows=40)
-        g2 = harness.join_room("g2", code, cols=140, rows=40)
+        host, ticket = harness.create_room("host", cols=140, rows=40)
+        g1 = harness.join_room("g1", ticket, cols=140, rows=40)
+        g2 = harness.join_room("g2", ticket, cols=140, rows=40)
         peers = (host, g1, g2)
         time.sleep(1.5)
 

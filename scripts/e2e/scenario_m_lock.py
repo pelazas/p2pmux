@@ -48,19 +48,6 @@ def chord(peer, lead: bytes, letter: bytes, settle: float = 1.5) -> None:
     time.sleep(settle)
 
 
-def full_ticket(harness: Harness, code: str) -> str:
-    result = subprocess.run(
-        [str(BINARY), "ticket", code],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        env={"HOME": str(harness.home), "PATH": "/usr/bin:/bin"},
-    )
-    if result.returncode != 0:
-        raise AssertionError(f"`p2pmux ticket {code}` failed:\n{result.stderr.strip()}")
-    return result.stdout.strip()
-
-
 def main() -> int:
     insider = RemoteHost(home="/root/e2e-home")
     outsider = RemoteHost(home="/root/e2e-home-2")
@@ -76,9 +63,8 @@ def main() -> int:
 
     try:
         with Harness("scenario_m_lock") as harness:
-            host, code = harness.create_room("mac")
-            ticket = full_ticket(harness, code)
-            check("mac created a session", bool(code), f"join code {code}")
+            host, ticket = harness.create_room("mac")
+            check("mac created a session", bool(ticket), f"{len(ticket)} chars")
 
             guest = harness.spawn(
                 "insider",

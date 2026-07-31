@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from driver import (  # noqa: E402
     DeadlineExceeded,
     Harness,
-    join_code_from,
     p2pmux_pids,
     rss_kb,
 )
@@ -75,8 +74,8 @@ def smoke_local() -> None:
 
 
 def smoke_create_and_cleanup() -> None:
-    """`p2pmux create`: prints a join code, and teardown reaps the detached node."""
-    print("\n[2] p2pmux create -- join code, sandbox isolation, orphan reaping")
+    """`p2pmux create`: publishes a ticket, and teardown reaps the detached node."""
+    print("\n[2] p2pmux create -- ticket, sandbox isolation, orphan reaping")
     baseline = p2pmux_pids()
 
     with Harness("smoke-create") as harness:
@@ -84,19 +83,14 @@ def smoke_create_and_cleanup() -> None:
         screen = host.settle(quiet_for=0.6, timeout=15)
 
         try:
-            code = join_code_from(screen)
-            check("create prints a join code", len(code) >= 6, code)
+            ticket = harness.wait_for_ticket("hostuser", timeout=15)
+            check("create publishes a ticket", ticket.startswith("p2pmux-v"), ticket[:24])
         except AssertionError:
-            check("create prints a join code", False, f"screen:\n{screen[:600]}")
+            check("create publishes a ticket", False, f"screen:\n{screen[:600]}")
 
         # Sandboxed HOME really is where state landed.
         store = harness.home / "Library" / "Application Support" / "p2pmux" / "sessions"
-        rendezvous = harness.home / ".cache" / "p2pmux" / "rendezvous"
-        check(
-            "state stays in the sandbox HOME",
-            store.exists() or rendezvous.exists(),
-            f"store={store.exists()} rendezvous={rendezvous.exists()}",
-        )
+        check("state stays in the sandbox HOME", store.exists(), f"store={store.exists()}")
 
         spawned = p2pmux_pids() - baseline
         check("background node was forked", len(spawned) >= 2, f"{len(spawned)} new pids")

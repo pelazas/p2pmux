@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p2pmux — a terminal room where every pane runs on its owner's machine</title>
+<meta name="description" content="A macOS terminal multiplexer for two or more people. Each pane's process runs on its host's Mac, under its host's credentials.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbf9; --fg: #1c1c1a; --muted: #5d5d57; --rule: #e0e0d8;
+    --accent: #b3401f; --code-bg: #f2f2ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --fg: #e8e8e3; --muted: #9a9a93; --rule: #2e2e34;
+      --accent: #ff8a63; --code-bg: #1f1f25;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 42rem; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+  h1 { font-size: 1.9rem; line-height: 1.25; letter-spacing: -0.02em; margin: 0 0 .5rem; }
+  h2 { font-size: 1.05rem; letter-spacing: .04em; text-transform: uppercase;
+       color: var(--muted); margin: 3rem 0 .75rem; font-weight: 600; }
+  .lede { font-size: 1.15rem; color: var(--muted); margin: 0 0 2.5rem; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: .9rem 1rem; overflow-x: auto; margin: 0 0 .5rem;
+    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+  p code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  ul { padding-left: 1.1rem; }
+  li { margin: .35rem 0; }
+  .note { color: var(--muted); font-size: .93rem; }
+  .warn {
+    border-left: 3px solid var(--accent); padding: .1rem 0 .1rem 1rem; margin: 2rem 0;
+  }
+  footer { border-top: 1px solid var(--rule); margin-top: 4rem; padding-top: 1.25rem;
+           color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Every pane runs on its owner's machine.</h1>
+  <p class="lede">
+    p2pmux is a terminal multiplexer for two or more people. You share a layout, not a computer:
+    each pane's shell runs on the Mac of whoever created it, under that person's PATH, environment
+    and credentials.
+  </p>
+
+  <h2>Install</h2>
+  <pre><code>curl -fsSL https://p2pmux.com/install.sh | sh</code></pre>
+  <p class="note">
+    macOS, Apple Silicon or Intel. The script is served as plain text —
+    <a href="/install.sh">read it first</a>. It downloads a binary and its SHA256 from GitHub
+    Releases, checks the hash, and copies one file into place.
+  </p>
+  <p class="note">Or build it yourself:</p>
+  <pre><code>cargo install --git https://github.com/pelazas/p2pmux --locked</code></pre>
+
+  <h2>Use</h2>
+  <pre><code>p2pmux create          # then Ctrl+S for the join code
+p2pmux join 4KP7Q-M2XRW</code></pre>
+  <p class="note">
+    Ctrl+P then arrows for panes, Ctrl+T for tabs, Ctrl+Q to leave the session running.
+  </p>
+
+  <h2>What that buys you</h2>
+  <ul>
+    <li>Start an agent in your pane, on your subscription. A teammate can take control and drive it
+        without ever holding your API key.</li>
+    <li>They host panes too. Same session, their machine, their credentials.</li>
+    <li>Direct peer-to-peer when the network allows, relayed when NAT says no. Encrypted either way,
+        and the status bar tells you which path you are on.</li>
+  </ul>
+
+  <div class="warn">
+    <strong>This is a trusted shared shell.</strong> Whoever holds a pane can run commands as that
+    Mac's user and read anything that user can read — including printing a secret to the screen.
+    Credential <em>files</em> and processes never leave the host Mac, but that is not the same as
+    being sandboxed. <a href="/trust">Both halves, in detail →</a>
+  </div>
+
+  <footer>
+    <a href="https://github.com/pelazas/p2pmux">Source</a> ·
+    <a href="/trust">Trust model</a> ·
+    Free, MIT licensed
+  </footer>
+</main>
+</body>
+</html>

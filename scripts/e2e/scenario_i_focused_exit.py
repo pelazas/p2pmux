@@ -54,9 +54,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
     with Harness(f"i-focus-{index}") as harness:
-        host, code = harness.create_room("host", cols=110, rows=30)
-        g1 = harness.join_room("g1", code, cols=110, rows=30)
-        g2 = harness.join_room("g2", code, cols=110, rows=30)
+        host, ticket = harness.create_room("host", cols=110, rows=30)
+        g1 = harness.join_room("g1", ticket, cols=110, rows=30)
+        g2 = harness.join_room("g2", ticket, cols=110, rows=30)
         time.sleep(1.5)
 
         # g1 creates its own pane, so pane 2 is g1-hosted.

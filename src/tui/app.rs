@@ -174,7 +174,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
-    let footer = format!("{CONTROL_HELP} | join: p2pmux join {}", runtime.join_code);
+    let footer = CONTROL_HELP.to_owned();
     let mut dirty = true;
     let mut last_draw: Option<Instant> = None;
     let mut sync_gate = SyncGate::default();

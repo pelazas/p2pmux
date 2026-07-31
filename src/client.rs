@@ -33,7 +33,7 @@ use crate::{
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
         PaneMouseProtocol, PaneViewState, ShareView, copy_selection_to_clipboard,
-        render_multi_pane_with_copy_feedback, resolve_local_ticket, share_copy_result,
+        render_multi_pane_with_copy_feedback, share_copy_result,
     },
 };
 
@@ -152,10 +152,10 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut pending_resync = BTreeSet::new();
     let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
-    let mut join_code = None;
-    // Resolved once per snapshot rather than on every open: the record does not change while
-    // the node lives, and reading it is a filesystem hop.
+    // Carried on the snapshot rather than looked up here: only the node holds the ticket,
+    // and a member's node has none to send.
     let mut share_ticket: Option<String> = None;
+    let mut share_code: Option<String> = None;
     let mut share_notice: Option<String> = None;
     let mut pending_wake = None;
     let mut next_perf_id = 1_u64;
@@ -179,7 +179,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         local_peer_id: next_local_peer_id,
                         tab_id,
                         pane_id,
-                        join_code: next_join_code,
+                        ticket: next_ticket,
+                        code: next_code,
                         ..
                     } => {
                         let apply_started = Instant::now();
@@ -229,8 +230,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             )?;
                         }
                         local_peer_id = next_local_peer_id;
-                        join_code = next_join_code;
-                        share_ticket = join_code.as_deref().and_then(resolve_local_ticket);
+                        share_ticket = next_ticket;
+                        share_code = next_code;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
                         }
@@ -424,8 +425,8 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         copied_lines,
                         footer_notice.as_deref(),
                         ShareView {
-                            code: join_code.as_deref(),
                             ticket: share_ticket.as_deref(),
+                            code: share_code.as_deref(),
                             notice: share_notice.as_deref(),
                         },
                         Some(&local_peer_id),
@@ -479,7 +480,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             share_notice = Some(share_copy_result(
                                 request,
                                 share_ticket.as_deref(),
-                                join_code.as_deref(),
+                                share_code.as_deref(),
                             ));
                         }
                         // The notice belongs to one visit to the modal, not to the session.

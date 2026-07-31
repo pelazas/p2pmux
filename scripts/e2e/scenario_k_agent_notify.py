@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from driver import (  # noqa: E402
     DeadlineExceeded,
     Harness,
-    join_code_from,
     p2pmux_pids,
 )
 
@@ -97,11 +96,11 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             env=peer_env(host_log),
         )
         host.wait_ready(timeout=25)
-        code = join_code_from(host.wait_for(r"p2pmux join [A-Za-z0-9]{6,}", timeout=25))
+        ticket = harness.wait_for_ticket("host", timeout=25)
 
         guest = harness.spawn(
             "guest",
-            ["join", code, "--name", "guest"],
+            ["join", ticket, "--name", "guest"],
             env=peer_env(guest_log),
         )
         guest.wait_ready(timeout=30)

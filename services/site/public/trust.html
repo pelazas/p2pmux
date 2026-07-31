@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p2pmux — trust model</title>
+<meta name="description" content="What a p2pmux join code actually grants, what stays on your machine, and what our one server can and cannot see.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbf9; --fg: #1c1c1a; --muted: #5d5d57; --rule: #e0e0d8;
+    --accent: #b3401f; --code-bg: #f2f2ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --fg: #e8e8e3; --muted: #9a9a93; --rule: #2e2e34;
+      --accent: #ff8a63; --code-bg: #1f1f25;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 42rem; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+  h1 { font-size: 1.8rem; line-height: 1.25; letter-spacing: -0.02em; margin: 0 0 2rem; }
+  h2 { font-size: 1.2rem; margin: 2.75rem 0 .6rem; letter-spacing: -0.01em; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  ul { padding-left: 1.1rem; }
+  li { margin: .4rem 0; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+  .warn { border-left: 3px solid var(--accent); padding: .1rem 0 .1rem 1rem; margin: 1.5rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95rem; }
+  th, td { text-align: left; padding: .55rem .6rem; border-bottom: 1px solid var(--rule);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .85rem; text-transform: uppercase;
+       letter-spacing: .04em; }
+  footer { border-top: 1px solid var(--rule); margin-top: 4rem; padding-top: 1.25rem;
+           color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>What a join code actually grants</h1>
+
+  <div class="warn">
+    <strong>A p2pmux session is a trusted shared shell.</strong> Anyone holding the code or ticket
+    can see every pane and take interactive control of the terminals that are available. They can
+    run commands as that Mac's user, read anything that user can read, and print a secret to the
+    screen. Share it with people you would hand your unlocked laptop to, and nobody else.
+  </div>
+
+  <p>
+    There is a second half to that sentence, and both halves are true at once. Credential
+    <em>files</em> and <em>processes</em> never leave the machine that hosts a pane: your API keys,
+    your SSH keys and your logged-in CLIs stay on your disk, and a teammate driving your pane is
+    running a program on your computer rather than copying anything to theirs. That is what makes
+    "start Claude Code on my subscription, without giving you my key" work.
+  </p>
+  <p>
+    It is <strong>not</strong> a sandbox. Nothing stops a controller from running
+    <code>cat ~/.aws/credentials</code>. If that distinction matters for a given collaborator, use a
+    separate low-privilege macOS account and keep production credentials out of shared panes.
+  </p>
+
+  <h2>Where things run</h2>
+  <table>
+    <tr><th>Thing</th><th>Where it lives</th></tr>
+    <tr><td>Your shell, your agent, your build</td><td>Your Mac. Always.</td></tr>
+    <tr><td>Your API keys and credential files</td><td>Your disk. Never uploaded.</td></tr>
+    <tr><td>Terminal output and keystrokes</td>
+        <td>Encrypted, peer to peer — or through an iroh relay when NAT blocks a direct path.
+            A relay forwards encrypted bytes it cannot read.</td></tr>
+    <tr><td>Tabs, panes, who is where</td><td>Between the peers in the session.</td></tr>
+  </table>
+
+  <h2>The one server we run</h2>
+  <p>
+    Joining takes a ten-character code instead of a two-hundred-character ticket, and that
+    convenience needs somewhere to look the code up. That is
+    <code>rv.p2pmux.com</code>, and it is the only thing we operate.
+  </p>
+  <p>
+    It cannot read what it stores. Your client turns the code into two separate values: an address
+    to store the record at, and a key to encrypt it with. Only the first is ever sent. The service
+    receives an opaque handle and a sealed blob, holds them for a few hours, and hands them back to
+    whoever presents the same handle. There is no configuration of that service that reveals a
+    ticket, because the key never reaches it.
+  </p>
+  <ul>
+    <li>Terminal bytes never pass through it. Those go peer to peer, or over an iroh relay.</li>
+    <li>Records expire on their own, and a session deletes its own record when it exits.</li>
+    <li>No accounts, no email, no analytics on it.</li>
+    <li>Skip it entirely if you like: <code>p2pmux ticket</code> prints the full ticket, and
+        <code>p2pmux join &lt;ticket&gt;</code> never contacts us.</li>
+  </ul>
+  <p>
+    We do not claim "no servers". iroh's public relays exist and carry encrypted traffic when a
+    direct path cannot form, and the code lookup above is ours. What we claim is narrower and
+    checkable: <em>your processes and your credential files stay on your machine.</em>
+  </p>
+
+  <h2>Limits worth knowing</h2>
+  <ul>
+    <li>A code is a bearer credential with no revocation yet. Anyone who obtains it can join for as
+        long as the session lives.</li>
+    <li>Codes are not one-time. They expire, but a code read once can be read again inside its
+        lifetime.</li>
+    <li>Session locking exists (<code>Ctrl+P</code> then <code>Shift+L</code>) and refuses new
+        peers, which is the tool for "everyone who should be here is here".</li>
+    <li>Up to 8 members, 9 tabs, 8 panes per tab.</li>
+  </ul>
+
+  <footer>
+    <a href="/">Home</a> ·
+    <a href="https://github.com/pelazas/p2pmux">Source</a> ·
+    <a href="/install.sh">install.sh</a>
+  </footer>
+</main>
+</body>
+</html>

@@ -13,7 +13,9 @@ use crate::{
     config::UiTheme,
     tui::{
         RenamePrompt, RenameTarget, ShareView,
-        render::footer::{SHARE_HELP, SHARE_HELP_GUEST, render_footer_segments},
+        render::footer::{
+            SHARE_HELP, SHARE_HELP_GUEST, SHARE_HELP_NO_CODE, render_footer_segments,
+        },
         text::{truncate_trailing, wrap_fixed},
     },
 };
@@ -38,17 +40,26 @@ pub(in crate::tui) fn render_share_modal(
     let mut lines: Vec<Line> = Vec::new();
     match share.ticket {
         Some(ticket) => {
-            lines.push(Line::styled("TICKET — works from any Mac", label));
+            // The code first, because it is the one a person can read down a phone line.
+            // Each carries what it actually costs: the code is short but expires and needs
+            // our service to be up; the ticket is unwieldy but depends on nothing.
+            match share.code {
+                Some(code) => {
+                    lines.push(Line::styled("CODE — p2pmux join, expires in 6h", label));
+                    lines.push(Line::styled(code.to_owned(), value));
+                }
+                None => lines.push(Line::styled(
+                    "CODE — unavailable, rendezvous unreachable",
+                    Style::default().fg(theme.agent_overlay_warm),
+                )),
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("TICKET — never expires, no service", label));
             lines.extend(
                 wrap_fixed(ticket, content_width)
                     .into_iter()
                     .map(|chunk| Line::styled(chunk, value)),
             );
-            if let Some(code) = share.code {
-                lines.push(Line::raw(""));
-                lines.push(Line::styled("CODE — this Mac only", label));
-                lines.push(Line::styled(code.to_owned(), value));
-            }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 "Anyone with the ticket can join this session.",
@@ -121,10 +132,10 @@ pub(in crate::tui) fn render_share_modal(
         help.x.saturating_add(1),
         help.y,
         help.right(),
-        if share.ticket.is_some() {
-            SHARE_HELP
-        } else {
-            SHARE_HELP_GUEST
+        match (share.ticket.is_some(), share.code.is_some()) {
+            (true, true) => SHARE_HELP,
+            (true, false) => SHARE_HELP_NO_CODE,
+            (false, _) => SHARE_HELP_GUEST,
         },
     );
 }
@@ -222,7 +233,7 @@ mod tests {
     };
 
     #[test]
-    fn share_modal_shows_the_ticket_and_the_code_with_their_reach() {
+    fn share_modal_shows_both_invites_with_what_each_costs() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -243,9 +254,9 @@ mod tests {
                     None,
                     None,
                     ShareView {
-                        code: Some("TESTCODE"),
-                        ticket: Some("p2pmux-v1:TICKETVALUE"),
-                        notice: Some("✓ copied ticket"),
+                        code: Some("4KP7Q-M2XRW"),
+                        ticket: Some("p2pmux-v3:TICKETVALUE"),
+                        notice: Some("✓ copied code"),
                     },
                     None,
                     None,
@@ -260,11 +271,62 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Share this session"));
-        assert!(rendered.contains("TICKET — works from any Mac"));
-        assert!(rendered.contains("p2pmux-v1:TICKETVALUE"));
-        assert!(rendered.contains("CODE — this Mac only"));
-        assert!(rendered.contains("TESTCODE"));
-        assert!(rendered.contains("✓ copied ticket"));
+        // Each identifier is shown with what it actually costs, because the difference is the
+        // whole point: the code is readable but expires and needs our service up.
+        assert!(rendered.contains("CODE — p2pmux join, expires in 6h"));
+        assert!(rendered.contains("4KP7Q-M2XRW"));
+        assert!(rendered.contains("TICKET — never expires, no service"));
+        assert!(rendered.contains("p2pmux-v3:TICKETVALUE"));
+        assert!(rendered.contains("✓ copied code"));
+        assert!(rendered.contains("COPY CODE"));
+        assert!(rendered.contains("COPY TICKET"));
+    }
+
+    #[test]
+    fn share_modal_says_so_when_the_rendezvous_gave_no_code() {
+        // A session whose node could not reach the service still has a working invite, so the
+        // panel has to distinguish "no code" from "no session to share".
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("layout");
+        tui.modal = ModalState::Share;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_multi_pane_with_copy_feedback(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    None,
+                    None,
+                    ShareView {
+                        code: None,
+                        ticket: Some("p2pmux-v3:TICKETVALUE"),
+                        notice: None,
+                    },
+                    None,
+                    None,
+                );
+            })
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("CODE — unavailable, rendezvous unreachable"));
+        assert!(rendered.contains("p2pmux-v3:TICKETVALUE"));
+        // Enter has to fall back to the ticket, so the help row must not promise a code.
+        assert!(!rendered.contains("COPY CODE"));
         assert!(rendered.contains("COPY TICKET"));
     }
 }

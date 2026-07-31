@@ -22,11 +22,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    hosted_rendezvous::PublishedCode,
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
     },
-    rendezvous::LocalRendezvous,
     session::{
         HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
         layout_snapshot_from_state,
@@ -104,14 +104,14 @@ pub fn read_bootstrap(path: &std::path::Path) -> io::Result<NodeBootstrap> {
     Ok(bootstrap)
 }
 
-/// Private child entrypoint. It owns the descriptor, rendezvous record, socket and every PTY.
+/// Private child entrypoint. It owns the descriptor, socket and every PTY.
 pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Error>> {
     let mut descriptor = bootstrap.descriptor.clone();
     descriptor.node_pid = std::process::id();
     // Before the first pane spawns: every PTY this node opens inherits the
     // socket path from here, and pane 1 is created a few lines below.
     crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
-    let (mut node, dispatcher_task, rendezvous) = match bootstrap.kind {
+    let (mut node, dispatcher_task, published_code) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -145,18 +145,28 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     .map_err(|error| io::Error::other(format!("invalid host layout: {error:?}")))?;
             let dispatcher = host.incoming_dispatcher(panes.clone())?;
             let dispatcher_task = tokio::spawn(async move { dispatcher.accept_loop().await });
-            let rendezvous = LocalRendezvous::for_current_user()?.publish(host.ticket())?;
-            let join_code = rendezvous.code().to_owned();
+            // The descriptor is the only out-of-process copy, so `p2pmux ticket <name>` and
+            // the attaching client both read it from there rather than minting their own.
+            let ticket = host.ticket().to_string();
+            descriptor.ticket = Some(ticket.clone());
+            // The short code is a convenience layered on the ticket, so a rendezvous outage
+            // degrades the invite rather than failing the session: the ticket still works,
+            // and the share panel says there is no code instead of showing a dead one.
+            let published_code = PublishedCode::publish(ticket.clone()).await.ok();
+            let code = published_code
+                .as_ref()
+                .map(|published| published.code().printable());
+            descriptor.join_code = code.clone();
             let session_id = host.ticket().session_id().to_vec();
             let handle = tokio::runtime::Handle::current();
             let mut runtime = crate::tui::SharedLayoutRuntime::host(
-                host, panes, layout, initial, join_code, handle,
+                host, panes, layout, initial, ticket, code, handle,
             )?;
             runtime.set_session_id(session_id);
             (
                 SharedLayoutNode::new(runtime),
                 dispatcher_task,
-                Some(rendezvous),
+                published_code,
             )
         }
         NodeBootstrapKind::Join {
@@ -216,12 +226,30 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     tokio::task::block_in_place(|| node.shutdown());
     dispatcher_task.abort();
     let _ = dispatcher_task.await;
-    if let Some(rendezvous) = rendezvous {
-        let _ = rendezvous.remove();
+    if let Some(published) = published_code {
+        published.retire().await;
     }
     let _ = fs::remove_file(&descriptor.socket_path);
     let _ = store.remove(&descriptor.id);
     result.map_err(Into::into)
+}
+
+/// Apply this node's timeouts to a freshly accepted connection.
+///
+/// `None` means the connection is not worth keeping, never that the node is in trouble.
+/// That distinction is the whole point: `SessionStore::sweep_dead_sockets` probes liveness by
+/// opening a connection and dropping it at once, and on macOS these calls answer EINVAL for a
+/// peer that is already gone. Propagating that ended the socket loop and tore down the
+/// session, so any `p2pmux attach`, `ls`, `ticket` or `--resume` — every caller of
+/// `list_live` — killed every live session on the machine.
+fn configure_accepted(stream: UnixStream) -> Option<UnixStream> {
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT)).ok()?;
+    // Prevent stalled clients from wedging the node on large Snapshot writes.
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    Some(stream)
 }
 
 fn run_socket_loop(
@@ -241,10 +269,9 @@ fn run_socket_loop(
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT))?;
-                    // Prevent stalled clients from wedging the node on large Snapshot writes.
-                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    let Some(stream) = configure_accepted(stream) else {
+                        continue;
+                    };
                     let mut reader = BufReader::new(stream);
                     match read_message(&mut reader) {
                         // Probes and shutdowns are control requests. They must not consume or
@@ -857,7 +884,8 @@ fn snapshot_message(
         local_peer_id,
         tab_id,
         pane_id,
-        join_code: node.runtime.join_code().map(str::to_owned),
+        ticket: node.runtime.share_ticket().map(str::to_owned),
+        code: node.runtime.share_code().map(str::to_owned),
     };
     Ok((message, layout, leases, rosters, screens, updates))
 }
@@ -1354,6 +1382,38 @@ mod tests {
     };
 
     #[test]
+    fn a_peer_that_hung_up_before_being_accepted_costs_only_its_connection() {
+        // `SessionStore::sweep_dead_sockets` tests liveness by connecting and dropping at
+        // once, so this is what every `p2pmux attach`, `ticket` or `--resume` does to a live
+        // node. macOS answers EINVAL when the timeouts are applied to a peer that is already
+        // gone; propagating that ended the socket loop, and the node tore its own session
+        // down. One dead connection must never be able to do that.
+        let directory = std::env::temp_dir().join(format!("p2pmux-accept-{}", std::process::id()));
+        let _ = fs::create_dir_all(&directory);
+        let path = directory.join("node.sock");
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("listener should bind");
+
+        drop(UnixStream::connect(&path).expect("sweep-style probe should connect"));
+        let (accepted, _) = listener.accept().expect("accept should succeed");
+        // Whether the platform refuses this one is its business; the signature is the fix,
+        // because an `Option` cannot be `?`-propagated into ending the session.
+        let _: Option<UnixStream> = configure_accepted(accepted);
+
+        // What must hold is that the dead peer left nothing behind: the next real client
+        // still gets a usable stream from the same listener.
+        let live = UnixStream::connect(&path).expect("live peer should connect");
+        let (accepted, _) = listener.accept().expect("accept should succeed");
+        assert!(
+            configure_accepted(accepted).is_some(),
+            "a hung-up peer poisoned the listener for the next client"
+        );
+        drop(live);
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn reads_concatenated_client_frames_from_one_reader() {
         let (mut writer, stream) = UnixStream::pair().unwrap();
         let mut frames = serde_json::to_vec(&ClientMessage::Input {
@@ -1688,6 +1748,7 @@ mod tests {
                 snapshot,
                 initial,
                 String::from("TESTCODE"),
+                None,
                 tokio::runtime::Handle::current(),
             )
             .unwrap(),
@@ -1759,7 +1820,8 @@ mod tests {
                 local_peer_id: vec![],
                 tab_id: 1,
                 pane_id: 1,
-                join_code: None,
+                ticket: None,
+                code: None,
             },
         )
         .unwrap();

@@ -105,16 +105,17 @@ impl MultiPaneTui {
 
     /// Keys for the share modal.
     ///
-    /// Enter takes the ticket because that is the only thing a peer on another machine can
-    /// use; the code is the secondary key precisely because it only resolves on this Mac.
-    /// Every key is consumed so no invite material leaks into the focused pane.
+    /// Enter and `c` take the code, `t` takes the ticket. The client resolves Enter to the
+    /// ticket when there is no code, so the primary key always copies something usable rather
+    /// than reporting nothing to copy. Every key is consumed so no invite material leaks into
+    /// the focused pane.
     pub(in crate::tui) fn handle_share_key(&mut self, key: KeyEvent) -> KeyHandling {
         match key.code {
-            KeyCode::Enter if key.modifiers.is_empty() => {
-                self.pending_share_copy = Some(ShareCopy::Ticket);
-            }
-            KeyCode::Char('c') if key.modifiers.is_empty() => {
+            KeyCode::Enter | KeyCode::Char('c') if key.modifiers.is_empty() => {
                 self.pending_share_copy = Some(ShareCopy::Code);
+            }
+            KeyCode::Char('t') if key.modifiers.is_empty() => {
+                self.pending_share_copy = Some(ShareCopy::Ticket);
             }
             KeyCode::Esc if key.modifiers.is_empty() => {
                 self.modal = ModalState::None;
@@ -482,15 +483,19 @@ mod tests {
         );
 
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area);
-        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Ticket));
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Code));
         assert_eq!(
             tui.take_share_copy_request(),
             None,
             "a claimed request must not copy again on the next key"
         );
 
+        // `c` is muscle memory for copy and must not fall through to the pane.
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), area);
         assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Code));
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), area);
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Ticket));
 
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
         assert!(!tui.share_open());

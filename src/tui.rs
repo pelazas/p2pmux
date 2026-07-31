@@ -48,7 +48,7 @@ pub use pane::local::SharedLocalPane;
 pub use render::panes::{render_multi_pane, render_multi_pane_with_copy_feedback};
 pub use runtime::SharedLayoutRuntime;
 pub(crate) use selection::copy_selection_to_clipboard;
-pub(crate) use share::{resolve_local_ticket, share_copy_result};
+pub(crate) use share::share_copy_result;
 pub(crate) use snapshot::{
     LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot, NodeScreenSnapshots,
 };
@@ -57,7 +57,7 @@ pub use state::{
     ShareView, UiIntent,
 };
 pub(in crate::tui) use state::{
-    ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
+    Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
 };
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
 

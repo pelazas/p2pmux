@@ -57,8 +57,8 @@ impl SharedLayoutRuntime {
                 if let Some(request) = self.tui.take_share_copy_request() {
                     self.share_notice = Some(share_copy_result(
                         request,
-                        self.share_ticket.as_deref(),
-                        self.join_code.as_deref(),
+                        self.invite.ticket.as_deref(),
+                        self.invite.code.as_deref(),
                     ));
                 }
                 // The notice belongs to one visit to the modal, not to the session.
@@ -169,8 +169,8 @@ impl SharedLayoutRuntime {
                             .as_deref()
                             .or_else(|| self.exited_footer_notice()),
                         ShareView {
-                            code: self.join_code.as_deref(),
-                            ticket: self.share_ticket.as_deref(),
+                            code: self.invite.code.as_deref(),
+                            ticket: self.invite.ticket.as_deref(),
                             notice: self.share_notice.as_deref(),
                         },
                         link.as_deref(),

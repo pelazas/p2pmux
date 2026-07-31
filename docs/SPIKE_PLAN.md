@@ -11,7 +11,10 @@ Derived from the locked MVP design. Prove hard parts in order; pretty mux last.
 - Network: **Iroh 1.x** (direct QUIC + public relays for dogfood)
 - Protocol: **prost**, versioned length-delimited envelopes
 - Invite: **reusable Iroh/session ticket** for the live session
-- Short human invite codes: only later if still wanted (tiny HTTPS map)
+- Short human invite codes: **done** — a Cloudflare Worker + KV blind store at
+  `rv.p2pmux.com`. The client derives an index and a sealing key from the code and sends only
+  the index, so the service holds an opaque handle and a sealed blob. UX, not capability: iroh
+  already provides relays and discovery, and `join <ticket>` never contacts it.
 
 ## Spikes
 
@@ -96,6 +99,12 @@ random bytes; v1/v2 still parse and are flagged `secret_is_public()`. The coordi
 admitted roster, which is what the session lock is built on. C is the remainder: bandwidth and
 input-latency behaviour under a relay, and ticket staleness across a network switch.
 
+**Update (2026-07-30).** `scripts/e2e/scenario_p_short_code.py` joins a Mac-hosted session
+from the droplet with nothing but a ten-character code resolved through the deployed
+rendezvous, and lands on `relayed 100ms`. So a relayed cross-machine session is now
+reproducible on demand, which is the fixture Phase C's bandwidth and input-latency
+measurements need — those numbers still have to be taken and written down.
+
 ### Two-Mac checklist (hands-on, ~10 minutes)
 
 Everything below is already automated against the droplet; this is the part only a human can do.
@@ -118,9 +127,24 @@ Minimal reconnect lands early, in Spike 4, so internet tests are not read as fai
 
 ### Spike 6 — Brew formula
 
-Last. Source-build tap is enough for dogfood.
+**Done (2026-07-30).** `brew install pelazas/tap/p2pmux`, plus
+`curl -fsSL https://p2pmux.com/install.sh | sh` for anyone without Homebrew.
+
+Binaries rather than a source build. A source tap needs a Rust toolchain and minutes of
+compiling for an iroh + ratatui binary, which the pre-launch gate — a clean Mac from zero to
+joined in under five minutes — cannot afford. `.github/workflows/release.yml` builds both macOS
+architectures on a tag, ad-hoc signs them (arm64 refuses unsigned binaries at exec, and CI
+artifacts do not get the signature a local `cargo build` applies for free), and publishes each
+archive with its SHA256 beside it.
+
+Both install paths fetch from GitHub Releases, never from `p2pmux.com`: a domain compromise must
+be able to break an install without being able to ship a different binary.
 
 ## Non-goals during spikes
 
-Drag/resize, >8 peers, mosh prediction, custom relay deploy, sandbox/ACL tiers. Short local codes
-are only dogfooding convenience; portable ticket distribution is validated in Spike 4.
+Drag/resize, >8 peers, mosh prediction, custom relay deploy, sandbox/ACL tiers.
+
+Two things once listed here have since shipped: the local short code is gone (it never resolved
+off the machine that minted it), and short codes that do work anywhere are served by the blind
+store described in the stack section above. Neither changes authorization — a code resolves to
+the same ticket, and the ticket is still the credential.

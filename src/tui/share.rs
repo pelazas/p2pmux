@@ -1,27 +1,23 @@
-//! What the share modal offers: the local ticket for a join code, and the
-//! outcome of a copy.
+//! What the share modal offers, and the outcome of a copy.
 
 use crate::tui::{ShareCopy, copy_selection_to_clipboard};
 
-/// Read the full ticket the local rendezvous record holds for a join code.
-///
-/// Only a coordinator publishes a record, so a guest resolves nothing and the share modal
-/// says so rather than offering an invite it cannot make.
-pub(crate) fn resolve_local_ticket(join_code: &str) -> Option<String> {
-    crate::rendezvous::LocalRendezvous::for_current_user()
-        .and_then(|store| store.resolve(join_code))
-        .ok()
-        .map(|ticket| ticket.to_string())
-}
 /// Run one share-modal copy and report the result back into the modal.
+///
+/// A code request with no code falls back to the ticket rather than reporting nothing: the
+/// primary key should always yield a working invite, and the ticket is the one that never
+/// depends on the rendezvous service being up.
 pub(crate) fn share_copy_result(
     request: ShareCopy,
     ticket: Option<&str>,
-    join_code: Option<&str>,
+    code: Option<&str>,
 ) -> String {
     let (what, text) = match request {
+        ShareCopy::Code => match code {
+            Some(code) => ("code", Some(code)),
+            None => ("ticket", ticket),
+        },
         ShareCopy::Ticket => ("ticket", ticket),
-        ShareCopy::Code => ("code", join_code),
     };
     let Some(text) = text else {
         return format!("no {what} to copy");
@@ -29,5 +25,22 @@ pub(crate) fn share_copy_result(
     match copy_selection_to_clipboard(text) {
         Ok(_) => format!("✓ copied {what}"),
         Err(error) => format!("clipboard copy failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_code_copy_with_no_code_falls_back_to_the_ticket() {
+        assert_eq!(
+            share_copy_result(ShareCopy::Code, Some("p2pmux-v3:T"), None),
+            share_copy_result(ShareCopy::Ticket, Some("p2pmux-v3:T"), None),
+        );
+        assert_eq!(
+            share_copy_result(ShareCopy::Code, None, None),
+            "no ticket to copy"
+        );
     }
 }

@@ -1,14 +1,7 @@
-use std::{
-    fs,
-    net::SocketAddr,
-    str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{net::SocketAddr, str::FromStr};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, SecretKey};
-use p2pmux::rendezvous::{LocalRendezvous, RendezvousError, SHORT_CODE_LEN};
 use p2pmux::ticket::{
     JoinTicket, MAX_TICKET_PAYLOAD_BYTES, TICKET_PREFIX, TICKET_PREFIX_V2, TICKET_PREFIX_V3,
     TicketError,
@@ -174,105 +167,4 @@ fn parser_rejects_invalid_ticket_classes_without_echoing_input() {
             assert!(!error.to_string().contains(input));
         }
     }
-}
-
-#[test]
-fn local_rendezvous_codes_are_short_reusable_and_resolve_the_ticket() {
-    let directory = temporary_directory();
-    let store = LocalRendezvous::at(directory.clone());
-    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
-
-    let entry = store.publish(&ticket).expect("ticket should publish");
-    assert_eq!(entry.code().len(), SHORT_CODE_LEN);
-    assert!(entry.code().chars().all(|character| {
-        matches!(character, '2'..='9' | 'A'..='H' | 'J'..='K' | 'M'..='N' | 'P'..='Z')
-    }));
-    assert_eq!(
-        store.resolve(entry.code()).expect("code should resolve"),
-        ticket
-    );
-    assert_eq!(
-        store
-            .resolve(entry.code())
-            .expect("code should be reusable"),
-        ticket
-    );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        assert_eq!(
-            fs::metadata(entry.path())
-                .expect("entry metadata")
-                .permissions()
-                .mode()
-                & 0o077,
-            0
-        );
-    }
-
-    entry.remove().expect("entry should remove");
-    fs::remove_dir_all(directory).expect("temporary directory should remove");
-}
-
-#[test]
-fn local_rendezvous_rejects_unknown_codes_without_echoing_them() {
-    let directory = temporary_directory();
-    fs::create_dir_all(&directory).expect("temporary directory should create");
-    let store = LocalRendezvous::at(directory.clone());
-    let code = "ABCDEFGHJK";
-
-    let error = store.resolve(code).expect_err("unknown code should fail");
-    assert!(matches!(error, RendezvousError::NotFound));
-    assert!(!error.to_string().contains(code));
-
-    fs::remove_dir_all(directory).expect("temporary directory should remove");
-}
-
-#[test]
-fn local_rendezvous_lists_published_codes_and_ignores_other_files() {
-    let directory = temporary_directory();
-    let store = LocalRendezvous::at(directory.clone());
-    let ticket = JoinTicket::mint(endpoint_addr()).expect("ticket should mint");
-
-    let first = store.publish(&ticket).expect("first ticket should publish");
-    let second = store
-        .publish(&ticket)
-        .expect("second ticket should publish");
-    fs::write(directory.join("not-a-code"), b"ignored").expect("stray file should write");
-
-    let mut expected = vec![first.code().to_owned(), second.code().to_owned()];
-    expected.sort();
-    assert_eq!(store.codes().expect("codes should list"), expected);
-
-    drop(first);
-    drop(second);
-    fs::remove_dir_all(directory).expect("temporary directory should remove");
-}
-
-#[test]
-fn local_rendezvous_lists_no_codes_before_any_session_exists() {
-    let store = LocalRendezvous::at(temporary_directory());
-
-    assert!(
-        store
-            .codes()
-            .expect("a missing directory should not be an error")
-            .is_empty()
-    );
-}
-
-static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-fn temporary_directory() -> std::path::PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "p2pmux-rendezvous-test-{}-{nonce}-{sequence}",
-        std::process::id()
-    ))
 }

@@ -141,8 +141,10 @@ pub enum ShareCopy {
 }
 /// The host-only invite material the share modal renders.
 ///
-/// The ticket is resolved by the attaching process, so a guest — who has no rendezvous record
-/// to resolve — simply arrives here with both fields empty and gets told so.
+/// Only the coordinator's node holds a ticket, so a guest arrives here with empty fields and
+/// gets told so rather than being offered an invite it cannot make. `code` is additionally
+/// absent when the rendezvous service could not be reached, which is why the two are separate
+/// options rather than one: a session with no code still has a working invite.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShareView<'a> {
     pub code: Option<&'a str>,
@@ -150,6 +152,16 @@ pub struct ShareView<'a> {
     /// The result of the last copy, shown in the modal rather than the footer.
     pub notice: Option<&'a str>,
 }
+/// What a coordinator can hand out, owned by the runtime.
+///
+/// The two travel together everywhere and are absent together on a member, so they are one
+/// value rather than a pair of options threaded through every constructor.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::tui) struct Invite {
+    pub ticket: Option<String>,
+    pub code: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::tui) enum ModalState {
     #[default]

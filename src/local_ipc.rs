@@ -103,8 +103,14 @@ pub enum NodeMessage {
         local_peer_id: Vec<u8>,
         tab_id: u64,
         pane_id: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        join_code: Option<String>,
+        /// The coordinator's printable join ticket. Members receive `None` and the share
+        /// modal says so rather than offering an invite the client cannot make.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ticket: Option<String>,
+        /// The short code the ticket was published under, when the rendezvous accepted it.
+        /// `None` on a member, and also on a coordinator that could not reach the service.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     Screens {
         screens: Vec<PaneScreenSnapshot>,
@@ -384,8 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_join_code_serde_is_optional_and_backwards_compatible() {
-        let snapshot = |join_code| NodeMessage::Snapshot {
+    fn snapshot_ticket_serde_is_optional_and_backwards_compatible() {
+        let snapshot = |ticket: Option<String>| NodeMessage::Snapshot {
             room_name: "test".into(),
             role: "coordinator".into(),
             summary: SessionSummary::default(),
@@ -402,19 +408,20 @@ mod tests {
             local_peer_id: vec![],
             tab_id: 1,
             pane_id: 1,
-            join_code,
+            code: ticket.as_ref().map(|_| "4KP7Q-M2XRW".to_owned()),
+            ticket,
         };
 
-        let with_join_code = serde_json::to_value(snapshot(Some("TESTCODE".into()))).unwrap();
-        assert_eq!(with_join_code["join_code"], "TESTCODE");
+        let with_ticket = serde_json::to_value(snapshot(Some("p2pmux-v3:TEST".into()))).unwrap();
+        assert_eq!(with_ticket["ticket"], "p2pmux-v3:TEST");
 
-        let without_join_code = serde_json::to_value(snapshot(None)).unwrap();
-        assert!(without_join_code.get("join_code").is_none());
+        let without_ticket = serde_json::to_value(snapshot(None)).unwrap();
+        assert!(without_ticket.get("ticket").is_none());
 
-        let parsed: NodeMessage = serde_json::from_value(without_join_code).unwrap();
-        let NodeMessage::Snapshot { join_code, .. } = parsed else {
+        let parsed: NodeMessage = serde_json::from_value(without_ticket).unwrap();
+        let NodeMessage::Snapshot { ticket, .. } = parsed else {
             panic!("expected snapshot");
         };
-        assert_eq!(join_code, None);
+        assert_eq!(ticket, None);
     }
 }

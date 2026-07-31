@@ -1,0 +1,117 @@
+name: Release
+
+# Tag-driven so the artifacts and the tag can never disagree: whatever `v*` points at is what
+# gets built, hashed and published.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both macOS architectures ship from day one. Linux is one more entry here plus a
+        # `runs-on` change when it is wanted; nothing else about this workflow assumes macOS.
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Sign
+        # arm64 refuses to exec an unsigned binary. A local `cargo build` gets an ad-hoc
+        # signature for free; a CI-built artifact does not, so it has to be applied here or the
+        # download fails at run time on exactly the machines most people have.
+        run: |
+          codesign -s - --force --timestamp=none \
+            target/${{ matrix.target }}/release/p2pmux
+          codesign -v target/${{ matrix.target }}/release/p2pmux
+
+      - name: Package
+        # tar rather than zip on purpose: an archive downloaded by a browser carries the
+        # Gatekeeper quarantine flag, and `curl | tar` does not.
+        run: |
+          set -euo pipefail
+          asset="p2pmux-${{ matrix.target }}.tar.gz"
+          tar -czf "$asset" -C "target/${{ matrix.target }}/release" p2pmux
+          shasum -a 256 "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            p2pmux-${{ matrix.target }}.tar.gz
+            p2pmux-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Verify every archive against its published hash
+        # The hash is what `install.sh` trusts, so a mismatch here has to stop the release
+        # rather than publish a checksum nobody validated.
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -l
+          for sum in *.sha256; do
+            sha256sum -c "$sum"
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```sh
+            curl -fsSL https://p2pmux.com/install.sh | sh
+            ```
+
+            or
+
+            ```sh
+            brew install pelazas/tap/p2pmux
+            ```
+
+            Prefer to build it yourself:
+
+            ```sh
+            cargo install --git https://github.com/pelazas/p2pmux --locked
+            ```
+
+            Every archive is published with its SHA256 beside it, and `install.sh` checks it
+            before installing anything.
+
+            **A p2pmux session is a trusted shared shell.** Whoever holds a join code can run
+            commands as your macOS user. https://p2pmux.com/trust

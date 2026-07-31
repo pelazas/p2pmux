@@ -69,7 +69,8 @@ Guest render + control/input when controller
 ### Local detach / resume
 
 A live session has one headless node process and at most one local TUI client. The same binary
-starts the private node entrypoint; it owns PTYs, Iroh, rendezvous, and in-memory layout/focus.
+starts the private node entrypoint; it owns PTYs, Iroh, the join ticket, and in-memory
+layout/focus.
 The client connects through a Unix socket and Ctrl+Q detaches, releasing local control leases
 without stopping the node. `--resume` shows live sessions and `attach <name>` reconnects.
 `kill <name>` is graceful (and warns before coordinator shutdown).

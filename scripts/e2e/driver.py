@@ -18,9 +18,9 @@ harness kills the nodes it can trace back to its own peers -- by the `node_pid` 
 one recorded in this run's scratch session store, and by the parent link captured
 before the peers die.
 
-Isolation: p2pmux resolves its session store, config file and join-code rendezvous
-directory from $HOME. Each Harness gets a private scratch HOME, so a run can never
-see, disturb, or kill the developer's real p2pmux sessions -- including one started
+Isolation: p2pmux resolves its session store and config file from $HOME. Each Harness
+gets a private scratch HOME, so a run can never see, disturb, or kill the developer's
+real p2pmux sessions -- including one started
 *during* the run, which "anything that is not in the starting pid snapshot" would
 have swept up.
 """
@@ -564,22 +564,36 @@ class Harness:
         rows: int = DEFAULT_ROWS,
         timeout: float = 25.0,
     ) -> tuple[Peer, str]:
-        """Start a host peer and return it with its live join code."""
+        """Start a host peer and return it with its join ticket.
+
+        The ticket is read off the session record rather than the screen: invite material
+        lives behind Ctrl+S now, and a ~200-character ticket would never have fitted in a
+        footer anyway.
+        """
         host = self.spawn(name, ["create", "--name", name], cols=cols, rows=rows)
         host.wait_ready(timeout=timeout)
-        screen = host.wait_for(r"p2pmux join [A-Za-z0-9]{6,}", timeout=timeout)
-        return host, join_code_from(screen)
+        return host, self.wait_for_ticket(name, timeout=timeout)
+
+    def wait_for_ticket(self, name: str, timeout: float = 25.0) -> str:
+        """The ticket the coordinator's node published for `name`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for descriptor in self.session_descriptors():
+                if descriptor.get("name") == name and descriptor.get("ticket"):
+                    return descriptor["ticket"]
+            time.sleep(0.1)
+        raise AssertionError(f"no ticket appeared for session {name!r} within {timeout}s")
 
     def join_room(
         self,
         name: str,
-        code: str,
+        ticket: str,
         cols: int = DEFAULT_COLS,
         rows: int = DEFAULT_ROWS,
         timeout: float = 30.0,
     ) -> Peer:
         """Join an existing room and wait until the shared layout has rendered."""
-        guest = self.spawn(name, ["join", code, "--name", name], cols=cols, rows=rows)
+        guest = self.spawn(name, ["join", ticket, "--name", name], cols=cols, rows=rows)
         guest.wait_ready(timeout=timeout)
         guest.wait_for(r"Pane #\d+", timeout=timeout)
         return guest
@@ -714,14 +728,6 @@ class Harness:
         if not self.keep_home:
             shutil.rmtree(self.home, ignore_errors=True)
         return False  # never swallow scenario exceptions
-
-
-def join_code_from(screen: str) -> str:
-    """Pull the 10-character join code out of a host's `p2pmux create` output."""
-    match = re.search(r"p2pmux join ([A-Za-z0-9]{6,})", screen)
-    if not match:
-        raise AssertionError(f"no join code on screen:\n{screen}")
-    return match.group(1)
 
 
 # `direct 55ms`, `relayed 120ms ×3`, `locked · direct <1ms` -- the connectivity badge

@@ -135,6 +135,14 @@ pub struct SessionDescriptor {
     pub node_pid: u32,
     pub role: SessionRole,
     pub created_at: u64,
+    /// The coordinator's printable join ticket, so `p2pmux ticket <name>` can read it back
+    /// out of process. Members never mint one, and the record is deleted with the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// The short code the ticket was published under, when the rendezvous accepted it.
+    /// Absent on a member, and on a coordinator that could not reach the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_code: Option<String>,
 }
 
 impl SessionDescriptor {
@@ -153,6 +161,8 @@ impl SessionDescriptor {
             node_pid,
             role,
             created_at: now_secs(),
+            ticket: None,
+            join_code: None,
         }
     }
 

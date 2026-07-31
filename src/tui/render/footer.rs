@@ -136,13 +136,23 @@ pub(in crate::tui) const AGENT_OVERLAY_HELP: &[FooterSegment] = &[
     FooterSegment::Text("> FOCUS"),
 ];
 /// Enter takes the ticket: it is the only identifier that reaches another machine, so it is
-/// what the primary key copies.
+/// Enter takes the code: it is what a person can actually relay over a call, and it resolves
+/// to the ticket anywhere. The ticket stays one key away for a peer who cannot reach the
+/// rendezvous service, or who would rather not depend on it.
 pub(in crate::tui) const SHARE_HELP: &[FooterSegment] = &[
     FooterSegment::Text("<"),
     FooterSegment::Key("Enter"),
-    FooterSegment::Text("> COPY TICKET   <"),
-    FooterSegment::Key("c"),
     FooterSegment::Text("> COPY CODE   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> COPY TICKET   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> CLOSE"),
+];
+/// When the rendezvous was unreachable there is no code to offer, so Enter falls back.
+pub(in crate::tui) const SHARE_HELP_NO_CODE: &[FooterSegment] = &[
+    FooterSegment::Text("<"),
+    FooterSegment::Key("Enter"),
+    FooterSegment::Text("> COPY TICKET   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> CLOSE"),
 ];

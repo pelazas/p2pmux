@@ -46,8 +46,8 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             print(f"    {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
     with Harness(f"d-load-{index}") as harness:
-        host, code = harness.create_room("host")
-        guest = harness.join_room("guest", code)
+        host, ticket = harness.create_room("host")
+        guest = harness.join_room("guest", ticket)
         time.sleep(1.0)
 
         rss_before = rss_kb(host.pid) + rss_kb(guest.pid)
