@@ -30,7 +30,7 @@ To dogfood the shared layout on one Mac:
 
 ```text
 Terminal 1: cargo run -- create
-Terminal 2: cargo run -- join <the code or ticket from Ctrl+S>
+Terminal 2: cargo run -- join <the code from Ctrl+S>
 ```
 
 `cargo run -- local` starts one local shell with no session at all. Press Ctrl+Q to leave p2pmux.
@@ -39,30 +39,39 @@ and smaller windows crop the upper-left fixed viewport.
 
 ## Inviting someone
 
-`Ctrl+S` opens the share panel. It shows two things, and `join` takes either:
+`Ctrl+S` shows the line your guest runs. Enter copies it; send it as-is:
 
 ```text
-p2pmux join 4KP7Q-M2XRW      # the code: short, expires in 6 hours
-p2pmux join p2pmux-v3:...    # the ticket: long, never expires, needs no service
+p2pmux join 4KP7Q-M2XRW
 ```
 
-Both are also available from a shell, printed to stdout alone so `p2pmux code | pbcopy` gives you
+That is the whole invite. Ten characters, good for 6 hours, and it resolves from any machine on
+any network — your guest needs nothing else, and nothing about your setup.
+
+Treat it like a password: it grants full shared-shell access to the session, to anyone who runs
+it, for as long as the session lives. Only a coordinator can invite; a guest is told so.
+
+It is also available from a shell, printed to stdout alone so `p2pmux code | pbcopy` gives you
 something directly pasteable:
 
 ```text
 p2pmux code              # the one session hosted on this Mac
-p2pmux ticket <name>     # when several are; the name is the one p2pmux ls shows
+p2pmux code <name>       # when several are; the name is the one p2pmux ls shows
 ```
 
-Treat either as a password. Both grant full shared-shell access to the session, to anyone holding
-them, for as long as the session lives. Only a coordinator holds them; a guest is told so.
+### The ticket behind the code
 
-The code is the ticket, stored where a peer can fetch it. Your machine derives two independent
-values from the code: an index to store the record at, and a key to seal it with. Only the index
-reaches `rv.p2pmux.com`, so the service holds an opaque handle and a sealed blob and has nothing
-that would let it join. Terminal traffic never goes near it — that is peer to peer, or over an
-iroh relay when NAT requires it. If the service is unreachable when a session starts, the panel
-says so and the ticket still works; `p2pmux join <ticket>` never contacts it at all.
+The code is not a second credential. It *is* a ticket, stored where your guest can fetch it. Your
+machine derives two independent values from the code: an index to store the record at, and a key
+to seal it with. Only the index reaches `rv.p2pmux.com`, so the service holds an opaque handle and
+a sealed blob and has nothing that would let it join. Terminal traffic never goes near it — that
+is peer to peer, or over an iroh relay when NAT requires it.
+
+You deal with the ticket directly in one case: the rendezvous being unreachable when your session
+starts, which leaves no code to mint. The share panel says so and offers the ticket instead — some
+170 characters, never expires, contacts no service at all. `t` copies it, `p2pmux ticket <name>`
+prints it, and `p2pmux join <ticket>` works the same way from the other end. That fallback is why
+an outage in a service we run cannot stop you sharing a session.
 
 Tickets are emitted as `p2pmux-v3:`, which carries 32 independent random bytes as the join
 credential. `join` still parses `p2pmux-v1:` and `p2pmux-v2:` tickets, in which the credential

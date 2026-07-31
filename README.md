@@ -43,11 +43,13 @@ are true at once, and [the trust model](#trust) says exactly what that means.
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
 
-p2pmux create        # then Ctrl+S for the join code
-p2pmux join 4KP7Q-M2XRW
+p2pmux create                # you host; Ctrl+S shows the line to send
+p2pmux join 4KP7Q-M2XRW      # them, on their own Mac
 ```
 
-Your teammate types that code on their own Mac, on their own network, and lands in your grid.
+`Ctrl+S` gives you that second line, ready to paste into a chat window. Your teammate runs it on
+their own Mac, on their own network, and lands in your grid. Ten characters, nothing else to set
+up on either side.
 
 ## Why it exists
 
@@ -73,7 +75,8 @@ not an agent orchestration platform.
 - Presence — a color per member, showing who is on which tab and watching which pane.
 - End-to-end encrypted peer-to-peer streaming, over an iroh relay when NAT requires it. The tab bar
   says which you got: `direct 55ms` or `relayed 120ms`.
-- One ten-character join code that expires in 6 hours, or a ticket that contacts no service at all.
+- One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
+  that contacts no service at all, for when our rendezvous is down.
 - An agents overlay (`Ctrl+A`) tracking Claude Code, Codex, Cursor, Pi and OpenCode across every
   machine in the session — including which ones are blocked waiting on a human.
 
