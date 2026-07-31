@@ -8,15 +8,20 @@ A terminal multiplexer for two or more people, where **every pane runs on the ma
 opened it**. Two developers, two AI subscriptions, one terminal — and neither holds the other's
 keys.
 
+<p align="center">
+  <img src="docs/assets/demo.gif" width="820"
+       alt="userB joins with a code, opens a pane on their own machine, then types into a pane hosted by userA">
+</p>
+
+<p align="center">
+  <em>userB joins with the ten-character code, opens a pane of their own, then takes control of
+  userA's pane and runs a command in it. Both windows are real clients; the pane titles say who
+  hosts what.</em>
+</p>
+
 **A shared control surface, not a shared computer.** Your processes and credential files never
 leave your Mac. But whoever holds a pane has a real shell on the machine hosting it — both halves
 are true at once, and [the trust model](#trust) says exactly what that means.
-
-![userB joins with a code, opens a pane on their own machine, then types into a pane hosted by userA](docs/assets/demo.gif)
-
-*userB joins with the ten-character code, opens a pane of their own, then takes control of
-userA's pane and runs a command in it. Both windows are real clients; the pane titles say who
-hosts what.*
 
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
