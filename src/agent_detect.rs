@@ -186,7 +186,7 @@ pub trait ProcessSampler {
     fn snapshot(&mut self) -> Vec<ProcessSnapshot>;
 }
 
-/// `sysinfo`-backed process sampler used by the macOS host runtime.
+/// `sysinfo`-backed process sampler used by the host runtime.
 pub struct SysinfoSampler {
     system: System,
 }
