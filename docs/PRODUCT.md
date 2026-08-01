@@ -1,7 +1,8 @@
 # Product brief
 
 Source: Notion — *peer-to-peer multiplayer terminal multiplexer*  
-Name: **to decide**
+Name: **p2pmux** — settled by shipping. v0.1.0, p2pmux.com, the Homebrew tap and the binary
+all carry it, so the open item in [docs/LAUNCH_KIT.md](./LAUNCH_KIT.md) §8 is closed.
 
 > **Scope note (2026-07-29).** This brief describes the mux accurately and stays normative for
 > what the binary does. It is *not* the company sequencing. As of 2026-07-29 the mux is substrate

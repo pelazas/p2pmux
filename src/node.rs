@@ -104,6 +104,25 @@ pub fn read_bootstrap(path: &std::path::Path) -> io::Result<NodeBootstrap> {
     Ok(bootstrap)
 }
 
+/// Say what a failed join means, rather than which library reported it.
+///
+/// This message is what someone sees after pasting an invite that does not work, so it
+/// has to name the likely causes rather than the transport. Only a failure to *reach*
+/// the coordinator is reworded: a session that answered and then refused -- full,
+/// locked, a bad ticket -- already says so, and burying that under "could not reach"
+/// would be a worse message, not a better one.
+fn describe_join_failure(error: crate::session::SessionError) -> Box<dyn Error> {
+    use crate::session::SessionError;
+    match error {
+        SessionError::Transport(_) | SessionError::TimedOut(_) => io::Error::other(
+            "could not reach the session host: they may be offline or on a different network, \
+             or the invite may be out of date. Ask for a fresh join code.",
+        )
+        .into(),
+        other => Box::<dyn Error>::from(other.to_string()),
+    }
+}
+
 /// Private child entrypoint. It owns the descriptor, socket and every PTY.
 pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Error>> {
     let mut descriptor = bootstrap.descriptor.clone();
@@ -179,8 +198,9 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                 .parse::<JoinTicket>()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ticket"))?;
             let transport = Transport::bind().await?;
-            let mut member =
-                join_layout_with_display_name(transport, ticket.clone(), display_name).await?;
+            let mut member = join_layout_with_display_name(transport, ticket.clone(), display_name)
+                .await
+                .map_err(describe_join_failure)?;
             let state = match member.events.recv().await {
                 Some(LayoutControlEvent::Snapshot(snapshot)) => {
                     snapshot.state.ok_or("missing layout snapshot")?
