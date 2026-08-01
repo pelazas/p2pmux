@@ -23,6 +23,7 @@ from driver import (  # noqa: E402
     DeadlineExceeded,
     Harness,
     p2pmux_pids,
+    orphans_after,
     rss_kb,
 )
 
@@ -103,7 +104,7 @@ def smoke_create_and_cleanup() -> None:
         check("background node was forked", len(spawned) >= 2, f"{len(spawned)} new pids")
 
     time.sleep(0.5)
-    leaked = p2pmux_pids() - baseline
+    leaked = orphans_after(baseline)
     check("teardown leaves no orphans", not leaked, f"leaked={sorted(leaked)}")
 
 
@@ -119,7 +120,7 @@ def smoke_raises_still_cleans() -> None:
     except RuntimeError:
         pass
     time.sleep(0.5)
-    leaked = p2pmux_pids() - baseline
+    leaked = orphans_after(baseline)
     check("cleanup runs on exception", not leaked, f"leaked={sorted(leaked)}")
 
 
