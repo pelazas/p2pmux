@@ -101,6 +101,7 @@ impl SharedControl {
         &mut self,
         current_revision: u64,
         seen_presence_epoch: &mut u64,
+        seen_agent_generations: &mut BTreeMap<Vec<u8>, u64>,
     ) -> Option<LayoutControlEvent> {
         match self {
             // The coordinator is the authority, so it does not receive its own broadcasts. Poll
@@ -113,6 +114,21 @@ impl SharedControl {
                 if let Some((epoch, roster)) = host.presence_if_newer(*seen_presence_epoch) {
                     *seen_presence_epoch = epoch;
                     return Some(LayoutControlEvent::Presence(roster));
+                }
+                // Same reason as presence: an accepted roster is broadcast to the peers,
+                // and the coordinator is not one of them, so a member's agents would never
+                // reach the coordinator's own overlay. Rosters already carry a per-host
+                // generation, so that is the counter rather than a second epoch. One per
+                // call is enough — the caller drains this in a loop.
+                if let Some(roster) = host.agent_rosters().ok().and_then(|rosters| {
+                    rosters.into_iter().find(|roster| {
+                        seen_agent_generations
+                            .get(&roster.host_peer_id)
+                            .is_none_or(|seen| roster.generation > *seen)
+                    })
+                }) {
+                    seen_agent_generations.insert(roster.host_peer_id.clone(), roster.generation);
+                    return Some(LayoutControlEvent::AgentRoster(roster));
                 }
                 host.session_snapshot()
                     .ok()
