@@ -12,7 +12,7 @@ live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
 for confirmation; use `--yes` for non-interactive scripts.
 
-`p2pmux ls` prints the live sessions on this Mac — the names every one of those commands takes:
+`p2pmux ls` prints the live sessions on this machine — the names every one of those commands takes:
 
 ```text
 NAME       ROLE         CODE         UP

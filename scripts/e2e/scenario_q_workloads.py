@@ -8,7 +8,7 @@ alternate screen *and* takes input that changes the buffer, and top repaints on 
 timer whether anyone is typing or not.
 
 The interesting claim is not "vim renders". It is that a guest can drive an editor
-running on someone else's Mac and both peers keep the same screen while it happens.
+running on someone else's machine and both peers keep the same screen while it happens.
 
 The control lease is load-bearing here. Whoever typed last holds the pane for 30s
 (`src/lease.rs` IDLE_AFTER), so the peer that starts a program and the peer that drives
@@ -80,9 +80,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         guest.send(TYPED.encode())
         try:
             host.wait_for(TYPED, timeout=20)
-            check("guest's insert-mode text reached vim on the host's Mac", True)
+            check("guest's insert-mode text reached vim on the host's machine", True)
         except Exception as error:
-            check("guest's insert-mode text reached vim on the host's Mac", False, str(error)[:200])
+            check("guest's insert-mode text reached vim on the host's machine", False, str(error)[:200])
         try:
             guest.wait_for(TYPED, timeout=20)
             check("the guest sees what it typed", True)
