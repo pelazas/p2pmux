@@ -7,7 +7,9 @@ ran, what two machines were involved, and what happened instead.
 
 Open an issue with:
 
-- Your macOS version and `p2pmux --version` on **both** machines.
+- The operating system and version, and `p2pmux --version`, on **both** machines. Say which one
+  hosted the pane that misbehaved — a Mac and a Linux box in one session are not interchangeable
+  when something goes wrong.
 - Whether the tab bar said `direct` or `relayed`.
 - The exact keys or command that led to it, and what you expected.
 
@@ -16,7 +18,7 @@ Say so in the issue — intermittent is still a data point.
 
 ## Setting up
 
-Rust stable, macOS. There is no other toolchain.
+Rust stable, on macOS or Linux. There is no other toolchain.
 
 ```sh
 git clone https://github.com/pelazas/p2pmux
@@ -30,8 +32,8 @@ the join code, and `cargo run -- join <code>` in the second to exercise both sid
 
 ## Before you open a PR
 
-CI runs these four on `macos-latest`, and a PR that fails any of them will not be looked at until
-it passes:
+CI runs these four on `macos-latest` **and** `ubuntu-latest`, and a PR that fails any of them on
+either will not be looked at until it passes:
 
 ```sh
 cargo fmt --all -- --check

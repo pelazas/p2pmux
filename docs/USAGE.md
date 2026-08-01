@@ -15,18 +15,20 @@ for confirmation; use `--yes` for non-interactive scripts.
 Every `create` automatically receives a memorable world-city session name such as `tokyo` or
 `cape-town`; no session name is required. `create --session-name <name>` remains available when
 you want to choose a name explicitly. A joining peer uses the coordinator's session name for its
-local chrome and finder record when that name is free locally; on the same Mac it adds `-2`, `-3`,
+local chrome and finder record when that name is free locally; on one machine it adds `-2`, `-3`,
 and so on to avoid a collision. Automatically chosen create names avoid live local session names
 the same way.
 
 There is one local client per session: a second attach is refused rather than taking over. The
-finder descriptor is the only durable session data, under `~/Library/Application Support/p2pmux/`;
-the Unix socket is under `/tmp/p2pmux-$UID/`. Screens, PTYs, tickets, layout state, and focus are
-never restored from disk. The node survives terminal closure but is not managed by launchd. Local
-IPC is intentionally versioned as an implementation detail, so restart an existing session after
-upgrading when attach protocol changes are present.
+finder descriptor is the only durable session data, under `~/Library/Application Support/p2pmux/`
+on macOS and `$XDG_STATE_HOME/p2pmux/` — `~/.local/state/p2pmux/` unless you set it — on Linux.
+The Unix socket is under `$XDG_RUNTIME_DIR/p2pmux/` where Linux provides one, and `/tmp/p2pmux-$UID/`
+otherwise, which is also where macOS keeps it. Screens, PTYs, tickets, layout state, and focus are
+never restored from disk. The node survives terminal closure but is managed by neither launchd nor
+systemd. Local IPC is intentionally versioned as an implementation detail, so restart an existing
+session after upgrading when attach protocol changes are present.
 
-To dogfood the shared layout on one Mac:
+To dogfood the shared layout on one machine:
 
 ```text
 Terminal 1: cargo run -- create
@@ -51,11 +53,11 @@ any network — your guest needs nothing else, and nothing about your setup.
 Treat it like a password: it grants full shared-shell access to the session, to anyone who runs
 it, for as long as the session lives. Only a coordinator can invite; a guest is told so.
 
-It is also available from a shell, printed to stdout alone so `p2pmux code | pbcopy` gives you
-something directly pasteable:
+It is also available from a shell, printed to stdout alone so `p2pmux code | pbcopy` — or
+`| wl-copy`, or `| xclip -selection clipboard` — gives you something directly pasteable:
 
 ```text
-p2pmux code              # the one session hosted on this Mac
+p2pmux code              # the one session hosted on this machine
 p2pmux code <name>       # when several are; the name is the one p2pmux ls shows
 ```
 
@@ -96,13 +98,13 @@ to leave the mode and send that key to the focused PTY.
 - `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
   tab. Some terminals need Shift with Option for horizontal arrows.
 - `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new PTY
-  runs on the requester's Mac and inherits the target pane's cwd when that pane is hosted locally
-  by the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
+  runs on the requester's machine and inherits the target pane's cwd when that pane is hosted
+  locally by the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
 - `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
   focused pane. Its local PTY inherits the target pane's cwd under the same conditions.
 - `Ctrl+P`, then `X` — delete the focused pane. Only that pane's host may delete it.
 - `Ctrl+P`, then `i` — copy this session's full join ticket to the clipboard, for inviting someone
-  on another Mac. Coordinator only.
+  on another machine. Coordinator only.
 - `Ctrl+P`, then `k` — lock the focused pane. A locked pane accepts input only from its own host,
   and its header reads `locked by <name>` for everyone else.
 - `Ctrl+P`, then `Shift+L` — lock the whole session. The coordinator then refuses any peer that
@@ -112,7 +114,7 @@ to leave the mode and send that key to the focused PTY.
 - `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
   cancels; a blank title restores `Pane #N`.
 - `Ctrl+P`, then arrows — move focus.
-- `Ctrl+T`, then `N` — create a tab with a local PTY on the requester's Mac.
+- `Ctrl+T`, then `N` — create a tab with a local PTY on the requester's machine.
 - `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
 - `Ctrl+T`, then `e` — rename the current tab for every admitted member. Enter saves; Esc cancels;
   a blank title restores `Tab #N`.
@@ -163,8 +165,11 @@ Clicking a pane focuses it locally without taking control or sending input. When
 inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disabled or a locked
 passthrough configuration.
 
-Drag inside a pane's terminal content to select text; releasing the mouse copies it to the macOS
-clipboard. Drag a shared pane border to resize its split. Corner drags lock to one axis after a
+Drag inside a pane's terminal content to select text; releasing the mouse copies it to the system
+clipboard — `pbcopy` on macOS, and `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed.
+Over `ssh` or in a bare TTY, where none of those exist, p2pmux asks the terminal emulator itself
+via OSC 52; terminals that do not implement it drop the request silently, so a copy can be
+reported that did not land. Drag a shared pane border to resize its split. Corner drags lock to one axis after a
 short motion threshold, preview locally, and commit one shared ratio on release. The affected pane
 hosts then resize their own PTY and VT screen and publish their local grids.
 
@@ -271,8 +276,13 @@ would read as an alert.
 
 Agent-completion notifications live under `[ui.notifications]`. `sound_enabled = false` keeps the
 local unread stars while silencing sound. By default p2pmux plays
-`/System/Library/Sounds/Tink.aiff`; set the optional `sound_path` to any local sound file. These
-settings are client-local and load when the client attaches.
+`/System/Library/Sounds/Tink.aiff` on macOS and
+`/usr/share/sounds/freedesktop/stereo/complete.oga` on Linux; set the optional `sound_path` to any
+local sound file. Playback goes through `afplay` on macOS, and on Linux through the first of
+`pw-play`, `paplay`, `canberra-gtk-play` or `aplay` that is installed. A machine with none of them
+— a server, typically, which also has no sound theme to play — rings the terminal bell instead, so
+the notification still reaches whoever is sitting at the terminal. These settings are client-local
+and load when the client attaches.
 
 An agent counts as finished when it rings the terminal bell, or failing that after `quiet_seconds`
 of silence (default 20, clamped to 5-3600). The bell is by far the better signal — silence cannot

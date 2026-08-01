@@ -6,7 +6,32 @@ use std::{
     thread,
 };
 
+/// The sound an agent's completion plays when the config names none.
+///
+/// macOS ships one with the system. On Linux this is the freedesktop sound
+/// theme's completion chime, which desktop installs have and servers do not —
+/// see [`play_sound`] for what happens when it is absent.
+#[cfg(target_os = "macos")]
 pub const DEFAULT_SOUND_PATH: &str = "/System/Library/Sounds/Tink.aiff";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SOUND_PATH: &str = "/usr/share/sounds/freedesktop/stereo/complete.oga";
+
+/// Command-line players to try in order, and the arguments each needs before
+/// the file name.
+///
+/// macOS has one and it is always installed. Linux has a stack of sound servers
+/// and a machine answers to whichever it happens to be running, so the list is
+/// tried top to bottom: PipeWire, then PulseAudio, then libcanberra, then raw
+/// ALSA. `aplay` is last because it only understands WAV.
+#[cfg(target_os = "macos")]
+const PLAYERS: &[(&str, &[&str])] = &[("afplay", &[])];
+#[cfg(not(target_os = "macos"))]
+const PLAYERS: &[(&str, &[&str])] = &[
+    ("pw-play", &[]),
+    ("paplay", &[]),
+    ("canberra-gtk-play", &["-f"]),
+    ("aplay", &["-q"]),
+];
 
 /// Plays local agent-completion sounds without blocking the terminal UI.
 #[derive(Clone, Debug)]
@@ -44,26 +69,46 @@ impl NotificationSound {
     }
 }
 
+/// Play `path` through the first player on this machine that will take it.
+///
+/// A headless Linux box has no sound theme and often no sound server either, so
+/// every player can legitimately be missing. Falling back to the terminal bell
+/// keeps the notification audible there: the terminal emulator on the human's
+/// own machine is the one thing guaranteed to be present.
 fn play_sound(path: &Path, reported_failures: &Mutex<BTreeSet<PathBuf>>) {
-    let status = Command::new("afplay")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => report_failure(
-            path,
-            reported_failures,
-            &format!("afplay exited with {status}"),
-        ),
-        Err(error) => report_failure(
-            path,
-            reported_failures,
-            &format!("could not run afplay: {error}"),
-        ),
+    let mut last_failure = None;
+    for (program, arguments) in PLAYERS {
+        let status = Command::new(program)
+            .args(*arguments)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(status) if status.success() => return,
+            Ok(status) => last_failure = Some(format!("{program} exited with {status}")),
+            Err(error) => last_failure = Some(format!("could not run {program}: {error}")),
+        }
     }
+    ring_terminal_bell();
+    report_failure(
+        path,
+        reported_failures,
+        &last_failure.unwrap_or_else(|| String::from("no sound player is installed")),
+    );
+}
+
+/// Ask the terminal to make the noise instead.
+///
+/// Written to stderr, not stdout: the TUI renders through stdout and a stray
+/// byte in that stream lands in ratatui's picture of the screen.
+fn ring_terminal_bell() {
+    use std::io::Write as _;
+
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(b"\x07");
+    let _ = stderr.flush();
 }
 
 fn report_failure(path: &Path, reported_failures: &Mutex<BTreeSet<PathBuf>>, message: &str) {

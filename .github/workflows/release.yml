@@ -18,15 +18,23 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.target }}
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Both macOS architectures ship from day one. Linux is one more entry here plus a
-        # `runs-on` change when it is wanted; nothing else about this workflow assumes macOS.
+        # Both architectures of both platforms, each built natively. Linux is pinned to 22.04
+        # rather than `latest` on purpose: a binary links the glibc it was built against or
+        # newer, so building on 24.04 would raise the floor to glibc 2.39 and refuse to start
+        # on Debian 12 and Ubuntu 22.04, which are what a lot of servers still are.
         include:
           - target: aarch64-apple-darwin
+            os: macos-latest
           - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,6 +51,9 @@ jobs:
         # arm64 refuses to exec an unsigned binary. A local `cargo build` gets an ad-hoc
         # signature for free; a CI-built artifact does not, so it has to be applied here or the
         # download fails at run time on exactly the machines most people have.
+        #
+        # A Linux binary has no such requirement and no `codesign` to apply it with.
+        if: runner.os == 'macOS'
         run: |
           codesign -s - --force --timestamp=none \
             target/${{ matrix.target }}/release/p2pmux
@@ -55,7 +66,13 @@ jobs:
           set -euo pipefail
           asset="p2pmux-${{ matrix.target }}.tar.gz"
           tar -czf "$asset" -C "target/${{ matrix.target }}/release" p2pmux
-          shasum -a 256 "$asset" > "$asset.sha256"
+          # The same hash under two names: macOS ships `shasum`, Linux ships `sha256sum`, and
+          # both print the one line `install.sh` and the publish job read back.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$asset" > "$asset.sha256"
+          else
+            sha256sum "$asset" > "$asset.sha256"
+          fi
           cat "$asset.sha256"
 
       - uses: actions/upload-artifact@v4
@@ -101,10 +118,12 @@ jobs:
             or
 
             ```sh
-            brew tap pelazas/tap
-            brew trust pelazas/tap   # Homebrew 6+ refuses untrusted third-party taps
+            brew tap pelazas/tap      # macOS
+            brew trust pelazas/tap    # Homebrew 6+ refuses untrusted third-party taps
             brew install p2pmux
             ```
+
+            macOS and Linux, on both architectures.
 
             Prefer to build it yourself:
 
@@ -116,4 +135,4 @@ jobs:
             before installing anything.
 
             **A p2pmux session is a trusted shared shell.** Whoever holds a join code can run
-            commands as your macOS user. https://p2pmux.com/trust
+            commands as your user account. https://p2pmux.com/trust

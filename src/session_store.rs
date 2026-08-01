@@ -193,9 +193,18 @@ impl SessionStore {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
         let uid = current_uid()?;
         Ok(Self::at(
-            PathBuf::from(home).join("Library/Application Support/p2pmux/sessions"),
-            PathBuf::from("/tmp").join(format!("p2pmux-{uid}")),
+            sessions_dir(Path::new(&home), std::env::var_os("XDG_STATE_HOME")),
+            socket_dir(std::env::var_os("XDG_RUNTIME_DIR"), &uid),
         ))
+    }
+
+    /// The sessions directory a p2pmux started with this `HOME`, and with no XDG
+    /// overrides in its environment, would read and write.
+    ///
+    /// Exposed so a test can point its fixture wherever the binary under test is
+    /// about to look, rather than restating a platform's layout and drifting.
+    pub fn sessions_dir_for_home(home: &Path) -> PathBuf {
+        sessions_dir(home, None)
     }
 
     /// Test-friendly constructor.  Directories are created lazily with private permissions.
@@ -478,6 +487,47 @@ fn probe(path: &Path) -> Liveness {
     }
 }
 
+/// Where the durable session descriptors live.
+///
+/// Each platform is asked in its own idiom rather than in a shared one: macOS
+/// applications keep state under `Application Support`, and Linux ones follow
+/// the XDG base directory spec, where `$XDG_STATE_HOME` wins when it is set to
+/// an absolute path and `~/.local/state` is the specified fallback.
+#[cfg(target_os = "macos")]
+fn sessions_dir(home: &Path, _state_home: Option<std::ffi::OsString>) -> PathBuf {
+    home.join("Library/Application Support/p2pmux/sessions")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sessions_dir(home: &Path, state_home: Option<std::ffi::OsString>) -> PathBuf {
+    state_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local/state"))
+        .join("p2pmux/sessions")
+}
+
+/// Where the per-session control sockets live.
+///
+/// `$XDG_RUNTIME_DIR` is the better home on Linux than the `/tmp` directory
+/// macOS uses: it already belongs to one user, is already `0700`, and is
+/// already emptied at logout. `/tmp` is none of those on a shared machine —
+/// another user can hold `/tmp/p2pmux-{uid}` before we get there — so it stays
+/// the fallback for the sessions that have no runtime directory at all.
+#[cfg(target_os = "macos")]
+fn socket_dir(_runtime_dir: Option<std::ffi::OsString>, uid: &str) -> PathBuf {
+    PathBuf::from("/tmp").join(format!("p2pmux-{uid}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn socket_dir(runtime_dir: Option<std::ffi::OsString>, uid: &str) -> PathBuf {
+    runtime_dir
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|path| path.join("p2pmux"))
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(format!("p2pmux-{uid}")))
+}
+
 fn current_uid() -> io::Result<String> {
     let output = std::process::Command::new("id").arg("-u").output()?;
     if !output.status.success() {
@@ -508,6 +558,61 @@ mod tests {
                 .as_nanos()
         ));
         SessionStore::at(root.join("sessions"), root.join("sockets"))
+    }
+
+    #[test]
+    fn the_sessions_directory_follows_this_platform() {
+        let home = Path::new("/home/example");
+        let state_home = Some(std::ffi::OsString::from("/state"));
+
+        #[cfg(target_os = "macos")]
+        {
+            // XDG variables are not a macOS convention, so one that happens to be
+            // set does not move a Mac's session records out from under it.
+            assert_eq!(
+                sessions_dir(home, state_home),
+                home.join("Library/Application Support/p2pmux/sessions")
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                sessions_dir(home, state_home),
+                PathBuf::from("/state/p2pmux/sessions")
+            );
+            assert_eq!(
+                sessions_dir(home, None),
+                home.join(".local/state/p2pmux/sessions")
+            );
+            // The spec says a relative XDG path is invalid and must be ignored.
+            assert_eq!(
+                sessions_dir(home, Some(std::ffi::OsString::from("state"))),
+                home.join(".local/state/p2pmux/sessions")
+            );
+        }
+    }
+
+    #[test]
+    fn the_socket_directory_follows_this_platform() {
+        let runtime_dir = Some(std::ffi::OsString::from("/run/user/501"));
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            socket_dir(runtime_dir, "501"),
+            PathBuf::from("/tmp/p2pmux-501")
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                socket_dir(runtime_dir, "501"),
+                PathBuf::from("/run/user/501/p2pmux")
+            );
+            // No runtime directory at all — a cron job, a container, a bare
+            // `ssh` command — still has to land somewhere writable.
+            assert_eq!(socket_dir(None, "501"), PathBuf::from("/tmp/p2pmux-501"));
+        }
     }
 
     #[test]

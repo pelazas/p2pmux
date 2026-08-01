@@ -24,10 +24,14 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 /// Run against an isolated session store so tests never read the user's live sessions.
+///
+/// `XDG_STATE_HOME` outranks `HOME` where it is honoured, so a developer who has
+/// one set would otherwise send the child straight back to their own sessions.
 fn run_with_home(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_p2pmux"))
         .args(args)
         .env("HOME", home)
+        .env_remove("XDG_STATE_HOME")
         .output()
         .expect("p2pmux binary should run")
 }
@@ -128,7 +132,7 @@ fn ticket_reports_an_unknown_session_without_echoing_it() {
     let empty = FakeSession::empty();
     let unknown = "atlantis";
     for (args, expected) in [
-        (vec!["ticket"], "no session was created on this Mac"),
+        (vec!["ticket"], "no session was created on this machine"),
         (vec!["ticket", unknown], "no live session by that name"),
     ] {
         let output = run_with_home(empty.home(), &args);
@@ -142,9 +146,9 @@ fn ticket_reports_an_unknown_session_without_echoing_it() {
 }
 
 #[test]
-fn ticket_refuses_a_session_this_mac_only_joined() {
+fn ticket_refuses_a_session_this_machine_only_joined() {
     // A member's node never minted a ticket, so there is nothing to hand out — and saying so
-    // beats printing the coordinator's ticket, which this Mac does not have either.
+    // beats printing the coordinator's ticket, which this machine does not have either.
     let session = FakeSession::joined("oslo");
 
     let output = run_with_home(session.home(), &["ticket", "oslo"]);
@@ -300,10 +304,7 @@ impl FakeSession {
             std::process::id(),
             TEMPORARY_CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let store = SessionStore::at(
-            home.join("Library/Application Support/p2pmux/sessions"),
-            sockets.clone(),
-        );
+        let store = SessionStore::at(SessionStore::sessions_dir_for_home(&home), sockets.clone());
         fs::create_dir_all(&sockets).expect("socket directory");
         Self {
             home,

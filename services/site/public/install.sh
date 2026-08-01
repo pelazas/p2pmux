@@ -2,15 +2,15 @@
 # p2pmux installer.
 #
 # Read this before you run it. You are about to install a program that, when you share a
-# join ticket, lets whoever holds it run commands as your macOS user. That is the product,
-# not a flaw — but it means you should read installers like this one rather than pipe them
-# blind. This script is served as text/plain so you can.
+# join ticket, lets whoever holds it run commands as your user account. That is the
+# product, not a flaw — but it means you should read installers like this one rather than
+# pipe them blind. This script is served as text/plain so you can.
 #
 #   curl -fsSL https://p2pmux.com/install.sh | sh
 #
-# What it does: works out your CPU, downloads that build and its SHA256 from GitHub
-# Releases, checks the hash, and copies one binary into place. Nothing else. No launch
-# agents, no shell-rc edits, no telemetry.
+# What it does: works out your system and CPU, downloads that build and its SHA256 from
+# GitHub Releases, checks the hash, and copies one binary into place. Nothing else. No
+# launch agents, no shell-rc edits, no telemetry.
 #
 # Binaries come from GitHub Releases, never from p2pmux.com. Whoever controls the domain can
 # break your install; they cannot hand you a different binary than the one published and
@@ -29,22 +29,41 @@ say() { printf '%s\n' "$*" >&2; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
-  Darwin) ;;
-  Linux) die "Linux builds are not published yet. Build from source:
-  cargo install --git https://github.com/$REPO --locked" ;;
-  *) die "p2pmux supports macOS today. Build from source:
+  Darwin) PLATFORM="apple-darwin" ;;
+  Linux) PLATFORM="unknown-linux-gnu" ;;
+  *) die "p2pmux supports macOS and Linux. Build from source:
   cargo install --git https://github.com/$REPO --locked" ;;
 esac
 
+# macOS says arm64 where Linux says aarch64, and both mean the same silicon.
 case "$(uname -m)" in
-  arm64) ARCH="aarch64-apple-darwin" ;;
-  x86_64) ARCH="x86_64-apple-darwin" ;;
+  arm64 | aarch64) ARCH="aarch64-$PLATFORM" ;;
+  x86_64 | amd64) ARCH="x86_64-$PLATFORM" ;;
   *) die "unsupported CPU: $(uname -m)" ;;
 esac
 
-for tool in curl shasum tar install; do
+# The published Linux builds link glibc. On a musl system — Alpine, and most of what
+# people build containers out of — the binary installs fine and then fails to start with
+# a message about a missing loader, which reads like a corrupt download. Say so here
+# instead.
+if [ "$PLATFORM" = "unknown-linux-gnu" ] && (ldd --version 2>&1 || true) | grep -qi musl; then
+  die "this looks like a musl system, and the published Linux builds need glibc.
+Build from source:
+  cargo install --git https://github.com/$REPO --locked"
+fi
+
+for tool in curl tar install; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
+
+# Same hash, two names: macOS ships `shasum`, Linux ships `sha256sum`.
+if command -v shasum >/dev/null 2>&1; then
+  sha256_of() { shasum -a 256 "$1"; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256_of() { sha256sum "$1"; }
+else
+  die "missing required tool: shasum or sha256sum"
+fi
 
 if [ "$TAG" = "latest" ]; then
   BASE="https://github.com/$REPO/releases/latest/download"
@@ -69,7 +88,7 @@ curl -fsSL --proto '=https' --tlsv1.2 -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha2
 # The point of the checksum is that it is published beside the artifact on GitHub, so a
 # compromised p2pmux.com can break this install but cannot substitute a binary.
 EXPECTED="$(cut -d' ' -f1 < "$TMP/$ASSET.sha256")"
-ACTUAL="$(shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1)"
+ACTUAL="$(sha256_of "$TMP/$ASSET" | cut -d' ' -f1)"
 [ -n "$EXPECTED" ] || die "the published checksum was empty; refusing to install"
 [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch — refusing to install
   expected $EXPECTED
@@ -78,13 +97,22 @@ ACTUAL="$(shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1)"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 [ -f "$TMP/p2pmux" ] || die "the archive did not contain a p2pmux binary"
 
-if [ -w "$INSTALL_DIR" ] || [ ! -e "$INSTALL_DIR" ]; then
-  mkdir -p "$INSTALL_DIR"
+if mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
   install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux"
-else
+elif command -v sudo >/dev/null 2>&1; then
   say "$INSTALL_DIR is not writable; using sudo."
   sudo mkdir -p "$INSTALL_DIR"
   sudo install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux"
+else
+  # /usr/local/bin is root-owned on most Linux systems, and plenty of the machines
+  # someone would run this on — a container, a locked-down work laptop — have no sudo at
+  # all. A home directory needs no privileges, and the PATH note below covers the
+  # distributions that do not already add this one.
+  INSTALL_DIR="$HOME/.local/bin"
+  say "the install directory is not writable and sudo is not available;"
+  say "installing to $INSTALL_DIR instead."
+  mkdir -p "$INSTALL_DIR"
+  install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux"
 fi
 
 say ""

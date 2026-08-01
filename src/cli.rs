@@ -51,13 +51,13 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Print the full reusable join ticket for a session hosted on this Mac.
+    /// Print the full reusable join ticket for a session hosted on this machine.
     Ticket {
         /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
         /// is hosted here.
         session: Option<String>,
     },
-    /// Print the short join code for a session hosted on this Mac.
+    /// Print the short join code for a session hosted on this machine.
     Code {
         /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
         /// is hosted here.
@@ -110,11 +110,11 @@ enum NotifyAgent {
     },
 }
 
-const TRUST_WARNING: &str = "TRUST WARNING: This is a fully trusted shared-shell session. Anyone with the join ticket can see every pane and may obtain interactive control of available terminals (run commands, see output, touch files reachable to that macOS user).
+const TRUST_WARNING: &str = "TRUST WARNING: This is a fully trusted shared-shell session. Anyone with the join ticket can see every pane and may obtain interactive control of available terminals (run commands, see output, touch files reachable to that user account).
 
-Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege Mac account and avoid production credentials in shared panes.
+Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege user account and avoid production credentials in shared panes.
 
-Processes and credential files stay on the pane host's Mac (not uploaded to peers). That does not stop a controller from using or displaying them via the shared shell.";
+Processes and credential files stay on the pane host's machine (not uploaded to peers). That does not stop a controller from using or displaying them via the shared shell.";
 
 /// The short form of `TRUST_WARNING`, for a command whose stdout is meant to be piped.
 const TICKET_WARNING: &str = "TRUST WARNING: this ticket grants full shared-shell access to the session for as long as it lives, to anyone who holds it. Share it only with people you trust with that access.";
@@ -165,7 +165,7 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
     }
 }
 
-/// Hand this Mac's completion tuning to the detector, once per process.
+/// Hand this machine's completion tuning to the detector, once per process.
 ///
 /// Panes are hosted by the detached node, which reaches this same dispatch, so every process
 /// that can own a PTY passes through here. A config that cannot be read is not worth failing a
@@ -616,19 +616,19 @@ async fn resolve_join_ticket(input: &str) -> Result<JoinTicket, Box<dyn Error>> 
     Ok(JoinTicket::from_str(&ticket).map_err(|_| CliError("invalid ticket format"))?)
 }
 
-/// Print the portable join ticket for a session hosted on this Mac.
+/// Print the portable join ticket for a session hosted on this machine.
 ///
 /// Read back off the session record the coordinator's node wrote, and printed to stdout alone
 /// so `p2pmux ticket | pbcopy` yields something directly pasteable.
 fn print_join_ticket(session: Option<String>) -> Result<(), Box<dyn Error>> {
     let descriptor = hosted_session(session)?;
     let ticket = descriptor.ticket.ok_or(CliError(
-        "that session was joined, not created here, so this Mac holds no ticket for it",
+        "that session was joined, not created here, so this machine holds no ticket for it",
     ))?;
     print_invite(&ticket)
 }
 
-/// Print the short join code for a session hosted on this Mac.
+/// Print the short join code for a session hosted on this machine.
 ///
 /// The code needs the rendezvous service to have accepted it, so unlike the ticket this can
 /// legitimately not exist for a live session — say which of the two it is rather than making
@@ -637,7 +637,7 @@ fn print_join_code(session: Option<String>) -> Result<(), Box<dyn Error>> {
     let descriptor = hosted_session(session)?;
     if descriptor.ticket.is_none() {
         return Err(CliError(
-            "that session was joined, not created here, so this Mac holds no code for it",
+            "that session was joined, not created here, so this machine holds no code for it",
         )
         .into());
     }
@@ -667,7 +667,7 @@ fn hosted_session(
         Some(name) => sessions
             .into_iter()
             .find(|session| session.name == name)
-            .ok_or(CliError("no live session by that name on this Mac"))?,
+            .ok_or(CliError("no live session by that name on this machine"))?,
         None => sole_hosted_session(sessions)?,
     })
 }
@@ -685,11 +685,11 @@ fn sole_hosted_session(
         .collect();
     match hosted.len() {
         0 => Err(CliError(
-            "no session was created on this Mac; run p2pmux create first",
+            "no session was created on this machine; run p2pmux create first",
         )),
         1 => Ok(hosted.remove(0)),
         _ => Err(CliError(
-            "several sessions are hosted on this Mac; pass the session name, as listed by p2pmux ls",
+            "several sessions are hosted on this machine; pass the session name, as listed by p2pmux ls",
         )),
     }
 }

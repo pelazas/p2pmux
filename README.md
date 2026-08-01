@@ -37,19 +37,19 @@ keys.
 </p>
 
 **A shared control surface, not a shared computer.** Your processes and credential files never
-leave your Mac. But whoever holds a pane has a real shell on the machine hosting it — both halves
-are true at once, and [the trust model](#trust) says exactly what that means.
+leave your machine. But whoever holds a pane has a real shell on the machine hosting it — both
+halves are true at once, and [the trust model](#trust) says exactly what that means.
 
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
 
 p2pmux create                # you host; Ctrl+S shows the line to send
-p2pmux join 4KP7Q-M2XRW      # them, on their own Mac
+p2pmux join 4KP7Q-M2XRW      # them, on their own machine
 ```
 
 `Ctrl+S` gives you that second line, ready to paste into a chat window. Your teammate runs it on
-their own Mac, on their own network, and lands in your grid. Ten characters, nothing else to set
-up on either side.
+their own machine, on their own network, and lands in your grid. Ten characters, nothing else to
+set up on either side. A Mac and a Linux box work the same session; nobody has to match anybody.
 
 ## Why it exists
 
@@ -57,17 +57,17 @@ Every way two developers share a terminal today collapses onto one box with one 
 credentials. SSH, tmux, screen sharing, cloud dev environments — somebody's machine runs
 everything, and somebody's keys pay for it.
 
-p2pmux keeps the machines separate. You bring your Mac and your AI subscription, your teammate
+p2pmux keeps the machines separate. You bring your laptop and your AI subscription, your teammate
 brings theirs, and you work in one grid. Your teammate can start Claude Code in a pane on your
-Mac, on your subscription, and never hold your API key. It goes both ways at the same time: their
-panes run on their hardware, and you can drive those without holding anything of theirs.
+machine, on your subscription, and never hold your API key. It goes both ways at the same time:
+their panes run on their hardware, and you can drive those without holding anything of theirs.
 
 **That is all it does.** It is not a cloud VM, not a remote box everyone's processes run on, and
 not an agent orchestration platform.
 
 ## What you get
 
-- Every pane is a PTY on its owner's Mac — shell, Docker, an agent — with that machine's PATH,
+- Every pane is a PTY on its owner's machine — shell, Docker, an agent — with that machine's PATH,
   env, and subscriptions. Host and guest are **per pane**, not per person.
 - Take control of any free pane by typing into it, or hand yours over. Active typing is protected,
   so there is no forced takeover.
@@ -83,8 +83,8 @@ not an agent orchestration platform.
 ## Status
 
 **Early, but real.** v0.1.0 runs sessions between machines on different networks and different
-continents. macOS only. Coordinator failover and disconnect grace are not built yet, so a
-coordinator that dies ends the session.
+continents. macOS and Linux, both architectures. Coordinator failover and disconnect grace are not
+built yet, so a coordinator that dies ends the session.
 
 ## Install
 
@@ -92,24 +92,27 @@ coordinator that dies ends the session.
 curl -fsSL https://p2pmux.com/install.sh | sh
 ```
 
-The script fetches a binary and its SHA256 from GitHub Releases and checks the hash before
-installing. It is served as plain text so you can read it first, and
-`cargo install --git https://github.com/pelazas/p2pmux --locked` is a supported path for anyone
-who would rather not run an installer at all.
+macOS and Linux, Apple Silicon, Intel and arm64. The script fetches a binary and its SHA256 from
+GitHub Releases and checks the hash before installing. It is served as plain text so you can read
+it first, and `cargo install --git https://github.com/pelazas/p2pmux --locked` is a supported path
+for anyone who would rather not run an installer at all.
+
+Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up. A musl system
+has to build from source.
 
 ## Trust
 
 A p2pmux session is a **fully trusted shared shell**. Anyone with the join code or ticket can see
 every pane and can obtain interactive control of the terminals in it — run commands, read output,
-touch any file that macOS user can touch.
+touch any file that user account can touch.
 
-Processes and credential *files* stay on the pane host's Mac and are never uploaded to peers. That
-is a real boundary, and it is the point of the design. It is **not** a sandbox: a controller can
-still use your credentials, or print one to the screen, through the shell you handed them.
+Processes and credential *files* stay on the pane host's machine and are never uploaded to peers.
+That is a real boundary, and it is the point of the design. It is **not** a sandbox: a controller
+can still use your credentials, or print one to the screen, through the shell you handed them.
 
 So: treat the code like a password, and share it only with people you would hand an unlocked
-laptop to. For anyone else, use a separate low-privilege macOS account and keep production
-credentials out of shared panes.
+laptop to. For anyone else, use a separate low-privilege account and keep production credentials
+out of shared panes.
 
 ## Using it
 
@@ -128,7 +131,7 @@ key — is in [docs/USAGE.md](./docs/USAGE.md).
 | [docs/MVP_DESIGN.md](./docs/MVP_DESIGN.md) | **Locked** MVP design (source of truth) |
 | [docs/SPIKE_PLAN.md](./docs/SPIKE_PLAN.md) | Build order / spikes |
 
-Built in Rust with ratatui, portable-pty, vt100, and iroh. macOS only for v1.
+Built in Rust with ratatui, portable-pty, vt100, and iroh. macOS and Linux.
 
 Found a rough edge? Please open an issue — a specific report of what broke is the most useful
 thing anyone can send right now.

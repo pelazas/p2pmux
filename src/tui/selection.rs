@@ -50,22 +50,82 @@ pub(in crate::tui) fn selection_text(
     Some(lines.join("\n"))
 }
 pub(crate) fn copy_selection_to_clipboard(text: &str) -> io::Result<usize> {
-    copy_to_macos_clipboard(text)?;
+    copy_to_system_clipboard(text)?;
     Ok(copied_line_count(text))
 }
-fn copy_to_macos_clipboard(text: &str) -> io::Result<()> {
-    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+
+/// Hand text to whatever owns the clipboard on this machine.
+///
+/// macOS has one answer and it is always installed. Linux has three, none of
+/// them guaranteed: a Wayland session answers to `wl-copy`, an X11 one to
+/// `xclip` or `xsel`, and a bare TTY or an `ssh` session to none of them.
+#[cfg(target_os = "macos")]
+fn copy_to_system_clipboard(text: &str) -> io::Result<()> {
+    pipe_to_clipboard_helper("pbcopy", &[], text)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_to_system_clipboard(text: &str) -> io::Result<()> {
+    const HELPERS: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    for (program, arguments) in HELPERS {
+        if pipe_to_clipboard_helper(program, arguments, text).is_ok() {
+            return Ok(());
+        }
+    }
+    // Nothing local could take it, which is the normal case over ssh and in a
+    // bare TTY. OSC 52 hands the text to the terminal emulator instead, so it
+    // lands on the clipboard of whichever machine the human is sitting at.
+    write_osc52(text)
+}
+
+fn pipe_to_clipboard_helper(program: &str, arguments: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("pbcopy stdin unavailable"))?;
+        .ok_or_else(|| io::Error::other(format!("{program} stdin unavailable")))?;
     stdin.write_all(text.as_bytes())?;
     drop(stdin);
     if child.wait()?.success() {
         Ok(())
     } else {
-        Err(io::Error::other("pbcopy failed"))
+        Err(io::Error::other(format!("{program} failed")))
     }
+}
+
+/// Ask the terminal emulator to put `text` on its own clipboard.
+///
+/// Unacknowledged by design: the sequence goes out and the terminal either
+/// honours it or drops it silently, so a success here means "asked", not
+/// "copied". Terminals that ignore unknown OSC codes — which is all of the ones
+/// that do not implement this — discard it without printing anything.
+///
+/// Written to stderr, not stdout: the TUI renders through stdout, and a byte
+/// that arrives from anywhere else is one ratatui does not know it drew.
+#[cfg(not(target_os = "macos"))]
+fn write_osc52(text: &str) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(osc52_sequence(text).as_bytes())?;
+    stderr.flush()
+}
+
+/// The OSC 52 clipboard-set sequence for `text`, base64 in the standard
+/// alphabet with padding, which is what the terminals implementing this expect.
+#[cfg(not(target_os = "macos"))]
+fn osc52_sequence(text: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
 #[cfg(test)]
@@ -105,6 +165,21 @@ mod tests {
             selection_text(screen.as_ref(), selection),
             Some("on".to_owned())
         );
+    }
+
+    /// The one part of the clipboard path with no visible failure: a terminal
+    /// that receives a malformed OSC 52 discards it in silence, exactly as one
+    /// that does not implement OSC 52 discards a correct one. Nothing at run
+    /// time can tell those apart, so the bytes are pinned here instead.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn osc52_carries_the_selection_as_padded_base64() {
+        use super::osc52_sequence;
+
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+        // A multi-line selection travels as one payload; the newline is data,
+        // not a terminator, and must not end the sequence early.
+        assert_eq!(osc52_sequence("a\nb"), "\x1b]52;c;YQpi\x07");
     }
 
     #[test]
