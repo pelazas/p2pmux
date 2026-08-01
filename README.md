@@ -21,9 +21,9 @@
 
 </div>
 
-A terminal multiplexer for two or more people, where **every pane runs on the machine of whoever
-opened it**. Two developers, two AI subscriptions, one terminal — and neither holds the other's
-keys.
+**Everyone brings their own terminal.** Every pane runs on the machine of whoever opened it — their
+toolchain, their libraries, their env, their AI subscription. Hop into a teammate's pane and you get
+a real shell on *their* machine, running *their* setup, without ever holding their keys.
 
 <p align="center">
   <img src="docs/assets/demo.gif" width="820"
@@ -53,14 +53,17 @@ set up on either side. A Mac and a Linux box work the same session; nobody has t
 
 ## Why it exists
 
-Every way two developers share a terminal today collapses onto one box with one set of
-credentials. SSH, tmux, screen sharing, cloud dev environments — somebody's machine runs
-everything, and somebody's keys pay for it.
+Every other way to share a terminal collapses onto one box. SSH, tmux, tmate, screen sharing, cloud
+dev environments — one machine runs everything, one person's toolchain is the only one in the room,
+and one person's keys pay for it. Whoever joins arrives empty-handed.
 
-p2pmux keeps the machines separate. You bring your laptop and your AI subscription, your teammate
-brings theirs, and you work in one grid. Your teammate can start Claude Code in a pane on your
-machine, on your subscription, and never hold your API key. It goes both ways at the same time:
-their panes run on their hardware, and you can drive those without holding anything of theirs.
+p2pmux keeps the machines separate and joins the surface instead. You bring your laptop, your
+dotfiles, your language versions and your Claude subscription. Your teammate brings theirs. Both
+setups are live in the same grid at once, and either of you can reach into the other's.
+
+Concretely: your teammate opens a pane on your machine and runs Claude Code on your subscription —
+they drive it, you pay for it, they never see the key. The pane beside it is on their box, with
+their Python env and their GPU, and you drive that one without installing a thing.
 
 **That is all it does.** It is not a cloud VM, not a remote box everyone's processes run on, and
 not an agent orchestration platform.
