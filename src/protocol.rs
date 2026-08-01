@@ -525,6 +525,12 @@ pub enum LayoutRejectReason {
     /// Distinct from `Limit`: a full session may have room again later, a locked one is a
     /// deliberate refusal, and the joiner must be told which so it can say something true.
     Locked = 9,
+    /// The host revoked this endpoint's place on the roster.
+    ///
+    /// Distinct from `Locked`: a lock is about the door and lifts for everyone at once,
+    /// while a revocation names one public key and survives both an unlock and a reshared
+    /// ticket. The joiner is told which so it does not sit there retrying.
+    Revoked = 10,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

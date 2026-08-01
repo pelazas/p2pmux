@@ -10,8 +10,8 @@ use p2pmux::{
     },
     screen::HostScreen,
     session::{
-        GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent, SharedLayoutHost,
-        join_layout, layout_snapshot_from_state, pane_wire_id, subscribe_pane,
+        GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent, RosterStatus, SessionError,
+        SharedLayoutHost, join_layout, layout_snapshot_from_state, pane_wire_id, subscribe_pane,
     },
     transport::{ALPN, Transport},
 };
@@ -998,5 +998,85 @@ async fn admission_invalidates_a_member_reservation_and_notifies_its_creator() {
 
     first.shutdown().await;
     second.shutdown().await;
+    coordinator.close().await;
+}
+
+/// Drain control events until the member's stream reports it has been dropped.
+///
+/// The eviction is announced by closing the connection, and whatever commits were already
+/// in flight arrive first, so the test cannot assume `Disconnected` is the very next event.
+async fn next_disconnect(member: &mut p2pmux::session::SharedLayoutMember) {
+    for _ in 0..16 {
+        if matches!(next_event(member).await, LayoutControlEvent::Disconnected) {
+            return;
+        }
+    }
+    panic!("member should have been disconnected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_member_evicts_it_and_refuses_the_key_afterwards() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let member_transport = loopback_transport().await;
+    let mut member = join_layout(member_transport.clone(), coordinator.ticket().clone())
+        .await
+        .expect("member joins");
+    accept.await.expect("accept task").expect("accept member");
+    let member_id = member.peer_id.clone();
+
+    assert!(
+        coordinator.revoke_member(&member_id).expect("revoke"),
+        "revoking a seated member changes the roster"
+    );
+    next_disconnect(&mut member).await;
+
+    // The session is never locked in this test: a revoked key has to be turned away on its
+    // own account, or "kick" would only work while the door was shut to everyone.
+    assert!(!coordinator.is_session_locked().expect("lock state"));
+    let accept_again = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let rejoin = join_layout(member_transport.clone(), coordinator.ticket().clone()).await;
+    assert!(
+        matches!(rejoin, Err(SessionError::MembershipRevoked)),
+        "a revoked key must be told why, not merely dropped"
+    );
+    assert!(matches!(
+        accept_again.await.expect("accept task"),
+        Err(SessionError::MembershipRevoked)
+    ));
+
+    assert_eq!(
+        coordinator
+            .roster()
+            .expect("roster")
+            .into_iter()
+            .find(|(peer_id, _)| peer_id == &member_id)
+            .map(|(_, status)| status),
+        Some(RosterStatus::Revoked)
+    );
+
+    drop(member);
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_the_coordinators_own_key_is_refused() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let own_key = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
+
+    assert!(
+        !coordinator.revoke_member(&own_key).expect("revoke"),
+        "a session whose only authority cannot rejoin it is not a session"
+    );
+    assert!(coordinator.roster().expect("roster").is_empty());
+
     coordinator.close().await;
 }

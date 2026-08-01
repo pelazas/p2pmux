@@ -6,7 +6,7 @@ use p2pmux::{
         NewPanePosition, PaneFailed, PaneGrid, PaneReady, Presence, SetPaneLock, SetSplitRatio,
         SplitAxis, UpdatePaneGrids,
     },
-    session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator},
+    session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator, RosterStatus},
 };
 use std::{
     net::SocketAddr,
@@ -937,5 +937,73 @@ fn a_locked_refusal_is_distinct_from_a_full_one() {
     assert_eq!(
         LayoutRejectReason::try_from(LayoutRejectReason::Locked as i32),
         Ok(LayoutRejectReason::Locked)
+    );
+}
+
+#[test]
+fn a_revoked_key_stays_revoked_when_it_knocks_again() {
+    let mut coordinator = coordinator();
+    coordinator.remember_admitted(host_b());
+    assert!(coordinator.is_admitted(&host_b()));
+
+    assert!(
+        coordinator.revoke(host_b()),
+        "first revoke changes the roster"
+    );
+    assert!(coordinator.is_revoked(&host_b()));
+    assert!(!coordinator.is_admitted(&host_b()));
+
+    // Knocking again is exactly what a revoked peer does next. Honouring it would make
+    // revoking a suggestion rather than a decision.
+    coordinator.remember_admitted(host_b());
+    assert!(coordinator.is_revoked(&host_b()));
+    assert!(!coordinator.is_admitted(&host_b()));
+    assert!(
+        !coordinator.revoke(host_b()),
+        "revoking an already-revoked key changes nothing"
+    );
+}
+
+#[test]
+fn the_roster_names_every_key_the_session_has_an_opinion_about() {
+    let mut coordinator = coordinator();
+    let stranger = endpoint(5, 4105).id.as_bytes().to_vec();
+    coordinator.remember_admitted(host_b());
+    coordinator.revoke(stranger.clone());
+
+    let roster: Vec<(Vec<u8>, RosterStatus)> = coordinator
+        .roster()
+        .entries()
+        .map(|(peer_id, status)| (peer_id.to_vec(), status))
+        .collect();
+
+    assert_eq!(roster.len(), 2);
+    assert_eq!(
+        roster
+            .iter()
+            .find(|(peer_id, _)| peer_id == &host_b())
+            .map(|(_, status)| *status),
+        Some(RosterStatus::Admitted)
+    );
+    assert_eq!(
+        roster
+            .iter()
+            .find(|(peer_id, _)| peer_id == &stranger)
+            .map(|(_, status)| *status),
+        Some(RosterStatus::Revoked)
+    );
+}
+
+#[test]
+fn a_revoked_refusal_is_distinct_from_a_locked_one() {
+    // A lock lifts for everybody at once; a revocation names one key and survives the
+    // unlock. A joiner that cannot tell them apart will keep retrying forever.
+    assert_ne!(
+        LayoutRejectReason::Revoked as i32,
+        LayoutRejectReason::Locked as i32
+    );
+    assert_eq!(
+        LayoutRejectReason::try_from(LayoutRejectReason::Revoked as i32),
+        Ok(LayoutRejectReason::Revoked)
     );
 }

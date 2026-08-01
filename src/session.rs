@@ -1,7 +1,7 @@
 //! Authenticated Join/Welcome session handshakes over Iroh bi-streams.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     error::Error,
     fmt,
     future::Future,
@@ -55,7 +55,67 @@ pub struct LayoutCoordinator {
     presence_epoch: u64,
     reservation_timeout: Duration,
     locked: bool,
-    admitted: BTreeSet<Vec<u8>>,
+    roster: MemberRoster,
+}
+
+/// Which endpoint public keys the coordinator will let into this session.
+///
+/// The ticket secret is what gets a stranger *considered*; this roster is what decides. The
+/// two used to be the same thing, which made refusal impossible to express: a ticket that
+/// had been forwarded once could not be un-forwarded, and the only lever -- the session
+/// lock -- shut the door on everybody at once. Naming keys instead means a refusal can be
+/// about one person, and it outlives both an unlock and a reshared ticket.
+///
+/// Entries are keyed by the raw endpoint public key, which QUIC has already authenticated
+/// by the time anything here is consulted, so a peer cannot claim to be someone else's
+/// entry.
+#[derive(Clone, Debug, Default)]
+pub struct MemberRoster {
+    entries: BTreeMap<Vec<u8>, RosterStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RosterStatus {
+    /// Admitted at least once, and welcome back through a locked door.
+    Admitted,
+    /// Turned away by name, whatever the lock says.
+    Revoked,
+}
+
+impl MemberRoster {
+    /// Record a key as admitted. A revoked key stays revoked: the whole point of revoking
+    /// is that the holder cannot undo it by knocking again.
+    pub fn admit(&mut self, peer_id: Vec<u8>) -> bool {
+        if self.is_revoked(&peer_id) {
+            return false;
+        }
+        self.entries.insert(peer_id, RosterStatus::Admitted);
+        true
+    }
+
+    /// Turn one key away for the rest of the session. Returns whether this changed anything.
+    pub fn revoke(&mut self, peer_id: Vec<u8>) -> bool {
+        self.entries.insert(peer_id, RosterStatus::Revoked) != Some(RosterStatus::Revoked)
+    }
+
+    pub fn status(&self, peer_id: &[u8]) -> Option<RosterStatus> {
+        self.entries.get(peer_id).copied()
+    }
+
+    pub fn is_admitted(&self, peer_id: &[u8]) -> bool {
+        self.status(peer_id) == Some(RosterStatus::Admitted)
+    }
+
+    pub fn is_revoked(&self, peer_id: &[u8]) -> bool {
+        self.status(peer_id) == Some(RosterStatus::Revoked)
+    }
+
+    /// Every key this session has an opinion about, in deterministic key order.
+    pub fn entries(&self) -> impl Iterator<Item = (&[u8], RosterStatus)> {
+        self.entries
+            .iter()
+            .map(|(peer_id, status)| (peer_id.as_slice(), *status))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -201,7 +261,7 @@ impl LayoutCoordinator {
             presence_epoch: 0,
             reservation_timeout,
             locked: false,
-            admitted: BTreeSet::new(),
+            roster: MemberRoster::default(),
         })
     }
 
@@ -235,12 +295,32 @@ impl LayoutCoordinator {
     /// Kept separately from the member list because a member who drops off the roster
     /// during a disconnect must still be able to come back through a locked door.
     pub fn is_admitted(&self, peer_id: &[u8]) -> bool {
-        self.admitted.contains(peer_id)
+        self.roster.is_admitted(peer_id)
     }
 
     /// Record a peer as admitted, so a later lock cannot shut it out of its own session.
     pub fn remember_admitted(&mut self, peer_id: Vec<u8>) {
-        self.admitted.insert(peer_id);
+        self.roster.admit(peer_id);
+    }
+
+    /// Whether this peer has been turned away by name.
+    pub fn is_revoked(&self, peer_id: &[u8]) -> bool {
+        self.roster.is_revoked(peer_id)
+    }
+
+    /// Strike one key off the roster. Returns whether this changed anything.
+    ///
+    /// Only the roster is touched here. Evicting the member that key is currently using --
+    /// dropping its control connection and committing its departure -- is the caller's job,
+    /// because only the caller can reach the connection; see
+    /// [`SharedLayoutHost::revoke_member`].
+    pub fn revoke(&mut self, peer_id: Vec<u8>) -> bool {
+        self.roster.revoke(peer_id)
+    }
+
+    /// The roster as the coordinator sees it, for callers that want to show or audit it.
+    pub fn roster(&self) -> &MemberRoster {
+        &self.roster
     }
 
     pub fn session_snapshot(&self) -> Result<SessionSnapshot, CoordinatorError> {
@@ -1633,6 +1713,7 @@ pub enum SessionError {
     PeerTask,
     SessionFull,
     SessionLocked,
+    MembershipRevoked,
     JoinRefused,
     Coordinator(CoordinatorError),
 }
@@ -1660,6 +1741,9 @@ impl fmt::Display for SessionError {
             Self::SessionLocked => {
                 formatter.write_str("this session is locked; ask the host to unlock it")
             }
+            Self::MembershipRevoked => {
+                formatter.write_str("the host removed this device from the session")
+            }
             Self::JoinRefused => formatter.write_str("the session coordinator refused the join"),
             Self::Coordinator(error) => write!(formatter, "layout coordinator error: {error}"),
         }
@@ -1681,6 +1765,7 @@ impl Error for SessionError {
             | Self::PeerTask
             | Self::SessionFull
             | Self::SessionLocked
+            | Self::MembershipRevoked
             | Self::JoinRefused => None,
             Self::Coordinator(error) => Some(error),
         }
@@ -2477,6 +2562,57 @@ impl SharedLayoutHost {
             .is_locked())
     }
 
+    /// Strike one endpoint key off the roster and put its member out of the session.
+    ///
+    /// Returns whether the roster changed, so a caller can stay quiet about a key that was
+    /// already revoked. Revoking a key that is not currently connected is allowed and
+    /// meaningful: it is how a host refuses a device before it ever knocks.
+    ///
+    /// Revoking the coordinator's own key is refused. It would leave a session whose only
+    /// authority cannot rejoin it, and the coordinator is not a peer it can turn away.
+    pub fn revoke_member(&self, peer_id: &[u8]) -> Result<bool, SessionError> {
+        if peer_id == self.host.ticket().endpoint_addr().id.as_bytes() {
+            return Ok(false);
+        }
+        let change = {
+            let mut coordinator = self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?;
+            if !coordinator.revoke(peer_id.to_vec()) {
+                return Ok(false);
+            }
+            // A revoked key that never joined has no member record to remove; the roster
+            // entry alone is the whole effect.
+            coordinator.remove_member(peer_id).ok()
+        };
+        // Drop the control connection before announcing the departure, so the evicted peer
+        // cannot act on the very commit that removes it.
+        remove_control_peer(&self.peers, peer_id);
+        if let Some(change) = change {
+            if let Some(state) = change.commit.state.as_ref() {
+                self.pane_server.replace_roster_from_layout(state)?;
+            }
+            self.broadcast_commit(change.commit);
+            if let Some(reject) = change.invalidated_reservation {
+                self.send_reject(reject);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Every endpoint key this session has admitted or revoked, for display and audit.
+    pub fn roster(&self) -> Result<Vec<(Vec<u8>, RosterStatus)>, SessionError> {
+        Ok(self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .roster()
+            .entries()
+            .map(|(peer_id, status)| (peer_id.to_vec(), status))
+            .collect())
+    }
+
     pub fn incoming_dispatcher(
         &self,
         panes: PaneServer,
@@ -2514,25 +2650,32 @@ impl SharedLayoutHost {
     ) -> Result<JoinReceipt, SessionError> {
         let mut admitted_peer_id = None;
         let result = async {
-            // A locked session turns away peers it has never admitted, before the
-            // handshake can welcome them. Peers already admitted are let back through, so
-            // locking never strands someone mid-session over a transient reconnect.
-            // Resolved into a plain bool first: the lock guard must not be alive across
+            // The roster decides before the handshake can welcome anybody. A revoked key is
+            // turned away whatever the lock says -- that is what makes revoking durable
+            // once the ticket has been forwarded. A locked session then turns away peers it
+            // has never admitted, while letting admitted ones back through, so locking
+            // never strands someone mid-session over a transient reconnect.
+            // Resolved into a plain enum first: the lock guard must not be alive across
             // the refusal's await, or this whole accept future stops being `Send`.
-            let shut_out = {
+            let refusal = {
                 let coordinator_guard = self
                     .coordinator
                     .lock()
                     .map_err(|_| SessionError::PeerTask)?;
-                coordinator_guard.is_locked()
-                    && !coordinator_guard.is_admitted(connection.remote_id().as_bytes())
+                let remote_id = connection.remote_id();
+                let peer_id = remote_id.as_bytes();
+                if coordinator_guard.is_revoked(peer_id) {
+                    Some((LayoutRejectReason::Revoked, SessionError::MembershipRevoked))
+                } else if coordinator_guard.is_locked() && !coordinator_guard.is_admitted(peer_id) {
+                    Some((LayoutRejectReason::Locked, SessionError::SessionLocked))
+                } else {
+                    None
+                }
             };
-            if shut_out {
-                self.host
-                    .refuse_join(join_writer, LayoutRejectReason::Locked)
-                    .await?;
+            if let Some((reason, error)) = refusal {
+                self.host.refuse_join(join_writer, reason).await?;
                 self.host.drain_refusal(&connection).await;
-                return Err(SessionError::SessionLocked);
+                return Err(error);
             }
             // Refuse a full session *before* welcoming it. `admit_with_display_name`
             // below enforces the same limit, but only after `Welcome` has gone out --
@@ -3775,6 +3918,7 @@ async fn join_handshake_with_display_name(
             return Err(match LayoutRejectReason::try_from(reject.reason) {
                 Ok(LayoutRejectReason::Limit) => SessionError::SessionFull,
                 Ok(LayoutRejectReason::Locked) => SessionError::SessionLocked,
+                Ok(LayoutRejectReason::Revoked) => SessionError::MembershipRevoked,
                 _ => SessionError::JoinRefused,
             });
         }
