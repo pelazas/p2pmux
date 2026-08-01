@@ -11,8 +11,9 @@ use p2pmux::{
     },
     screen::HostScreen,
     session::{
-        GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent, RosterStatus, SessionError,
-        SharedLayoutHost, join_layout, layout_snapshot_from_state, pane_wire_id, subscribe_pane,
+        CoordinatorResponse, GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent,
+        RosterStatus, SessionError, SharedLayoutHost, join_layout, layout_snapshot_from_state,
+        pane_wire_id, subscribe_pane,
     },
     transport::{ALPN, Transport},
 };
@@ -1155,5 +1156,45 @@ async fn a_member_receives_a_chained_ledger_alongside_every_commit() {
 
     drop(second);
     first.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_coordinators_own_request_is_signed_and_recorded_under_its_key() {
+    // The host's own UI goes through `handle_local_request` rather than the wire, so it is
+    // the one path where a signing mistake would show up as "splits stopped working" with
+    // nothing else to see.
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let own_key = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
+
+    let reservation = match coordinator
+        .handle_local_request(create_request(1, 1))
+        .expect("the host may split its own layout")
+    {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected a reservation, got {other:?}"),
+    };
+    let commit = match coordinator
+        .handle_local_ready(PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 1,
+            request_id: 1,
+            author_signature: Vec::new(),
+        })
+        .expect("the host may report its own pane live")
+    {
+        CoordinatorResponse::Commit(commit) => commit,
+        other => panic!("expected a commit, got {other:?}"),
+    };
+
+    let sealed = commit.entry.expect("the host's own change is sealed too");
+    assert_eq!(sealed.author_peer_id, own_key);
+    assert!(
+        !sealed.author_signature.is_empty(),
+        "the coordinator signs its own requests; otherwise one identity in the session \
+         writes entries nobody can check"
+    );
+
     coordinator.close().await;
 }

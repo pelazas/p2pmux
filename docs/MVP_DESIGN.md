@@ -156,6 +156,21 @@ lease is drawn as a reversed chip instead.
 
 Membership, `LayoutCommit` revisions, presence, control lease / Take control, Snapshot/Delta, SessionSnapshot bootstrap for joiners. Split/close → coordinator commit (except during coordinator grace freeze).
 
+Every `LayoutCommit` seals a `LedgerEntry`: a numbered, hash-chained record naming the key that
+asked for the change, carrying the request they made, signed by that key and then by the
+coordinator. The layout state still travels beside it as a checkpoint — that is what renderers
+draw, and what lets a joiner start without replaying from the beginning — but the entry is the
+record. A member verifies each entry as it arrives and drops the connection rather than render a
+layout it cannot account for.
+
+This is deliberately the control plane only. PTY bytes and screen deltas stay a plain stream;
+putting them through the ledger would buy nothing and cost the latency the whole product rests
+on.
+
+Admission is a roster of endpoint public keys, not a shared secret. The ticket gets a stranger
+considered; the roster decides. A revoked key is turned away on its own account, whatever the
+session lock says, so a refusal survives both an unlock and a ticket that has been forwarded.
+
 Presence is two messages. A member sends `Presence` (its focused tab and pane, plus whether it
 is attached at all) to the coordinator, which caches the latest one per member and re-broadcasts
 the whole set as a `PresenceRoster`. Carrying every member is what makes the broadcast safe to
