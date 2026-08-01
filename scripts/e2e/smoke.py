@@ -79,7 +79,14 @@ def smoke_create_and_cleanup() -> None:
     baseline = p2pmux_pids()
 
     with Harness("smoke-create") as harness:
-        host = harness.spawn("host", ["create", "--name", "hostuser"], cols=100, rows=30)
+        host = harness.spawn(
+            "host",
+            # The session name has to be pinned: `create` picks a random world city
+            # otherwise, and the record lookup below has nothing to match on.
+            ["create", "--name", "hostuser", "--session-name", "hostuser"],
+            cols=100,
+            rows=30,
+        )
         screen = host.settle(quiet_for=0.6, timeout=15)
 
         try:
