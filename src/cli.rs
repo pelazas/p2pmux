@@ -647,14 +647,35 @@ fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn
     if !io::stdin().is_terminal() {
         return Err(CliError("missing display name; run: p2pmux config set name <name>").into());
     }
-    {
-        let mut stdout = io::stdout().lock();
-        write!(stdout, "Choose a display name (visible to session peers): ")?;
-        stdout.flush()?;
+    // This prompt is the first thing a new install shows. Ending the whole command on a
+    // stray Enter -- the single likeliest thing to happen here -- means retyping `p2pmux
+    // create` and reading the trust warning again to recover from a keystroke, so ask
+    // again instead. Bounded, so a terminal feeding an endless stream of blank lines
+    // cannot spin here forever.
+    const PROMPT_ATTEMPTS: usize = 3;
+    for attempt in 1..=PROMPT_ATTEMPTS {
+        {
+            let mut stdout = io::stdout().lock();
+            write!(stdout, "Choose a display name (visible to session peers): ")?;
+            stdout.flush()?;
+        }
+        let mut name = String::new();
+        // Zero bytes is end of input, not a short name: the pipe is closed and asking
+        // again would read zero bytes forever.
+        if io::stdin().read_line(&mut name)? == 0 {
+            return Err(CliError("no display name given").into());
+        }
+        match crate::config::save(&name) {
+            Ok(saved) => return Ok(saved),
+            Err(error) if attempt < PROMPT_ATTEMPTS => {
+                let mut stderr = io::stderr().lock();
+                writeln!(stderr, "{error}")?;
+                stderr.flush()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
-    Ok(crate::config::save(&name)?)
+    unreachable!("the loop returns on its last attempt either way")
 }
 
 /// Turn whatever the user pasted into a dialable ticket.
