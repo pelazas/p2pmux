@@ -70,6 +70,13 @@ KEYS = {
     "ctrl_c": b"\x03",
     "ctrl_d": b"\x04",
     "ctrl_b": b"\x02",
+    # The four mux mode keys the manual is written around. Without them a scenario can
+    # reach a pane's shell but not the multiplexer wrapped around it -- no split, no tab,
+    # no share panel, no agents overlay.
+    "ctrl_a": b"\x01",
+    "ctrl_p": b"\x10",
+    "ctrl_s": b"\x13",
+    "ctrl_t": b"\x14",
 }
 
 
@@ -569,13 +576,26 @@ class Harness:
         The ticket is read off the session record rather than the screen: invite material
         lives behind Ctrl+S now, and a ~200-character ticket would never have fitted in a
         footer anyway.
+
+        `--session-name` is not decoration. `create` now hands every session a random
+        world-city name, and `--name` sets only the *display* name -- so looking the record
+        up by the peer's name found nothing, and every scenario built on `create_room` died
+        at its first step. Pinning the session name is what makes the record addressable.
         """
-        host = self.spawn(name, ["create", "--name", name], cols=cols, rows=rows)
+        host = self.spawn(
+            name,
+            ["create", "--name", name, "--session-name", name],
+            cols=cols,
+            rows=rows,
+        )
         host.wait_ready(timeout=timeout)
         return host, self.wait_for_ticket(name, timeout=timeout)
 
     def wait_for_ticket(self, name: str, timeout: float = 25.0) -> str:
-        """The ticket the coordinator's node published for `name`."""
+        """The ticket the coordinator's node published for session `name`.
+
+        `name` is the *session* name (`--session-name`), not the peer's display name.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for descriptor in self.session_descriptors():

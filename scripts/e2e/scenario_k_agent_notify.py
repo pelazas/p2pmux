@@ -92,7 +92,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
 
         host = harness.spawn(
             "host",
-            ["create", "--name", "host"],
+            # Pinned so `wait_for_ticket("host")` below has a name to match; `create`
+            # otherwise names the session after a random world city.
+            ["create", "--name", "host", "--session-name", "host"],
             env=peer_env(host_log),
         )
         host.wait_ready(timeout=25)
