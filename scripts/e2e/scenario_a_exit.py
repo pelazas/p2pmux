@@ -23,6 +23,7 @@ from driver import (  # noqa: E402
     Harness,
     diff_screens,
     p2pmux_pids,
+    orphans_after,
     rss_kb,
 )
 
@@ -174,7 +175,7 @@ def main() -> int:
         else:
             print(f"    0/{len(all_runs)}  pass  {name}")
 
-    leaked = p2pmux_pids() - baseline
+    leaked = orphans_after(baseline)
     print(f"\n  orphans left behind: {sorted(leaked) if leaked else 'none'}")
     return 1 if (any_failure or leaked) else 0
 

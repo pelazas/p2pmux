@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from driver import DeadlineExceeded, Harness, p2pmux_pids  # noqa: E402
+from driver import DeadlineExceeded, Harness, p2pmux_pids, orphans_after  # noqa: E402
 
 
 def wait_exit(peer, timeout: float) -> int | None:
@@ -56,10 +56,16 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         check("a bad join ticket exits instead of hanging", code is not None,
               "still running after 30s")
         check("a bad join ticket exits non-zero", code not in (0, None), f"exit={code}")
+        # `ZZZZZZZZZZ` is ten symbols of the code alphabet, so `join` reads it as a short
+        # code and asks the rendezvous, which has no such record. The message that comes
+        # back names that cause; the older "expected a join ticket" wording predates short
+        # codes existing and is kept only so this still passes on a build without them.
         check(
             "a bad join ticket explains itself",
             any(word in bad.raw_text().lower()
-                for word in ("expected a join ticket", "invalid ticket")),
+                for word in ("expired or does not exist", "was not found on this mac",
+                             "expected a join code or ticket",
+                             "expected a join ticket", "invalid ticket")),
             f"output tail: {bad.raw_text()[-300:]!r}",
         )
 
@@ -207,7 +213,7 @@ def main() -> int:
         any_failure |= bool(failures)
         print(f"    {failures}/{len(runs)}  {'FAIL' if failures else 'pass'}  {name}")
 
-    leaked = p2pmux_pids() - baseline
+    leaked = orphans_after(baseline)
     print(f"\n  orphans left behind: {sorted(leaked) if leaked else 'none'}")
     return 1 if (any_failure or leaked) else 0
 

@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from driver import Harness, diff_screens, p2pmux_pids, rss_kb  # noqa: E402
+from driver import Harness, diff_screens, orphans_after, p2pmux_pids, rss_kb  # noqa: E402
 
 LINES = 10000
 TYPED = "TYPED-DURING-STREAM-Q1W2E3R4T5"
@@ -144,7 +144,7 @@ def main() -> int:
         any_failure |= bool(failures)
         print(f"    {failures}/{len(runs)}  {'FAIL' if failures else 'pass'}  {name}")
 
-    leaked = p2pmux_pids() - baseline
+    leaked = orphans_after(baseline)
     print(f"\n  orphans left behind: {sorted(leaked) if leaked else 'none'}")
     return 1 if (any_failure or leaked) else 0
 

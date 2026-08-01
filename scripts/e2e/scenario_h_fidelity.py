@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from driver import DeadlineExceeded, Harness, diff_screens, p2pmux_pids  # noqa: E402
+from driver import DeadlineExceeded, Harness, diff_screens, p2pmux_pids, orphans_after  # noqa: E402
 
 CTRL_P = b"\x10"
 CTRL_Q = b"\x11"
@@ -184,7 +184,7 @@ def main() -> int:
         any_failure |= bool(failures)
         print(f"    {failures}/{len(runs)}  {'FAIL' if failures else 'pass'}  {name}")
 
-    leaked = p2pmux_pids() - baseline
+    leaked = orphans_after(baseline)
     print(f"\n  orphans left behind: {sorted(leaked) if leaked else 'none'}")
     return 1 if (any_failure or leaked) else 0
 

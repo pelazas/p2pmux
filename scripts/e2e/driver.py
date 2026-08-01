@@ -502,6 +502,23 @@ def p2pmux_pids() -> set[int]:
     }
 
 
+def orphans_after(baseline: set[int], settle: float = 4.0) -> set[int]:
+    """p2pmux processes still alive `settle` seconds after teardown.
+
+    Sampling the instant a scenario ends reports transients as leaks. Not every p2pmux
+    process is a session: `p2pmux notify` is spawned per agent hook, runs for
+    milliseconds and exits, and one caught mid-flight looks identical to a leaked node.
+    A node that genuinely leaked is still there after the grace window -- it lives until
+    something kills it -- so waiting costs nothing and removes the false positive.
+    """
+    deadline = time.monotonic() + settle
+    leaked = p2pmux_pids() - baseline
+    while leaked and time.monotonic() < deadline:
+        time.sleep(0.25)
+        leaked = p2pmux_pids() - baseline
+    return leaked
+
+
 # ----------------------------------------------------------------------- harness
 
 
