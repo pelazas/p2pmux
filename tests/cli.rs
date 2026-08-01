@@ -24,10 +24,14 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 /// Run against an isolated session store so tests never read the user's live sessions.
+///
+/// `XDG_STATE_HOME` outranks `HOME` where it is honoured, so a developer who has
+/// one set would otherwise send the child straight back to their own sessions.
 fn run_with_home(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_p2pmux"))
         .args(args)
         .env("HOME", home)
+        .env_remove("XDG_STATE_HOME")
         .output()
         .expect("p2pmux binary should run")
 }
@@ -300,10 +304,7 @@ impl FakeSession {
             std::process::id(),
             TEMPORARY_CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let store = SessionStore::at(
-            home.join("Library/Application Support/p2pmux/sessions"),
-            sockets.clone(),
-        );
+        let store = SessionStore::at(SessionStore::sessions_dir_for_home(&home), sockets.clone());
         fs::create_dir_all(&sockets).expect("socket directory");
         Self {
             home,
