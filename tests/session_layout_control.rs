@@ -3,10 +3,11 @@ use std::{net::Ipv4Addr, time::Duration};
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
     lease::LeaseState,
+    ledger::entry_hash,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, Envelope, Join, LayoutRejectReason, LayoutRequest, PROTOCOL_VERSION,
-        PaneDescriptor, PaneReady, SplitAxis, envelope,
+        DeleteTab, Envelope, Join, LayoutRejectReason, LayoutRequest, MembershipRecord,
+        PROTOCOL_VERSION, PaneDescriptor, PaneReady, SplitAxis, envelope,
     },
     screen::HostScreen,
     session::{
@@ -15,6 +16,7 @@ use p2pmux::{
     },
     transport::{ALPN, Transport},
 };
+use prost::Message;
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1078,5 +1080,69 @@ async fn revoking_the_coordinators_own_key_is_refused() {
     );
     assert!(coordinator.roster().expect("roster").is_empty());
 
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_receives_a_chained_ledger_alongside_every_commit() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut first = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("first joins");
+    accept_first
+        .await
+        .expect("accept task")
+        .expect("accept first");
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+
+    // A second member joining, then leaving, is two changes the coordinator authored on its
+    // own account -- the pair the first member has to be able to follow.
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second joins");
+    accept_second
+        .await
+        .expect("accept task")
+        .expect("accept second");
+    let second_id = second.peer_id.clone();
+
+    let LayoutControlEvent::Commit(admission) = next_event(&mut first).await else {
+        panic!("the first member should see the second arrive");
+    };
+    coordinator.revoke_member(&second_id).expect("revoke");
+    let LayoutControlEvent::Commit(departure) = next_event(&mut first).await else {
+        panic!("the first member should see the second leave");
+    };
+
+    let admission = admission.entry.expect("admission is sealed");
+    let departure = departure.entry.expect("departure is sealed");
+    assert_eq!(departure.seq, admission.seq + 1);
+    assert_eq!(
+        departure.prev_hash,
+        entry_hash(coordinator.ticket().session_id(), &admission).to_vec(),
+        "each entry names the one before it, so a dropped commit cannot pass unnoticed"
+    );
+    assert_eq!(
+        MembershipRecord::decode(departure.payload.as_slice())
+            .expect("payload is a membership record")
+            .peer_id,
+        second_id
+    );
+
+    drop(second);
+    first.shutdown().await;
     coordinator.close().await;
 }

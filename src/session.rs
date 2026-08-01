@@ -17,6 +17,7 @@ use iroh::{
     EndpointAddr, EndpointId,
     endpoint::{ConnectingError, Connection, Incoming, SendStream},
 };
+use prost::Message as _;
 use tokio::{
     sync::{broadcast, mpsc, watch},
     time::{interval, timeout},
@@ -28,14 +29,16 @@ use crate::{
         NewPanePosition as LayoutNewPanePosition, Node, Pane, SessionState, Tab,
     },
     lease::LeaseState,
+    ledger::{LedgerVerifier, LedgerWriter},
     protocol::{
         AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
         Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
-        LayoutSplit, LayoutState, MarkPaneExited, MemberDescriptor,
-        NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
-        PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ReleaseControl,
-        RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
-        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
+        LayoutSplit, LayoutState, LedgerEntryKind, MarkPaneExited, MemberDescriptor,
+        MembershipEvent, MembershipRecord, NewPanePosition as ProtocolNewPanePosition,
+        PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
+        Presence, PresenceRoster, ReleaseControl, RenamePane, RenameTab, SessionSnapshot,
+        SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
+        UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -49,6 +52,8 @@ pub const DEFAULT_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// their protocol messages to this type.
 pub struct LayoutCoordinator {
     state: SessionState,
+    coordinator_peer_id: Vec<u8>,
+    ledger: LedgerWriter,
     reservations: BTreeMap<u64, ReservationContext>,
     agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     presence: BTreeMap<Vec<u8>, Presence>,
@@ -56,6 +61,19 @@ pub struct LayoutCoordinator {
     reservation_timeout: Duration,
     locked: bool,
     roster: MemberRoster,
+}
+
+/// What applying one request did to the layout, before the ledger seals it.
+///
+/// Handlers used to build their own commit, which meant every one of them had to be handed
+/// the author and the request bytes to record. Reporting what happened instead leaves a
+/// single place where a change becomes an entry, so no path can quietly commit without
+/// writing one.
+enum Applied {
+    /// The layout changed and the change needs sealing.
+    Changed,
+    /// A pane was reserved. Nothing is committed until its creator reports it live.
+    Reserved(PaneReservation),
 }
 
 /// Which endpoint public keys the coordinator will let into this session.
@@ -188,12 +206,14 @@ impl LayoutCoordinator {
     pub fn new(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, CoordinatorError> {
         Self::new_with_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            ledger,
             String::new(),
             grid_rows,
             grid_cols,
@@ -203,6 +223,7 @@ impl LayoutCoordinator {
     pub fn new_with_display_name(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         display_name: String,
         grid_rows: u16,
         grid_cols: u16,
@@ -210,6 +231,7 @@ impl LayoutCoordinator {
         Self::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            ledger,
             display_name,
             grid_rows,
             grid_cols,
@@ -221,6 +243,7 @@ impl LayoutCoordinator {
     pub fn with_reservation_timeout(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         grid_rows: u16,
         grid_cols: u16,
         reservation_timeout: Duration,
@@ -229,6 +252,7 @@ impl LayoutCoordinator {
         Self::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            ledger,
             String::new(),
             grid_rows,
             grid_cols,
@@ -237,9 +261,11 @@ impl LayoutCoordinator {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_reservation_timeout_and_display_name(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         display_name: String,
         grid_rows: u16,
         grid_cols: u16,
@@ -249,12 +275,14 @@ impl LayoutCoordinator {
         let endpoint_addr = serialized_endpoint(&coordinator_peer_id, endpoint_addr)?;
         Ok(Self {
             state: SessionState::new_with_display_name(
-                coordinator_peer_id,
+                coordinator_peer_id.clone(),
                 endpoint_addr,
                 display_name,
                 grid_rows,
                 grid_cols,
             )?,
+            coordinator_peer_id,
+            ledger,
             reservations: BTreeMap::new(),
             agent_rosters: BTreeMap::new(),
             presence: BTreeMap::new(),
@@ -438,11 +466,11 @@ impl LayoutCoordinator {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
         let invalidated = self.state.add_member_with_display_name(
             self.state.revision(),
-            peer_id,
+            peer_id.clone(),
             endpoint_addr,
             display_name,
         )?;
-        self.membership_change(invalidated)
+        self.membership_change(peer_id, MembershipEvent::Joined, invalidated)
     }
 
     pub fn update_member_endpoint(
@@ -456,7 +484,11 @@ impl LayoutCoordinator {
             authenticated_peer_id,
             endpoint_addr,
         )?;
-        self.membership_change(invalidated)
+        self.membership_change(
+            authenticated_peer_id.to_vec(),
+            MembershipEvent::EndpointChanged,
+            invalidated,
+        )
     }
 
     pub fn remove_member(&mut self, peer_id: &[u8]) -> Result<MembershipChange, CoordinatorError> {
@@ -465,7 +497,7 @@ impl LayoutCoordinator {
         if self.presence.remove(peer_id).is_some() {
             self.presence_epoch = self.presence_epoch.saturating_add(1);
         }
-        self.membership_change(invalidated)
+        self.membership_change(peer_id.to_vec(), MembershipEvent::Left, invalidated)
     }
 
     pub fn handle_request(
@@ -497,6 +529,9 @@ impl LayoutCoordinator {
         if request_id == 0 || request.base_revision == 0 || action_count != 1 {
             return reject(request_id, LayoutRejectReason::Malformed);
         }
+        // Captured before the request is taken apart: the ledger records what was asked
+        // for, not a reconstruction of it after the fact.
+        let payload = request.encode_to_vec();
 
         let result = if let Some(create) = request.create_pane {
             self.reserve_pane(
@@ -535,11 +570,18 @@ impl LayoutCoordinator {
         };
 
         match result {
-            Ok(response) => {
-                if matches!(response, CoordinatorResponse::Commit(_)) {
-                    self.prune_agent_rosters();
+            Ok(Applied::Reserved(reservation)) => CoordinatorResponse::Reservation(reservation),
+            Ok(Applied::Changed) => {
+                self.prune_agent_rosters();
+                match self.layout_commit(
+                    authenticated_peer_id.to_vec(),
+                    LedgerEntryKind::LayoutChange,
+                    payload,
+                    Vec::new(),
+                ) {
+                    Ok(commit) => CoordinatorResponse::Commit(commit),
+                    Err(error) => reject(request_id, reject_reason(&layout_error(error))),
                 }
-                response
             }
             Err(error) => reject(request_id, reject_reason(&error)),
         }
@@ -566,7 +608,13 @@ impl LayoutCoordinator {
         ) {
             Ok(_) => {
                 self.reservations.remove(&ready.reservation_id);
-                match self.layout_commit() {
+                let payload = ready.encode_to_vec();
+                match self.layout_commit(
+                    authenticated_peer_id.to_vec(),
+                    LedgerEntryKind::PaneReady,
+                    payload,
+                    Vec::new(),
+                ) {
                     Ok(commit) => CoordinatorResponse::Commit(commit),
                     Err(error) => reject(ready.request_id, reject_reason(&layout_error(error))),
                 }
@@ -681,7 +729,7 @@ impl LayoutCoordinator {
         create: CreatePane,
         request_id: u64,
         now: Instant,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let axis = protocol_axis(create.axis)?;
         let position = protocol_pane_position(create.position)?;
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
@@ -705,9 +753,7 @@ impl LayoutCoordinator {
                 deadline: now + self.reservation_timeout,
             },
         );
-        Ok(CoordinatorResponse::Reservation(protocol_reservation(
-            reservation,
-        )))
+        Ok(Applied::Reserved(protocol_reservation(reservation)))
     }
 
     fn reserve_tab(
@@ -717,7 +763,7 @@ impl LayoutCoordinator {
         create: CreateTab,
         request_id: u64,
         now: Instant,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
         let reservation =
             self.state
@@ -730,9 +776,7 @@ impl LayoutCoordinator {
                 deadline: now + self.reservation_timeout,
             },
         );
-        Ok(CoordinatorResponse::Reservation(protocol_reservation(
-            reservation,
-        )))
+        Ok(Applied::Reserved(protocol_reservation(reservation)))
     }
 
     fn delete_pane(
@@ -740,15 +784,13 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         delete: DeletePane,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if delete.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .delete_pane(authenticated_peer_id, base_revision, delete.pane_id)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn delete_tab(
@@ -756,15 +798,13 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         delete: DeleteTab,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if delete.tab_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .delete_tab(authenticated_peer_id, base_revision, delete.tab_id)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn set_split_ratio(
@@ -772,7 +812,7 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         ratio: SetSplitRatio,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let axis = protocol_axis(ratio.axis)?;
         let first_share_bps =
             u16::try_from(ratio.first_share_bps).map_err(|_| LayoutError::InvalidSplitRatio)?;
@@ -783,9 +823,7 @@ impl LayoutCoordinator {
             axis,
             first_share_bps,
         )?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn update_pane_grids(
@@ -793,7 +831,7 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         update: UpdatePaneGrids,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let grids = update
             .panes
             .into_iter()
@@ -807,9 +845,7 @@ impl LayoutCoordinator {
             .collect::<Result<Vec<_>, LayoutError>>()?;
         self.state
             .update_pane_grids(authenticated_peer_id, base_revision, &grids)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn rename_pane(
@@ -817,15 +853,13 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         rename: RenamePane,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if rename.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .rename_pane(peer, revision, rename.pane_id, rename.title)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn rename_tab(
@@ -833,15 +867,13 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         rename: RenameTab,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if rename.tab_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .rename_tab(peer, revision, rename.tab_id, rename.title)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn set_pane_lock(
@@ -849,15 +881,13 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         lock: SetPaneLock,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if lock.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .set_pane_lock(peer, revision, lock.pane_id, lock.locked)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn mark_pane_exited(
@@ -865,23 +895,54 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         exited: MarkPaneExited,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if exited.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .mark_pane_exited(peer, revision, exited.pane_id)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
-    fn layout_commit(&self) -> Result<LayoutCommit, CoordinatorError> {
+    /// Seal one change into the ledger and publish the layout it produced.
+    ///
+    /// The entry is the record and the state is the checkpoint beside it: a member that has
+    /// been following can verify the entry chains onto the last one it saw, and a member
+    /// that just arrived can draw the state while it starts its own chain from here.
+    fn layout_commit(
+        &mut self,
+        author_peer_id: Vec<u8>,
+        kind: LedgerEntryKind,
+        payload: Vec<u8>,
+        author_signature: Vec<u8>,
+    ) -> Result<LayoutCommit, CoordinatorError> {
         let state = self.protocol_layout_state()?;
+        let entry = self
+            .ledger
+            .append(author_peer_id, kind, payload, author_signature);
         Ok(LayoutCommit {
             revision: state.revision,
             state: Some(state),
+            entry: Some(entry),
         })
+    }
+
+    /// Seal a change the coordinator made on its own account.
+    ///
+    /// Nobody asked for these -- a connection dropped, a member moved to a new address --
+    /// so there is no member signature to carry and the coordinator is honestly the author.
+    fn membership_commit(
+        &mut self,
+        peer_id: Vec<u8>,
+        event: MembershipEvent,
+    ) -> Result<LayoutCommit, CoordinatorError> {
+        let payload = MembershipRecord {
+            peer_id,
+            event: event as i32,
+        }
+        .encode_to_vec();
+        let author = self.coordinator_peer_id.clone();
+        self.layout_commit(author, LedgerEntryKind::Membership, payload, Vec::new())
     }
 
     fn protocol_layout_state(&self) -> Result<LayoutState, CoordinatorError> {
@@ -892,6 +953,8 @@ impl LayoutCoordinator {
 
     fn membership_change(
         &mut self,
+        peer_id: Vec<u8>,
+        event: MembershipEvent,
         invalidated: Option<crate::layout::InvalidatedReservation>,
     ) -> Result<MembershipChange, CoordinatorError> {
         let invalidated_reservation = invalidated.and_then(|reservation| {
@@ -906,7 +969,7 @@ impl LayoutCoordinator {
                 })
         });
         Ok(MembershipChange {
-            commit: self.layout_commit()?,
+            commit: self.membership_commit(peer_id, event)?,
             invalidated_reservation,
         })
     }
@@ -2375,9 +2438,16 @@ impl SharedLayoutHost {
     ) -> Result<Self, SessionError> {
         let pane_server = host.pane_server();
         let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        // The ledger is signed with the same endpoint key the joiners already authenticated
+        // through the ticket, so no separate trust root has to be established for it.
+        let ledger = LedgerWriter::new(
+            host.ticket().session_id().to_vec(),
+            host.transport.secret_key(),
+        );
         let coordinator = LayoutCoordinator::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             host.ticket().endpoint_addr().clone(),
+            ledger,
             display_name,
             grid_rows,
             grid_cols,
@@ -3126,11 +3196,16 @@ pub async fn join_layout_with_display_name(
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let coordinator_peer_id = receipt.coordinator_peer_id;
         let session_name = receipt.session_name;
+        // Anchored on the endpoint key the ticket named and QUIC proved on this very
+        // connection, rather than on the coordinator id the Welcome claimed: a peer that
+        // could lie about the latter is exactly the one this verifier exists to catch.
+        let verifier = LedgerVerifier::new(ticket.session_id().to_vec(), ticket.endpoint_addr().id);
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
                 events_tx,
                 coordinator_peer_id.clone(),
+                verifier,
             )),
             tokio::spawn(layout_member_writer_task(
                 writer,
@@ -3301,6 +3376,7 @@ async fn layout_member_reader_task(
     mut reader: crate::transport::FrameReader,
     events_tx: mpsc::Sender<LayoutControlEvent>,
     coordinator_peer_id: Vec<u8>,
+    mut verifier: LedgerVerifier,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != coordinator_peer_id {
@@ -3315,7 +3391,18 @@ async fn layout_member_reader_task(
             Some(envelope::Body::PaneReservation(reservation)) => {
                 LayoutControlEvent::Reservation(reservation)
             }
-            Some(envelope::Body::LayoutCommit(commit)) => LayoutControlEvent::Commit(commit),
+            Some(envelope::Body::LayoutCommit(commit)) => {
+                // An unverifiable commit ends the session rather than being skipped. A
+                // member that quietly ignored one would keep drawing a layout it can no
+                // longer account for, which is worse than visibly losing the connection.
+                let Some(entry) = commit.entry.as_ref() else {
+                    break;
+                };
+                if verifier.accept(entry).is_err() {
+                    break;
+                }
+                LayoutControlEvent::Commit(commit)
+            }
             Some(envelope::Body::LayoutReject(reject)) => LayoutControlEvent::Reject(reject),
             _ => break,
         };
@@ -4107,6 +4194,7 @@ mod control_queue_tests {
             envelope::Body::LayoutCommit(LayoutCommit {
                 revision,
                 state: None,
+                entry: None,
             }),
         )
     }

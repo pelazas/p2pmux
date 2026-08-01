@@ -1,13 +1,15 @@
 use iroh::{EndpointAddr, SecretKey};
 use p2pmux::{
+    ledger::{GENESIS_PREV_HASH, LedgerVerifier, LedgerWriter},
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, MarkPaneExited,
-        NewPanePosition, PaneFailed, PaneGrid, PaneReady, Presence, SetPaneLock, SetSplitRatio,
-        SplitAxis, UpdatePaneGrids,
+        DeleteTab, LayoutCommit, LayoutRejectReason, LayoutRequest, LedgerEntry, LedgerEntryKind,
+        MarkPaneExited, MembershipEvent, MembershipRecord, NewPanePosition, PaneFailed, PaneGrid,
+        PaneReady, Presence, RenamePane, SetPaneLock, SetSplitRatio, SplitAxis, UpdatePaneGrids,
     },
     session::{CoordinatorError, CoordinatorResponse, LayoutCoordinator, RosterStatus},
 };
+use prost::Message;
 use std::{
     net::SocketAddr,
     time::{Duration, Instant},
@@ -32,7 +34,13 @@ fn addr_b() -> EndpointAddr {
 }
 
 fn coordinator() -> LayoutCoordinator {
-    LayoutCoordinator::new(host_a(), addr_a(), 24, 80).expect("valid coordinator")
+    LayoutCoordinator::new(host_a(), addr_a(), ledger(), 24, 80).expect("valid coordinator")
+}
+
+/// A ledger signed with the same key `host_a` is derived from, so entries a test reads back
+/// verify against the coordinator it thinks wrote them.
+fn ledger() -> LedgerWriter {
+    LedgerWriter::new(b"test-session".to_vec(), SecretKey::from_bytes(&[1; 32]))
 }
 
 fn request(request_id: u64, base_revision: u64) -> LayoutRequest {
@@ -750,6 +758,7 @@ fn reservation_expiry_is_deterministic_and_unwedges_new_requests() {
     let mut coordinator = LayoutCoordinator::with_reservation_timeout(
         host_a(),
         addr_a(),
+        ledger(),
         24,
         80,
         Duration::from_secs(5),
@@ -828,13 +837,14 @@ fn pane_failure_clears_its_creator_reservation_immediately() {
 #[test]
 fn endpoints_and_ready_request_ids_must_match_authenticated_reservations() {
     assert!(matches!(
-        LayoutCoordinator::new(host_a(), addr_b(), 24, 80),
+        LayoutCoordinator::new(host_a(), addr_b(), ledger(), 24, 80),
         Err(CoordinatorError::EndpointIdentityMismatch)
     ));
     assert!(matches!(
         LayoutCoordinator::new(
             host_a(),
             EndpointAddr::new(SecretKey::from_bytes(&[1; 32]).public()),
+            ledger(),
             24,
             80
         ),
@@ -1006,4 +1016,137 @@ fn a_revoked_refusal_is_distinct_from_a_locked_one() {
         LayoutRejectReason::try_from(LayoutRejectReason::Revoked as i32),
         Ok(LayoutRejectReason::Revoked)
     );
+}
+
+fn ledger_verifier() -> LedgerVerifier {
+    LedgerVerifier::new(
+        b"test-session".to_vec(),
+        SecretKey::from_bytes(&[1; 32]).public(),
+    )
+}
+
+fn entry(commit: &LayoutCommit) -> LedgerEntry {
+    commit.entry.clone().expect("every commit seals an entry")
+}
+
+#[test]
+fn the_chain_a_session_writes_verifies_against_its_coordinator_key() {
+    let mut coordinator = coordinator();
+    let mut verifier = ledger_verifier();
+
+    let admission = coordinator.admit(host_b(), addr_b()).expect("admitted");
+    let first = entry(&admission.commit);
+    assert_eq!(first.seq, 1);
+    assert_eq!(first.prev_hash, GENESIS_PREV_HASH.to_vec());
+    assert_eq!(verifier.accept(&first), Ok(()));
+
+    for (step, request_id) in (2..=4u64).enumerate() {
+        let renamed = commit(coordinator.handle_request(
+            &host_a(),
+            LayoutRequest {
+                rename_pane: Some(RenamePane {
+                    pane_id: 1,
+                    title: format!("pass {request_id}"),
+                }),
+                ..request(request_id, renamed_base_revision(step))
+            },
+        ));
+        let sealed = entry(&renamed);
+        assert_eq!(sealed.seq, request_id);
+        assert_eq!(verifier.accept(&sealed), Ok(()));
+    }
+}
+
+/// Each rename advances the revision by one, starting from the admission at revision 2.
+fn renamed_base_revision(step: usize) -> u64 {
+    2 + step as u64
+}
+
+#[test]
+fn the_ledger_records_the_request_that_was_made() {
+    let mut coordinator = coordinator();
+    let renamed = commit(coordinator.handle_request(
+        &host_a(),
+        LayoutRequest {
+            rename_pane: Some(RenamePane {
+                pane_id: 1,
+                title: String::from("build"),
+            }),
+            ..request(7, 1)
+        },
+    ));
+
+    let sealed = entry(&renamed);
+    assert_eq!(sealed.kind, LedgerEntryKind::LayoutChange as i32);
+    assert_eq!(sealed.author_peer_id, host_a());
+    // The entry holds the request itself, not a summary of it: a reader a week later has to
+    // be able to see what was asked for, not what somebody later decided it meant.
+    let recorded =
+        LayoutRequest::decode(sealed.payload.as_slice()).expect("the payload is the request");
+    assert_eq!(recorded.request_id, 7);
+    assert_eq!(recorded.rename_pane.expect("rename").title, "build");
+}
+
+#[test]
+fn a_change_is_recorded_under_the_key_that_asked_for_it() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member admitted");
+
+    let reservation = match coordinator.handle_request(
+        &host_b(),
+        LayoutRequest {
+            create_tab: Some(CreateTab {
+                grid_rows: 24,
+                grid_cols: 80,
+            }),
+            ..request(1, 2)
+        },
+    ) {
+        CoordinatorResponse::Reservation(value) => value,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    let ready = commit(coordinator.handle_pane_ready(
+        &host_b(),
+        PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 2,
+            request_id: 1,
+        },
+    ));
+
+    let sealed = entry(&ready);
+    assert_eq!(sealed.author_peer_id, host_b());
+    assert_eq!(sealed.kind, LedgerEntryKind::PaneReady as i32);
+    // A reservation is not a change, so it must not have taken a place in the chain: the
+    // admission is 1 and this is 2.
+    assert_eq!(sealed.seq, 2);
+}
+
+#[test]
+fn a_departure_is_authored_by_the_coordinator_because_nobody_asked_for_it() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member admitted");
+
+    let departure = coordinator
+        .remove_member(&host_b())
+        .expect("member removed");
+    let sealed = entry(&departure.commit);
+
+    assert_eq!(
+        sealed.author_peer_id,
+        host_a(),
+        "a dropped connection is the coordinator's own observation, not a member's request"
+    );
+    assert!(
+        sealed.author_signature.is_empty(),
+        "there is no member intent to carry"
+    );
+    let record = MembershipRecord::decode(sealed.payload.as_slice())
+        .expect("payload is a membership record");
+    assert_eq!(record.peer_id, host_b());
+    assert_eq!(record.event, MembershipEvent::Left as i32);
 }

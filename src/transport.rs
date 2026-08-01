@@ -9,7 +9,7 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
     endpoint::{
         ClosedStream, ConnectingError, Connection, ConnectionError, Incoming, ReadError,
         ReadToEndError, RecvStream, SendStream, WriteError, presets,
@@ -292,6 +292,15 @@ impl Transport {
 
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// This endpoint's signing key.
+    ///
+    /// The same key QUIC already proves ownership of on every connection, handed out so
+    /// that what a peer says can be authenticated after the fact too -- a relayed ledger
+    /// entry is read by members who were never on the connection that carried it.
+    pub fn secret_key(&self) -> SecretKey {
+        self.endpoint.secret_key().clone()
     }
 
     pub fn endpoint_addr(&self) -> EndpointAddr {
