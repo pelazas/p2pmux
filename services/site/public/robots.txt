@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://p2pmux.com/sitemap.xml
