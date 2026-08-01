@@ -12,6 +12,18 @@ live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
 for confirmation; use `--yes` for non-interactive scripts.
 
+`p2pmux ls` prints the live sessions on this Mac — the names every one of those commands takes:
+
+```text
+NAME       ROLE         CODE         UP
+firenze    coordinator  7REWA-P3QEQ  12m
+firenze-2  member       -            11m
+```
+
+`CODE` is `-` for a session you joined rather than created, and for a coordinator that started
+while the rendezvous was unreachable and so has only a ticket. `p2pmux --version` reports the
+build, which is the first thing to put in a bug report.
+
 Every `create` automatically receives a memorable world-city session name such as `tokyo` or
 `cape-town`; no session name is required. `create --session-name <name>` remains available when
 you want to choose a name explicitly. A joining peer uses the coordinator's session name for its
