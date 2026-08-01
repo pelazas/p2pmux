@@ -9,6 +9,7 @@ pub mod hosted_rendezvous;
 pub mod kitty_keyboard;
 pub mod layout;
 pub mod lease;
+pub mod ledger;
 pub mod local_ipc;
 pub mod node;
 pub mod notify_sound;

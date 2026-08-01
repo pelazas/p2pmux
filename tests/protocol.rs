@@ -1,14 +1,15 @@
 use p2pmux::protocol::{
     AgentRoster, AgentRosterEntry, AgentRosterState, ControlLease, CreatePane, CreateTab,
-    DeletePane, DeleteTab, Delta, Envelope, Input, Join, LayoutCommit, LayoutNode, LayoutReject,
-    LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, MAX_AGENT_CWD_BYTES,
-    MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
-    MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES,
-    MAX_PRESENCE_ENTRIES, MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited,
-    MemberDescriptor, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneGrid,
-    PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ProtocolError,
-    SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
-    UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
+    DeletePane, DeleteTab, Delta, Envelope, Input, Join, LEDGER_HASH_BYTES, LEDGER_SIGNATURE_BYTES,
+    LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
+    LayoutState, LedgerEntry, LedgerEntryKind, MAX_AGENT_CWD_BYTES, MAX_AGENT_KIND_BYTES,
+    MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES,
+    MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_LEDGER_PAYLOAD_BYTES, MAX_PANE_ID_BYTES,
+    MAX_PEER_ID_BYTES, MAX_PRESENCE_ENTRIES, MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES,
+    MarkPaneExited, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor,
+    PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster,
+    ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
+    TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -17,6 +18,30 @@ struct ParsedField {
     field_number: u32,
     wire_type: u8,
     value: Vec<u8>,
+}
+
+/// A structurally valid ledger entry. The signatures are the right shape and nothing more:
+/// `validate_envelope` checks framing, and only [`p2pmux::ledger::LedgerVerifier`] checks
+/// that a signature means anything.
+fn ledger_entry() -> LedgerEntry {
+    LedgerEntry {
+        seq: 1,
+        prev_hash: vec![0; LEDGER_HASH_BYTES],
+        author_peer_id: b"peer-a".to_vec(),
+        kind: LedgerEntryKind::LayoutChange as i32,
+        payload: b"payload".to_vec(),
+        author_signature: Vec::new(),
+        coordinator_signature: vec![7; LEDGER_SIGNATURE_BYTES],
+    }
+}
+
+/// A commit whose state is valid, so only the entry can be what a case is testing.
+fn commit_with(entry: LedgerEntry) -> LayoutCommit {
+    LayoutCommit {
+        revision: 1,
+        state: Some(layout_state(leaf(1))),
+        entry: Some(entry),
+    }
 }
 
 fn envelope(body: envelope::Body) -> Envelope {
@@ -28,8 +53,8 @@ fn envelope(body: envelope::Body) -> Envelope {
 }
 
 #[test]
-fn protocol_version_is_v8() {
-    assert_eq!(PROTOCOL_VERSION, 8);
+fn protocol_version_is_v9() {
+    assert_eq!(PROTOCOL_VERSION, 9);
 }
 
 #[test]
@@ -75,6 +100,7 @@ fn ratio_and_grid_actions_validate_strictly() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid request");
@@ -103,6 +129,7 @@ fn ratio_and_grid_actions_validate_strictly() {
                 rename_tab: None,
                 set_pane_lock: None,
                 mark_pane_exited: None,
+                author_signature: Vec::new(),
             }
         };
         assert!(encode_frame(&envelope(envelope::Body::LayoutRequest(invalid))).is_err());
@@ -128,6 +155,7 @@ fn ratio_and_grid_actions_validate_strictly() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     assert!(
         decode_frame(
@@ -155,6 +183,7 @@ fn pane_lock_action_round_trips_and_is_the_only_action() {
             locked: true,
         }),
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid lock request");
@@ -179,6 +208,7 @@ fn mark_pane_exited_round_trips_and_is_the_only_action() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: Some(MarkPaneExited { pane_id: 1 }),
+        author_signature: Vec::new(),
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid exited request");
@@ -773,6 +803,7 @@ fn v2_envelopes() -> Vec<Envelope> {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
@@ -783,10 +814,12 @@ fn v2_envelopes() -> Vec<Envelope> {
             reservation_id: 1,
             base_revision: 1,
             request_id: 1,
+            author_signature: Vec::new(),
         })),
         envelope(envelope::Body::LayoutCommit(LayoutCommit {
             revision: 1,
             state: Some(state),
+            entry: Some(ledger_entry()),
         })),
         envelope(envelope::Body::LayoutReject(LayoutReject {
             request_id: 1,
@@ -812,7 +845,8 @@ fn envelope_exposes_each_v2_layout_body_with_stable_tags() {
         &[(1, 0), (2, 0), (3, 2)],
         &[(1, 0), (2, 0)],
         &[(1, 0), (2, 0), (3, 0)],
-        &[(1, 0), (2, 2)],
+        // LayoutCommit: revision, state, and the ledger entry the state materializes.
+        &[(1, 0), (2, 2), (3, 2)],
         &[(1, 0), (2, 0)],
         &[(1, 2), (2, 2), (3, 0)],
         &[(1, 0), (2, 0), (3, 0)],
@@ -862,6 +896,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
@@ -963,6 +998,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
     let invalid_commit = LayoutCommit {
         revision: 2,
         state: Some(state.clone()),
+        entry: Some(ledger_entry()),
     };
 
     let cases = vec![
@@ -994,6 +1030,41 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             state: Some(zero_pane_grid),
         })),
         envelope(envelope::Body::LayoutCommit(invalid_commit)),
+        // A commit with no entry is a snapshot with nothing vouching for it, which is the
+        // shape this protocol version exists to stop accepting.
+        envelope(envelope::Body::LayoutCommit(LayoutCommit {
+            revision: 1,
+            state: Some(state.clone()),
+            entry: None,
+        })),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            seq: 0,
+            ..ledger_entry()
+        }))),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            prev_hash: vec![0; LEDGER_HASH_BYTES - 1],
+            ..ledger_entry()
+        }))),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            author_peer_id: Vec::new(),
+            ..ledger_entry()
+        }))),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            kind: 99,
+            ..ledger_entry()
+        }))),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            payload: vec![0; MAX_LEDGER_PAYLOAD_BYTES + 1],
+            ..ledger_entry()
+        }))),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            author_signature: vec![3; LEDGER_SIGNATURE_BYTES - 1],
+            ..ledger_entry()
+        }))),
+        envelope(envelope::Body::LayoutCommit(commit_with(LedgerEntry {
+            coordinator_signature: Vec::new(),
+            ..ledger_entry()
+        }))),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 0,
             pane_id: 1,
@@ -1003,6 +1074,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             reservation_id: 0,
             base_revision: 1,
             request_id: 1,
+            author_signature: Vec::new(),
         })),
         envelope(envelope::Body::LayoutReject(LayoutReject {
             request_id: 1,
@@ -1035,11 +1107,13 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         reservation_id: 1,
         base_revision: 0,
         request_id: 1,
+        author_signature: Vec::new(),
     }));
     let missing_ready_request = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
         base_revision: 1,
         request_id: 0,
+        author_signature: Vec::new(),
     }));
     let missing_failed_request = envelope(envelope::Body::PaneFailed(PaneFailed {
         reservation_id: 1,
@@ -1088,6 +1162,7 @@ fn create_pane_axis_and_position_are_validated() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         }))
     }
 
@@ -1200,6 +1275,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
 
     for valid in [

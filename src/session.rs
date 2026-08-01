@@ -1,7 +1,7 @@
 //! Authenticated Join/Welcome session handshakes over Iroh bi-streams.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     error::Error,
     fmt,
     future::Future,
@@ -17,6 +17,7 @@ use iroh::{
     EndpointAddr, EndpointId,
     endpoint::{ConnectingError, Connection, Incoming, SendStream},
 };
+use prost::Message as _;
 use tokio::{
     sync::{broadcast, mpsc, watch},
     time::{interval, timeout},
@@ -28,14 +29,16 @@ use crate::{
         NewPanePosition as LayoutNewPanePosition, Node, Pane, SessionState, Tab,
     },
     lease::LeaseState,
+    ledger::{IntentSigner, LedgerVerifier, LedgerWriter, verify_intent},
     protocol::{
         AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
         Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
-        LayoutSplit, LayoutState, MarkPaneExited, MemberDescriptor,
-        NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
-        PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ReleaseControl,
-        RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
-        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
+        LayoutSplit, LayoutState, LedgerEntryKind, MarkPaneExited, MemberDescriptor,
+        MembershipEvent, MembershipRecord, NewPanePosition as ProtocolNewPanePosition,
+        PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
+        Presence, PresenceRoster, ReleaseControl, RenamePane, RenameTab, SessionSnapshot,
+        SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
+        UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -49,13 +52,88 @@ pub const DEFAULT_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// their protocol messages to this type.
 pub struct LayoutCoordinator {
     state: SessionState,
+    coordinator_peer_id: Vec<u8>,
+    ledger: LedgerWriter,
     reservations: BTreeMap<u64, ReservationContext>,
     agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     presence: BTreeMap<Vec<u8>, Presence>,
     presence_epoch: u64,
     reservation_timeout: Duration,
     locked: bool,
-    admitted: BTreeSet<Vec<u8>>,
+    roster: MemberRoster,
+}
+
+/// What applying one request did to the layout, before the ledger seals it.
+///
+/// Handlers used to build their own commit, which meant every one of them had to be handed
+/// the author and the request bytes to record. Reporting what happened instead leaves a
+/// single place where a change becomes an entry, so no path can quietly commit without
+/// writing one.
+enum Applied {
+    /// The layout changed and the change needs sealing.
+    Changed,
+    /// A pane was reserved. Nothing is committed until its creator reports it live.
+    Reserved(PaneReservation),
+}
+
+/// Which endpoint public keys the coordinator will let into this session.
+///
+/// The ticket secret is what gets a stranger *considered*; this roster is what decides. The
+/// two used to be the same thing, which made refusal impossible to express: a ticket that
+/// had been forwarded once could not be un-forwarded, and the only lever -- the session
+/// lock -- shut the door on everybody at once. Naming keys instead means a refusal can be
+/// about one person, and it outlives both an unlock and a reshared ticket.
+///
+/// Entries are keyed by the raw endpoint public key, which QUIC has already authenticated
+/// by the time anything here is consulted, so a peer cannot claim to be someone else's
+/// entry.
+#[derive(Clone, Debug, Default)]
+pub struct MemberRoster {
+    entries: BTreeMap<Vec<u8>, RosterStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RosterStatus {
+    /// Admitted at least once, and welcome back through a locked door.
+    Admitted,
+    /// Turned away by name, whatever the lock says.
+    Revoked,
+}
+
+impl MemberRoster {
+    /// Record a key as admitted. A revoked key stays revoked: the whole point of revoking
+    /// is that the holder cannot undo it by knocking again.
+    pub fn admit(&mut self, peer_id: Vec<u8>) -> bool {
+        if self.is_revoked(&peer_id) {
+            return false;
+        }
+        self.entries.insert(peer_id, RosterStatus::Admitted);
+        true
+    }
+
+    /// Turn one key away for the rest of the session. Returns whether this changed anything.
+    pub fn revoke(&mut self, peer_id: Vec<u8>) -> bool {
+        self.entries.insert(peer_id, RosterStatus::Revoked) != Some(RosterStatus::Revoked)
+    }
+
+    pub fn status(&self, peer_id: &[u8]) -> Option<RosterStatus> {
+        self.entries.get(peer_id).copied()
+    }
+
+    pub fn is_admitted(&self, peer_id: &[u8]) -> bool {
+        self.status(peer_id) == Some(RosterStatus::Admitted)
+    }
+
+    pub fn is_revoked(&self, peer_id: &[u8]) -> bool {
+        self.status(peer_id) == Some(RosterStatus::Revoked)
+    }
+
+    /// Every key this session has an opinion about, in deterministic key order.
+    pub fn entries(&self) -> impl Iterator<Item = (&[u8], RosterStatus)> {
+        self.entries
+            .iter()
+            .map(|(peer_id, status)| (peer_id.as_slice(), *status))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,12 +206,14 @@ impl LayoutCoordinator {
     pub fn new(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, CoordinatorError> {
         Self::new_with_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            ledger,
             String::new(),
             grid_rows,
             grid_cols,
@@ -143,6 +223,7 @@ impl LayoutCoordinator {
     pub fn new_with_display_name(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         display_name: String,
         grid_rows: u16,
         grid_cols: u16,
@@ -150,6 +231,7 @@ impl LayoutCoordinator {
         Self::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            ledger,
             display_name,
             grid_rows,
             grid_cols,
@@ -161,6 +243,7 @@ impl LayoutCoordinator {
     pub fn with_reservation_timeout(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         grid_rows: u16,
         grid_cols: u16,
         reservation_timeout: Duration,
@@ -169,6 +252,7 @@ impl LayoutCoordinator {
         Self::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             endpoint_addr,
+            ledger,
             String::new(),
             grid_rows,
             grid_cols,
@@ -177,9 +261,11 @@ impl LayoutCoordinator {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_reservation_timeout_and_display_name(
         coordinator_peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
+        ledger: LedgerWriter,
         display_name: String,
         grid_rows: u16,
         grid_cols: u16,
@@ -189,19 +275,21 @@ impl LayoutCoordinator {
         let endpoint_addr = serialized_endpoint(&coordinator_peer_id, endpoint_addr)?;
         Ok(Self {
             state: SessionState::new_with_display_name(
-                coordinator_peer_id,
+                coordinator_peer_id.clone(),
                 endpoint_addr,
                 display_name,
                 grid_rows,
                 grid_cols,
             )?,
+            coordinator_peer_id,
+            ledger,
             reservations: BTreeMap::new(),
             agent_rosters: BTreeMap::new(),
             presence: BTreeMap::new(),
             presence_epoch: 0,
             reservation_timeout,
             locked: false,
-            admitted: BTreeSet::new(),
+            roster: MemberRoster::default(),
         })
     }
 
@@ -235,12 +323,32 @@ impl LayoutCoordinator {
     /// Kept separately from the member list because a member who drops off the roster
     /// during a disconnect must still be able to come back through a locked door.
     pub fn is_admitted(&self, peer_id: &[u8]) -> bool {
-        self.admitted.contains(peer_id)
+        self.roster.is_admitted(peer_id)
     }
 
     /// Record a peer as admitted, so a later lock cannot shut it out of its own session.
     pub fn remember_admitted(&mut self, peer_id: Vec<u8>) {
-        self.admitted.insert(peer_id);
+        self.roster.admit(peer_id);
+    }
+
+    /// Whether this peer has been turned away by name.
+    pub fn is_revoked(&self, peer_id: &[u8]) -> bool {
+        self.roster.is_revoked(peer_id)
+    }
+
+    /// Strike one key off the roster. Returns whether this changed anything.
+    ///
+    /// Only the roster is touched here. Evicting the member that key is currently using --
+    /// dropping its control connection and committing its departure -- is the caller's job,
+    /// because only the caller can reach the connection; see
+    /// [`SharedLayoutHost::revoke_member`].
+    pub fn revoke(&mut self, peer_id: Vec<u8>) -> bool {
+        self.roster.revoke(peer_id)
+    }
+
+    /// The roster as the coordinator sees it, for callers that want to show or audit it.
+    pub fn roster(&self) -> &MemberRoster {
+        &self.roster
     }
 
     pub fn session_snapshot(&self) -> Result<SessionSnapshot, CoordinatorError> {
@@ -358,11 +466,11 @@ impl LayoutCoordinator {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
         let invalidated = self.state.add_member_with_display_name(
             self.state.revision(),
-            peer_id,
+            peer_id.clone(),
             endpoint_addr,
             display_name,
         )?;
-        self.membership_change(invalidated)
+        self.membership_change(peer_id, MembershipEvent::Joined, invalidated)
     }
 
     pub fn update_member_endpoint(
@@ -376,7 +484,11 @@ impl LayoutCoordinator {
             authenticated_peer_id,
             endpoint_addr,
         )?;
-        self.membership_change(invalidated)
+        self.membership_change(
+            authenticated_peer_id.to_vec(),
+            MembershipEvent::EndpointChanged,
+            invalidated,
+        )
     }
 
     pub fn remove_member(&mut self, peer_id: &[u8]) -> Result<MembershipChange, CoordinatorError> {
@@ -385,7 +497,7 @@ impl LayoutCoordinator {
         if self.presence.remove(peer_id).is_some() {
             self.presence_epoch = self.presence_epoch.saturating_add(1);
         }
-        self.membership_change(invalidated)
+        self.membership_change(peer_id.to_vec(), MembershipEvent::Left, invalidated)
     }
 
     pub fn handle_request(
@@ -399,7 +511,7 @@ impl LayoutCoordinator {
     pub fn handle_request_at(
         &mut self,
         authenticated_peer_id: &[u8],
-        request: LayoutRequest,
+        mut request: LayoutRequest,
         now: Instant,
     ) -> CoordinatorResponse {
         let request_id = request.request_id;
@@ -416,6 +528,21 @@ impl LayoutCoordinator {
             + usize::from(request.mark_pane_exited.is_some());
         if request_id == 0 || request.base_revision == 0 || action_count != 1 {
             return reject(request_id, LayoutRejectReason::Malformed);
+        }
+        // Taken out before encoding, so the bytes hashed here are the bytes the author
+        // hashed: a signature cannot cover itself. Then captured before the request is
+        // pulled apart, because the ledger records what was asked for rather than a
+        // reconstruction of it after the fact.
+        let author_signature = std::mem::take(&mut request.author_signature);
+        let payload = request.encode_to_vec();
+        if !verify_intent(
+            self.ledger.session_id(),
+            authenticated_peer_id,
+            LedgerEntryKind::LayoutChange,
+            &payload,
+            &author_signature,
+        ) {
+            return reject(request_id, LayoutRejectReason::Unsigned);
         }
 
         let result = if let Some(create) = request.create_pane {
@@ -455,11 +582,18 @@ impl LayoutCoordinator {
         };
 
         match result {
-            Ok(response) => {
-                if matches!(response, CoordinatorResponse::Commit(_)) {
-                    self.prune_agent_rosters();
+            Ok(Applied::Reserved(reservation)) => CoordinatorResponse::Reservation(reservation),
+            Ok(Applied::Changed) => {
+                self.prune_agent_rosters();
+                match self.layout_commit(
+                    authenticated_peer_id.to_vec(),
+                    LedgerEntryKind::LayoutChange,
+                    payload,
+                    author_signature,
+                ) {
+                    Ok(commit) => CoordinatorResponse::Commit(commit),
+                    Err(error) => reject(request_id, reject_reason(&layout_error(error))),
                 }
-                response
             }
             Err(error) => reject(request_id, reject_reason(&error)),
         }
@@ -468,10 +602,21 @@ impl LayoutCoordinator {
     pub fn handle_pane_ready(
         &mut self,
         authenticated_peer_id: &[u8],
-        ready: PaneReady,
+        mut ready: PaneReady,
     ) -> CoordinatorResponse {
         if ready.reservation_id == 0 || ready.base_revision == 0 || ready.request_id == 0 {
             return reject(ready.request_id, LayoutRejectReason::Malformed);
+        }
+        let author_signature = std::mem::take(&mut ready.author_signature);
+        let payload = ready.encode_to_vec();
+        if !verify_intent(
+            self.ledger.session_id(),
+            authenticated_peer_id,
+            LedgerEntryKind::PaneReady,
+            &payload,
+            &author_signature,
+        ) {
+            return reject(ready.request_id, LayoutRejectReason::Unsigned);
         }
         let Some(context) = self.reservations.get(&ready.reservation_id) else {
             return reject(ready.request_id, LayoutRejectReason::ReservationFailure);
@@ -486,7 +631,12 @@ impl LayoutCoordinator {
         ) {
             Ok(_) => {
                 self.reservations.remove(&ready.reservation_id);
-                match self.layout_commit() {
+                match self.layout_commit(
+                    authenticated_peer_id.to_vec(),
+                    LedgerEntryKind::PaneReady,
+                    payload,
+                    author_signature,
+                ) {
                     Ok(commit) => CoordinatorResponse::Commit(commit),
                     Err(error) => reject(ready.request_id, reject_reason(&layout_error(error))),
                 }
@@ -601,7 +751,7 @@ impl LayoutCoordinator {
         create: CreatePane,
         request_id: u64,
         now: Instant,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let axis = protocol_axis(create.axis)?;
         let position = protocol_pane_position(create.position)?;
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
@@ -625,9 +775,7 @@ impl LayoutCoordinator {
                 deadline: now + self.reservation_timeout,
             },
         );
-        Ok(CoordinatorResponse::Reservation(protocol_reservation(
-            reservation,
-        )))
+        Ok(Applied::Reserved(protocol_reservation(reservation)))
     }
 
     fn reserve_tab(
@@ -637,7 +785,7 @@ impl LayoutCoordinator {
         create: CreateTab,
         request_id: u64,
         now: Instant,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
         let reservation =
             self.state
@@ -650,9 +798,7 @@ impl LayoutCoordinator {
                 deadline: now + self.reservation_timeout,
             },
         );
-        Ok(CoordinatorResponse::Reservation(protocol_reservation(
-            reservation,
-        )))
+        Ok(Applied::Reserved(protocol_reservation(reservation)))
     }
 
     fn delete_pane(
@@ -660,15 +806,13 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         delete: DeletePane,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if delete.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .delete_pane(authenticated_peer_id, base_revision, delete.pane_id)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn delete_tab(
@@ -676,15 +820,13 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         delete: DeleteTab,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if delete.tab_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .delete_tab(authenticated_peer_id, base_revision, delete.tab_id)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn set_split_ratio(
@@ -692,7 +834,7 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         ratio: SetSplitRatio,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let axis = protocol_axis(ratio.axis)?;
         let first_share_bps =
             u16::try_from(ratio.first_share_bps).map_err(|_| LayoutError::InvalidSplitRatio)?;
@@ -703,9 +845,7 @@ impl LayoutCoordinator {
             axis,
             first_share_bps,
         )?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn update_pane_grids(
@@ -713,7 +853,7 @@ impl LayoutCoordinator {
         authenticated_peer_id: &[u8],
         base_revision: u64,
         update: UpdatePaneGrids,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         let grids = update
             .panes
             .into_iter()
@@ -727,9 +867,7 @@ impl LayoutCoordinator {
             .collect::<Result<Vec<_>, LayoutError>>()?;
         self.state
             .update_pane_grids(authenticated_peer_id, base_revision, &grids)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn rename_pane(
@@ -737,15 +875,13 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         rename: RenamePane,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if rename.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .rename_pane(peer, revision, rename.pane_id, rename.title)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn rename_tab(
@@ -753,15 +889,13 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         rename: RenameTab,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if rename.tab_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .rename_tab(peer, revision, rename.tab_id, rename.title)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn set_pane_lock(
@@ -769,15 +903,13 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         lock: SetPaneLock,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if lock.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .set_pane_lock(peer, revision, lock.pane_id, lock.locked)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
     fn mark_pane_exited(
@@ -785,23 +917,54 @@ impl LayoutCoordinator {
         peer: &[u8],
         revision: u64,
         exited: MarkPaneExited,
-    ) -> Result<CoordinatorResponse, LayoutError> {
+    ) -> Result<Applied, LayoutError> {
         if exited.pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
         self.state
             .mark_pane_exited(peer, revision, exited.pane_id)?;
-        Ok(CoordinatorResponse::Commit(
-            self.layout_commit().map_err(layout_error)?,
-        ))
+        Ok(Applied::Changed)
     }
 
-    fn layout_commit(&self) -> Result<LayoutCommit, CoordinatorError> {
+    /// Seal one change into the ledger and publish the layout it produced.
+    ///
+    /// The entry is the record and the state is the checkpoint beside it: a member that has
+    /// been following can verify the entry chains onto the last one it saw, and a member
+    /// that just arrived can draw the state while it starts its own chain from here.
+    fn layout_commit(
+        &mut self,
+        author_peer_id: Vec<u8>,
+        kind: LedgerEntryKind,
+        payload: Vec<u8>,
+        author_signature: Vec<u8>,
+    ) -> Result<LayoutCommit, CoordinatorError> {
         let state = self.protocol_layout_state()?;
+        let entry = self
+            .ledger
+            .append(author_peer_id, kind, payload, author_signature);
         Ok(LayoutCommit {
             revision: state.revision,
             state: Some(state),
+            entry: Some(entry),
         })
+    }
+
+    /// Seal a change the coordinator made on its own account.
+    ///
+    /// Nobody asked for these -- a connection dropped, a member moved to a new address --
+    /// so there is no member signature to carry and the coordinator is honestly the author.
+    fn membership_commit(
+        &mut self,
+        peer_id: Vec<u8>,
+        event: MembershipEvent,
+    ) -> Result<LayoutCommit, CoordinatorError> {
+        let payload = MembershipRecord {
+            peer_id,
+            event: event as i32,
+        }
+        .encode_to_vec();
+        let author = self.coordinator_peer_id.clone();
+        self.layout_commit(author, LedgerEntryKind::Membership, payload, Vec::new())
     }
 
     fn protocol_layout_state(&self) -> Result<LayoutState, CoordinatorError> {
@@ -812,6 +975,8 @@ impl LayoutCoordinator {
 
     fn membership_change(
         &mut self,
+        peer_id: Vec<u8>,
+        event: MembershipEvent,
         invalidated: Option<crate::layout::InvalidatedReservation>,
     ) -> Result<MembershipChange, CoordinatorError> {
         let invalidated_reservation = invalidated.and_then(|reservation| {
@@ -826,7 +991,7 @@ impl LayoutCoordinator {
                 })
         });
         Ok(MembershipChange {
-            commit: self.layout_commit()?,
+            commit: self.membership_commit(peer_id, event)?,
             invalidated_reservation,
         })
     }
@@ -849,6 +1014,22 @@ impl LayoutCoordinator {
             true
         });
     }
+}
+
+/// Sign a request the way the coordinator will check it: over the encoded message with the
+/// signature field cleared, since a signature cannot cover itself.
+fn sign_request(signer: &IntentSigner, mut request: LayoutRequest) -> LayoutRequest {
+    request.author_signature = Vec::new();
+    let signature = signer.sign(LedgerEntryKind::LayoutChange, &request.encode_to_vec());
+    request.author_signature = signature;
+    request
+}
+
+fn sign_ready(signer: &IntentSigner, mut ready: PaneReady) -> PaneReady {
+    ready.author_signature = Vec::new();
+    let signature = signer.sign(LedgerEntryKind::PaneReady, &ready.encode_to_vec());
+    ready.author_signature = signature;
+    ready
 }
 
 fn serialized_endpoint(
@@ -1633,6 +1814,7 @@ pub enum SessionError {
     PeerTask,
     SessionFull,
     SessionLocked,
+    MembershipRevoked,
     JoinRefused,
     Coordinator(CoordinatorError),
 }
@@ -1660,6 +1842,9 @@ impl fmt::Display for SessionError {
             Self::SessionLocked => {
                 formatter.write_str("this session is locked; ask the host to unlock it")
             }
+            Self::MembershipRevoked => {
+                formatter.write_str("the host removed this device from the session")
+            }
             Self::JoinRefused => formatter.write_str("the session coordinator refused the join"),
             Self::Coordinator(error) => write!(formatter, "layout coordinator error: {error}"),
         }
@@ -1681,6 +1866,7 @@ impl Error for SessionError {
             | Self::PeerTask
             | Self::SessionFull
             | Self::SessionLocked
+            | Self::MembershipRevoked
             | Self::JoinRefused => None,
             Self::Coordinator(error) => Some(error),
         }
@@ -1962,6 +2148,9 @@ pub struct SharedLayoutHost {
     coordinator: Arc<Mutex<LayoutCoordinator>>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     reservation_timeout: Duration,
+    /// The coordinator signs its own requests like anybody else. Exempting it would leave
+    /// exactly one identity in the session whose entries nobody could check.
+    signer: IntentSigner,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2011,7 +2200,9 @@ pub enum LayoutControlQueueError {
 }
 
 enum LayoutClientMessage {
-    Request(LayoutRequest),
+    /// Boxed because a signed request dwarfs every other message in this queue, and an
+    /// unboxed variant would make each of them pay for it.
+    Request(Box<LayoutRequest>),
     Ready(PaneReady),
     Failed(PaneFailed),
     AgentRoster(AgentRoster),
@@ -2169,6 +2360,7 @@ pub struct SharedLayoutMember {
     pub coordinator_peer_id: Vec<u8>,
     pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
+    signer: IntentSigner,
     outbound: mpsc::Sender<LayoutClientMessage>,
     transport: Transport,
     connection: Connection,
@@ -2189,13 +2381,16 @@ impl SharedLayoutMember {
 
     pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
         self.outbound
-            .try_send(LayoutClientMessage::Request(request))
+            .try_send(LayoutClientMessage::Request(Box::new(sign_request(
+                &self.signer,
+                request,
+            ))))
             .map_err(layout_queue_error)
     }
 
     pub fn try_ready(&self, ready: PaneReady) -> Result<(), LayoutControlQueueError> {
         self.outbound
-            .try_send(LayoutClientMessage::Ready(ready))
+            .try_send(LayoutClientMessage::Ready(sign_ready(&self.signer, ready)))
             .map_err(layout_queue_error)
     }
 
@@ -2290,21 +2485,33 @@ impl SharedLayoutHost {
     ) -> Result<Self, SessionError> {
         let pane_server = host.pane_server();
         let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        // The ledger is signed with the same endpoint key the joiners already authenticated
+        // through the ticket, so no separate trust root has to be established for it.
+        let ledger = LedgerWriter::new(
+            host.ticket().session_id().to_vec(),
+            host.transport.secret_key(),
+        );
         let coordinator = LayoutCoordinator::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             host.ticket().endpoint_addr().clone(),
+            ledger,
             display_name,
             grid_rows,
             grid_cols,
             reservation_timeout,
             Instant::now(),
         )?;
+        let signer = IntentSigner::new(
+            host.ticket().session_id().to_vec(),
+            host.transport.secret_key(),
+        );
         Ok(Self {
             host,
             pane_server,
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
+            signer,
         })
     }
 
@@ -2398,6 +2605,7 @@ impl SharedLayoutHost {
         &self,
         request: LayoutRequest,
     ) -> Result<CoordinatorResponse, SessionError> {
+        let request = sign_request(&self.signer, request);
         let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
         let response = self
             .coordinator
@@ -2413,6 +2621,7 @@ impl SharedLayoutHost {
         &self,
         ready: PaneReady,
     ) -> Result<CoordinatorResponse, SessionError> {
+        let ready = sign_ready(&self.signer, ready);
         let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
         let response = self
             .coordinator
@@ -2477,6 +2686,57 @@ impl SharedLayoutHost {
             .is_locked())
     }
 
+    /// Strike one endpoint key off the roster and put its member out of the session.
+    ///
+    /// Returns whether the roster changed, so a caller can stay quiet about a key that was
+    /// already revoked. Revoking a key that is not currently connected is allowed and
+    /// meaningful: it is how a host refuses a device before it ever knocks.
+    ///
+    /// Revoking the coordinator's own key is refused. It would leave a session whose only
+    /// authority cannot rejoin it, and the coordinator is not a peer it can turn away.
+    pub fn revoke_member(&self, peer_id: &[u8]) -> Result<bool, SessionError> {
+        if peer_id == self.host.ticket().endpoint_addr().id.as_bytes() {
+            return Ok(false);
+        }
+        let change = {
+            let mut coordinator = self
+                .coordinator
+                .lock()
+                .map_err(|_| SessionError::PeerTask)?;
+            if !coordinator.revoke(peer_id.to_vec()) {
+                return Ok(false);
+            }
+            // A revoked key that never joined has no member record to remove; the roster
+            // entry alone is the whole effect.
+            coordinator.remove_member(peer_id).ok()
+        };
+        // Drop the control connection before announcing the departure, so the evicted peer
+        // cannot act on the very commit that removes it.
+        remove_control_peer(&self.peers, peer_id);
+        if let Some(change) = change {
+            if let Some(state) = change.commit.state.as_ref() {
+                self.pane_server.replace_roster_from_layout(state)?;
+            }
+            self.broadcast_commit(change.commit);
+            if let Some(reject) = change.invalidated_reservation {
+                self.send_reject(reject);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Every endpoint key this session has admitted or revoked, for display and audit.
+    pub fn roster(&self) -> Result<Vec<(Vec<u8>, RosterStatus)>, SessionError> {
+        Ok(self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .roster()
+            .entries()
+            .map(|(peer_id, status)| (peer_id.to_vec(), status))
+            .collect())
+    }
+
     pub fn incoming_dispatcher(
         &self,
         panes: PaneServer,
@@ -2514,25 +2774,32 @@ impl SharedLayoutHost {
     ) -> Result<JoinReceipt, SessionError> {
         let mut admitted_peer_id = None;
         let result = async {
-            // A locked session turns away peers it has never admitted, before the
-            // handshake can welcome them. Peers already admitted are let back through, so
-            // locking never strands someone mid-session over a transient reconnect.
-            // Resolved into a plain bool first: the lock guard must not be alive across
+            // The roster decides before the handshake can welcome anybody. A revoked key is
+            // turned away whatever the lock says -- that is what makes revoking durable
+            // once the ticket has been forwarded. A locked session then turns away peers it
+            // has never admitted, while letting admitted ones back through, so locking
+            // never strands someone mid-session over a transient reconnect.
+            // Resolved into a plain enum first: the lock guard must not be alive across
             // the refusal's await, or this whole accept future stops being `Send`.
-            let shut_out = {
+            let refusal = {
                 let coordinator_guard = self
                     .coordinator
                     .lock()
                     .map_err(|_| SessionError::PeerTask)?;
-                coordinator_guard.is_locked()
-                    && !coordinator_guard.is_admitted(connection.remote_id().as_bytes())
+                let remote_id = connection.remote_id();
+                let peer_id = remote_id.as_bytes();
+                if coordinator_guard.is_revoked(peer_id) {
+                    Some((LayoutRejectReason::Revoked, SessionError::MembershipRevoked))
+                } else if coordinator_guard.is_locked() && !coordinator_guard.is_admitted(peer_id) {
+                    Some((LayoutRejectReason::Locked, SessionError::SessionLocked))
+                } else {
+                    None
+                }
             };
-            if shut_out {
-                self.host
-                    .refuse_join(join_writer, LayoutRejectReason::Locked)
-                    .await?;
+            if let Some((reason, error)) = refusal {
+                self.host.refuse_join(join_writer, reason).await?;
                 self.host.drain_refusal(&connection).await;
-                return Err(SessionError::SessionLocked);
+                return Err(error);
             }
             // Refuse a full session *before* welcoming it. `admit_with_display_name`
             // below enforces the same limit, but only after `Welcome` has gone out --
@@ -2983,11 +3250,16 @@ pub async fn join_layout_with_display_name(
         let peer_id = transport.endpoint_id().as_bytes().to_vec();
         let coordinator_peer_id = receipt.coordinator_peer_id;
         let session_name = receipt.session_name;
+        // Anchored on the endpoint key the ticket named and QUIC proved on this very
+        // connection, rather than on the coordinator id the Welcome claimed: a peer that
+        // could lie about the latter is exactly the one this verifier exists to catch.
+        let verifier = LedgerVerifier::new(ticket.session_id().to_vec(), ticket.endpoint_addr().id);
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
                 events_tx,
                 coordinator_peer_id.clone(),
+                verifier,
             )),
             tokio::spawn(layout_member_writer_task(
                 writer,
@@ -3000,6 +3272,7 @@ pub async fn join_layout_with_display_name(
             coordinator_peer_id,
             session_name,
             events,
+            signer: IntentSigner::new(ticket.session_id().to_vec(), transport.secret_key()),
             outbound,
             transport: transport.clone(),
             connection: connection.clone(),
@@ -3138,7 +3411,7 @@ async fn layout_member_writer_task(
 ) {
     while let Some(message) = outbound.recv().await {
         let body = match message {
-            LayoutClientMessage::Request(request) => envelope::Body::LayoutRequest(request),
+            LayoutClientMessage::Request(request) => envelope::Body::LayoutRequest(*request),
             LayoutClientMessage::Ready(ready) => envelope::Body::PaneReady(ready),
             LayoutClientMessage::Failed(failed) => envelope::Body::PaneFailed(failed),
             LayoutClientMessage::AgentRoster(roster) => envelope::Body::AgentRoster(roster),
@@ -3158,6 +3431,7 @@ async fn layout_member_reader_task(
     mut reader: crate::transport::FrameReader,
     events_tx: mpsc::Sender<LayoutControlEvent>,
     coordinator_peer_id: Vec<u8>,
+    mut verifier: LedgerVerifier,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != coordinator_peer_id {
@@ -3172,7 +3446,18 @@ async fn layout_member_reader_task(
             Some(envelope::Body::PaneReservation(reservation)) => {
                 LayoutControlEvent::Reservation(reservation)
             }
-            Some(envelope::Body::LayoutCommit(commit)) => LayoutControlEvent::Commit(commit),
+            Some(envelope::Body::LayoutCommit(commit)) => {
+                // An unverifiable commit ends the session rather than being skipped. A
+                // member that quietly ignored one would keep drawing a layout it can no
+                // longer account for, which is worse than visibly losing the connection.
+                let Some(entry) = commit.entry.as_ref() else {
+                    break;
+                };
+                if verifier.accept(entry).is_err() {
+                    break;
+                }
+                LayoutControlEvent::Commit(commit)
+            }
             Some(envelope::Body::LayoutReject(reject)) => LayoutControlEvent::Reject(reject),
             _ => break,
         };
@@ -3775,6 +4060,7 @@ async fn join_handshake_with_display_name(
             return Err(match LayoutRejectReason::try_from(reject.reason) {
                 Ok(LayoutRejectReason::Limit) => SessionError::SessionFull,
                 Ok(LayoutRejectReason::Locked) => SessionError::SessionLocked,
+                Ok(LayoutRejectReason::Revoked) => SessionError::MembershipRevoked,
                 _ => SessionError::JoinRefused,
             });
         }
@@ -3963,6 +4249,7 @@ mod control_queue_tests {
             envelope::Body::LayoutCommit(LayoutCommit {
                 revision,
                 state: None,
+                entry: None,
             }),
         )
     }

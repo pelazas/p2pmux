@@ -3,18 +3,21 @@ use std::{net::Ipv4Addr, time::Duration};
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use p2pmux::{
     lease::LeaseState,
+    ledger::entry_hash,
     protocol::{
         AgentRoster, AgentRosterEntry, AgentRosterState, CreatePane, CreateTab, DeletePane,
-        DeleteTab, Envelope, Join, LayoutRejectReason, LayoutRequest, PROTOCOL_VERSION,
-        PaneDescriptor, PaneReady, SplitAxis, envelope,
+        DeleteTab, Envelope, Join, LayoutRejectReason, LayoutRequest, MembershipRecord,
+        PROTOCOL_VERSION, PaneDescriptor, PaneReady, SplitAxis, envelope,
     },
     screen::HostScreen,
     session::{
-        GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent, SharedLayoutHost,
-        join_layout, layout_snapshot_from_state, pane_wire_id, subscribe_pane,
+        CoordinatorResponse, GuestEvent, HostPaneChannels, HostSession, LayoutControlEvent,
+        RosterStatus, SessionError, SharedLayoutHost, join_layout, layout_snapshot_from_state,
+        pane_wire_id, subscribe_pane,
     },
     transport::{ALPN, Transport},
 };
+use prost::Message;
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -115,6 +118,7 @@ fn create_request(request_id: u64, base_revision: u64) -> LayoutRequest {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     }
 }
 
@@ -190,6 +194,7 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
             reservation_id: reservation.reservation_id,
             base_revision: 2,
             request_id: 1,
+            author_signature: Vec::new(),
         })
         .expect("first marks pane ready");
     assert!(matches!(
@@ -515,6 +520,7 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
                 rename_tab: None,
                 set_pane_lock: None,
                 mark_pane_exited: None,
+                author_signature: Vec::new(),
             })),
         })
         .await
@@ -587,6 +593,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue tab request");
     let reservation = match next_event(&mut second).await {
@@ -598,6 +605,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             reservation_id: reservation.reservation_id,
             base_revision: 3,
             request_id: 12,
+            author_signature: Vec::new(),
         })
         .expect("ready tab");
     let commit = match next_event(&mut first).await {
@@ -625,6 +633,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue tab delete");
     for member in [&mut first, &mut second] {
@@ -683,6 +692,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             reservation_id: reservation.reservation_id,
             base_revision: 3,
             request_id: 7,
+            author_signature: Vec::new(),
         })
         .expect("queue ready");
     assert!(
@@ -709,6 +719,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue deletion");
     assert!(
@@ -733,6 +744,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue foreign deletion");
     assert!(matches!(
@@ -848,6 +860,7 @@ async fn simultaneous_member_requests_publish_only_monotonic_commits() {
                     reservation_id: reservation.reservation_id,
                     base_revision: 3,
                     request_id: 31,
+                    author_signature: Vec::new(),
                 })
                 .expect("first ready");
             reservation
@@ -858,6 +871,7 @@ async fn simultaneous_member_requests_publish_only_monotonic_commits() {
                     reservation_id: reservation.reservation_id,
                     base_revision: 3,
                     request_id: 32,
+                    author_signature: Vec::new(),
                 })
                 .expect("second ready");
             reservation
@@ -998,5 +1012,189 @@ async fn admission_invalidates_a_member_reservation_and_notifies_its_creator() {
 
     first.shutdown().await;
     second.shutdown().await;
+    coordinator.close().await;
+}
+
+/// Drain control events until the member's stream reports it has been dropped.
+///
+/// The eviction is announced by closing the connection, and whatever commits were already
+/// in flight arrive first, so the test cannot assume `Disconnected` is the very next event.
+async fn next_disconnect(member: &mut p2pmux::session::SharedLayoutMember) {
+    for _ in 0..16 {
+        if matches!(next_event(member).await, LayoutControlEvent::Disconnected) {
+            return;
+        }
+    }
+    panic!("member should have been disconnected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_member_evicts_it_and_refuses_the_key_afterwards() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let accept = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let member_transport = loopback_transport().await;
+    let mut member = join_layout(member_transport.clone(), coordinator.ticket().clone())
+        .await
+        .expect("member joins");
+    accept.await.expect("accept task").expect("accept member");
+    let member_id = member.peer_id.clone();
+
+    assert!(
+        coordinator.revoke_member(&member_id).expect("revoke"),
+        "revoking a seated member changes the roster"
+    );
+    next_disconnect(&mut member).await;
+
+    // The session is never locked in this test: a revoked key has to be turned away on its
+    // own account, or "kick" would only work while the door was shut to everyone.
+    assert!(!coordinator.is_session_locked().expect("lock state"));
+    let accept_again = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let rejoin = join_layout(member_transport.clone(), coordinator.ticket().clone()).await;
+    assert!(
+        matches!(rejoin, Err(SessionError::MembershipRevoked)),
+        "a revoked key must be told why, not merely dropped"
+    );
+    assert!(matches!(
+        accept_again.await.expect("accept task"),
+        Err(SessionError::MembershipRevoked)
+    ));
+
+    assert_eq!(
+        coordinator
+            .roster()
+            .expect("roster")
+            .into_iter()
+            .find(|(peer_id, _)| peer_id == &member_id)
+            .map(|(_, status)| status),
+        Some(RosterStatus::Revoked)
+    );
+
+    drop(member);
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_the_coordinators_own_key_is_refused() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let own_key = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
+
+    assert!(
+        !coordinator.revoke_member(&own_key).expect("revoke"),
+        "a session whose only authority cannot rejoin it is not a session"
+    );
+    assert!(coordinator.roster().expect("roster").is_empty());
+
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_receives_a_chained_ledger_alongside_every_commit() {
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+
+    let accept_first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let mut first = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("first joins");
+    accept_first
+        .await
+        .expect("accept task")
+        .expect("accept first");
+    assert!(matches!(
+        next_event(&mut first).await,
+        LayoutControlEvent::Snapshot(_)
+    ));
+
+    // A second member joining, then leaving, is two changes the coordinator authored on its
+    // own account -- the pair the first member has to be able to follow.
+    let accept_second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.accept_one_member().await })
+    };
+    let second = join_layout(loopback_transport().await, coordinator.ticket().clone())
+        .await
+        .expect("second joins");
+    accept_second
+        .await
+        .expect("accept task")
+        .expect("accept second");
+    let second_id = second.peer_id.clone();
+
+    let LayoutControlEvent::Commit(admission) = next_event(&mut first).await else {
+        panic!("the first member should see the second arrive");
+    };
+    coordinator.revoke_member(&second_id).expect("revoke");
+    let LayoutControlEvent::Commit(departure) = next_event(&mut first).await else {
+        panic!("the first member should see the second leave");
+    };
+
+    let admission = admission.entry.expect("admission is sealed");
+    let departure = departure.entry.expect("departure is sealed");
+    assert_eq!(departure.seq, admission.seq + 1);
+    assert_eq!(
+        departure.prev_hash,
+        entry_hash(coordinator.ticket().session_id(), &admission).to_vec(),
+        "each entry names the one before it, so a dropped commit cannot pass unnoticed"
+    );
+    assert_eq!(
+        MembershipRecord::decode(departure.payload.as_slice())
+            .expect("payload is a membership record")
+            .peer_id,
+        second_id
+    );
+
+    drop(second);
+    first.shutdown().await;
+    coordinator.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_coordinators_own_request_is_signed_and_recorded_under_its_key() {
+    // The host's own UI goes through `handle_local_request` rather than the wire, so it is
+    // the one path where a signing mistake would show up as "splits stopped working" with
+    // nothing else to see.
+    let host = HostSession::from_transport(loopback_transport().await).expect("host");
+    let coordinator = SharedLayoutHost::new(host, 24, 80).expect("shared host");
+    let own_key = coordinator.ticket().endpoint_addr().id.as_bytes().to_vec();
+
+    let reservation = match coordinator
+        .handle_local_request(create_request(1, 1))
+        .expect("the host may split its own layout")
+    {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected a reservation, got {other:?}"),
+    };
+    let commit = match coordinator
+        .handle_local_ready(PaneReady {
+            reservation_id: reservation.reservation_id,
+            base_revision: 1,
+            request_id: 1,
+            author_signature: Vec::new(),
+        })
+        .expect("the host may report its own pane live")
+    {
+        CoordinatorResponse::Commit(commit) => commit,
+        other => panic!("expected a commit, got {other:?}"),
+    };
+
+    let sealed = commit.entry.expect("the host's own change is sealed too");
+    assert_eq!(sealed.author_peer_id, own_key);
+    assert!(
+        !sealed.author_signature.is_empty(),
+        "the coordinator signs its own requests; otherwise one identity in the session \
+         writes entries nobody can check"
+    );
+
     coordinator.close().await;
 }

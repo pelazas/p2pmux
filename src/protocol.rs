@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -21,6 +21,13 @@ pub const MAX_AGENT_KIND_BYTES: usize = 32;
 pub const MAX_AGENT_CWD_BYTES: usize = 512;
 pub const MAX_LAYOUT_TITLE_BYTES: usize = 128;
 pub const MAX_SESSION_NAME_BYTES: usize = 48;
+/// Length of a BLAKE3 ledger hash.
+pub const LEDGER_HASH_BYTES: usize = 32;
+/// Length of an ed25519 signature, which is what every endpoint key produces.
+pub const LEDGER_SIGNATURE_BYTES: usize = 64;
+/// A ledger payload is one encoded request, so it is bounded by the largest of those
+/// rather than by the frame.
+pub const MAX_LEDGER_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub enum ProtocolError {
@@ -371,6 +378,12 @@ pub struct LayoutRequest {
     pub set_pane_lock: Option<SetPaneLock>,
     #[prost(message, optional, tag = "12")]
     pub mark_pane_exited: Option<MarkPaneExited>,
+    /// The requester's signature over this request with its `author_signature` cleared.
+    ///
+    /// Carried into the ledger entry the coordinator seals, so the record of who asked for
+    /// a change rests on the asker's own key rather than on the coordinator's word.
+    #[prost(bytes = "vec", tag = "13")]
+    pub author_signature: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -481,6 +494,9 @@ pub struct PaneReady {
     pub base_revision: u64,
     #[prost(uint64, tag = "3")]
     pub request_id: u64,
+    /// As on `LayoutRequest`: the reporter's signature over this message unsigned.
+    #[prost(bytes = "vec", tag = "4")]
+    pub author_signature: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -499,6 +515,72 @@ pub struct LayoutCommit {
     pub revision: u64,
     #[prost(message, optional, tag = "2")]
     pub state: Option<LayoutState>,
+    /// The ledger entry this commit is the materialization of.
+    ///
+    /// `state` is a checkpoint -- convenient, and what every renderer actually draws --
+    /// but the entry is the record. It says who asked for the change and chains to the one
+    /// before it, so a member can tell that the history it was handed is the history that
+    /// happened rather than whatever the relay felt like sending.
+    #[prost(message, optional, tag = "3")]
+    pub entry: Option<LedgerEntry>,
+}
+
+/// One link in a session's append-only layout ledger.
+///
+/// Entries are numbered from 1 with no gaps and each names the hash of its predecessor, so
+/// a member that has been following along can detect a dropped, reordered or rewritten
+/// entry rather than having to trust that none of that happened.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LedgerEntry {
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    /// BLAKE3 of the previous entry, or 32 zero bytes at `seq` 1.
+    #[prost(bytes = "vec", tag = "2")]
+    pub prev_hash: Vec<u8>,
+    /// The endpoint public key that asked for this change.
+    #[prost(bytes = "vec", tag = "3")]
+    pub author_peer_id: Vec<u8>,
+    #[prost(enumeration = "LedgerEntryKind", tag = "4")]
+    pub kind: i32,
+    /// The authored message itself, encoded: a `LayoutRequest`, a `PaneReady`, or a
+    /// `MembershipRecord` depending on `kind`.
+    #[prost(bytes = "vec", tag = "5")]
+    pub payload: Vec<u8>,
+    /// The author's own signature over its request, empty when the coordinator is the
+    /// author of a change nobody asked for (a member's connection dropping, say).
+    #[prost(bytes = "vec", tag = "6")]
+    pub author_signature: Vec<u8>,
+    /// The coordinator's signature over this entry, which is what fixes its position.
+    #[prost(bytes = "vec", tag = "7")]
+    pub coordinator_signature: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LedgerEntryKind {
+    /// A member's `LayoutRequest` that the coordinator accepted.
+    LayoutChange = 1,
+    /// A member reporting that a reserved pane is live.
+    PaneReady = 2,
+    /// Somebody joining, leaving, or moving to a new address.
+    Membership = 3,
+}
+
+/// The payload of a [`LedgerEntryKind::Membership`] entry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MembershipRecord {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer_id: Vec<u8>,
+    #[prost(enumeration = "MembershipEvent", tag = "2")]
+    pub event: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MembershipEvent {
+    Joined = 1,
+    Left = 2,
+    EndpointChanged = 3,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -525,6 +607,17 @@ pub enum LayoutRejectReason {
     /// Distinct from `Limit`: a full session may have room again later, a locked one is a
     /// deliberate refusal, and the joiner must be told which so it can say something true.
     Locked = 9,
+    /// The host revoked this endpoint's place on the roster.
+    ///
+    /// Distinct from `Locked`: a lock is about the door and lifts for everyone at once,
+    /// while a revocation names one public key and survives both an unlock and a reshared
+    /// ticket. The joiner is told which so it does not sit there retrying.
+    Revoked = 10,
+    /// The request carried no usable signature from the peer that sent it.
+    ///
+    /// The connection is authentic -- QUIC saw to that -- but the ledger records authorship
+    /// for readers who were never on it, and that needs the author's own signature.
+    Unsigned = 11,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -914,6 +1007,7 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             validate_nonzero("pane_ready.reservation_id", ready.reservation_id)?;
             validate_nonzero("pane_ready.base_revision", ready.base_revision)?;
             validate_nonzero("pane_ready.request_id", ready.request_id)?;
+            validate_author_signature("pane_ready.author_signature", &ready.author_signature)?;
         }
         envelope::Body::PaneFailed(failed) => {
             validate_nonzero("pane_failed.reservation_id", failed.reservation_id)?;
@@ -930,6 +1024,11 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             if state.revision != commit.revision {
                 return Err(ProtocolError::InvalidLayout("layout_commit.revision"));
             }
+            let entry = commit
+                .entry
+                .as_ref()
+                .ok_or(ProtocolError::InvalidLayout("layout_commit.entry"))?;
+            validate_ledger_entry(entry)?;
         }
         envelope::Body::LayoutReject(reject) => {
             validate_nonzero("layout_reject.request_id", reject.request_id)?;
@@ -1080,9 +1179,54 @@ fn validate_pane_position(field: &'static str, position: Option<i32>) -> Result<
     Ok(())
 }
 
+fn validate_ledger_entry(entry: &LedgerEntry) -> Result<(), ProtocolError> {
+    validate_nonzero("ledger_entry.seq", entry.seq)?;
+    if entry.prev_hash.len() != LEDGER_HASH_BYTES {
+        return Err(ProtocolError::InvalidLayout("ledger_entry.prev_hash"));
+    }
+    validate_id(
+        "ledger_entry.author_peer_id",
+        &entry.author_peer_id,
+        MAX_PEER_ID_BYTES,
+    )?;
+    LedgerEntryKind::try_from(entry.kind)
+        .map_err(|_| ProtocolError::InvalidLayout("ledger_entry.kind"))?;
+    validate_field_size(
+        "ledger_entry.payload",
+        entry.payload.len(),
+        MAX_LEDGER_PAYLOAD_BYTES,
+    )?;
+    // The author's signature is optional -- a departure has no author to sign it -- but a
+    // present one has to be the right size, and the coordinator always signs.
+    if !entry.author_signature.is_empty() && entry.author_signature.len() != LEDGER_SIGNATURE_BYTES
+    {
+        return Err(ProtocolError::InvalidLayout(
+            "ledger_entry.author_signature",
+        ));
+    }
+    if entry.coordinator_signature.len() != LEDGER_SIGNATURE_BYTES {
+        return Err(ProtocolError::InvalidLayout(
+            "ledger_entry.coordinator_signature",
+        ));
+    }
+    Ok(())
+}
+
+/// Framing only checks that a signature is the right shape. Whether it is *there*, and
+/// whether it means anything, is the coordinator's business -- so a peer that forgets to
+/// sign gets a `LayoutRejectReason::Unsigned` it can act on rather than a dropped
+/// connection it cannot.
+fn validate_author_signature(field: &'static str, signature: &[u8]) -> Result<(), ProtocolError> {
+    if !signature.is_empty() && signature.len() != LEDGER_SIGNATURE_BYTES {
+        return Err(ProtocolError::InvalidLayout(field));
+    }
+    Ok(())
+}
+
 fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError> {
     validate_nonzero("layout_request.request_id", request.request_id)?;
     validate_nonzero("layout_request.base_revision", request.base_revision)?;
+    validate_author_signature("layout_request.author_signature", &request.author_signature)?;
 
     let actions = usize::from(request.create_pane.is_some())
         + usize::from(request.delete_pane.is_some())
