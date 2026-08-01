@@ -602,8 +602,15 @@ pub(crate) fn launch_background_node(
     }
     let error_path = descriptor.socket_path.with_extension("error");
     let _ = std::fs::remove_file(&error_path);
-    command.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut child = command.spawn()?;
+    // A `join` cannot report anything until it has dialled the coordinator, and iroh
+    // gives that dial about thirty seconds before it gives up. Waiting five and then
+    // printing a local-startup message meant the real cause -- "transport error: Iroh
+    // connect timed out", which the node does write, twenty-five seconds later -- was
+    // never the thing the user read. The cap is now past that dial, and the loop leaves
+    // early the moment the node resolves either way, so a session that starts normally
+    // is not slowed by it.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let take_node_error = || -> Option<String> {
         let message = std::fs::read_to_string(&error_path).ok()?;
         let message = message.trim().to_owned();
@@ -624,6 +631,18 @@ pub(crate) fn launch_background_node(
         // which points at a local startup problem that is not the actual cause.
         if let Some(message) = take_node_error() {
             return Err(NodeStartupError(message).into());
+        }
+        // A node that has exited is never going to become ready, and waiting out the
+        // rest of the cap for it would turn a fast failure into a slow one. It writes
+        // its reason before exiting, so re-read once after reaping to avoid losing a
+        // message that landed between the check above and the exit.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Err(match take_node_error() {
+                Some(message) => NodeStartupError(message).into(),
+                None => Box::<dyn Error>::from(io::Error::other(
+                    "the background node exited before the session started",
+                )),
+            });
         }
         std::thread::sleep(Duration::from_millis(25));
     }
