@@ -114,11 +114,18 @@ fn pipe_to_clipboard_helper(program: &str, arguments: &[&str], text: &str) -> io
 /// that arrives from anywhere else is one ratatui does not know it drew.
 #[cfg(not(target_os = "macos"))]
 fn write_osc52(text: &str) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(osc52_sequence(text).as_bytes())?;
+    stderr.flush()
+}
+
+/// The OSC 52 clipboard-set sequence for `text`, base64 in the standard
+/// alphabet with padding, which is what the terminals implementing this expect.
+#[cfg(not(target_os = "macos"))]
+fn osc52_sequence(text: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-    let mut stderr = io::stderr().lock();
-    write!(stderr, "\x1b]52;c;{}\x07", STANDARD.encode(text))?;
-    stderr.flush()
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
 #[cfg(test)]
@@ -158,6 +165,21 @@ mod tests {
             selection_text(screen.as_ref(), selection),
             Some("on".to_owned())
         );
+    }
+
+    /// The one part of the clipboard path with no visible failure: a terminal
+    /// that receives a malformed OSC 52 discards it in silence, exactly as one
+    /// that does not implement OSC 52 discards a correct one. Nothing at run
+    /// time can tell those apart, so the bytes are pinned here instead.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn osc52_carries_the_selection_as_padded_base64() {
+        use super::osc52_sequence;
+
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+        // A multi-line selection travels as one payload; the newline is data,
+        // not a terminator, and must not end the sequence early.
+        assert_eq!(osc52_sequence("a\nb"), "\x1b]52;c;YQpi\x07");
     }
 
     #[test]
