@@ -378,6 +378,12 @@ pub struct LayoutRequest {
     pub set_pane_lock: Option<SetPaneLock>,
     #[prost(message, optional, tag = "12")]
     pub mark_pane_exited: Option<MarkPaneExited>,
+    /// The requester's signature over this request with its `author_signature` cleared.
+    ///
+    /// Carried into the ledger entry the coordinator seals, so the record of who asked for
+    /// a change rests on the asker's own key rather than on the coordinator's word.
+    #[prost(bytes = "vec", tag = "13")]
+    pub author_signature: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -488,6 +494,9 @@ pub struct PaneReady {
     pub base_revision: u64,
     #[prost(uint64, tag = "3")]
     pub request_id: u64,
+    /// As on `LayoutRequest`: the reporter's signature over this message unsigned.
+    #[prost(bytes = "vec", tag = "4")]
+    pub author_signature: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -604,6 +613,11 @@ pub enum LayoutRejectReason {
     /// while a revocation names one public key and survives both an unlock and a reshared
     /// ticket. The joiner is told which so it does not sit there retrying.
     Revoked = 10,
+    /// The request carried no usable signature from the peer that sent it.
+    ///
+    /// The connection is authentic -- QUIC saw to that -- but the ledger records authorship
+    /// for readers who were never on it, and that needs the author's own signature.
+    Unsigned = 11,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -993,6 +1007,7 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
             validate_nonzero("pane_ready.reservation_id", ready.reservation_id)?;
             validate_nonzero("pane_ready.base_revision", ready.base_revision)?;
             validate_nonzero("pane_ready.request_id", ready.request_id)?;
+            validate_author_signature("pane_ready.author_signature", &ready.author_signature)?;
         }
         envelope::Body::PaneFailed(failed) => {
             validate_nonzero("pane_failed.reservation_id", failed.reservation_id)?;
@@ -1197,9 +1212,21 @@ fn validate_ledger_entry(entry: &LedgerEntry) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Framing only checks that a signature is the right shape. Whether it is *there*, and
+/// whether it means anything, is the coordinator's business -- so a peer that forgets to
+/// sign gets a `LayoutRejectReason::Unsigned` it can act on rather than a dropped
+/// connection it cannot.
+fn validate_author_signature(field: &'static str, signature: &[u8]) -> Result<(), ProtocolError> {
+    if !signature.is_empty() && signature.len() != LEDGER_SIGNATURE_BYTES {
+        return Err(ProtocolError::InvalidLayout(field));
+    }
+    Ok(())
+}
+
 fn validate_layout_request(request: &LayoutRequest) -> Result<(), ProtocolError> {
     validate_nonzero("layout_request.request_id", request.request_id)?;
     validate_nonzero("layout_request.base_revision", request.base_revision)?;
+    validate_author_signature("layout_request.author_signature", &request.author_signature)?;
 
     let actions = usize::from(request.create_pane.is_some())
         + usize::from(request.delete_pane.is_some())

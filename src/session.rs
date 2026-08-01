@@ -29,7 +29,7 @@ use crate::{
         NewPanePosition as LayoutNewPanePosition, Node, Pane, SessionState, Tab,
     },
     lease::LeaseState,
-    ledger::{LedgerVerifier, LedgerWriter},
+    ledger::{IntentSigner, LedgerVerifier, LedgerWriter, verify_intent},
     protocol::{
         AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
         Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
@@ -511,7 +511,7 @@ impl LayoutCoordinator {
     pub fn handle_request_at(
         &mut self,
         authenticated_peer_id: &[u8],
-        request: LayoutRequest,
+        mut request: LayoutRequest,
         now: Instant,
     ) -> CoordinatorResponse {
         let request_id = request.request_id;
@@ -529,9 +529,21 @@ impl LayoutCoordinator {
         if request_id == 0 || request.base_revision == 0 || action_count != 1 {
             return reject(request_id, LayoutRejectReason::Malformed);
         }
-        // Captured before the request is taken apart: the ledger records what was asked
-        // for, not a reconstruction of it after the fact.
+        // Taken out before encoding, so the bytes hashed here are the bytes the author
+        // hashed: a signature cannot cover itself. Then captured before the request is
+        // pulled apart, because the ledger records what was asked for rather than a
+        // reconstruction of it after the fact.
+        let author_signature = std::mem::take(&mut request.author_signature);
         let payload = request.encode_to_vec();
+        if !verify_intent(
+            self.ledger.session_id(),
+            authenticated_peer_id,
+            LedgerEntryKind::LayoutChange,
+            &payload,
+            &author_signature,
+        ) {
+            return reject(request_id, LayoutRejectReason::Unsigned);
+        }
 
         let result = if let Some(create) = request.create_pane {
             self.reserve_pane(
@@ -577,7 +589,7 @@ impl LayoutCoordinator {
                     authenticated_peer_id.to_vec(),
                     LedgerEntryKind::LayoutChange,
                     payload,
-                    Vec::new(),
+                    author_signature,
                 ) {
                     Ok(commit) => CoordinatorResponse::Commit(commit),
                     Err(error) => reject(request_id, reject_reason(&layout_error(error))),
@@ -590,10 +602,21 @@ impl LayoutCoordinator {
     pub fn handle_pane_ready(
         &mut self,
         authenticated_peer_id: &[u8],
-        ready: PaneReady,
+        mut ready: PaneReady,
     ) -> CoordinatorResponse {
         if ready.reservation_id == 0 || ready.base_revision == 0 || ready.request_id == 0 {
             return reject(ready.request_id, LayoutRejectReason::Malformed);
+        }
+        let author_signature = std::mem::take(&mut ready.author_signature);
+        let payload = ready.encode_to_vec();
+        if !verify_intent(
+            self.ledger.session_id(),
+            authenticated_peer_id,
+            LedgerEntryKind::PaneReady,
+            &payload,
+            &author_signature,
+        ) {
+            return reject(ready.request_id, LayoutRejectReason::Unsigned);
         }
         let Some(context) = self.reservations.get(&ready.reservation_id) else {
             return reject(ready.request_id, LayoutRejectReason::ReservationFailure);
@@ -608,12 +631,11 @@ impl LayoutCoordinator {
         ) {
             Ok(_) => {
                 self.reservations.remove(&ready.reservation_id);
-                let payload = ready.encode_to_vec();
                 match self.layout_commit(
                     authenticated_peer_id.to_vec(),
                     LedgerEntryKind::PaneReady,
                     payload,
-                    Vec::new(),
+                    author_signature,
                 ) {
                     Ok(commit) => CoordinatorResponse::Commit(commit),
                     Err(error) => reject(ready.request_id, reject_reason(&layout_error(error))),
@@ -992,6 +1014,22 @@ impl LayoutCoordinator {
             true
         });
     }
+}
+
+/// Sign a request the way the coordinator will check it: over the encoded message with the
+/// signature field cleared, since a signature cannot cover itself.
+fn sign_request(signer: &IntentSigner, mut request: LayoutRequest) -> LayoutRequest {
+    request.author_signature = Vec::new();
+    let signature = signer.sign(LedgerEntryKind::LayoutChange, &request.encode_to_vec());
+    request.author_signature = signature;
+    request
+}
+
+fn sign_ready(signer: &IntentSigner, mut ready: PaneReady) -> PaneReady {
+    ready.author_signature = Vec::new();
+    let signature = signer.sign(LedgerEntryKind::PaneReady, &ready.encode_to_vec());
+    ready.author_signature = signature;
+    ready
 }
 
 fn serialized_endpoint(
@@ -2110,6 +2148,9 @@ pub struct SharedLayoutHost {
     coordinator: Arc<Mutex<LayoutCoordinator>>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     reservation_timeout: Duration,
+    /// The coordinator signs its own requests like anybody else. Exempting it would leave
+    /// exactly one identity in the session whose entries nobody could check.
+    signer: IntentSigner,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2159,7 +2200,9 @@ pub enum LayoutControlQueueError {
 }
 
 enum LayoutClientMessage {
-    Request(LayoutRequest),
+    /// Boxed because a signed request dwarfs every other message in this queue, and an
+    /// unboxed variant would make each of them pay for it.
+    Request(Box<LayoutRequest>),
     Ready(PaneReady),
     Failed(PaneFailed),
     AgentRoster(AgentRoster),
@@ -2317,6 +2360,7 @@ pub struct SharedLayoutMember {
     pub coordinator_peer_id: Vec<u8>,
     pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
+    signer: IntentSigner,
     outbound: mpsc::Sender<LayoutClientMessage>,
     transport: Transport,
     connection: Connection,
@@ -2337,13 +2381,16 @@ impl SharedLayoutMember {
 
     pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
         self.outbound
-            .try_send(LayoutClientMessage::Request(request))
+            .try_send(LayoutClientMessage::Request(Box::new(sign_request(
+                &self.signer,
+                request,
+            ))))
             .map_err(layout_queue_error)
     }
 
     pub fn try_ready(&self, ready: PaneReady) -> Result<(), LayoutControlQueueError> {
         self.outbound
-            .try_send(LayoutClientMessage::Ready(ready))
+            .try_send(LayoutClientMessage::Ready(sign_ready(&self.signer, ready)))
             .map_err(layout_queue_error)
     }
 
@@ -2454,12 +2501,17 @@ impl SharedLayoutHost {
             reservation_timeout,
             Instant::now(),
         )?;
+        let signer = IntentSigner::new(
+            host.ticket().session_id().to_vec(),
+            host.transport.secret_key(),
+        );
         Ok(Self {
             host,
             pane_server,
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
+            signer,
         })
     }
 
@@ -2553,6 +2605,7 @@ impl SharedLayoutHost {
         &self,
         request: LayoutRequest,
     ) -> Result<CoordinatorResponse, SessionError> {
+        let request = sign_request(&self.signer, request);
         let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
         let response = self
             .coordinator
@@ -2568,6 +2621,7 @@ impl SharedLayoutHost {
         &self,
         ready: PaneReady,
     ) -> Result<CoordinatorResponse, SessionError> {
+        let ready = sign_ready(&self.signer, ready);
         let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();
         let response = self
             .coordinator
@@ -3218,6 +3272,7 @@ pub async fn join_layout_with_display_name(
             coordinator_peer_id,
             session_name,
             events,
+            signer: IntentSigner::new(ticket.session_id().to_vec(), transport.secret_key()),
             outbound,
             transport: transport.clone(),
             connection: connection.clone(),
@@ -3356,7 +3411,7 @@ async fn layout_member_writer_task(
 ) {
     while let Some(message) = outbound.recv().await {
         let body = match message {
-            LayoutClientMessage::Request(request) => envelope::Body::LayoutRequest(request),
+            LayoutClientMessage::Request(request) => envelope::Body::LayoutRequest(*request),
             LayoutClientMessage::Ready(ready) => envelope::Body::PaneReady(ready),
             LayoutClientMessage::Failed(failed) => envelope::Body::PaneFailed(failed),
             LayoutClientMessage::AgentRoster(roster) => envelope::Body::AgentRoster(roster),

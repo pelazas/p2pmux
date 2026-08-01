@@ -100,6 +100,7 @@ fn ratio_and_grid_actions_validate_strictly() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid request");
@@ -128,6 +129,7 @@ fn ratio_and_grid_actions_validate_strictly() {
                 rename_tab: None,
                 set_pane_lock: None,
                 mark_pane_exited: None,
+                author_signature: Vec::new(),
             }
         };
         assert!(encode_frame(&envelope(envelope::Body::LayoutRequest(invalid))).is_err());
@@ -153,6 +155,7 @@ fn ratio_and_grid_actions_validate_strictly() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     assert!(
         decode_frame(
@@ -180,6 +183,7 @@ fn pane_lock_action_round_trips_and_is_the_only_action() {
             locked: true,
         }),
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid lock request");
@@ -204,6 +208,7 @@ fn mark_pane_exited_round_trips_and_is_the_only_action() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: Some(MarkPaneExited { pane_id: 1 }),
+        author_signature: Vec::new(),
     };
     let encoded = encode_frame(&envelope(envelope::Body::LayoutRequest(request.clone())))
         .expect("valid exited request");
@@ -798,6 +803,7 @@ fn v2_envelopes() -> Vec<Envelope> {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })),
         envelope(envelope::Body::PaneReservation(PaneReservation {
             reservation_id: 1,
@@ -808,6 +814,7 @@ fn v2_envelopes() -> Vec<Envelope> {
             reservation_id: 1,
             base_revision: 1,
             request_id: 1,
+            author_signature: Vec::new(),
         })),
         envelope(envelope::Body::LayoutCommit(LayoutCommit {
             revision: 1,
@@ -889,6 +896,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
     let multiple_actions = LayoutRequest {
         create_pane: Some(CreatePane {
@@ -1066,6 +1074,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             reservation_id: 0,
             base_revision: 1,
             request_id: 1,
+            author_signature: Vec::new(),
         })),
         envelope(envelope::Body::LayoutReject(LayoutReject {
             request_id: 1,
@@ -1098,11 +1107,13 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         reservation_id: 1,
         base_revision: 0,
         request_id: 1,
+        author_signature: Vec::new(),
     }));
     let missing_ready_request = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
         base_revision: 1,
         request_id: 0,
+        author_signature: Vec::new(),
     }));
     let missing_failed_request = envelope(envelope::Body::PaneFailed(PaneFailed {
         reservation_id: 1,
@@ -1151,6 +1162,7 @@ fn create_pane_axis_and_position_are_validated() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         }))
     }
 
@@ -1263,6 +1275,7 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     };
 
     for valid in [

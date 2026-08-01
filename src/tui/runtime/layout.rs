@@ -214,6 +214,7 @@ impl SharedLayoutRuntime {
                 rename_tab: None,
                 set_pane_lock: None,
                 mark_pane_exited: None,
+                author_signature: Vec::new(),
             })?;
         }
         Ok(())
@@ -263,6 +264,7 @@ impl SharedLayoutRuntime {
                 rename_tab: None,
                 set_pane_lock: None,
                 mark_pane_exited: Some(MarkPaneExited { pane_id }),
+                author_signature: Vec::new(),
             })?;
         }
         Ok(())
@@ -311,6 +313,7 @@ impl SharedLayoutRuntime {
                     rename_tab: None,
                     set_pane_lock: None,
                     mark_pane_exited: None,
+                    author_signature: Vec::new(),
                 })?
             }
             UiIntent::DeleteTab { tab_id } => {
@@ -329,6 +332,7 @@ impl SharedLayoutRuntime {
                     rename_tab: None,
                     set_pane_lock: None,
                     mark_pane_exited: None,
+                    author_signature: Vec::new(),
                 })?
             }
             UiIntent::SetSplitRatio {
@@ -358,6 +362,7 @@ impl SharedLayoutRuntime {
                     rename_tab: None,
                     set_pane_lock: None,
                     mark_pane_exited: None,
+                    author_signature: Vec::new(),
                 })?;
             }
             UiIntent::RenamePane { pane_id, title } => {
@@ -375,6 +380,7 @@ impl SharedLayoutRuntime {
                     rename_tab: None,
                     set_pane_lock: None,
                     mark_pane_exited: None,
+                    author_signature: Vec::new(),
                 })?;
             }
             UiIntent::RenameTab { tab_id, title } => {
@@ -392,6 +398,7 @@ impl SharedLayoutRuntime {
                     rename_tab: Some(RenameTab { tab_id, title }),
                     set_pane_lock: None,
                     mark_pane_exited: None,
+                    author_signature: Vec::new(),
                 })?;
             }
             UiIntent::SetPaneLock { pane_id, locked } => {
@@ -472,6 +479,7 @@ impl SharedLayoutRuntime {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
     }
 
@@ -512,6 +520,7 @@ impl SharedLayoutRuntime {
             rename_tab: None,
             set_pane_lock: Some(SetPaneLock { pane_id, locked }),
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         };
         if let Err(error) = self.send_request(request) {
             self.pending_locks.remove(&request_id);
@@ -598,6 +607,7 @@ impl SharedLayoutRuntime {
             reservation_id: reservation.reservation_id,
             request_id: pending.request_id,
             base_revision: pending.base_revision,
+            author_signature: Vec::new(),
         })? {
             Some(CoordinatorResponse::Commit(commit)) => {
                 self.handle_control_event(LayoutControlEvent::Commit(commit))?

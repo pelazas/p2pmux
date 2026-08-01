@@ -117,6 +117,7 @@ fn create_request(request_id: u64, base_revision: u64) -> LayoutRequest {
         rename_tab: None,
         set_pane_lock: None,
         mark_pane_exited: None,
+        author_signature: Vec::new(),
     }
 }
 
@@ -192,6 +193,7 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
             reservation_id: reservation.reservation_id,
             base_revision: 2,
             request_id: 1,
+            author_signature: Vec::new(),
         })
         .expect("first marks pane ready");
     assert!(matches!(
@@ -517,6 +519,7 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
                 rename_tab: None,
                 set_pane_lock: None,
                 mark_pane_exited: None,
+                author_signature: Vec::new(),
             })),
         })
         .await
@@ -589,6 +592,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue tab request");
     let reservation = match next_event(&mut second).await {
@@ -600,6 +604,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             reservation_id: reservation.reservation_id,
             base_revision: 3,
             request_id: 12,
+            author_signature: Vec::new(),
         })
         .expect("ready tab");
     let commit = match next_event(&mut first).await {
@@ -627,6 +632,7 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue tab delete");
     for member in [&mut first, &mut second] {
@@ -685,6 +691,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             reservation_id: reservation.reservation_id,
             base_revision: 3,
             request_id: 7,
+            author_signature: Vec::new(),
         })
         .expect("queue ready");
     assert!(
@@ -711,6 +718,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue deletion");
     assert!(
@@ -735,6 +743,7 @@ async fn reservation_is_targeted_and_ready_broadcasts_the_commit() {
             rename_tab: None,
             set_pane_lock: None,
             mark_pane_exited: None,
+            author_signature: Vec::new(),
         })
         .expect("queue foreign deletion");
     assert!(matches!(
@@ -850,6 +859,7 @@ async fn simultaneous_member_requests_publish_only_monotonic_commits() {
                     reservation_id: reservation.reservation_id,
                     base_revision: 3,
                     request_id: 31,
+                    author_signature: Vec::new(),
                 })
                 .expect("first ready");
             reservation
@@ -860,6 +870,7 @@ async fn simultaneous_member_requests_publish_only_monotonic_commits() {
                     reservation_id: reservation.reservation_id,
                     base_revision: 3,
                     request_id: 32,
+                    author_signature: Vec::new(),
                 })
                 .expect("second ready");
             reservation

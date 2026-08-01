@@ -87,6 +87,12 @@ impl LedgerWriter {
         }
     }
 
+    /// The session these entries belong to, which the coordinator also needs in order to
+    /// check the intent signatures it is about to seal.
+    pub fn session_id(&self) -> &[u8] {
+        &self.session_id
+    }
+
     /// The position the next entry will take, and the hash it will name as its predecessor.
     pub fn head(&self) -> (u64, [u8; LEDGER_HASH_BYTES]) {
         (self.next_seq, self.prev_hash)
@@ -120,6 +126,54 @@ impl LedgerWriter {
         self.prev_hash = hash;
         entry
     }
+}
+
+/// A peer's own end of authorship: signs what it asks for, so the record of who asked
+/// rests on its key rather than on the coordinator's word.
+///
+/// The coordinator signs one of these too. It authors changes like every other member, and
+/// exempting it would leave exactly one identity in the session whose entries nobody could
+/// check.
+#[derive(Clone)]
+pub struct IntentSigner {
+    session_id: Vec<u8>,
+    secret: SecretKey,
+}
+
+impl IntentSigner {
+    pub fn new(session_id: Vec<u8>, secret: SecretKey) -> Self {
+        Self { session_id, secret }
+    }
+
+    /// Sign a change this peer is about to ask for.
+    ///
+    /// `payload` must be the encoded request with its own signature field cleared, which is
+    /// what the coordinator will reconstruct before checking this.
+    pub fn sign(&self, kind: LedgerEntryKind, payload: &[u8]) -> Vec<u8> {
+        let hash = intent_hash(
+            &self.session_id,
+            self.secret.public().as_bytes(),
+            kind,
+            payload,
+        );
+        self.secret.sign(&hash).to_bytes().to_vec()
+    }
+}
+
+/// Whether `author_peer_id` really did ask for this change.
+pub fn verify_intent(
+    session_id: &[u8],
+    author_peer_id: &[u8],
+    kind: LedgerEntryKind,
+    payload: &[u8],
+    author_signature: &[u8],
+) -> bool {
+    let (Some(author), Some(parsed)) = (public_key(author_peer_id), signature(author_signature))
+    else {
+        return false;
+    };
+    let hash = intent_hash(session_id, author_peer_id, kind, payload);
+    author.verify(&hash, &parsed).is_ok()
 }
 
 /// A member's end of the ledger: checks that what arrives is what the coordinator wrote.
@@ -185,22 +239,17 @@ impl LedgerVerifier {
             return Err(LedgerError::Forked);
         }
 
-        if !entry.author_signature.is_empty() {
-            let author = public_key(&entry.author_peer_id)
-                .ok_or(LedgerError::Malformed("author_peer_id"))?;
-            let signature = signature(&entry.author_signature)
-                .ok_or(LedgerError::Malformed("author_signature"))?;
-            let intent = intent_hash(
+        if !entry.author_signature.is_empty()
+            && !verify_intent(
                 &self.session_id,
                 &entry.author_peer_id,
                 kind,
                 &entry.payload,
-            );
-            author
-                .verify(&intent, &signature)
-                .map_err(|_| LedgerError::BadAuthorSignature)?;
+                &entry.author_signature,
+            )
+        {
+            return Err(LedgerError::BadAuthorSignature);
         }
-
         let hash = entry_hash(&self.session_id, entry);
         let signature = signature(&entry.coordinator_signature)
             .ok_or(LedgerError::Malformed("coordinator_signature"))?;
