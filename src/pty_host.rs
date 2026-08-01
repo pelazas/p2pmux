@@ -89,6 +89,26 @@ impl PtyHost {
         Self::spawn_default_shell_with_cwd(size, None, None)
     }
 
+    /// The shell to open a pane with when nothing in the environment names one.
+    ///
+    /// `SHELL` is set in every interactive session, so this only decides the
+    /// panes of a p2pmux that was not started from one — a `launchd` job, a
+    /// systemd unit, a container. macOS has shipped zsh as the login shell
+    /// since Catalina and Linux distributions ship bash; the ones that ship
+    /// neither still guarantee `/bin/sh`, so an absent `/bin/zsh` no longer
+    /// means every pane on the machine dies at spawn.
+    fn fallback_shell() -> OsString {
+        #[cfg(target_os = "macos")]
+        const CANDIDATES: &[&str] = &["/bin/zsh", "/bin/bash", "/bin/sh"];
+        #[cfg(not(target_os = "macos"))]
+        const CANDIDATES: &[&str] = &["/bin/bash", "/bin/zsh", "/bin/sh"];
+
+        let found = CANDIDATES
+            .iter()
+            .find(|candidate| Path::new(candidate).is_file());
+        OsString::from(found.copied().unwrap_or("/bin/sh"))
+    }
+
     /// Spawn the user's login shell with an optional working directory.
     ///
     /// `pane_id` is `None` for the shells that are not roster panes — the plain
@@ -99,7 +119,7 @@ impl PtyHost {
         cwd: Option<&Path>,
         pane_id: Option<u64>,
     ) -> Result<Self, Box<dyn Error>> {
-        let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/zsh"));
+        let shell = std::env::var_os("SHELL").unwrap_or_else(Self::fallback_shell);
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.env("TERM", "xterm-256color");
