@@ -24,6 +24,7 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(
     name = "p2pmux",
+    version,
     about = "Peer-to-peer multiplayer terminal multiplexer"
 )]
 pub struct Cli {
@@ -51,6 +52,8 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// List the live sessions on this machine.
+    Ls,
     /// Print the full reusable join ticket for a session hosted on this machine.
     Ticket {
         /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
@@ -161,8 +164,65 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
                 crate::agent_notify::run(crate::agent_detect::AgentKind::Claude, status.as_deref())
             }
         }),
+        // Reading the finder records is a directory scan; it needs no runtime either.
+        Some(Command::Ls) => Some(print_sessions()),
         _ => None,
     }
+}
+
+/// The live sessions on this machine, as `ticket`, `code`, `attach`, `kill` and `rename` name them.
+///
+/// Those five commands all take a session name and every one of them documented `p2pmux ls` as
+/// where to read it, so this is the command that makes the rest addressable. It prints nothing
+/// but a header when there are none, rather than failing: "no sessions" is a legitimate answer
+/// to a listing, unlike to `p2pmux code`.
+fn print_sessions() -> Result<(), Box<dyn Error>> {
+    let sessions = crate::session_store::SessionStore::for_current_user()?.list_live()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let width = sessions
+        .iter()
+        .map(|session| session.name.len())
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
+        "{:<width$}  {:<11}  {:<11}  UP",
+        "NAME", "ROLE", "CODE"
+    )?;
+    for session in &sessions {
+        let role = match session.role {
+            crate::session_store::SessionRole::Coordinator => "coordinator",
+            crate::session_store::SessionRole::Member => "member",
+        };
+        // A member never mints a code, and a coordinator that started while the rendezvous was
+        // unreachable has only a ticket. Both are ordinary states, not errors to report here.
+        let code = session.join_code.as_deref().unwrap_or("-");
+        writeln!(
+            stdout,
+            "{:<width$}  {role:<11}  {code:<11}  {}",
+            session.name,
+            format_uptime(now.saturating_sub(session.created_at))
+        )?;
+    }
+    Ok(())
+}
+
+/// Elapsed time a person can read at a glance, rather than the raw epoch the picker shows.
+fn format_uptime(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h{:02}m", minutes % 60);
+    }
+    format!("{}d{:02}h", hours / 24, hours % 24)
 }
 
 /// Hand this machine's completion tuning to the detector, once per process.
@@ -205,7 +265,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         // Already handled by the `run_without_runtime` call above; reaching
         // here would mean the two dispatches disagreed.
-        Some(Command::Notify { .. }) => Ok(()),
+        Some(Command::Notify { .. }) | Some(Command::Ls) => Ok(()),
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
             ConfigCommand::Init => {
