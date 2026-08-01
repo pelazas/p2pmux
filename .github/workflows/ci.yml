@@ -11,8 +11,16 @@ permissions:
 
 jobs:
   quality:
-    name: Rust quality gates
-    runs-on: macos-latest
+    name: Rust quality gates (${{ matrix.os }})
+    # Both supported platforms gate every PR. A macOS-only run cannot see the
+    # places where this code asks the operating system a question — clipboards,
+    # state directories, sound players — and those are exactly the places where
+    # a change compiles everywhere and works in one place.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
