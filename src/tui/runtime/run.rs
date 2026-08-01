@@ -410,14 +410,17 @@ impl SharedLayoutRuntime {
         let mut changed = false;
         self.retry_tick = self.retry_tick.saturating_add(1);
         let mut seen_presence_epoch = self.seen_presence_epoch;
-        while let Some(event) = self
-            .control
-            .try_event(self.tui.snapshot().revision, &mut seen_presence_epoch)
-        {
+        let mut seen_agent_generations = std::mem::take(&mut self.seen_agent_generations);
+        while let Some(event) = self.control.try_event(
+            self.tui.snapshot().revision,
+            &mut seen_presence_epoch,
+            &mut seen_agent_generations,
+        ) {
             self.handle_control_event(event)?;
             changed = true;
         }
         self.seen_presence_epoch = seen_presence_epoch;
+        self.seen_agent_generations = seen_agent_generations;
         while let Ok((pane_id, result)) = self.subscription_rx.try_recv() {
             match result {
                 Ok(pane) => {

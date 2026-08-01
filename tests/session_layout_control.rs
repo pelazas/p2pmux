@@ -258,6 +258,21 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
         LayoutControlEvent::AgentRoster(AgentRoster { entries, .. }) if entries.len() == 1
     ));
 
+    // The coordinator is not one of the peers `broadcast_roster` writes to, so this is the
+    // one view that a relay test cannot reach by reading events. Measured on two machines
+    // before this was checked: an agent on a member showed in that member's own overlay and
+    // in every other member's, and never in the coordinator's -- so in a two-person session
+    // the host could not see the guest's agents at all.
+    let held = coordinator.agent_rosters().expect("coordinator rosters");
+    assert_eq!(
+        held.len(),
+        1,
+        "the coordinator must hold a member's roster for its own renderer, got {held:?}"
+    );
+    assert_eq!(held[0].host_peer_id, first.peer_id);
+    assert_eq!(held[0].entries.len(), 1);
+    assert_eq!(held[0].entries[0].cwd, "/repo");
+
     first.shutdown().await;
     second.shutdown().await;
     third.shutdown().await;

@@ -2537,6 +2537,21 @@ impl SharedLayoutHost {
             .map_err(|_| SessionError::InvalidPostWelcome)
     }
 
+    /// Every host's cached roster, members' included.
+    ///
+    /// `broadcast_roster` sends an accepted roster to the *peers*, and the coordinator is
+    /// not one of them — so without polling here, the one place a member's agents never
+    /// appear is the coordinator's own overlay. Presence solves the same problem with
+    /// [`Self::presence_if_newer`]; rosters carry a per-host generation already, so the
+    /// caller filters on that instead of needing a second epoch.
+    pub fn agent_rosters(&self) -> Result<Vec<AgentRoster>, SessionError> {
+        Ok(self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .agent_rosters())
+    }
+
     /// Publish the coordinator host's own full agent roster through the same relay path.
     pub fn publish_local_agent_roster(&self, roster: AgentRoster) -> Result<(), SessionError> {
         let peer_id = self.host.transport.endpoint_id().as_bytes().to_vec();

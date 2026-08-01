@@ -68,6 +68,9 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) presence_generation: u64,
     pub(in crate::tui) last_local_presence: Option<Presence>,
     pub(in crate::tui) seen_presence_epoch: u64,
+    /// Highest roster generation this renderer has already applied, per host. Only the
+    /// coordinator advances it: a member is handed rosters by the broadcast instead.
+    pub(in crate::tui) seen_agent_generations: BTreeMap<Vec<u8>, u64>,
     pub(in crate::tui) presence: Vec<Presence>,
 }
 impl SharedLayoutRuntime {
@@ -184,6 +187,7 @@ impl SharedLayoutRuntime {
             presence_generation: 0,
             last_local_presence: None,
             seen_presence_epoch: 0,
+            seen_agent_generations: BTreeMap::new(),
             presence: Vec::new(),
         };
         value.refresh_local_views();
