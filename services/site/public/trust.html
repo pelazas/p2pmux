@@ -56,8 +56,8 @@
   <div class="warn">
     <strong>A p2pmux session is a trusted shared shell.</strong> Anyone holding the code or ticket
     can see every pane and take interactive control of the terminals that are available. They can
-    run commands as that Mac's user, read anything that user can read, and print a secret to the
-    screen. Share it with people you would hand your unlocked laptop to, and nobody else.
+    run commands as that machine's user, read anything that user can read, and print a secret to
+    the screen. Share it with people you would hand your unlocked laptop to, and nobody else.
   </div>
 
   <p>
@@ -70,13 +70,13 @@
   <p>
     It is <strong>not</strong> a sandbox. Nothing stops a controller from running
     <code>cat ~/.aws/credentials</code>. If that distinction matters for a given collaborator, use a
-    separate low-privilege macOS account and keep production credentials out of shared panes.
+    separate low-privilege user account and keep production credentials out of shared panes.
   </p>
 
   <h2>Where things run</h2>
   <table>
     <tr><th>Thing</th><th>Where it lives</th></tr>
-    <tr><td>Your shell, your agent, your build</td><td>Your Mac. Always.</td></tr>
+    <tr><td>Your shell, your agent, your build</td><td>Your machine. Always.</td></tr>
     <tr><td>Your API keys and credential files</td><td>Your disk. Never uploaded.</td></tr>
     <tr><td>Terminal output and keystrokes</td>
         <td>Encrypted, peer to peer — or through an iroh relay when NAT blocks a direct path.

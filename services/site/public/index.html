@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>p2pmux — a terminal room where every pane runs on its owner's machine</title>
-<meta name="description" content="A macOS terminal multiplexer for two or more people. Each pane's process runs on its host's Mac, under its host's credentials.">
+<meta name="description" content="A terminal multiplexer for two or more people, on macOS and Linux. Each pane's process runs on its host's machine, under its host's credentials.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://p2pmux.com/">
 <meta property="og:title" content="p2pmux — every pane runs on the machine of whoever opened it">
-<meta property="og:description" content="A macOS terminal multiplexer for two or more people. Each pane's process runs on its host's Mac, under its host's credentials.">
+<meta property="og:description" content="A terminal multiplexer for two or more people, on macOS and Linux. Each pane's process runs on its host's machine, under its host's credentials.">
 <meta property="og:image" content="https://p2pmux.com/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <style>
@@ -65,18 +65,20 @@
   <h1>Every pane runs on its owner's machine.</h1>
   <p class="lede">
     p2pmux is a terminal multiplexer for two or more people. You share a layout, not a computer:
-    each pane's shell runs on the Mac of whoever created it, under that person's PATH, environment
+    each pane's shell runs on the machine of whoever created it, under that person's PATH, environment
     and credentials.
   </p>
 
   <h2>Install</h2>
   <pre><code>curl -fsSL https://p2pmux.com/install.sh | sh</code></pre>
   <p class="note">
-    macOS, Apple Silicon or Intel. The script is served as plain text —
+    macOS and Linux, Apple Silicon, Intel and arm64. The script is served as plain text —
     <a href="/install.sh">read it first</a>. It downloads a binary and its SHA256 from GitHub
     Releases, checks the hash, and copies one file into place.
   </p>
-  <p class="note">Or with Homebrew:</p>
+  <p class="note">Linux builds need glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and
+    up. A musl system builds from source.</p>
+  <p class="note">Or with Homebrew, on macOS:</p>
   <pre><code>brew tap pelazas/tap
 brew trust pelazas/tap
 brew install p2pmux</code></pre>
@@ -90,7 +92,7 @@ brew install p2pmux</code></pre>
 
   <h2>Use</h2>
   <pre><code>p2pmux create                # you host; Ctrl+S shows the line to send
-p2pmux join 4KP7Q-M2XRW      # them, on their own Mac</code></pre>
+p2pmux join 4KP7Q-M2XRW      # them, on their own machine</code></pre>
   <p class="note">
     Ctrl+S copies that second line ready to paste; ten characters is the whole invite.
     Ctrl+P then arrows for panes, Ctrl+T for tabs, Ctrl+Q to leave the session running.
@@ -107,9 +109,9 @@ p2pmux join 4KP7Q-M2XRW      # them, on their own Mac</code></pre>
 
   <div class="warn">
     <strong>This is a trusted shared shell.</strong> Whoever holds a pane can run commands as that
-    Mac's user and read anything that user can read — including printing a secret to the screen.
-    Credential <em>files</em> and processes never leave the host Mac, but that is not the same as
-    being sandboxed. <a href="/trust">Both halves, in detail →</a>
+    machine's user and read anything that user can read — including printing a secret to the
+    screen. Credential <em>files</em> and processes never leave the host machine, but that is not
+    the same as being sandboxed. <a href="/trust">Both halves, in detail →</a>
   </div>
 
   <footer>

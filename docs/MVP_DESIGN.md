@@ -2,31 +2,35 @@
 
 **LOCKED** 2026-07-24 — Pelazas decisions + Codex (`gpt-5.6-terra`) normative wording.
 
+**Amended 2026-08-01:** the platform is macOS **and Linux**. That is the only decision changed
+since the lock; everywhere this document said “Mac” it now says “machine”, and the durable paths
+below gained their Linux equivalents. Nothing else about the design moved.
+
 This document is the **source of truth** for the MVP. Older Notion section pages are historical if they conflict.
 
 ---
 
 ## 0. Trust warning (product + README + invite UI)
 
-This is a **fully trusted shared-shell** session. Anyone with the join ticket can see every pane and may obtain interactive control of unlocked terminals (run commands, see output, touch files reachable to that macOS user). A pane host can temporarily make its own pane host-only, but locking is not an ACL. Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege Mac account and avoid production credentials in shared panes.
+This is a **fully trusted shared-shell** session. Anyone with the join ticket can see every pane and may obtain interactive control of unlocked terminals (run commands, see output, touch files reachable to that user account). A pane host can temporarily make its own pane host-only, but locking is not an ACL. Share the ticket only with people you trust with that access. For risky/unknown collaborators, use a separate low-privilege account and avoid production credentials in shared panes.
 
-**Clarification:** Processes and credential *files* stay on the pane host’s Mac (not uploaded to peers). That does **not** stop a controller from using or displaying them via the shared shell.
+**Clarification:** Processes and credential *files* stay on the pane host’s machine (not uploaded to peers). That does **not** stop a controller from using or displaying them via the shared shell.
 
 ## 1. Product one-liner
 
-Brew-installable macOS terminal mux: each pane’s process runs on its host’s machine; members in one encrypted P2P session see a shared layout, presence, and can take control of panes — secrets/files aren’t copied to other laptops, but teammates with control share that shell.
+Installable macOS and Linux terminal mux: each pane’s process runs on its host’s machine; members in one encrypted P2P session see a shared layout, presence, and can take control of panes — secrets/files aren’t copied to other laptops, but teammates with control share that shell.
 
 ## 2. Locked decisions
 
 - **Audience / success bar:** Dogfood & polish primarily with 2 people; protocol supports **N members**, **v1 hard cap 8** concurrent.
-- **Platform:** macOS only
+- **Platform:** macOS and Linux (amended 2026-08-01; locked as macOS only)
 - **Approach:** custom thin mux + Iroh P2P (not Zellij wrap)
 - **Invite:** one **reusable shareable join ticket** for the life of the live session. Not single-use. Caps at 8 members.
-- **Roles:** **coordinator** serializes shared structural state (layout, admission, lifecycle). **Pane host** = whose Mac runs that PTY (not exclusive control rights).
+- **Roles:** **coordinator** serializes shared structural state (layout, admission, lifecycle). **Pane host** = whose machine runs that PTY (not exclusive control rights).
 - **Trust:** all members fully trusted; full shell control when they are controller.
 - **Visibility:** everyone sees every pane; no private panes.
 - **Spike 3 structural authority:** any admitted member may split a pane or create a tab; the new
-  fixed-grid PTY runs on that requester’s Mac. Only a pane’s host may delete that pane. A tab may
+  fixed-grid PTY runs on that requester’s machine. Only a pane’s host may delete that pane. A tab may
   be deleted only by a member that hosts every pane in it. There is no close confirmation in this
   spike; stale requests are rejected rather than replayed.
 - **Input:** a pane has a controller only while that peer is actively typing. After about eight
@@ -43,9 +47,9 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 
 ## 3. How it works (plain language)
 
-1. You `create` → reusable join ticket → first shell on your Mac. You start as coordinator.
+1. You `create` → reusable join ticket → first shell on your machine. You start as coordinator.
 2. Others `join <ticket>` (up to 8). Everyone sees the same tabs/panes.
-3. Shells run on whoever **hosts** that pane’s Mac. Others watch; an idle pane is free for the
+3. Shells run on whoever **hosts** that pane’s machine. Others watch; an idle pane is free for the
    next member's ordinary key to claim and deliver. Active typing is protected until the host clears
    the controller after the idle timeout.
 4. Any member can split an available pane or create a tab; the requester hosts the new PTY, but is
@@ -56,7 +60,7 @@ Brew-installable macOS terminal mux: each pane’s process runs on its host’s 
 ## 4. Architecture
 
 ```text
-Members (≤8) on macOS
+Members (≤8) on macOS or Linux
 TUI + local PTYs for panes they host
 Guest render + control/input when controller
         \______ Iroh P2P (+ relay) ______/
@@ -75,8 +79,9 @@ The client connects through a Unix socket and Ctrl+Q detaches, releasing local c
 without stopping the node. `--resume` shows live sessions and `attach <name>` reconnects.
 `kill <name>` is graceful (and warns before coordinator shutdown).
 
-The durable finder descriptor lives in `~/Library/Application Support/p2pmux/sessions`; its socket
-lives in `/tmp/p2pmux-$UID`. Finder records contain no ticket, PTY, screen, layout, or focus state.
+The durable finder descriptor lives in `~/Library/Application Support/p2pmux/sessions` on macOS
+and `$XDG_STATE_HOME/p2pmux/sessions` (default `~/.local/state`) on Linux; its socket lives in
+`$XDG_RUNTIME_DIR/p2pmux` where Linux provides one and `/tmp/p2pmux-$UID` otherwise. Finder records contain no ticket, PTY, screen, layout, or focus state.
 There is no local-client takeover, launchd registration, disk screen restore, coordinator failover,
 or offline-pane grace in this implementation. Offline host placeholders/grace remain follow-up work.
 
