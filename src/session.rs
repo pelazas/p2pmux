@@ -355,6 +355,20 @@ impl LayoutCoordinator {
         self.state.members().len() >= MAX_MEMBERS
     }
 
+    /// Whether this peer would take a new seat, or is simply coming back to the one it has.
+    ///
+    /// A full session must still let its own members reconnect. Otherwise the cap turns into
+    /// a trap: eight people, one dropped stream, and the peer that owns half the panes can
+    /// never get back in -- and after a takeover, where every survivor rejoins, nobody could.
+    pub fn is_full_for(&self, peer_id: &[u8]) -> bool {
+        self.is_full()
+            && !self
+                .state
+                .members()
+                .iter()
+                .any(|member| member.peer_id == peer_id)
+    }
+
     /// Whether the host has closed the session to newcomers.
     pub fn is_locked(&self) -> bool {
         self.locked
@@ -510,6 +524,16 @@ impl LayoutCoordinator {
         self.admit_with_display_name(peer_id, endpoint_addr, String::new())
     }
 
+    /// Admit a peer, or readmit one the layout already lists.
+    ///
+    /// Rejoining is ordinary, not exceptional. A member whose control stream dropped comes
+    /// back through this door, and after a takeover every survivor does -- the successor
+    /// inherited a member list with all of them already in it, and refusing them would leave
+    /// a coordinator that no member could attach to.
+    ///
+    /// The readmission is an endpoint refresh rather than a fresh join, because that is what
+    /// actually happened and because a rejoin is exactly when an address is likely to have
+    /// changed: the usual reason a stream dropped is that the network underneath it moved.
     pub fn admit_with_display_name(
         &mut self,
         peer_id: Vec<u8>,
@@ -517,6 +541,19 @@ impl LayoutCoordinator {
         display_name: String,
     ) -> Result<MembershipChange, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
+        if self
+            .state
+            .members()
+            .iter()
+            .any(|member| member.peer_id == peer_id)
+        {
+            let invalidated = self.state.update_member_endpoint(
+                self.state.revision(),
+                &peer_id,
+                endpoint_addr,
+            )?;
+            return self.membership_change(peer_id, MembershipEvent::EndpointChanged, invalidated);
+        }
         let invalidated = self.state.add_member_with_display_name(
             self.state.revision(),
             peer_id.clone(),
@@ -3085,7 +3122,7 @@ impl SharedLayoutHost {
                 .coordinator
                 .lock()
                 .map_err(|_| SessionError::PeerTask)?
-                .is_full()
+                .is_full_for(connection.remote_id().as_bytes())
             {
                 self.host
                     .refuse_join(join_writer, LayoutRejectReason::Limit)
