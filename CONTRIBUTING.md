@@ -64,6 +64,29 @@ agent orchestration platform, or a sandbox around the shell it hands you.
 [docs/PRODUCT.md](./docs/PRODUCT.md) has the full is/isn't list. Reading it will save you a
 rejected PR.
 
+## Cutting a release
+
+Tag-driven, so whatever `v*` points at is what gets built, hashed and published:
+
+```sh
+# bump `version` in Cargo.toml and the version named in README.md's Status section
+cargo build                       # so Cargo.lock follows
+git commit -am "release: vX.Y.Z"
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin main && git push origin vX.Y.Z
+```
+
+`release.yml` then builds all four targets natively, verifies every archive against its own
+published SHA256, publishes the GitHub release, and points the Homebrew tap at it using those
+same verified hashes. Nothing about the tap is manual — it used to be, and v0.1.2 shipped for
+several minutes with a formula nobody could install from.
+
+**One-time setup:** the tap lives in another repo, which `GITHUB_TOKEN` cannot reach. Create a
+fine-grained personal access token with `contents: write` on `pelazas/homebrew-tap` and add it
+to this repo as the `HOMEBREW_TAP_TOKEN` secret. Without it the `homebrew` job fails on
+purpose rather than skipping quietly — the release itself is already published by then, so a
+red job there costs the formula, not the release.
+
 ## License
 
 Contributions are accepted under the [MIT license](./LICENSE).
