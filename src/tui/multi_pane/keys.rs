@@ -612,6 +612,32 @@ mod tests {
         assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 
+    /// Ctrl+F is not a binding here — it reaches the shell, where it is `forward-char`
+    /// and prints nothing. That makes it the key that exposes a repaint gap: the pane
+    /// sends back no output for the client to redraw on, so if the client does not
+    /// notice the mode ending on its own, the footer keeps advertising PANE MODE long
+    /// after the mode is gone.
+    #[test]
+    fn a_modified_key_the_chord_does_not_claim_still_ends_the_mode() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Forward
+        );
+        assert_eq!(tui.chord_mode(), ChordMode::None);
+    }
+
     #[test]
     fn paste_exits_sticky_chord_mode_before_forwarding() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");

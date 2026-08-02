@@ -33,8 +33,8 @@ use crate::{
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
         PaneMouseProtocol, PaneViewState, ShareView, clear_before_first_frame,
-        copy_selection_to_clipboard, missed_resize, render_multi_pane_with_copy_feedback,
-        resize_recheck_due, share_copy_result,
+        copy_selection_to_clipboard, render_multi_pane_with_copy_feedback, resize_recheck_due,
+        share_copy_result, stale_node_size,
     },
 };
 
@@ -210,6 +210,10 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     // the resize arm below resizes it. Tracked here to spot a resize that never
     // arrived as an event.
     let mut viewport = (initial_cols, initial_rows);
+    // The size the node last heard, which `Hello` above has just told it. Tracked apart
+    // from `viewport` because the two come apart whenever a resize is drawn but not
+    // forwarded, and that gap is the only evidence the node is behind.
+    let mut node_viewport = (initial_cols, initial_rows);
     let mut last_size_check: Option<Instant> = None;
 
     'attached: loop {
@@ -525,7 +529,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         }
         if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
             last_size_check = Some(Instant::now());
-            if let Some((cols, rows)) = missed_resize(viewport, terminal::size()) {
+            if let Some((cols, rows)) = stale_node_size(
+                viewport,
+                node_viewport,
+                terminal::size(),
+                tui.as_ref().is_some_and(MultiPaneTui::modal_open),
+            ) {
                 pending_wake = Some(WakeEvent::Terminal(Event::Resize(cols, rows)));
             }
         }
@@ -550,6 +559,13 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         };
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                // A forwarded key can still have ended chord mode on its way past, and the
+                // footer names the mode it is in. Redrawing on every keystroke would be a
+                // frame per character; redrawing when the mode actually moved is one frame
+                // per chord. Without it a key the chord does not claim — Ctrl+F, say, which
+                // reaches the shell and produces nothing to redraw for — leaves PANE MODE on
+                // screen after it has ended.
+                let chord_before = tui.chord_mode();
                 match tui.handle_key(key, terminal.size()?.into()) {
                     KeyHandling::Quit => {
                         write_message(&mut stream, &ClientMessage::Detach { generation })?;
@@ -589,6 +605,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             desired_scroll.remove(&tui.focused_pane());
                             tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
                         }
+                        dirty |= tui.chord_mode() != chord_before;
                     }
                 }
             }
@@ -716,6 +733,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     pending_scroll.clear();
                     desired_scroll.clear();
                     write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
+                    node_viewport = (cols, rows);
                 }
                 dirty = true;
             }
