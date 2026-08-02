@@ -277,7 +277,6 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         // Already handled by the `run_without_runtime` call above; reaching
         // here would mean the two dispatches disagreed.
-        // Handled in `run_without_runtime`, which returns before this dispatch.
         Some(Command::Notify { .. })
         | Some(Command::Ls)
         | Some(Command::Setup { .. })
