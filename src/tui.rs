@@ -48,7 +48,7 @@ pub use input::mouse::PaneMouseProtocol;
 pub use multi_pane::MultiPaneTui;
 pub use pane::local::SharedLocalPane;
 pub use render::panes::{render_multi_pane, render_multi_pane_with_copy_feedback};
-pub use runtime::SharedLayoutRuntime;
+pub use runtime::{RolePersist, SharedLayoutRuntime};
 pub(crate) use selection::copy_selection_to_clipboard;
 pub(crate) use share::share_copy_result;
 pub(crate) use snapshot::{

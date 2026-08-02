@@ -243,7 +243,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     let listener = UnixListener::bind(&descriptor.socket_path)?;
     listener.set_nonblocking(true)?;
     store.write(&descriptor)?;
-    let result = run_socket_loop(&mut node, listener, &descriptor);
+    let result = run_socket_loop(&mut node, listener, &mut descriptor, &store);
     // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
     // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
     tokio::task::block_in_place(|| node.shutdown());
@@ -294,7 +294,8 @@ fn configure_accepted(stream: UnixStream) -> Option<UnixStream> {
 fn run_socket_loop(
     node: &mut SharedLayoutNode,
     listener: UnixListener,
-    descriptor: &SessionDescriptor,
+    descriptor: &mut SessionDescriptor,
+    store: &SessionStore,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
     let mut client: Option<AttachedClient> = None;
@@ -425,6 +426,22 @@ fn run_socket_loop(
                 .drain()
                 .map_err(|error| io::Error::other(error.to_string()))?;
             drain_elapsed = drain_started.elapsed();
+        }
+        // A takeover or a step-down changes what this machine is advertising about itself.
+        // `p2pmux ls` and `p2pmux ticket <name>` read the record out of process, so until it
+        // is rewritten they hand out a ticket for an endpoint that stopped answering.
+        if let Some(role) = node.take_role_persist() {
+            descriptor.role = if role.coordinating {
+                SessionRole::Coordinator
+            } else {
+                SessionRole::Member
+            };
+            descriptor.ticket = role.ticket;
+            descriptor.join_code = role.join_code;
+            if let Err(error) = store.write(descriptor) {
+                eprintln!("p2pmux node: failed to record the new session role: {error}");
+            }
+            did_work = true;
         }
         did_work |= changed;
         let mut detached = false;
@@ -920,9 +937,12 @@ fn snapshot_message(
         .collect::<Vec<_>>();
     let message = NodeMessage::Snapshot {
         room_name: descriptor.name.clone(),
-        role: match descriptor.role {
-            SessionRole::Coordinator => "coordinator",
-            SessionRole::Member => "member",
+        // Read live rather than from the record this node started with: the role can change
+        // under a running session, and the attached client draws it every frame.
+        role: if node.is_coordinating() {
+            "coordinator"
+        } else {
+            "member"
         }
         .into(),
         summary: SessionSummary {
@@ -1414,6 +1434,16 @@ impl SharedLayoutNode {
         self.runtime
             .apply_agent_status(pane_id, kind, status, cwd, message)
     }
+    /// Whether this node currently serializes the session, for the attached client's header.
+    pub fn is_coordinating(&self) -> bool {
+        self.runtime.is_coordinating()
+    }
+
+    /// A role change the durable session record still has to be told about, once.
+    pub fn take_role_persist(&mut self) -> Option<crate::tui::RolePersist> {
+        self.runtime.take_role_persist()
+    }
+
     pub fn shutdown(self) {
         self.runtime.shutdown_node();
     }

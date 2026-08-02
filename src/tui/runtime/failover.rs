@@ -134,6 +134,7 @@ impl SharedLayoutRuntime {
     /// One pass of the failover state machine. Called from the drain loop.
     pub(in crate::tui) fn tick_failover(&mut self) -> Result<bool, Box<dyn Error>> {
         let mut changed = self.drain_rejoins()?;
+        changed |= self.drain_published_codes();
         self.note_isolation();
         let Some(lost_at) = self.coordinator_lost_at else {
             return Ok(changed);
@@ -193,8 +194,14 @@ impl SharedLayoutRuntime {
         // The invite has to be reissued: the old one names an endpoint nobody is listening
         // on. The short code is republished separately, so until that lands the share panel
         // offers the ticket alone rather than a code that resolves to a dead address.
-        self.invite.ticket = Some(ticket);
+        self.invite.ticket = Some(ticket.clone());
         self.invite.code = None;
+        self.publish_new_code(ticket.clone());
+        self.pending_role_persist = Some(super::RolePersist {
+            coordinating: true,
+            ticket: Some(ticket),
+            join_code: None,
+        });
         self.swap_accept_loop(true);
         if let SharedControl::Host(host) = &self.control
             && let Err(error) = host.announce_takeover(replaced)
@@ -220,7 +227,63 @@ impl SharedLayoutRuntime {
         }
         self.invite.ticket = None;
         self.invite.code = None;
+        self.retire_published_code();
+        self.pending_role_persist = Some(super::RolePersist {
+            coordinating: false,
+            ticket: None,
+            join_code: None,
+        });
         self.swap_accept_loop(false);
+    }
+
+    /// Put a fresh short code in front of the new ticket.
+    ///
+    /// The code a session was created with is sealed under a secret only its creator holds,
+    /// so a successor cannot republish the same one -- it mints another. That is a real cost:
+    /// an invite already pasted into a chat stops working. It is the recoverable half of the
+    /// choice, though, and the alternative is handing every member the power to redirect the
+    /// session's invite, in a product whose whole claim is that nobody holds anyone else's
+    /// keys.
+    ///
+    /// A rendezvous outage degrades the invite rather than the takeover: the ticket still
+    /// works, and the share panel says there is no code instead of showing a dead one.
+    fn publish_new_code(&mut self, ticket: String) {
+        self.retire_published_code();
+        let sender = self.code_tx.clone();
+        self.runtime.spawn(async move {
+            if let Ok(published) = crate::hosted_rendezvous::PublishedCode::publish(ticket).await {
+                let _ = sender.send(published);
+            }
+        });
+    }
+
+    fn retire_published_code(&mut self) {
+        if let Some(published) = self.published_code.take() {
+            self.runtime.spawn(async move { published.retire().await });
+        }
+    }
+
+    /// Adopt a code whose publish finished, if this node is still the one coordinating.
+    fn drain_published_codes(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(published) = self.code_rx.try_recv() {
+            if !matches!(self.control, SharedControl::Host(_)) {
+                // Stepped back down while the request was in flight. Publishing a code for a
+                // ticket nobody will answer is worse than having none.
+                self.runtime.spawn(async move { published.retire().await });
+                continue;
+            }
+            let code = published.code().printable();
+            self.invite.code = Some(code.clone());
+            self.pending_role_persist = Some(super::RolePersist {
+                coordinating: true,
+                ticket: self.invite.ticket.clone(),
+                join_code: Some(code),
+            });
+            self.published_code = Some(published);
+            changed = true;
+        }
+        changed
     }
 
     /// Point this endpoint's accept loop at the right service for the role it now holds.
