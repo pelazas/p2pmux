@@ -122,8 +122,32 @@ Everything below is already automated against the droplet; this is the part only
 
 ### Spike 5 — Disconnect grace + coordinator failover
 
-5-minute placeholders; structural freeze during coordinator grace; earliest-join promotion.
-Minimal reconnect lands early, in Spike 4, so internet tests are not read as failures.
+**Done (2026-08-02).** Structural freeze during grace, earliest-join promotion, and a
+deposed coordinator that rejoins as an ordinary member. Panes hosted by machines that are
+still up keep running and keep taking input throughout — they always did, because a pane
+runs on its host and settles its own lease; what was permanent before was the freeze.
+
+Three decisions worth knowing, each recorded at its call site:
+
+- **Nobody hands the role over.** A departed coordinator cannot nominate a successor, so
+  the decision has to be derivable identically by every member from the committed layout.
+  Join order is that ranking, turned into staggered time rather than a vote because members
+  have no shared view of who is still reachable. `src/failover.rs`.
+- **A claim proves nothing.** Every ledger entry carries the coordinator epoch that sealed
+  it, and a verifier only rotates onto a new key when its own election already agreed. A
+  peer answering the door proves it is alive, not that the room elected it.
+- **The invite is reissued, not inherited.** The short code is sealed under a secret only
+  the session's creator holds, so a successor mints a new one and an already-pasted invite
+  stops working. Replicating that secret to every member would hand each of them the power
+  to redirect the session's invite.
+
+Departed hosts' panes stay in the layout as unavailable placeholders rather than being
+evicted at promotion; the 5-minute reaping of them is still open. `p2pmux ticket <name>`
+and `p2pmux ls` follow the role across a takeover.
+
+Verified by `tests/failover.rs` over loopback endpoints and by
+`scripts/e2e/scenario_v_failover.py` across two droplets and this Mac, which kills the
+coordinator with `pkill -9` so the survivors get no departure notice.
 
 ### Spike 6 — Brew formula
 
