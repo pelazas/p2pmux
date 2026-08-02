@@ -1788,6 +1788,7 @@ pub struct HostSession {
     ticket: JoinTicket,
     address_ready: bool,
     session_name: String,
+    coordinator_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1798,6 +1799,9 @@ pub struct JoinReceipt {
     pub endpoint_addr: EndpointAddr,
     pub display_name: String,
     pub session_name: String,
+    /// How many takeovers this session has been through, so a joiner knows which
+    /// coordinator's signatures to expect without having to read the history it missed.
+    pub coordinator_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -1899,6 +1903,7 @@ impl HostSession {
             ticket,
             address_ready,
             session_name,
+            coordinator_epoch: 0,
         })
     }
 
@@ -1916,11 +1921,40 @@ impl HostSession {
             ticket,
             address_ready: true,
             session_name,
+            coordinator_epoch: 0,
+        })
+    }
+
+    /// The host end of a session that already existed, taken over by this endpoint.
+    ///
+    /// The session id is carried across rather than minted, because every live pane
+    /// subscription is keyed on it: a successor that invented a new one would be a new
+    /// session that happened to have the same people in it. What changes is the address the
+    /// ticket points at, which is this endpoint now, and the epoch that says so.
+    pub fn resume_with_session_name(
+        transport: Transport,
+        session_id: Vec<u8>,
+        session_name: String,
+        coordinator_epoch: u64,
+    ) -> Result<Self, SessionError> {
+        let ticket = JoinTicket::from_parts(session_id, transport.endpoint_addr())
+            .map_err(SessionError::Ticket)?;
+        Ok(Self {
+            transport,
+            ticket,
+            address_ready: true,
+            session_name,
+            coordinator_epoch,
         })
     }
 
     pub fn ticket(&self) -> &JoinTicket {
         &self.ticket
+    }
+
+    /// How many takeovers this session has been through, stamped into every welcome.
+    pub fn coordinator_epoch(&self) -> u64 {
+        self.coordinator_epoch
     }
 
     pub fn address_ready(&self) -> bool {
@@ -2072,6 +2106,7 @@ impl HostSession {
             endpoint_addr,
             display_name: join.display_name,
             session_name: self.session_name.clone(),
+            coordinator_epoch: self.coordinator_epoch,
         };
         self.transport
             .write_frame(
@@ -2084,6 +2119,7 @@ impl HostSession {
                         admitted_peer_id: receipt.admitted_peer_id.clone(),
                         coordinator_peer_id: receipt.coordinator_peer_id.clone(),
                         session_name: receipt.session_name.clone(),
+                        coordinator_epoch: receipt.coordinator_epoch,
                     })),
                 },
             )
@@ -2391,6 +2427,8 @@ impl ControlFrameSink for crate::transport::FrameWriter {
 pub struct SharedLayoutMember {
     pub peer_id: Vec<u8>,
     pub coordinator_peer_id: Vec<u8>,
+    /// The epoch this member is following, which is what a promotion has to move past.
+    pub coordinator_epoch: u64,
     pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
     signer: IntentSigner,
@@ -3324,7 +3362,14 @@ pub async fn join_layout_with_display_name(
         // Anchored on the endpoint key the ticket named and QUIC proved on this very
         // connection, rather than on the coordinator id the Welcome claimed: a peer that
         // could lie about the latter is exactly the one this verifier exists to catch.
-        let verifier = LedgerVerifier::new(ticket.session_id().to_vec(), ticket.endpoint_addr().id);
+        // The epoch comes from the welcome rather than starting at zero: a member joining a
+        // session that has already changed hands has no way to read the takeovers it missed,
+        // and entries sealed under the current epoch would otherwise all look wrong to it.
+        let verifier = LedgerVerifier::at_epoch(
+            ticket.session_id().to_vec(),
+            ticket.endpoint_addr().id,
+            receipt.coordinator_epoch,
+        );
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
@@ -3341,6 +3386,7 @@ pub async fn join_layout_with_display_name(
         Ok(SharedLayoutMember {
             peer_id,
             coordinator_peer_id,
+            coordinator_epoch: receipt.coordinator_epoch,
             session_name,
             events,
             signer: IntentSigner::new(ticket.session_id().to_vec(), transport.secret_key()),
@@ -4174,6 +4220,7 @@ async fn join_handshake_with_display_name(
         endpoint_addr: ticket.endpoint_addr().clone(),
         display_name: String::new(),
         session_name: welcome.session_name,
+        coordinator_epoch: welcome.coordinator_epoch,
     })
 }
 

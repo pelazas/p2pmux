@@ -32,6 +32,7 @@ fn ledger_entry() -> LedgerEntry {
         payload: b"payload".to_vec(),
         author_signature: Vec::new(),
         coordinator_signature: vec![7; LEDGER_SIGNATURE_BYTES],
+        coordinator_epoch: 0,
     }
 }
 
@@ -64,6 +65,7 @@ fn welcome_session_name_round_trips_and_defaults_empty() {
         admitted_peer_id: b"peer-a".to_vec(),
         coordinator_peer_id: b"peer-host".to_vec(),
         session_name: "lisbon".to_owned(),
+        coordinator_epoch: 0,
     }));
     assert_eq!(decode_frame(&encode_frame(&named).unwrap()).unwrap(), named);
 
@@ -72,6 +74,7 @@ fn welcome_session_name_round_trips_and_defaults_empty() {
         admitted_peer_id: b"peer-a".to_vec(),
         coordinator_peer_id: b"peer-host".to_vec(),
         session_name: String::new(),
+        coordinator_epoch: 0,
     }));
     let decoded = decode_frame(&encode_frame(&legacy).unwrap()).unwrap();
     let Some(envelope::Body::Welcome(welcome)) = decoded.body else {
@@ -232,6 +235,7 @@ fn envelope_exposes_each_v1_body() {
             admitted_peer_id: b"peer-a".to_vec(),
             coordinator_peer_id: b"peer-host".to_vec(),
             session_name: String::new(),
+            coordinator_epoch: 0,
         })),
         envelope(envelope::Body::Input(Input {
             pane_id: b"pane-a".to_vec(),
@@ -360,6 +364,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             admitted_peer_id: b"peer-a".to_vec(),
             coordinator_peer_id: b"peer-host".to_vec(),
             session_name: String::new(),
+            coordinator_epoch: 0,
         })),
         envelope(envelope::Body::Input(Input {
             pane_id: b"pane-a".to_vec(),
