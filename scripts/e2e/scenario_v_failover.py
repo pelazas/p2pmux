@@ -30,8 +30,10 @@ Run:  scripts/e2e/provision_droplets.sh create
 
 from __future__ import annotations
 
+import os
 import re
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -87,6 +89,57 @@ def pane_body_cell(screen: str, host: str) -> tuple[int, int]:
 
 def panes_on_screen(screen: str) -> int:
     return len(re.findall(r"Pane #\d+", screen))
+
+
+def footer(peer) -> str:
+    """The status line, which is where the node reports anything about the session."""
+    lines = [line.rstrip() for line in peer.snapshot().split("\n") if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def local_role(harness) -> str:
+    """What this Mac's own session record says its role is.
+
+    Asserted here rather than on the footer because the footer is a single line that every
+    subsystem shares: the departed coordinator's pane retries forever and its "retrying"
+    message overwrites the takeover notice within a second or two. The record is the thing
+    a takeover is supposed to update anyway -- it is what `p2pmux ls` and
+    `p2pmux ticket <name>` read out of process -- so checking it tests more, not less.
+    """
+    result = subprocess.run(
+        [str(BINARY), "ls"],
+        env={**os.environ, "HOME": str(harness.home)},
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
+def live_nodes(host) -> list[int]:
+    """PIDs of p2pmux processes on `host`, matched by name rather than command line.
+
+    `pgrep -f /usr/local/bin/p2pmux` also matches the ssh command line carrying that
+    path, so the shell running the search is itself a hit -- and `pkill -f` then kills
+    the connection before it finishes, which reads as "the coordinator survived".
+    Matching argv[0] exactly sees the nodes and nothing else.
+    """
+    output = host.run("pgrep -x p2pmux || true", check=False)
+    return [int(line) for line in output.split() if line.isdigit()]
+
+
+def kill_hard(host) -> None:
+    """SIGKILL every p2pmux on `host`, leaving no departure notice behind.
+
+    By PID for the same reason as above, and with `kill -9` because the point is to
+    simulate a machine that stopped rather than a session that ended: a graceful exit
+    would take the coordinator out of the roster on its way past.
+    """
+    for signal in ("-TERM", "-KILL"):
+        pids = live_nodes(host)
+        if not pids:
+            return
+        host.run(f"kill {signal} {' '.join(str(pid) for pid in pids)} || true", check=False)
+        time.sleep(1.0)
 
 
 def main() -> int:
@@ -184,19 +237,38 @@ def main() -> int:
 
             # -------------------------------------------------- the coordinator dies
             print("   killing the coordinator, hard", flush=True)
-            nyc_host.reap()
-            check("the coordinator's node is gone", not nyc_host._p2pmux_pids(), nyc_box)
+            kill_hard(nyc_host)
+            # Worth asserting rather than assuming: a coordinator that is still running is
+            # one the members will simply reattach to, and every check below would then be
+            # measuring an ordinary reconnect while claiming to measure a takeover.
+            check("the coordinator's node is gone", not live_nodes(nyc_host), nyc_box)
 
             guard(
                 "the survivors notice",
                 lambda: mac.wait_for("coordinator unreachable", timeout=60.0),
             )
+            print(f"   mac footer: {footer(mac)}", flush=True)
+            print(f"   fra footer: {footer(fra)}", flush=True)
+
+            # Asserted as an absence plus an explanation, because that is what the user
+            # sees: the pane they asked for does not appear, and the footer says why. The
+            # countdown overwrites any one-shot notice, so match on the countdown.
+            frozen_panes = panes_on_screen(mac.snapshot())
+            chord(mac, CTRL_P, b"n")
+            time.sleep(4.0)
+            check(
+                "a layout edit is refused rather than left hanging",
+                panes_on_screen(mac.snapshot()) == frozen_panes,
+                footer(mac),
+            )
             guard(
-                "a layout edit is refused with a notice, not left hanging",
-                lambda: (
-                    chord(mac, CTRL_P, b"n"),
-                    mac.wait_for("layout changes are paused", timeout=20.0),
-                )[-1],
+                "and the footer says how long the freeze lasts",
+                lambda: mac.wait_until(
+                    lambda screen: re.search(r"taking over in \d+s", screen) is not None,
+                    timeout=20.0,
+                    what="a countdown to the takeover",
+                ),
+                footer(mac),
             )
 
             # The claim that matters most: with nobody coordinating anything, one member
@@ -218,15 +290,19 @@ def main() -> int:
             )
 
             # -------------------------------------------------- somebody takes over
-            guard(
+            deadline = time.monotonic() + FAILOVER_TIMEOUT
+            promoted = ""
+            while time.monotonic() < deadline:
+                promoted = local_role(harness)
+                if "coordinator" in promoted:
+                    break
+                time.sleep(1.0)
+            check(
                 "this Mac promotes itself once grace expires",
-                lambda: mac.wait_until(
-                    lambda screen: "coordinated here" in screen,
-                    timeout=FAILOVER_TIMEOUT,
-                    what="the Mac to take the coordinator role",
-                ),
-                f"{GRACE_SECS}s grace",
+                "coordinator" in promoted,
+                " ".join(promoted.split()) or "no session listed",
             )
+            print(f"   mac footer after grace: {footer(mac)}", flush=True)
             guard(
                 "fra reattaches to it without being handed a ticket",
                 lambda: fra.wait_until(

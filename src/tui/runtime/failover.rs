@@ -39,6 +39,12 @@ use super::SharedLayoutRuntime;
 /// hammering it.
 const REJOIN_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long one dial may take before the next candidate gets a turn.
+///
+/// Generous enough for a relayed handshake between continents, short enough that a peer
+/// which is simply gone does not hold the queue.
+const ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The outcome of one attempt to attach to a coordinator, delivered back to the loop.
 pub(in crate::tui) struct Rejoin {
     pub(in crate::tui) peer_id: Vec<u8>,
@@ -150,6 +156,19 @@ impl SharedLayoutRuntime {
                 // changed networks, and a member that reattaches inside the grace window
                 // never learns there was one.
                 changed |= self.attempt_rejoin(&election);
+                // Say how long the freeze lasts. "Structure is frozen" with no end in sight
+                // reads as a broken session; "frozen for another two minutes" reads as a
+                // session waiting for somebody's laptop to come back, which is what it is.
+                if let Some(delay) = election.delay_for(&self.control.peer_id(), self.grace) {
+                    let remaining = delay.saturating_sub(elapsed).as_secs();
+                    let notice = format!(
+                        "coordinator unreachable; taking over in {remaining}s if it stays away"
+                    );
+                    if self.status != notice {
+                        self.status = notice;
+                        changed = true;
+                    }
+                }
             }
             Role::Promote { epoch } => {
                 self.promote(&election, epoch)?;
@@ -446,12 +465,19 @@ async fn attach(
     ticket: JoinTicket,
     display_name: String,
 ) -> Result<RejoinSuccess, SessionError> {
-    let mut member = join_layout_with_display_name(transport, ticket, display_name).await?;
-    match member.events.recv().await {
-        Some(crate::session::LayoutControlEvent::Snapshot(snapshot)) => {
-            let state = snapshot.state.ok_or(SessionError::InvalidPostWelcome)?;
-            Ok(RejoinSuccess { member, state })
+    // Bounded, because the peer being dialled is usually one that has stopped answering.
+    // Without this a single dial into a hole would hold the one in-flight slot forever and
+    // the node would never try anybody else.
+    tokio::time::timeout(ATTACH_TIMEOUT, async {
+        let mut member = join_layout_with_display_name(transport, ticket, display_name).await?;
+        match member.events.recv().await {
+            Some(crate::session::LayoutControlEvent::Snapshot(snapshot)) => {
+                let state = snapshot.state.ok_or(SessionError::InvalidPostWelcome)?;
+                Ok(RejoinSuccess { member, state })
+            }
+            _ => Err(SessionError::InvalidPostWelcome),
         }
-        _ => Err(SessionError::InvalidPostWelcome),
-    }
+    })
+    .await
+    .unwrap_or(Err(SessionError::TimedOut("rejoining a coordinator")))
 }
