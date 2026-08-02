@@ -2,6 +2,23 @@
 name = "p2pmux"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.85"
+description = "A peer-to-peer terminal multiplexer where every pane runs on its owner's machine"
+authors = ["Carlos Pelazas"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/pelazas/p2pmux"
+homepage = "https://p2pmux.com"
+documentation = "https://github.com/pelazas/p2pmux/blob/main/docs/USAGE.md"
+keywords = ["terminal", "multiplexer", "tui", "p2p", "collaboration"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = [
+    "docs/assets/*",
+    "scripts/",
+    "services/",
+    "tests/",
+    ".github/",
+]
 
 [dependencies]
 aes-gcm = "0.10"
