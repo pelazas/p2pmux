@@ -8,6 +8,7 @@
 <p>
   <a href="https://github.com/pelazas/p2pmux/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/pelazas/p2pmux/ci.yml?branch=main&label=ci"></a>
   <a href="https://github.com/pelazas/p2pmux/releases"><img alt="Release" src="https://img.shields.io/github/v/release/pelazas/p2pmux"></a>
+  <a href="https://crates.io/crates/p2pmux"><img alt="crates.io" src="https://img.shields.io/crates/v/p2pmux?logo=rust"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/pelazas/p2pmux"></a>
 </p>
 
@@ -99,8 +100,13 @@ curl -fsSL https://p2pmux.com/install.sh | sh
 
 macOS and Linux, Apple Silicon, Intel and arm64. The script fetches a binary and its SHA256 from
 GitHub Releases and checks the hash before installing. It is served as plain text so you can read
-it first, and `cargo install --git https://github.com/pelazas/p2pmux --locked` is a supported path
-for anyone who would rather not run an installer at all.
+it first.
+
+If you would rather not run an installer at all, it is [on crates.io](https://crates.io/crates/p2pmux):
+
+```sh
+cargo install p2pmux --locked
+```
 
 Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up. A musl system
 has to build from source.
@@ -110,7 +116,7 @@ Updating is however you installed:
 ```sh
 brew update && brew upgrade p2pmux                                   # Homebrew tap
 curl -fsSL https://p2pmux.com/install.sh | sh                        # the install script, again
-cargo install --git https://github.com/pelazas/p2pmux --locked --force  # from source
+cargo install p2pmux --locked --force                                # from source
 ```
 
 `p2pmux --version` says what you are running. Sessions already running keep the binary they
