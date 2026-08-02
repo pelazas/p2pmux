@@ -59,6 +59,7 @@ pub use state::{
 pub(in crate::tui) use state::{
     Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
 };
+pub(crate) use terminal::clear_before_first_frame;
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
 
 /// Kept as the module's public marker from the scaffold.

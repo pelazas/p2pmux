@@ -32,8 +32,9 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneMouseProtocol, PaneViewState, ShareView, copy_selection_to_clipboard, missed_resize,
-        render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
+        PaneMouseProtocol, PaneViewState, ShareView, clear_before_first_frame,
+        copy_selection_to_clipboard, missed_resize, render_multi_pane_with_copy_feedback,
+        resize_recheck_due, share_copy_result,
     },
 };
 
@@ -174,6 +175,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             viewport: Viewport::Fixed(Rect::new(0, 0, initial_cols, initial_rows)),
         },
     )?;
+    clear_before_first_frame(&mut terminal, Rect::new(0, 0, initial_cols, initial_rows))?;
     let terminal_thread = spawn_terminal_reader(wake_tx, Arc::clone(&terminal_stop));
     let mut tui = None;
     let mut screens = BTreeMap::new();
