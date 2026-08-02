@@ -230,9 +230,17 @@ impl SharedLocalPane {
             // One parse/snapshot/diff for the whole batch: process_pty clones the
             // screen per call, so per-chunk calls dominated CPU under output floods.
             let frame = self.screen.process_pty(&ready)?;
-            if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
-                && self.host.write_input(&reply).is_err()
-            {
+            // Everything this batch asked its terminal, answered in one write.
+            // A terminal query is a blocking round trip, so an unanswered one
+            // does not degrade the pane — it stops the program dead. The answers
+            // belong here, at the PTY, because that is the only place that has
+            // one: a pane hosted on another member's machine is answered by its
+            // own host, not by whoever happens to be looking at it.
+            let mut replies = self.screen.take_query_replies();
+            if let Some(kitty) = self.screen.take_kitty_keyboard_query_reply() {
+                replies.extend_from_slice(&kitty);
+            }
+            if !replies.is_empty() && self.host.write_input(&replies).is_err() {
                 changed |= self.transition_exited()?;
             } else {
                 self.screen_tx.send_replace(frame);

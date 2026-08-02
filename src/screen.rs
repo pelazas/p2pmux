@@ -176,25 +176,169 @@ fn partial_marker_suffix(tail: &[u8], marker: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Counts standalone audible bells (`^G`) seen by a hosted pane's parser.
+/// Rewrites the final byte of `CSI … f` to `CSI … H`.
 ///
-/// This deliberately hangs off the parser rather than scanning the raw PTY bytes for `0x07`:
-/// BEL also terminates an OSC string, and agents set the window title constantly, so a byte
-/// scan would count every title update as a bell. vt100 routes an OSC-terminating BEL through
-/// `osc_dispatch` and only reaches this callback for a standalone bell.
+/// HVP (`f`) and CUP (`H`) move the cursor to the same place — the distinction is
+/// a DEC historical artifact, and every terminal treats them alike. `vt100`
+/// implements `H` and leaves `f` unhandled, so in a p2pmux pane a program that
+/// positioned with `f` moved the cursor nowhere at all and drew wherever it had
+/// been. The pane was answering "you are at 1;1" to a size probe that had just
+/// parked the cursor at `999;999`, which is how this surfaced: a program asking
+/// how big its terminal is was told one column.
+///
+/// A state machine rather than a search, because `f` is an ordinary character
+/// everywhere except as a CSI's final byte — including inside the OSC strings
+/// agents write window titles with.
 #[derive(Debug, Default)]
-pub struct BellCounter {
-    count: u64,
+struct HvpRewriter {
+    state: VtState,
 }
 
-impl vt100::Callbacks for BellCounter {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum VtState {
+    #[default]
+    Ground,
+    Escape,
+    /// Inside `CSI`, collecting parameters until the final byte.
+    Csi,
+    /// Inside an OSC/DCS/APC/PM/SOS string, which ends at BEL or ST.
+    StringBody,
+    /// Saw `ESC` inside such a string: `\` ends it, anything else begins a new escape.
+    StringEscape,
+}
+
+impl HvpRewriter {
+    /// Borrows unless a rewrite is actually needed, which is almost always.
+    fn feed<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let mut owned: Option<Vec<u8>> = None;
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.state = match self.state {
+                VtState::Ground if byte == 0x1b => VtState::Escape,
+                VtState::Ground => VtState::Ground,
+                VtState::Escape => Self::after_escape(byte),
+                VtState::Csi if (0x40..=0x7e).contains(&byte) => {
+                    if byte == b'f' {
+                        owned.get_or_insert_with(|| bytes.to_vec())[index] = b'H';
+                    }
+                    VtState::Ground
+                }
+                VtState::Csi => VtState::Csi,
+                VtState::StringBody => match byte {
+                    0x07 => VtState::Ground,
+                    0x1b => VtState::StringEscape,
+                    _ => VtState::StringBody,
+                },
+                VtState::StringEscape if byte == b'\\' => VtState::Ground,
+                VtState::StringEscape => Self::after_escape(byte),
+            };
+        }
+        match owned {
+            Some(bytes) => std::borrow::Cow::Owned(bytes),
+            None => std::borrow::Cow::Borrowed(bytes),
+        }
+    }
+
+    fn after_escape(byte: u8) -> VtState {
+        match byte {
+            b'[' => VtState::Csi,
+            // OSC, DCS, APC, PM, SOS — everything that runs until a string terminator.
+            b']' | b'P' | b'^' | b'_' | b'X' => VtState::StringBody,
+            _ => VtState::Ground,
+        }
+    }
+}
+
+/// What a hosted pane's parser hands back: bells, and answers to the questions
+/// the program in the pane asks its terminal.
+///
+/// **Answering matters more than it sounds.** A terminal query is a blocking
+/// round trip — the program writes it and reads until the answer arrives. `vt100`
+/// implements none of them, so before this a p2pmux pane was simply silent, and
+/// anything that asked a question waited forever. `gh secret set` was the report
+/// that found it: it asks for the cursor position, gets nothing, and never
+/// reaches its own prompt. The same wait is behind any program that measures the
+/// terminal by parking the cursor at `999;999` and asking where it ended up.
+///
+/// Only questions with a truthful answer are answered. The colour queries
+/// (`OSC 10`/`OSC 11`) are deliberately left alone: this process cannot see the
+/// terminal the human is looking at — for a pane hosted on another member's
+/// machine there is no single such terminal — and a made-up background colour
+/// makes an application pick a palette against the wrong one. Silence there is a
+/// known limitation; inventing an answer would be a bug.
+#[derive(Debug, Default)]
+pub struct PaneCallbacks {
+    count: u64,
+    /// Replies to feed back into the pane's PTY, in the order they were asked.
+    replies: Vec<u8>,
+}
+
+impl PaneCallbacks {
+    fn reply(&mut self, bytes: &[u8]) {
+        // A program that asks faster than the pane is drained would otherwise
+        // grow this without bound. Answers are tiny and a backlog of them is
+        // meaningless, so a runaway asker loses its answers rather than the
+        // node's memory.
+        if self.replies.len() < 4096 {
+            self.replies.extend_from_slice(bytes);
+        }
+    }
+}
+
+impl vt100::Callbacks for PaneCallbacks {
+    /// Counts standalone audible bells (`^G`).
+    ///
+    /// This deliberately hangs off the parser rather than scanning the raw PTY bytes for `0x07`:
+    /// BEL also terminates an OSC string, and agents set the window title constantly, so a byte
+    /// scan would count every title update as a bell. vt100 routes an OSC-terminating BEL through
+    /// `osc_dispatch` and only reaches this callback for a standalone bell.
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.count = self.count.saturating_add(1);
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        intermediate: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        final_byte: char,
+    ) {
+        let first = params.first().and_then(|group| group.first()).copied();
+        // Reported one-based, and read from the screen after the batch that
+        // asked has been parsed — so the `\x1b[999;999f` in a size probe has
+        // already been clamped to the real grid, and the answer states the
+        // pane's true size without anyone having to special-case the trick.
+        let (row, column) = screen.cursor_position();
+        let (rows, columns) = screen.size();
+        match (intermediate, final_byte, first) {
+            // DSR: cursor position report.
+            (None, 'n', Some(6)) => {
+                self.reply(format!("\x1b[{};{}R", row + 1, column + 1).as_bytes());
+            }
+            // DECXCPR: the same, plus a page number, which is always the first.
+            (Some(b'?'), 'n', Some(6)) => {
+                self.reply(format!("\x1b[?{};{};1R", row + 1, column + 1).as_bytes());
+            }
+            // DSR: are you there? Reaching this callback is the proof.
+            (None, 'n', Some(5)) => self.reply(b"\x1b[0n"),
+            // Window manipulation: report the text area in characters.
+            (None, 't', Some(18)) => {
+                self.reply(format!("\x1b[8;{rows};{columns}t").as_bytes());
+            }
+            // Primary device attributes. Claimed conservatively — a VT100 with
+            // the advanced video option — because an application believes this:
+            // claiming a terminal `vt100` cannot render would buy nothing and
+            // invite sequences that come out as mojibake.
+            (None, 'c', None | Some(0)) => self.reply(b"\x1b[?1;2c"),
+            // Secondary device attributes: terminal id 0, version 10, no options.
+            (Some(b'>'), 'c', None | Some(0)) => self.reply(b"\x1b[>0;10;0c"),
+            _ => {}
+        }
     }
 }
 
 pub struct HostScreen {
-    parser: vt100::Parser<BellCounter>,
+    parser: vt100::Parser<PaneCallbacks>,
     /// Baseline for `state_diff`, held one batch behind `parser`.
     ///
     /// This used to be a clone of the live screen, but `vt100::Screen::clone` copies the
@@ -210,13 +354,20 @@ pub struct HostScreen {
     /// Retained scrollback rows, tracked here because reading it from the screen means
     /// moving the scrollback offset, which needs `&mut` that `history_metadata` lacks.
     retained_scrollback: usize,
+    /// Carries VT parse state across reads, so a `CSI` split over two of them is
+    /// still recognised.
+    hvp: HvpRewriter,
 }
 
 impl HostScreen {
     pub fn new(rows: u16, cols: u16) -> Result<Self, ScreenError> {
         validate_dimensions(rows, cols)?;
-        let parser =
-            vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, BellCounter::default());
+        let parser = vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            SCROLLBACK_LINES,
+            PaneCallbacks::default(),
+        );
         let snapshot = snapshot_payload(parser.screen())?;
         Ok(Self {
             parser,
@@ -232,11 +383,15 @@ impl HostScreen {
             history_floor: 0,
             history_end: 0,
             retained_scrollback: 0,
+            hvp: HvpRewriter::default(),
         })
     }
 
     pub fn process_pty(&mut self, bytes: &[u8]) -> Result<ScreenFrame, ScreenError> {
         let before_history = self.retained_scrollback;
+        // Both parsers see the same rewritten bytes, or the delta baseline would
+        // drift from the live screen by exactly the cursor moves being repaired.
+        let bytes = &*self.hvp.feed(bytes);
         self.kitty_keyboard.observe(bytes);
         self.parser.process(bytes);
         let after_history = retained_scrollback_len(self.parser.screen_mut());
@@ -389,6 +544,14 @@ impl HostScreen {
     pub fn take_kitty_keyboard_query_reply(&mut self) -> Option<Vec<u8>> {
         self.kitty_keyboard.take_query_reply()
     }
+
+    /// Answers the pane owes its own program, to be written back into its PTY.
+    ///
+    /// Empty in the ordinary case, so a caller pays a `Vec::is_empty` per batch.
+    /// See [`PaneCallbacks`] for why leaving these unanswered wedges a program.
+    pub fn take_query_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.parser.callbacks_mut().replies)
+    }
 }
 
 /// Retained scrollback rows, read by clamping the scrollback offset and restoring it.
@@ -528,6 +691,137 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+
+    #[test]
+    fn hvp_becomes_cup_and_nothing_else_does() {
+        let rewrite = |input: &[u8]| super::HvpRewriter::default().feed(input).into_owned();
+        assert_eq!(rewrite(b"\x1b[5;10f"), b"\x1b[5;10H");
+        assert_eq!(rewrite(b"\x1b[f"), b"\x1b[H");
+        assert_eq!(rewrite(b"a\x1b[2;3fb\x1b[9;9fc"), b"a\x1b[2;3Hb\x1b[9;9Hc");
+
+        // An `f` is an ordinary character everywhere else, and rewriting one
+        // would corrupt the very thing it appears in.
+        assert_eq!(rewrite(b"fluff"), b"fluff");
+        assert_eq!(rewrite(b"\x1b]0;my file.rs\x07"), b"\x1b]0;my file.rs\x07");
+        assert_eq!(
+            rewrite(b"\x1b]2;refactor\x1b\\f"),
+            b"\x1b]2;refactor\x1b\\f"
+        );
+        assert_eq!(rewrite(b"\x1bPtmux;f\x1b\\"), b"\x1bPtmux;f\x1b\\");
+        // Not a final byte: `f` after an intermediate is still the final byte,
+        // but a parameter `f` cannot occur, and other finals are untouched.
+        assert_eq!(
+            rewrite(b"\x1b[1;2H\x1b[K\x1b[?25l"),
+            b"\x1b[1;2H\x1b[K\x1b[?25l"
+        );
+    }
+
+    /// A read boundary lands wherever the kernel put it, including the middle of
+    /// the escape sequence being repaired.
+    #[test]
+    fn hvp_is_rewritten_across_a_split_read() {
+        let mut rewriter = super::HvpRewriter::default();
+        let mut out = rewriter.feed(b"text\x1b[12;").into_owned();
+        out.extend_from_slice(&rewriter.feed(b"34f more"));
+        assert_eq!(out, b"text\x1b[12;34H more");
+
+        // And the same for a string body, whose `f` must survive the split.
+        let mut rewriter = super::HvpRewriter::default();
+        let mut out = rewriter.feed(b"\x1b]0;fi").into_owned();
+        out.extend_from_slice(&rewriter.feed(b"le.rs\x07\x1b[1;1f"));
+        assert_eq!(out, b"\x1b]0;file.rs\x07\x1b[1;1H");
+    }
+
+    /// The whole point: `f` used to move the cursor nowhere.
+    #[test]
+    fn a_pane_positions_the_cursor_with_hvp() {
+        let mut screen = HostScreen::new(24, 80).expect("valid dimensions");
+        screen.process_pty(b"\x1b[5;10fhere").expect("processed");
+        assert_eq!(screen.screen().cursor_position(), (4, 13));
+        assert!(screen.screen().contents().contains("here"));
+    }
+
+    /// A terminal query is a blocking round trip, so silence is not a degraded
+    /// answer — it is a stopped program. `gh secret set` writes `\x1b[6n` and
+    /// reads until it is answered; unanswered, it never prints its own prompt.
+    #[test]
+    fn a_cursor_position_query_is_answered_where_the_cursor_is() {
+        let mut screen = HostScreen::new(24, 80).expect("valid dimensions");
+        assert!(screen.take_query_replies().is_empty(), "nothing asked yet");
+
+        screen
+            .process_pty(b"\x1b[3;10Hasking\x1b[6n")
+            .expect("processed");
+        // One-based, and past the six characters just written.
+        assert_eq!(screen.take_query_replies(), b"\x1b[3;16R");
+        assert!(
+            screen.take_query_replies().is_empty(),
+            "an answer is handed over once"
+        );
+
+        screen.process_pty(b"\x1b[?6n").expect("processed");
+        assert_eq!(screen.take_query_replies(), b"\x1b[?3;16;1R");
+    }
+
+    /// How programs measure a terminal: park the cursor far past the end and ask
+    /// where it actually landed. The answer has to be the pane's real grid, which
+    /// it is for free — the clamp happens while parsing, before the cursor is read.
+    #[test]
+    fn the_cursor_parking_size_probe_reports_the_panes_real_grid() {
+        let mut screen = HostScreen::new(24, 80).expect("valid dimensions");
+        screen
+            .process_pty(b"\x1b7\x1b[999;999f\x1b[6n\x1b8")
+            .expect("processed");
+        assert_eq!(screen.take_query_replies(), b"\x1b[24;80R");
+
+        let mut small = HostScreen::new(9, 40).expect("valid dimensions");
+        small
+            .process_pty(b"\x1b7\x1b[999;999f\x1b[6n\x1b8")
+            .expect("processed");
+        assert_eq!(small.take_query_replies(), b"\x1b[9;40R");
+    }
+
+    #[test]
+    fn the_other_answerable_queries_are_answered_too() {
+        let mut screen = HostScreen::new(12, 40).expect("valid dimensions");
+        // Are you there? Reaching the parser at all is the proof.
+        screen.process_pty(b"\x1b[5n").expect("processed");
+        assert_eq!(screen.take_query_replies(), b"\x1b[0n");
+        // Text area in characters.
+        screen.process_pty(b"\x1b[18t").expect("processed");
+        assert_eq!(screen.take_query_replies(), b"\x1b[8;12;40t");
+        // Device attributes, primary and secondary.
+        screen.process_pty(b"\x1b[c").expect("processed");
+        assert_eq!(screen.take_query_replies(), b"\x1b[?1;2c");
+        screen.process_pty(b"\x1b[>c").expect("processed");
+        assert_eq!(screen.take_query_replies(), b"\x1b[>0;10;0c");
+    }
+
+    /// Deliberate silence, not an oversight. This process cannot see the terminal
+    /// the human is looking at, and for a pane hosted on another member's machine
+    /// there is no single such terminal — so a colour here would be invented, and
+    /// an application would pick its palette against the wrong background.
+    #[test]
+    fn colour_queries_are_left_unanswered_rather_than_guessed() {
+        let mut screen = HostScreen::new(24, 80).expect("valid dimensions");
+        screen
+            .process_pty(b"\x1b]11;?\x1b\\\x1b]10;?\x1b\\")
+            .expect("processed");
+        assert!(screen.take_query_replies().is_empty());
+    }
+
+    /// A program asking faster than its pane is drained must lose its answers,
+    /// not the node's memory.
+    #[test]
+    fn a_flood_of_queries_is_bounded() {
+        let mut screen = HostScreen::new(24, 80).expect("valid dimensions");
+        screen
+            .process_pty(&b"\x1b[6n".repeat(10_000))
+            .expect("processed");
+        let replies = screen.take_query_replies();
+        assert!(!replies.is_empty(), "the early answers still went out");
+        assert!(replies.len() <= 4096 + 16, "unbounded: {}", replies.len());
+    }
 
     #[test]
     fn bell_count_ignores_osc_terminators_and_counts_standalone_bells() {

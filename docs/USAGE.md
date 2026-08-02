@@ -207,6 +207,33 @@ Slow viewers may receive coalesced screen deltas and then a fresh snapshot to re
 outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any
 changed host-owned grids. Guests only receive the resulting commit and screen snapshot.
 
+## What a pane's terminal answers
+
+A pane is a real PTY, and programs interrogate the terminal behind one. A query is a blocking
+round trip — the program writes it and reads until an answer arrives — so an unanswered query does
+not degrade a program, it stops it. A pane answers:
+
+| Query | Answer |
+| --- | --- |
+| `CSI 6 n` (cursor position) | `CSI row ; col R` |
+| `CSI ? 6 n` (DECXCPR) | `CSI ? row ; col ; 1 R` |
+| `CSI 5 n` (status) | `CSI 0 n` |
+| `CSI 18 t` (text area) | `CSI 8 ; rows ; cols t` |
+| `CSI c`, `CSI > c` (device attributes) | a VT100 with the advanced video option |
+
+The answers come from the machine hosting the pane, so a pane on another member's laptop is
+answered by their node, about their grid — which is the only correct answer.
+
+That covers the common way a program measures its terminal: park the cursor far past the end with
+`CSI 999 ; 999 f` and ask where it landed. p2pmux treats `f` (HVP) as the `H` (CUP) it is, so the
+cursor really moves and the reported size is the pane's own.
+
+**Colour queries are not answered.** `OSC 10` and `OSC 11` ask for the terminal's foreground and
+background, and no p2pmux process can see the terminal you are looking at — a pane hosted
+elsewhere has no single such terminal at all. An invented answer would make an application pick a
+palette against the wrong background, so these stay silent. Programs that use them for light/dark
+detection fall back to their default.
+
 ## Agents overlay
 
 `Ctrl+A` opens the Agents overlay, which lists supported coding agents running below hosted pane
