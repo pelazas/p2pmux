@@ -149,6 +149,8 @@ pub enum CoordinatorError {
     EndpointIdentityMismatch,
     InvalidEndpointAddress,
     EndpointSerialization(serde_json::Error),
+    /// A takeover by a peer the layout being taken over does not list as a member.
+    NotAMember,
 }
 
 impl fmt::Display for CoordinatorError {
@@ -163,6 +165,9 @@ impl fmt::Display for CoordinatorError {
             }
             Self::EndpointSerialization(error) => {
                 write!(formatter, "endpoint address serialization failed: {error}")
+            }
+            Self::NotAMember => {
+                formatter.write_str("cannot take over a session this peer is not a member of")
             }
         }
     }
@@ -290,6 +295,54 @@ impl LayoutCoordinator {
             reservation_timeout,
             locked: false,
             roster: MemberRoster::default(),
+        })
+    }
+
+    /// Take authority over a session that already exists, from its last committed layout.
+    ///
+    /// The counterpart to the constructors above, which all begin a session. This one
+    /// inherits one: the tabs, panes and join order every member is already looking at, and
+    /// a ledger resumed at the head this member last verified rather than restarted.
+    ///
+    /// Everyone in that member list is pre-admitted. They were admitted by the coordinator
+    /// that left, and a takeover is not the moment to make a room full of people knock
+    /// again -- especially in a locked session, where the lock exists to keep strangers out
+    /// rather than to expel the people already inside.
+    ///
+    /// The session lock itself is not inherited. It is the departed coordinator's live
+    /// setting, not a fact about the layout, so it is not in the snapshot to read; a
+    /// successor that guessed wrong would either leak a locked session open or wall a
+    /// deliberately open one shut. Starting unlocked is the recoverable half of that, and
+    /// the new coordinator can lock it again in one keystroke.
+    pub fn restore(
+        coordinator_peer_id: Vec<u8>,
+        snapshot: LayoutSnapshot,
+        ledger: LedgerWriter,
+        reservation_timeout: Duration,
+    ) -> Result<Self, CoordinatorError> {
+        let state = SessionState::restore(snapshot)?;
+        if !state
+            .members()
+            .iter()
+            .any(|member| member.peer_id == coordinator_peer_id)
+        {
+            return Err(CoordinatorError::NotAMember);
+        }
+        let mut roster = MemberRoster::default();
+        for member in state.members() {
+            roster.admit(member.peer_id.clone());
+        }
+        Ok(Self {
+            state,
+            coordinator_peer_id,
+            ledger,
+            reservations: BTreeMap::new(),
+            agent_rosters: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_epoch: 0,
+            reservation_timeout,
+            locked: false,
+            roster,
         })
     }
 
@@ -1064,7 +1117,8 @@ fn layout_error(error: CoordinatorError) -> LayoutError {
         CoordinatorError::Layout(error) => error,
         CoordinatorError::EndpointIdentityMismatch
         | CoordinatorError::InvalidEndpointAddress
-        | CoordinatorError::EndpointSerialization(_) => LayoutError::InvalidSnapshot,
+        | CoordinatorError::EndpointSerialization(_)
+        | CoordinatorError::NotAMember => LayoutError::InvalidSnapshot,
     }
 }
 

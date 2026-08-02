@@ -253,6 +253,55 @@ impl SessionState {
         })
     }
 
+    /// Rebuild authority over a session that already exists, from its last committed layout.
+    ///
+    /// Every other constructor here fabricates a session: one member, one tab, one pane. A
+    /// member promoted after its coordinator left needs the opposite -- the tabs, panes and
+    /// join order the room is already looking at, with itself now the one allowed to change
+    /// them. It does not get to invent any of that, which is why the snapshot goes through
+    /// the same validation an untrusted one would.
+    ///
+    /// The id counters resume past what the snapshot already uses, so a pane created after
+    /// the takeover cannot collide with one created before it. Reservations do not resume:
+    /// they live on the control streams a takeover tears down, and the requester is told its
+    /// pane never landed rather than being left holding a provisional PTY forever.
+    ///
+    /// The departed coordinator stays in the member list. Its panes are dead, and every
+    /// member already draws a pane whose host is gone as unavailable, so evicting it here
+    /// would trade a placeholder for a layout that silently rearranged itself under people
+    /// mid-sentence -- and in a two-person session where only the coordinator hosted
+    /// anything, for no layout at all. Eviction is a decision for whoever calls
+    /// [`Self::remove_member`], once the grace window has actually expired.
+    pub fn restore(snapshot: LayoutSnapshot) -> Result<Self, LayoutError> {
+        Self::validate_snapshot(&snapshot)?;
+        let next_pane_id = snapshot
+            .panes
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(LayoutError::RevisionExhausted)?;
+        let next_tab_id = snapshot
+            .tabs
+            .iter()
+            .map(|tab| tab.tab_id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(LayoutError::RevisionExhausted)?;
+        Ok(Self {
+            revision: snapshot.revision,
+            members: snapshot.members,
+            tabs: snapshot.tabs,
+            panes: snapshot.panes,
+            next_tab_id,
+            next_pane_id,
+            next_reservation_id: 1,
+            pending_reservation: None,
+        })
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
