@@ -3,25 +3,11 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-const DONE_GRACE: Duration = Duration::from_secs(15);
-/// Output this recent starts a working interval. Entering must be fast so the overlay reacts
-/// as soon as an agent does anything.
-const WORKING_ENTER: Duration = Duration::from_secs(2);
-/// Silence this long ends a working interval. Leaving must be slow because an agent that is
-/// still working goes quiet for many seconds at a time — waiting on a model response, or
-/// running a tool that streams nothing. Treating a short pause as "finished" is what made the
-/// completion notification fire mid-task.
-pub const DEFAULT_QUIET_BEFORE_DONE: Duration = Duration::from_secs(20);
-/// After an agent signals completion, ignore output this recent for the purpose of starting a
-/// new working interval. Agents ring the bell and then repaint their prompt, and that trailing
-/// redraw would otherwise open a fresh interval that has to time out all over again.
-const COMPLETION_SETTLE: Duration = Duration::from_secs(3);
 /// How long a pane may sit at its shell prompt with a pushed status still
 /// standing before that status is dropped.
 ///
@@ -48,38 +34,6 @@ pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
 
 fn existing_absolute_directory(path: &Path) -> Option<PathBuf> {
     (path.is_absolute() && path.is_dir()).then(|| path.to_path_buf())
-}
-
-/// Local tuning for when an agent counts as finished.
-///
-/// This module stays free of configuration IO: the values are handed to it during startup by
-/// whoever read the config file, so the detection logic remains pure and testable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NotificationTuning {
-    pub quiet_before_done: Duration,
-    /// Only end a working interval on an explicit completion signal. Removes every false
-    /// positive at the cost of showing an agent as working indefinitely when it never rings.
-    pub require_bell: bool,
-}
-
-impl Default for NotificationTuning {
-    fn default() -> Self {
-        Self {
-            quiet_before_done: DEFAULT_QUIET_BEFORE_DONE,
-            require_bell: false,
-        }
-    }
-}
-
-static NOTIFICATION_TUNING: OnceLock<NotificationTuning> = OnceLock::new();
-
-/// Install this process's tuning. Called once during startup; later calls are ignored.
-pub fn set_notification_tuning(tuning: NotificationTuning) {
-    let _ = NOTIFICATION_TUNING.set(tuning);
-}
-
-fn notification_tuning() -> NotificationTuning {
-    NOTIFICATION_TUNING.get().copied().unwrap_or_default()
 }
 
 /// A supported coding agent kind.
@@ -368,13 +322,21 @@ pub fn classify_pane_tree(
 
 /// Coarse activity state shown in the agents overlay.
 ///
-/// `Idle`, `Working`, and `Done` are inferable from PTY output timing.
-/// `Pending` and `Error` are not, and never will be: silence looks identical
-/// whether an agent is thinking or waiting on a permission prompt. They only
-/// ever arrive from a producer inside the pane — see
-/// [`PaneAgentTracker::record_pushed_status`].
+/// Every one of these arrives from a producer inside the pane — an agent hook,
+/// never an inference. This module used to derive `Working`/`Done` from how long
+/// a pane had been quiet, and that could not work: silence looks identical
+/// whether an agent is thinking, waiting on a permission prompt, or finished.
+/// The guess fired completions mid-task and could never once report the state a
+/// human most needs, so it is gone.
+///
+/// What is left when nothing has reported is [`Self::Unknown`] — the process
+/// scan can see that an agent is running in a pane without knowing a thing about
+/// what it is doing. Saying so is honest; calling it `Idle` was not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentState {
+    /// An agent is running here and no producer has reported its state. Either
+    /// its hooks are not wired up, or none has fired yet.
+    Unknown,
     Idle,
     Working,
     Done,
@@ -386,6 +348,7 @@ impl AgentState {
     /// Stable wire value for a pushed status.
     pub const fn wire_value(self) -> &'static str {
         match self {
+            Self::Unknown => "unknown",
             Self::Idle => "idle",
             Self::Working => "working",
             Self::Done => "done",
@@ -410,14 +373,6 @@ impl AgentState {
     }
 }
 
-/// A just-finished agent retained for the done grace period.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DoneAgent {
-    pub kind: AgentKind,
-    pub cwd: String,
-    pub entered_done_at: Instant,
-}
-
 /// A status reported by a producer running inside the pane — an agent hook,
 /// not an inference. Authoritative while present: the agent said so.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -425,6 +380,13 @@ pub struct PushedAgent {
     pub kind: AgentKind,
     pub cwd: String,
     pub state: AgentState,
+    /// What the agent is doing, in its own words.
+    ///
+    /// Local only. This is the one field carrying anything the agent actually
+    /// said, and a p2pmux session is shared: it reaches this machine's own
+    /// overlay and stops there, stripped before the roster goes to peers. See
+    /// `SharedLocalPane::agent_roster_entry`.
+    pub message: String,
     /// When this status arrived. The expiry policy reads it.
     pub at: Instant,
     /// Start of the current working interval, carried across pushes that stay
@@ -432,44 +394,36 @@ pub struct PushedAgent {
     pub working_since_unix_ms: u64,
 }
 
-/// Per-pane agent state maintained between global sampler snapshots.
-#[derive(Clone, Debug)]
-pub struct PaneAgentTracker {
-    pub last_output_at: Option<Instant>,
-    pub active_agent: Option<DetectedAgent>,
-    pub done_agent: Option<DoneAgent>,
-    pub working_since: Option<Instant>,
+/// One agent worth showing a row for, and everything the row needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListedAgent {
+    pub agent: DetectedAgent,
+    pub state: AgentState,
+    /// The agent's own words. Empty unless a producer sent them; never leaves
+    /// this machine.
+    pub message: String,
+    /// Unix milliseconds when the current working interval started, or `0`.
     pub working_since_unix_ms: u64,
+}
+
+/// Per-pane agent state.
+///
+/// Two sources, and only one of them speaks about state. The process scan says
+/// *which* agent is running in a pane; a producer's hook says *what it is
+/// doing*. Nothing here tries to derive the second from PTY output any more —
+/// see [`AgentState`] for why that never worked.
+#[derive(Clone, Debug, Default)]
+pub struct PaneAgentTracker {
+    /// What the process scan last saw running in this pane.
+    pub active_agent: Option<DetectedAgent>,
     /// Latest producer-pushed status, when one is running in this pane.
     pub pushed: Option<PushedAgent>,
     /// When this pane was first seen sitting at its shell prompt while a pushed
     /// status was still standing. `None` cancels the grace clock.
     push_suspect_since: Option<Instant>,
-    tuning: NotificationTuning,
-    settle_until: Option<Instant>,
-}
-
-impl Default for PaneAgentTracker {
-    fn default() -> Self {
-        Self::with_tuning(notification_tuning())
-    }
 }
 
 impl PaneAgentTracker {
-    pub fn with_tuning(tuning: NotificationTuning) -> Self {
-        Self {
-            last_output_at: None,
-            active_agent: None,
-            done_agent: None,
-            working_since: None,
-            working_since_unix_ms: 0,
-            pushed: None,
-            push_suspect_since: None,
-            tuning,
-            settle_until: None,
-        }
-    }
-
     /// Feed the pane's liveness into the pushed-status grace clock.
     ///
     /// `has_children` is whether the pane is running anything at all. Nothing
@@ -497,35 +451,48 @@ impl PaneAgentTracker {
 
     /// Apply a status pushed by a producer inside the pane.
     ///
-    /// A push outranks every inference this module makes, because the producer
-    /// is the agent: it knows it is blocked on a permission prompt, and no
-    /// amount of output timing can tell that apart from waiting on a model.
-    ///
     /// A `Working` push carries its interval start forward from the previous
     /// `Working` push, so the per-tool-call stream a hooked agent emits shows
     /// one continuous interval rather than restarting the clock every few
     /// seconds.
+    ///
+    /// An empty `message` leaves the stored one standing. Not every hook event
+    /// carries text — a `PreToolUse` has nothing to say — and blanking the line
+    /// on each of those would leave the message visible only in the gaps
+    /// between tool calls.
     pub fn record_pushed_status(
         &mut self,
         kind: AgentKind,
         cwd: String,
         state: AgentState,
+        message: String,
         now: Instant,
         unix_ms_now: u64,
     ) {
-        let continuing = self
+        let previous = self
             .pushed
             .as_ref()
-            .filter(|pushed| pushed.state == AgentState::Working && pushed.kind == kind)
-            .map(|pushed| pushed.working_since_unix_ms);
+            .filter(|pushed| pushed.kind == kind)
+            .map(|pushed| (pushed.state, pushed.working_since_unix_ms, &pushed.message));
         let working_since_unix_ms = match state {
-            AgentState::Working => continuing.unwrap_or(unix_ms_now),
+            AgentState::Working => previous
+                .filter(|(state, ..)| *state == AgentState::Working)
+                .map(|(_, since, _)| since)
+                .unwrap_or(unix_ms_now),
             _ => 0,
+        };
+        let message = if message.is_empty() {
+            previous
+                .map(|(.., message)| message.clone())
+                .unwrap_or_default()
+        } else {
+            message
         };
         self.pushed = Some(PushedAgent {
             kind,
             cwd,
             state,
+            message,
             at: now,
             working_since_unix_ms,
         });
@@ -550,151 +517,36 @@ impl PaneAgentTracker {
         self.owning_push().is_some()
     }
 
-    /// Working-interval start for whichever source currently owns the state.
-    pub fn reported_working_since_unix_ms(&self) -> u64 {
-        match self.owning_push() {
-            Some(pushed) => pushed.working_since_unix_ms,
-            None => self.working_since_unix_ms,
-        }
-    }
-
-    /// Record PTY output for the working/idle state calculation.
-    pub fn record_output(&mut self, now: Instant, unix_ms_now: u64) {
-        self.last_output_at = Some(now);
-        self.reconcile_working_state(now, unix_ms_now);
-    }
-
-    /// Record an explicit completion signal from the agent (a terminal bell).
-    ///
-    /// This ends the working interval immediately rather than waiting out the quiet window,
-    /// which is the whole point of preferring it: the timing heuristic can only ever guess when
-    /// an agent stopped, while the bell says so.
-    pub fn record_completion_signal(&mut self, now: Instant) {
-        if self.active_agent.is_none() {
-            return;
-        }
-        self.last_output_at = None;
-        self.settle_until = Some(now + COMPLETION_SETTLE);
-        self.clear_working_state();
-    }
-
     /// Apply this pane's latest process-tree classification.
-    pub fn update(&mut self, detected: Option<DetectedAgent>, now: Instant, unix_ms_now: u64) {
-        match detected {
-            Some(agent) => {
-                if self
-                    .active_agent
-                    .as_ref()
-                    .is_some_and(|active| active != &agent)
-                {
-                    self.last_output_at = None;
-                    self.settle_until = None;
-                    self.clear_working_state();
-                }
-                self.active_agent = Some(agent);
-                self.done_agent = None;
-            }
-            None => {
-                if let Some(agent) = self.active_agent.take() {
-                    self.done_agent = Some(DoneAgent {
-                        kind: agent.kind,
-                        cwd: agent.cwd,
-                        entered_done_at: now,
-                    });
-                }
-                self.last_output_at = None;
-                self.clear_working_state();
-                if self
-                    .done_agent
-                    .as_ref()
-                    .is_some_and(|done| now.duration_since(done.entered_done_at) > DONE_GRACE)
-                {
-                    self.done_agent = None;
-                }
-            }
-        }
-        self.reconcile_working_state(now, unix_ms_now);
+    pub fn update(&mut self, detected: Option<DetectedAgent>) {
+        self.active_agent = detected;
     }
 
-    /// Return the current agent and coarse state, if the pane should be listed.
-    pub fn listed_agent(
-        &mut self,
-        now: Instant,
-        unix_ms_now: u64,
-    ) -> Option<(DetectedAgent, AgentState)> {
-        self.reconcile_working_state(now, unix_ms_now);
-        // A producer inside the pane outranks detection, and stands alone: a
-        // hooked agent this build's process matchers do not recognize still
-        // gets a row, which is the whole point of accepting pushes.
+    /// Return the agent and state for this pane's row, if it should have one.
+    ///
+    /// A producer outranks the scan and stands alone: a hooked agent this
+    /// build's process matchers do not recognize still gets a row, which is the
+    /// whole point of accepting pushes. A scanned agent with nothing pushed
+    /// gets a row too, reported as [`AgentState::Unknown`] — it is running, and
+    /// that is genuinely all anyone here knows about it.
+    pub fn listed_agent(&self) -> Option<ListedAgent> {
         if let Some(pushed) = self.owning_push() {
-            return Some((
-                DetectedAgent {
+            return Some(ListedAgent {
+                agent: DetectedAgent {
                     kind: pushed.kind,
                     cwd: pushed.cwd.clone(),
                 },
-                pushed.state,
-            ));
+                state: pushed.state,
+                message: pushed.message.clone(),
+                working_since_unix_ms: pushed.working_since_unix_ms,
+            });
         }
-        if let Some(agent) = &self.active_agent {
-            let state = if self.working_since.is_some() {
-                AgentState::Working
-            } else {
-                AgentState::Idle
-            };
-            return Some((agent.clone(), state));
-        }
-
-        self.done_agent
-            .as_ref()
-            .filter(|done| now.duration_since(done.entered_done_at) <= DONE_GRACE)
-            .map(|done| {
-                (
-                    DetectedAgent {
-                        kind: done.kind,
-                        cwd: done.cwd.clone(),
-                    },
-                    AgentState::Done,
-                )
-            })
-    }
-
-    /// Working state uses hysteresis: it is entered on any recent output but only left after a
-    /// much longer silence. One symmetric threshold cannot serve both, because "how fast we
-    /// notice work" and "how sure we are it stopped" want opposite values.
-    fn reconcile_working_state(&mut self, now: Instant, unix_ms_now: u64) {
-        if self.active_agent.is_none() {
-            self.clear_working_state();
-            return;
-        }
-        let Some(last_output) = self.last_output_at else {
-            self.clear_working_state();
-            return;
-        };
-        let quiet_for = now.duration_since(last_output);
-        if self.working_since.is_some() {
-            if !self.tuning.require_bell && quiet_for >= self.tuning.quiet_before_done {
-                self.clear_working_state();
-            }
-        } else if quiet_for <= WORKING_ENTER && !self.settling(now) {
-            self.working_since = Some(now);
-            self.working_since_unix_ms = unix_ms_now;
-        }
-    }
-
-    fn settling(&mut self, now: Instant) -> bool {
-        match self.settle_until {
-            Some(until) if now < until => true,
-            Some(_) => {
-                self.settle_until = None;
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn clear_working_state(&mut self) {
-        self.working_since = None;
-        self.working_since_unix_ms = 0;
+        self.active_agent.as_ref().map(|agent| ListedAgent {
+            agent: agent.clone(),
+            state: AgentState::Unknown,
+            message: String::new(),
+            working_since_unix_ms: 0,
+        })
     }
 }
 
@@ -927,6 +779,7 @@ mod tests {
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Pending,
+            String::new(),
             now,
             1_000,
         );
@@ -935,7 +788,7 @@ mod tests {
         // would ever retire this row.
         tracker.observe_pane_liveness(false, now);
         assert_eq!(
-            tracker.listed_agent(now, 1_000).map(|(_, state)| state),
+            tracker.listed_agent().map(|listed| listed.state),
             Some(AgentState::Pending),
             "one sighting only starts the clock"
         );
@@ -947,7 +800,7 @@ mod tests {
 
         tracker.observe_pane_liveness(false, now + PUSHED_STATUS_GRACE);
         assert!(tracker.pushed.is_none(), "a dead producer stops asking");
-        assert_eq!(tracker.listed_agent(now + PUSHED_STATUS_GRACE, 1_000), None);
+        assert_eq!(tracker.listed_agent(), None);
     }
 
     #[test]
@@ -958,6 +811,7 @@ mod tests {
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Working,
+            String::new(),
             now,
             1_000,
         );
@@ -978,6 +832,7 @@ mod tests {
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Working,
+            String::new(),
             now + PUSHED_STATUS_GRACE + Duration::from_secs(2),
             1_000,
         );
@@ -1007,23 +862,20 @@ mod tests {
         let mut tracker = PaneAgentTracker::default();
         assert!(!tracker.has_owning_push());
 
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Claude,
-                cwd: "/repo".into(),
-            }),
-            now,
-            1_000,
-        );
+        tracker.update(Some(DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: "/repo".into(),
+        }));
         assert!(
             !tracker.has_owning_push(),
-            "a detected agent alone is inference, and inference needs fast sampling"
+            "the scan sees an agent, but nothing has reported what it is doing"
         );
 
         tracker.record_pushed_status(
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Working,
+            String::new(),
             now,
             1_000,
         );
@@ -1032,12 +884,13 @@ mod tests {
             "a hooked agent reports its own state; sampling only has to watch it exit"
         );
 
-        // An idle push hands the pane back to inference, so the fast cadence
-        // has to come back with it.
+        // An idle push hands the pane back to the scan, which knows only that
+        // the process is there.
         tracker.record_pushed_status(
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Idle,
+            String::new(),
             now,
             1_000,
         );
@@ -1057,162 +910,6 @@ mod tests {
     }
 
     #[test]
-    fn tracker_marks_working_idle_done_and_expires_done_grace() {
-        let now = Instant::now();
-        let agent = DetectedAgent {
-            kind: AgentKind::Codex,
-            cwd: "/repo".into(),
-        };
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(Some(agent.clone()), now, 1_000);
-        assert_eq!(
-            tracker.listed_agent(now, 1_000),
-            Some((agent.clone(), AgentState::Idle))
-        );
-
-        tracker.record_output(now, 1_001);
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(2), 3_001),
-            Some((agent.clone(), AgentState::Working))
-        );
-        assert_eq!(
-            tracker.listed_agent(now + DEFAULT_QUIET_BEFORE_DONE, 21_001),
-            Some((agent.clone(), AgentState::Idle))
-        );
-
-        tracker.update(None, now + Duration::from_secs(21), 22_001);
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(35), 36_001),
-            Some((agent.clone(), AgentState::Done))
-        );
-        tracker.update(None, now + Duration::from_secs(37), 38_001);
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(37), 38_001),
-            None
-        );
-    }
-
-    #[test]
-    fn a_pause_shorter_than_the_quiet_window_stays_working() {
-        let now = Instant::now();
-        let agent = DetectedAgent {
-            kind: AgentKind::Claude,
-            cwd: "/repo".into(),
-        };
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(Some(agent.clone()), now, 1_000);
-        tracker.record_output(now, 1_000);
-
-        // An agent waiting on a model response or a silent tool call goes quiet for many
-        // seconds without having finished. Every one of these used to report Idle, which is
-        // what rang the completion sound mid-task.
-        for pause_secs in [3, 5, 10, 19] {
-            assert_eq!(
-                tracker.listed_agent(now + Duration::from_secs(pause_secs), 1_000),
-                Some((agent.clone(), AgentState::Working)),
-                "a {pause_secs}s pause must not read as finished"
-            );
-        }
-
-        assert_eq!(
-            tracker.listed_agent(now + DEFAULT_QUIET_BEFORE_DONE, 1_000),
-            Some((agent.clone(), AgentState::Idle))
-        );
-    }
-
-    #[test]
-    fn output_during_a_pause_extends_the_working_interval_without_restarting_it() {
-        let now = Instant::now();
-        let agent = DetectedAgent {
-            kind: AgentKind::Codex,
-            cwd: "/repo".into(),
-        };
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(Some(agent.clone()), now, 1_000);
-        tracker.record_output(now, 1_000);
-        let first_episode = tracker.working_since_unix_ms;
-
-        // Output at 15s resets the silence clock, so the interval must survive past the
-        // original 20s deadline and keep the same episode start.
-        tracker.record_output(now + Duration::from_secs(15), 16_000);
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(30), 31_000),
-            Some((agent.clone(), AgentState::Working))
-        );
-        assert_eq!(tracker.working_since_unix_ms, first_episode);
-
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(35), 36_000),
-            Some((agent, AgentState::Idle))
-        );
-    }
-
-    #[test]
-    fn a_completion_signal_ends_the_working_interval_immediately() {
-        let now = Instant::now();
-        let agent = DetectedAgent {
-            kind: AgentKind::Claude,
-            cwd: "/repo".into(),
-        };
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(Some(agent.clone()), now, 1_000);
-        tracker.record_output(now, 1_000);
-        assert_eq!(
-            tracker.listed_agent(now, 1_000),
-            Some((agent.clone(), AgentState::Working))
-        );
-
-        // The bell says the agent is done, so there is no need to wait out the quiet window.
-        tracker.record_completion_signal(now + Duration::from_secs(1));
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(1), 2_000),
-            Some((agent.clone(), AgentState::Idle))
-        );
-
-        // Agents repaint their prompt right after ringing. That trailing output must not open
-        // a new interval, or the completion would have to time out all over again.
-        tracker.record_output(now + Duration::from_secs(2), 3_000);
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(2), 3_000),
-            Some((agent.clone(), AgentState::Idle))
-        );
-
-        // Once settled, real new work is tracked normally.
-        tracker.record_output(now + Duration::from_secs(10), 11_000);
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(10), 11_000),
-            Some((agent, AgentState::Working))
-        );
-    }
-
-    #[test]
-    fn require_bell_never_finishes_on_the_silence_timer_alone() {
-        let now = Instant::now();
-        let agent = DetectedAgent {
-            kind: AgentKind::Claude,
-            cwd: "/repo".into(),
-        };
-        let mut tracker = PaneAgentTracker::with_tuning(NotificationTuning {
-            quiet_before_done: Duration::from_secs(20),
-            require_bell: true,
-        });
-        tracker.update(Some(agent.clone()), now, 1_000);
-        tracker.record_output(now, 1_000);
-
-        // An hour of silence is not a completion when the user asked for explicit signals only.
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(3_600), 1_000),
-            Some((agent.clone(), AgentState::Working))
-        );
-
-        tracker.record_completion_signal(now + Duration::from_secs(3_601));
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(3_601), 1_000),
-            Some((agent, AgentState::Idle))
-        );
-    }
-
-    #[test]
     fn a_pushed_status_outranks_detection_and_stands_alone() {
         let now = Instant::now();
         let mut tracker = PaneAgentTracker::default();
@@ -1223,35 +920,24 @@ mod tests {
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Pending,
+            String::new(),
             now,
             1_000,
         );
-        assert_eq!(
-            tracker.listed_agent(now, 1_000),
-            Some((
-                DetectedAgent {
-                    kind: AgentKind::Claude,
-                    cwd: "/repo".into(),
-                },
-                AgentState::Pending,
-            ))
-        );
+        let listed = tracker.listed_agent().expect("a pushed row stands alone");
+        assert_eq!(listed.agent.kind, AgentKind::Claude);
+        assert_eq!(listed.agent.cwd, "/repo");
+        assert_eq!(listed.state, AgentState::Pending);
 
-        // Detection says "working" (the pane is chattering); the producer says
-        // the agent is blocked. The producer wins — that is the whole point.
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Claude,
-                cwd: "/detected".into(),
-            }),
-            now,
-            1_000,
-        );
-        tracker.record_output(now, 1_000);
-        assert_eq!(
-            tracker.listed_agent(now, 1_000).map(|(_, state)| state),
-            Some(AgentState::Pending)
-        );
+        // The scan found a different cwd for the same pane. The producer still
+        // wins on both — it is the agent, and it knows where it is working.
+        tracker.update(Some(DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: "/detected".into(),
+        }));
+        let listed = tracker.listed_agent().expect("still the pushed row");
+        assert_eq!(listed.state, AgentState::Pending);
+        assert_eq!(listed.agent.cwd, "/repo");
 
         // An idle push means "no activity", not "blank the row": the pane goes
         // back to what detection can see rather than losing a live agent.
@@ -1259,18 +945,18 @@ mod tests {
             AgentKind::Claude,
             "/repo".into(),
             AgentState::Idle,
+            String::new(),
             now,
             1_000,
         );
+        let listed = tracker
+            .listed_agent()
+            .expect("the scanned agent keeps its row");
+        assert_eq!(listed.agent.cwd, "/detected");
         assert_eq!(
-            tracker.listed_agent(now, 1_000),
-            Some((
-                DetectedAgent {
-                    kind: AgentKind::Claude,
-                    cwd: "/detected".into(),
-                },
-                AgentState::Working,
-            ))
+            listed.state,
+            AgentState::Unknown,
+            "nothing is reporting on it any more, and saying `idle` would be a guess"
         );
     }
 
@@ -1286,36 +972,60 @@ mod tests {
             AgentKind::Codex,
             "/repo".into(),
             AgentState::Working,
+            String::new(),
             now,
             5_000,
         );
-        assert_eq!(tracker.reported_working_since_unix_ms(), 5_000);
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            5_000
+        );
         tracker.record_pushed_status(
             AgentKind::Codex,
             "/repo".into(),
             AgentState::Working,
+            String::new(),
             now + Duration::from_secs(3),
             8_000,
         );
-        assert_eq!(tracker.reported_working_since_unix_ms(), 5_000);
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            5_000
+        );
 
         // Finishing drops the interval; the next turn starts a fresh one.
         tracker.record_pushed_status(
             AgentKind::Codex,
             "/repo".into(),
             AgentState::Done,
+            String::new(),
             now + Duration::from_secs(4),
             9_000,
         );
-        assert_eq!(tracker.reported_working_since_unix_ms(), 0);
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            0
+        );
         tracker.record_pushed_status(
             AgentKind::Codex,
             "/repo".into(),
             AgentState::Working,
+            String::new(),
             now + Duration::from_secs(5),
             10_000,
         );
-        assert_eq!(tracker.reported_working_since_unix_ms(), 10_000);
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            10_000
+        );
     }
 
     #[test]
@@ -1347,131 +1057,6 @@ mod tests {
         // erase the row the producer meant to update.
         assert_eq!(AgentState::from_wire("pendign"), None);
         assert_eq!(AgentState::from_wire(""), None);
-    }
-
-    #[test]
-    fn a_completion_signal_without_an_agent_is_ignored() {
-        let now = Instant::now();
-        let mut tracker = PaneAgentTracker::default();
-        tracker.record_output(now, 1_000);
-        tracker.record_completion_signal(now);
-
-        // A plain shell ringing the bell must not manufacture agent state.
-        assert_eq!(tracker.listed_agent(now, 1_000), None);
-        assert_eq!(tracker.last_output_at, Some(now));
-    }
-
-    #[test]
-    fn replacement_clears_done_agent_immediately() {
-        let now = Instant::now();
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Claude,
-                cwd: "/old".into(),
-            }),
-            now,
-            1_000,
-        );
-        tracker.update(None, now + Duration::from_secs(1), 2_000);
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Pi,
-                cwd: "/new".into(),
-            }),
-            now + Duration::from_secs(2),
-            3_000,
-        );
-
-        assert_eq!(
-            tracker.listed_agent(now + Duration::from_secs(2), 3_000),
-            Some((
-                DetectedAgent {
-                    kind: AgentKind::Pi,
-                    cwd: "/new".into(),
-                },
-                AgentState::Idle,
-            ))
-        );
-    }
-
-    #[test]
-    fn working_interval_tracks_transitions_without_refreshing() {
-        let now = Instant::now();
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Codex,
-                cwd: "/repo".into(),
-            }),
-            now,
-            1_000,
-        );
-
-        tracker.record_output(now, 1_001);
-        let started_at = tracker.working_since;
-        assert_eq!(tracker.working_since_unix_ms, 1_001);
-
-        tracker.record_output(now + Duration::from_secs(1), 2_001);
-        assert_eq!(tracker.working_since, started_at);
-        assert_eq!(tracker.working_since_unix_ms, 1_001);
-
-        // The interval ends only once the pane has been quiet for the full window, measured
-        // from the most recent output rather than from when the interval began.
-        tracker.listed_agent(now + Duration::from_secs(4), 5_001);
-        assert_eq!(tracker.working_since, started_at);
-
-        tracker.listed_agent(
-            now + Duration::from_secs(1) + DEFAULT_QUIET_BEFORE_DONE,
-            22_001,
-        );
-        assert_eq!(tracker.working_since, None);
-        assert_eq!(tracker.working_since_unix_ms, 0);
-    }
-
-    #[test]
-    fn agent_replacement_resets_working_interval() {
-        let now = Instant::now();
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Codex,
-                cwd: "/old".into(),
-            }),
-            now,
-            1_000,
-        );
-        tracker.record_output(now, 1_001);
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Claude,
-                cwd: "/new".into(),
-            }),
-            now + Duration::from_secs(1),
-            2_001,
-        );
-
-        assert_eq!(tracker.working_since, None);
-        assert_eq!(tracker.working_since_unix_ms, 0);
-    }
-
-    #[test]
-    fn done_clears_working_interval() {
-        let now = Instant::now();
-        let mut tracker = PaneAgentTracker::default();
-        tracker.update(
-            Some(DetectedAgent {
-                kind: AgentKind::Codex,
-                cwd: "/repo".into(),
-            }),
-            now,
-            1_000,
-        );
-        tracker.record_output(now, 1_001);
-        tracker.update(None, now + Duration::from_secs(1), 2_001);
-
-        assert_eq!(tracker.working_since, None);
-        assert_eq!(tracker.working_since_unix_ms, 0);
     }
 
     #[test]

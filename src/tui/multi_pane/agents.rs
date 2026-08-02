@@ -12,7 +12,7 @@ use crate::{
         AGENT_TOGGLE_WINDOW, AgentOverlayRow, ModalState, MultiPaneTui, UiIntent,
         debug_log::ui_debug_log,
         geometry::{contains_leaf, rect_contains},
-        render::agents::{AGENT_OVERLAY_CARD_LINES, agents_overlay_content},
+        render::agents::agents_overlay_layout,
     },
 };
 
@@ -58,14 +58,21 @@ impl MultiPaneTui {
         true
     }
 
-    /// Updates attached-client agent rows and reports newly unread completions.
+    /// Updates attached-client agent rows and reports panes that just started wanting a human.
     ///
     /// The first observed roster only establishes the local baseline. Roster rows that disappear
     /// intentionally retain their previous state and unread marker until their pane is deleted.
-    /// Apply the latest roster and return the panes whose agent just finished a work episode
-    /// the user has not been told about. Announcing is keyed on the work episode rather than on
-    /// the unread marker: focusing a pane clears the marker, and that must not re-arm the
-    /// completion sound for work the user has already been notified about.
+    ///
+    /// The trigger is arriving at a state that wants attention — `done`, `needs
+    /// you`, or `error` — from one that did not. It used to be `working → idle`,
+    /// which was the shape of the old inference: `idle` was what a pane decayed
+    /// into once it had been quiet long enough, so the marker fired on a guess
+    /// about silence and could never fire for an agent blocked on a question.
+    /// Now the agent says when it is done, and says when it is stuck.
+    ///
+    /// Keyed on the work episode rather than on the marker itself: focusing a
+    /// pane clears the marker, and that must not re-arm it for work the user
+    /// has already seen.
     pub fn update_attached_agent_rows(&mut self, rows: Vec<AgentOverlayRow>) -> Vec<PaneId> {
         self.set_agent_rows(rows);
         let mut newly_unread = Vec::new();
@@ -75,8 +82,8 @@ impl MultiPaneTui {
                     .insert(row.pane_id, row.working_since_unix_ms);
             }
             let previous = self.prior_agent_states.insert(row.pane_id, row.state);
-            if previous != Some(AgentRosterState::Working)
-                || row.state != AgentRosterState::Idle
+            if previous.is_none_or(AgentRosterState::needs_attention)
+                || !row.state.needs_attention()
                 || row.pane_id == self.focused_pane
             {
                 continue;
@@ -97,15 +104,13 @@ impl MultiPaneTui {
     }
 
     pub(crate) fn set_agent_overlay_viewport(&mut self, area: Rect) {
-        self.agent_overlay_viewport_lines = agents_overlay_content(area).height;
+        self.agent_overlay_viewport_lines = agents_overlay_layout(area, self).rows.height;
         self.clamp_agent_overlay_scroll();
     }
 
+    /// Lines the agent list wants. One per agent, so this is the row count.
     pub(in crate::tui) fn agent_overlay_total_lines(&self) -> usize {
-        self.agent_rows
-            .len()
-            .saturating_mul(AGENT_OVERLAY_CARD_LINES)
-            .saturating_sub(1)
+        self.agent_rows.len()
     }
 
     pub(in crate::tui) fn agent_overlay_max_scroll(&self) -> usize {
@@ -134,17 +139,14 @@ impl MultiPaneTui {
             return;
         };
         let viewport_lines = usize::from(self.agent_overlay_viewport_lines.max(1));
-        let card_start = index.saturating_mul(AGENT_OVERLAY_CARD_LINES);
-        let card_end = card_start.saturating_add(1);
-        if card_start < self.agent_overlay_scroll_line {
-            self.agent_overlay_scroll_line = card_start;
-        } else if card_end
+        if index < self.agent_overlay_scroll_line {
+            self.agent_overlay_scroll_line = index;
+        } else if index
             >= self
                 .agent_overlay_scroll_line
                 .saturating_add(viewport_lines)
         {
-            self.agent_overlay_scroll_line =
-                card_end.saturating_add(1).saturating_sub(viewport_lines);
+            self.agent_overlay_scroll_line = index.saturating_add(1).saturating_sub(viewport_lines);
         }
         self.clamp_agent_overlay_scroll();
     }
@@ -153,13 +155,9 @@ impl MultiPaneTui {
         self.set_agent_overlay_viewport(area);
         let previous = self.agent_overlay_scroll_line;
         if up {
-            self.agent_overlay_scroll_line = self
-                .agent_overlay_scroll_line
-                .saturating_sub(AGENT_OVERLAY_CARD_LINES);
+            self.agent_overlay_scroll_line = self.agent_overlay_scroll_line.saturating_sub(1);
         } else {
-            self.agent_overlay_scroll_line = self
-                .agent_overlay_scroll_line
-                .saturating_add(AGENT_OVERLAY_CARD_LINES);
+            self.agent_overlay_scroll_line = self.agent_overlay_scroll_line.saturating_add(1);
         }
         self.clamp_agent_overlay_scroll();
         self.agent_overlay_scroll_line != previous
@@ -202,18 +200,17 @@ impl MultiPaneTui {
         row: u16,
         area: Rect,
     ) -> Option<PaneId> {
-        let content = agents_overlay_content(area);
-        if !rect_contains(content, column, row) {
+        // Measured against the row list's own rect, not the panel interior: the
+        // members header sits above it, and deriving the offset from the panel
+        // put every click that many lines too high whenever anyone else was in
+        // the session.
+        let rows = agents_overlay_layout(area, self).rows;
+        if !rect_contains(rows, column, row) {
             return None;
         }
-        let line = usize::from(row.saturating_sub(content.y))
-            .saturating_add(self.agent_overlay_scroll_line);
-        if line % AGENT_OVERLAY_CARD_LINES == 2 {
-            return None;
-        }
-        self.agent_rows
-            .get(line / AGENT_OVERLAY_CARD_LINES)
-            .map(|agent| agent.pane_id)
+        let line =
+            usize::from(row.saturating_sub(rows.y)).saturating_add(self.agent_overlay_scroll_line);
+        self.agent_rows.get(line).map(|agent| agent.pane_id)
     }
 
     pub(in crate::tui) fn jump_to_agent_pane(
@@ -270,16 +267,13 @@ mod tests {
         layout::{Axis, Node, Tab},
         tui::{
             KeyHandling, MultiPaneTui, UiIntent,
-            render::agents::{
-                agents_overlay_content, agents_overlay_help, agents_overlay_inner,
-                format_agent_overlay_card,
-            },
+            render::agents::{agents_overlay_layout, format_agent_overlay_card},
             test_support::{agent_overlay_tui, agent_row, layout},
         },
     };
 
     #[test]
-    fn attached_agent_rows_mark_only_unfocused_working_to_idle_transitions_unread() {
+    fn attached_agent_rows_mark_only_unfocused_arrivals_at_attention_unread() {
         let snapshot = layout(
             vec![Tab {
                 tab_id: 1,
@@ -296,7 +290,7 @@ mod tests {
         let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
         let working = agent_row(2, 1, 2);
         let mut idle = working.clone();
-        idle.state = crate::protocol::AgentRosterState::Idle;
+        idle.state = crate::protocol::AgentRosterState::Done;
 
         assert_eq!(
             tui.update_attached_agent_rows(vec![working.clone()]),
@@ -343,7 +337,7 @@ mod tests {
         let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
         let working = agent_row(2, 1, 2);
         let mut idle = working.clone();
-        idle.state = crate::protocol::AgentRosterState::Idle;
+        idle.state = crate::protocol::AgentRosterState::Done;
         // A real host sends the `0` sentinel on a non-working row, so the episode a completion
         // refers to is only ever visible on the working row that preceded it.
         idle.working_since_unix_ms = 0;
@@ -389,14 +383,14 @@ mod tests {
         let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
         let working = agent_row(2, 1, 2);
         let mut idle = working.clone();
-        idle.state = crate::protocol::AgentRosterState::Idle;
+        idle.state = crate::protocol::AgentRosterState::Done;
 
         tui.update_attached_agent_rows(vec![working]);
         assert_eq!(tui.update_attached_agent_rows(vec![idle]), vec![2]);
         tui.update_attached_agent_rows(Vec::new());
         assert_eq!(
             tui.prior_agent_states[&2],
-            crate::protocol::AgentRosterState::Idle
+            crate::protocol::AgentRosterState::Done
         );
         assert!(tui.unread_agent_panes.contains(&2));
     }
@@ -475,11 +469,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(8, 1, 1), (6, 1, 2), (3, 2, 1)]
         );
+        // The row line itself carries the agent, not the plumbing — the tab and
+        // pane live on the detail line under the selection now.
         assert!(
-            format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0, 0, &UiTheme::default(),)
-                [1]
-            .to_string()
-            .contains("Tab #2 · Pane #1")
+            format_agent_overlay_card(&tui.agent_rows[2], false, 120, 0, 0, &UiTheme::default())
+                .to_string()
+                .contains("codex")
         );
     }
 
@@ -510,33 +505,29 @@ mod tests {
 
         assert_eq!(tui.handle_agent_overlay_click(0, 0, area), Vec::new());
         assert!(tui.overlay_open());
-        let inner = agents_overlay_inner(area);
-        let content = agents_overlay_content(area);
-        let help = agents_overlay_help(area).expect("help row");
+        let overlay = agents_overlay_layout(area, &tui);
+        let content = overlay.rows;
+        let help = overlay.help;
         assert_eq!(
             tui.agent_overlay_row_at(content.x.saturating_sub(1), content.y, area),
             None
         );
-        assert_eq!(tui.agent_overlay_row_at(content.x, inner.y, area), None);
         assert_eq!(tui.agent_overlay_row_at(help.x, help.y, area), None);
+        // One line per agent, so the second row is the very next line.
         assert_eq!(
             tui.agent_overlay_row_at(content.x, content.y, area),
             Some(1)
         );
         assert_eq!(
             tui.agent_overlay_row_at(content.x, content.y.saturating_add(1), area),
-            Some(1)
-        );
-        assert_eq!(
-            tui.agent_overlay_row_at(content.x, content.y.saturating_add(3), area),
             Some(2)
         );
         assert_eq!(
-            tui.agent_overlay_row_at(content.x, content.y.saturating_add(4), area),
-            Some(2)
+            tui.agent_overlay_row_at(content.x, content.y.saturating_add(2), area),
+            None
         );
         assert_eq!(
-            tui.handle_agent_overlay_click(content.x, content.y.saturating_add(3), area),
+            tui.handle_agent_overlay_click(content.x, content.y.saturating_add(1), area),
             vec![UiIntent::FocusPane { pane_id: 2 }]
         );
         assert!(!tui.overlay_open());
@@ -548,43 +539,55 @@ mod tests {
 
     #[test]
     fn agents_overlay_hit_test_accounts_for_terminal_line_scroll() {
-        let area = Rect::new(0, 0, 80, 8);
+        // Short on purpose: the panel now grows to fit its rows, so a list only
+        // scrolls when the terminal itself cannot hold them.
+        let area = Rect::new(0, 0, 80, 6);
         let mut tui = agent_overlay_tui(3);
-        let content = agents_overlay_content(area);
+        let content = agents_overlay_layout(area, &tui).rows;
+        assert!(
+            content.height < 3,
+            "the list has to be shorter than the roster for scrolling to mean anything"
+        );
 
         assert!(tui.scroll_agent_overlay(area, false));
-        assert_eq!(tui.agent_overlay_scroll_line, 3);
+        assert_eq!(tui.agent_overlay_scroll_line, 1);
         assert_eq!(
             tui.agent_overlay_row_at(content.x, content.y, area),
-            Some(2)
-        );
-        assert_eq!(
-            tui.agent_overlay_row_at(content.x, content.y.saturating_add(2), area),
-            None
+            Some(2),
+            "the first visible line is the second agent once scrolled by one"
         );
     }
 
     #[test]
-    fn agents_overlay_selection_auto_scrolls_to_keep_cards_visible() {
-        let area = Rect::new(0, 0, 80, 8);
+    fn agents_overlay_selection_auto_scrolls_to_keep_rows_visible() {
+        let area = Rect::new(0, 0, 80, 6);
         let mut tui = agent_overlay_tui(4);
+        let visible = usize::from(agents_overlay_layout(area, &tui).rows.height);
+        assert!(visible < 4, "the roster has to outgrow the list");
 
-        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
-        assert_eq!(tui.agent_selected_pane, Some(2));
-        assert_eq!(tui.agent_overlay_scroll_line, 3);
-        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
-        assert_eq!(tui.agent_selected_pane, Some(3));
-        assert_eq!(tui.agent_overlay_scroll_line, 6);
+        // Arrowing past the last visible row scrolls by exactly enough to bring
+        // it into view, and no further.
+        for step in 0..3 {
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), area);
+            let index = step + 1;
+            assert_eq!(tui.agent_selected_pane, Some(index as u64 + 1));
+            assert!(
+                tui.agent_overlay_scroll_line <= index
+                    && index < tui.agent_overlay_scroll_line + visible,
+                "row {index} out of view at scroll {}",
+                tui.agent_overlay_scroll_line
+            );
+        }
     }
 
     #[test]
     fn agents_overlay_scroll_clamps_when_roster_shrinks() {
-        let area = Rect::new(0, 0, 80, 8);
+        let area = Rect::new(0, 0, 80, 6);
         let mut tui = agent_overlay_tui(4);
 
         assert!(tui.scroll_agent_overlay(area, false));
         assert!(tui.scroll_agent_overlay(area, false));
-        assert_eq!(tui.agent_overlay_scroll_line, 6);
+        assert!(tui.agent_overlay_scroll_line > 0);
         tui.set_agent_rows(vec![agent_row(1, 1, 1)]);
         assert_eq!(tui.agent_overlay_scroll_line, 0);
     }

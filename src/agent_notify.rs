@@ -13,10 +13,15 @@
 //!   A hook that fails is a hook the user disables.
 //! - **It never blocks.** One connect and one small write, both with timeouts.
 //!
-//! Note what is *not* sent: the assistant's message, the user's prompt, the
-//! tool being run. Those reach this process and are used only to decide the
-//! status; they never go on the wire. A p2pmux session is shared with every
-//! member, and the agent's conversation is not the mux's to publish.
+//! Note what is *not* sent: the user's prompt and the tool being run. Those
+//! reach this process and are used only to decide the status.
+//!
+//! One line of the assistant's message *is* sent, and travels exactly as far as
+//! the Unix socket this writes to. The node that owns the pane keeps it for its
+//! own overlay and strips it from the roster it publishes — see
+//! `SharedLocalPane::agent_roster_entry`. A p2pmux session is shared with every
+//! member, and the agent's conversation is still not the mux's to publish; it is
+//! only the local user's to read, on their own machine, about their own pane.
 
 use std::{
     error::Error,
@@ -49,11 +54,37 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// user to ignore the state that matters most.
 const GENERIC_PENDING: [&str; 2] = ["Claude needs attention", "Claude Code needs your attention"];
 
+/// Longest activity message a hook will forward.
+///
+/// The node caps it again on arrival; this one keeps the socket write small on
+/// the agent's critical path.
+const MAX_MESSAGE_CHARS: usize = 160;
+
 /// What a hook payload resolved to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookUpdate {
     pub state: AgentState,
     pub cwd: String,
+    /// One line of what the agent is doing, for the local overlay only.
+    pub message: String,
+}
+
+/// The first line of an agent's message, bounded.
+///
+/// Only the first line: these are prose replies that run to paragraphs, and the
+/// overlay has one line to show. Only the first [`MAX_MESSAGE_CHARS`]: the rest
+/// would be truncated by the renderer anyway, and there is no reason to put it
+/// on a socket to find that out.
+fn summarize(message: &str) -> String {
+    let line = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    match line.char_indices().nth(MAX_MESSAGE_CHARS) {
+        Some((end, _)) => format!("{}…", line[..end].trim_end()),
+        None => line.to_owned(),
+    }
 }
 
 /// Map a Claude hook event name to a status.
@@ -136,7 +167,11 @@ pub fn derive_claude(raw: &str, status_arg: Option<&str>) -> Option<HookUpdate> 
         })
         .unwrap_or_default();
 
-    Some(HookUpdate { state, cwd })
+    Some(HookUpdate {
+        state,
+        cwd,
+        message: summarize(message),
+    })
 }
 
 /// The pane this process is running in, and the node socket to report to.
@@ -165,6 +200,7 @@ fn send(pane_id: u64, socket: &PathBuf, kind: AgentKind, update: HookUpdate) -> 
         kind: kind.wire_value().to_owned(),
         status: update.state.wire_value().to_owned(),
         cwd: update.cwd,
+        message: update.message,
     };
     let mut line = serde_json::to_vec(&message).ok()?;
     line.push(b'\n');
@@ -194,6 +230,7 @@ pub fn run(kind: AgentKind, status_arg: Option<&str>) -> Result<(), Box<dyn Erro
                 cwd: std::env::current_dir()
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default(),
+                message: String::new(),
             }),
     };
     if let Some(update) = update {

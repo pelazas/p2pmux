@@ -75,6 +75,7 @@ pub(in crate::tui) fn agent_row(
     pane_ordinal: usize,
 ) -> AgentOverlayRow {
     AgentOverlayRow {
+        message: String::new(),
         pane_id,
         tab_ordinal,
         pane_ordinal,

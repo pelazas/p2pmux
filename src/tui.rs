@@ -40,7 +40,9 @@ use std::time::Duration;
 use app::member_label;
 pub use app::{run_guest, run_host, run_local};
 pub(crate) use debug_log::ui_debug_log;
-pub(crate) use geometry::{initial_root_pane_grid, missed_resize, resize_recheck_due};
+pub(crate) use geometry::{
+    initial_root_pane_grid, missed_resize, resize_recheck_due, stale_node_size,
+};
 pub use host::HostPaneRuntime;
 pub use input::mouse::PaneMouseProtocol;
 pub use multi_pane::MultiPaneTui;
@@ -59,6 +61,7 @@ pub use state::{
 pub(in crate::tui) use state::{
     Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
 };
+pub(crate) use terminal::clear_before_first_frame;
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
 
 /// Kept as the module's public marker from the scaffold.

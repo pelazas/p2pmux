@@ -32,8 +32,9 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneMouseProtocol, PaneViewState, ShareView, copy_selection_to_clipboard, missed_resize,
-        render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
+        PaneMouseProtocol, PaneViewState, ShareView, clear_before_first_frame,
+        copy_selection_to_clipboard, render_multi_pane_with_copy_feedback, resize_recheck_due,
+        share_copy_result, stale_node_size,
     },
 };
 
@@ -144,9 +145,6 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         ))
     })?;
     let theme = config.ui.theme;
-    let sound_enabled = config.ui.notifications.sound_enabled;
-    let notification_sound =
-        crate::notify_sound::NotificationSound::new(config.ui.notifications.sound_path);
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
@@ -174,6 +172,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
             viewport: Viewport::Fixed(Rect::new(0, 0, initial_cols, initial_rows)),
         },
     )?;
+    clear_before_first_frame(&mut terminal, Rect::new(0, 0, initial_cols, initial_rows))?;
     let terminal_thread = spawn_terminal_reader(wake_tx, Arc::clone(&terminal_stop));
     let mut tui = None;
     let mut screens = BTreeMap::new();
@@ -208,6 +207,10 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     // the resize arm below resizes it. Tracked here to spot a resize that never
     // arrived as an event.
     let mut viewport = (initial_cols, initial_rows);
+    // The size the node last heard, which `Hello` above has just told it. Tracked apart
+    // from `viewport` because the two come apart whenever a resize is drawn but not
+    // forwarded, and that gap is the only evidence the node is behind.
+    let mut node_viewport = (initial_cols, initial_rows);
     let mut last_size_check: Option<Instant> = None;
 
     'attached: loop {
@@ -252,11 +255,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         apply_leases(view, leases);
                         view.set_presence(presence);
                         apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
-                        announce_agent_completions(
-                            apply_rosters(view, rosters),
-                            sound_enabled,
-                            &notification_sound,
-                        );
+                        announce_agent_completions(apply_rosters(view, rosters));
                         let apply_elapsed = apply_started.elapsed();
                         if crate::perf::enabled() && apply_elapsed >= Duration::from_millis(5) {
                             crate::perf::log(&format!(
@@ -421,11 +420,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     NodeMessage::Rosters { rosters } => {
                         if let Some(view) = tui.as_mut() {
-                            announce_agent_completions(
-                                apply_rosters(view, rosters),
-                                sound_enabled,
-                                &notification_sound,
-                            );
+                            announce_agent_completions(apply_rosters(view, rosters));
                             dirty = true;
                         }
                     }
@@ -523,7 +518,12 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         }
         if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
             last_size_check = Some(Instant::now());
-            if let Some((cols, rows)) = missed_resize(viewport, terminal::size()) {
+            if let Some((cols, rows)) = stale_node_size(
+                viewport,
+                node_viewport,
+                terminal::size(),
+                tui.as_ref().is_some_and(MultiPaneTui::modal_open),
+            ) {
                 pending_wake = Some(WakeEvent::Terminal(Event::Resize(cols, rows)));
             }
         }
@@ -548,6 +548,13 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         };
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                // A forwarded key can still have ended chord mode on its way past, and the
+                // footer names the mode it is in. Redrawing on every keystroke would be a
+                // frame per character; redrawing when the mode actually moved is one frame
+                // per chord. Without it a key the chord does not claim — Ctrl+F, say, which
+                // reaches the shell and produces nothing to redraw for — leaves PANE MODE on
+                // screen after it has ended.
+                let chord_before = tui.chord_mode();
                 match tui.handle_key(key, terminal.size()?.into()) {
                     KeyHandling::Quit => {
                         write_message(&mut stream, &ClientMessage::Detach { generation })?;
@@ -587,6 +594,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                             desired_scroll.remove(&tui.focused_pane());
                             tui.set_pane_scrollback_offset(tui.focused_pane(), 0);
                         }
+                        dirty |= tui.chord_mode() != chord_before;
                     }
                 }
             }
@@ -714,6 +722,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     pending_scroll.clear();
                     desired_scroll.clear();
                     write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
+                    node_viewport = (cols, rows);
                 }
                 dirty = true;
             }
@@ -912,24 +921,16 @@ fn apply_leases(view: &mut MultiPaneTui, leases: Vec<crate::local_ipc::PaneLease
     }
 }
 
-/// Ring for panes whose agent just finished, and record the decision.
+/// Record that a pane's agent finished.
 ///
-/// The log line matters: a spurious notification is otherwise invisible after the fact, and
-/// the last round of false positives had to be diagnosed by reasoning about the state machine
-/// rather than by reading what it actually did.
-fn announce_agent_completions(
-    panes: Vec<u64>,
-    sound_enabled: bool,
-    sound: &crate::notify_sound::NotificationSound,
-) {
+/// This used to also play a sound. It no longer does — a completion that a hook
+/// reported is already unmissable in the overlay and the pane's unread mark, and
+/// the chime fired on the inference path that could not tell a finished turn from
+/// a quiet one. The log line stays: a completion that arrives at the wrong moment
+/// is otherwise invisible after the fact.
+fn announce_agent_completions(panes: Vec<u64>) {
     for pane_id in panes {
-        crate::tui::ui_debug_log(
-            "agent_completion",
-            format_args!("pane={pane_id} sound={sound_enabled}"),
-        );
-        if sound_enabled {
-            sound.play();
-        }
+        crate::tui::ui_debug_log("agent_completion", format_args!("pane={pane_id}"));
     }
 }
 
@@ -952,6 +953,7 @@ fn apply_rosters(
                 working_since_unix_ms: row.working_since_unix_ms,
                 host: row.host,
                 controller: row.controller,
+                message: row.message,
             })
             .collect(),
     )
@@ -1302,6 +1304,7 @@ mod tests {
 
     fn roster_row(pane_id: u64, state: i32) -> AgentOverlaySnapshotRow {
         AgentOverlaySnapshotRow {
+            message: String::new(),
             pane_id,
             kind: String::from("codex"),
             cwd: String::from("/repo"),
@@ -1709,7 +1712,9 @@ mod tests {
             ],
         );
         let tui = tui.as_mut().unwrap();
-        let area = Rect::new(0, 0, 24, 8);
+        // Short enough that three rows do not fit, so there is something to scroll:
+        // the overlay grows to fit its list whenever the terminal lets it.
+        let area = Rect::new(0, 0, 24, 6);
         tui.set_agent_overlay_viewport(area);
         tui.handle_key(
             crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),

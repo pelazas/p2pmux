@@ -118,7 +118,7 @@ jobs:
             or
 
             ```sh
-            brew tap pelazas/tap      # macOS
+            brew tap pelazas/tap
             brew trust pelazas/tap    # Homebrew 6+ refuses untrusted third-party taps
             brew install p2pmux
             ```
@@ -136,3 +136,64 @@ jobs:
 
             **A p2pmux session is a trusted shared shell.** Whoever holds a join code can run
             commands as your user account. https://p2pmux.com/trust
+
+  homebrew:
+    name: Point the Homebrew tap at this release
+    # Last, and only once the archives are published: the formula names a download URL, so a
+    # tap bumped before the release exists sends every `brew install` at a 404.
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail loudly when the tap token is missing
+        # Deliberately a failure rather than a skip. This step exists because the tap used to
+        # be bumped by hand and v0.1.2 shipped for several minutes with a formula nobody
+        # could install from — a warning in a green run's log is how that happens again. The
+        # release itself is already published by the time this runs, so a red job here costs
+        # the formula, not the release.
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set. The release published fine; only the" \
+                 "Homebrew formula is stale. Add a token with contents:write on" \
+                 "pelazas/homebrew-tap as the HOMEBREW_TAP_TOKEN secret, then re-run this job."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: pelazas/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Rewrite the formula
+        # The same `.sha256` files the publish job verified against their archives, so the
+        # formula can only ever carry a hash this run has already checked.
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          python3 scripts/release/bump-homebrew-formula.py \
+            tap/Formula/p2pmux.rb "${version#v}" dist
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "formula already current — nothing to push"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -aqm "p2pmux ${{ github.event.inputs.tag || github.ref_name }}
+
+          Hashes taken from the release archives the workflow verified before publishing."
+          git push

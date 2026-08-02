@@ -121,6 +121,10 @@ pub struct AgentOverlayRow {
     pub working_since_unix_ms: u64,
     pub host: String,
     pub controller: String,
+    /// What the agent said it is doing. Populated only for panes hosted on this
+    /// machine — a peer's node strips it before publishing, so a remote row's is
+    /// always empty.
+    pub message: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::tui) enum RenameTarget {

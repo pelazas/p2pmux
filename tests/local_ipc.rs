@@ -13,6 +13,7 @@ fn agent_status_is_tagged_and_tolerates_a_producer_that_omits_cwd() {
         kind: "claude".into(),
         status: "pending".into(),
         cwd: "/repo".into(),
+        message: "waiting on you".into(),
     };
     let value = serde_json::to_value(&message).unwrap();
     assert_eq!(value["type"], "agent_status");
@@ -35,6 +36,8 @@ fn agent_status_is_tagged_and_tolerates_a_producer_that_omits_cwd() {
             kind: "claude".into(),
             status: "done".into(),
             cwd: String::new(),
+            // A producer from before the message existed still reports.
+            message: String::new(),
         }
     );
 }
@@ -124,6 +127,7 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                 working_since_unix_ms: 2,
                 host: "host".into(),
                 controller: "controller".into(),
+                message: "running tests".into(),
             }],
         },
         NodeMessage::Focus {

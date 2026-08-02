@@ -97,20 +97,30 @@ ACTUAL="$(sha256_of "$TMP/$ASSET" | cut -d' ' -f1)"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 [ -f "$TMP/p2pmux" ] || die "the archive did not contain a p2pmux binary"
 
+# Having `sudo` on PATH is not the same as being able to use it. A locked-down work
+# laptop or a stock container ships the binary without a sudoers entry for you, and a
+# piped installer has no terminal to type a password into. So run it inside an `if`
+# rather than as a bare command: `set -e` would abort on the failure and never reach
+# the home-directory branch that exists for exactly these machines.
+sudo_install() {
+  command -v sudo >/dev/null 2>&1 || return 1
+  say "$INSTALL_DIR is not writable; using sudo."
+  sudo mkdir -p "$INSTALL_DIR" || return 1
+  sudo install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux" || return 1
+}
+
 if mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
   install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux"
-elif command -v sudo >/dev/null 2>&1; then
-  say "$INSTALL_DIR is not writable; using sudo."
-  sudo mkdir -p "$INSTALL_DIR"
-  sudo install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux"
+elif sudo_install; then
+  : # installed with elevated privileges
 else
   # /usr/local/bin is root-owned on most Linux systems, and plenty of the machines
-  # someone would run this on — a container, a locked-down work laptop — have no sudo at
-  # all. A home directory needs no privileges, and the PATH note below covers the
-  # distributions that do not already add this one.
+  # someone would run this on — a container, a locked-down work laptop — either have no
+  # sudo at all or have one you are not allowed to use. A home directory needs no
+  # privileges, and the PATH note below covers the distributions that do not already add
+  # this one.
   INSTALL_DIR="$HOME/.local/bin"
-  say "the install directory is not writable and sudo is not available;"
-  say "installing to $INSTALL_DIR instead."
+  say "could not install to a system directory; falling back to $INSTALL_DIR."
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$TMP/p2pmux" "$INSTALL_DIR/p2pmux"
 fi

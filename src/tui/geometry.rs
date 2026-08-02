@@ -391,6 +391,25 @@ pub(crate) fn missed_resize(
     (cols > 0 && rows > 0 && (cols, rows) != drawn_at).then_some((cols, rows))
 }
 
+/// The size a run loop should re-adopt, covering both ways the node falls behind.
+///
+/// [`missed_resize`] catches the window moving out from under the UI. It cannot catch
+/// the other case: a resize that arrived, was drawn, and was never forwarded, because
+/// `drawn_at` advanced all the same and the two sizes agree again. A modal open at that
+/// moment swallows the message, and nothing else would ever send it — the panes keep
+/// the old grid for the rest of the session while their borders draw at the new size.
+///
+/// Re-sending waits for the modal to close. Reflowing panes under an open dialog is
+/// what the guard exists to prevent, and half a second later is soon enough.
+pub(crate) fn stale_node_size(
+    drawn_at: (u16, u16),
+    node_told: (u16, u16),
+    actual: io::Result<(u16, u16)>,
+    modal_open: bool,
+) -> Option<(u16, u16)> {
+    missed_resize(drawn_at, actual).or((!modal_open && node_told != drawn_at).then_some(drawn_at))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::tui) struct ResizeDrag {
     pub(in crate::tui) pane_id: PaneId,
@@ -436,7 +455,7 @@ mod tests {
     use super::{
         RESIZE_RECHECK_INTERVAL, allocate_node_with_preview, area_from_terminal_size,
         grid_for_pane, initial_root_pane_grid, missed_resize, mouse_to_screen_cell,
-        resize_recheck_due,
+        resize_recheck_due, stale_node_size,
     };
 
     #[test]
@@ -465,6 +484,41 @@ mod tests {
         );
         assert_eq!(missed_resize((100, 30), Ok((0, 50))), None);
         assert_eq!(missed_resize((100, 30), Ok((160, 0))), None);
+    }
+
+    /// The case `missed_resize` alone cannot see: the event arrived and was drawn, so
+    /// the real size and the drawn size agree again, but a modal swallowed the message
+    /// on its way to the node. Without the second comparison the panes keep the old
+    /// grid for the rest of the session.
+    #[test]
+    fn a_resize_the_node_never_heard_is_re_sent_once_the_modal_closes() {
+        assert_eq!(
+            stale_node_size((160, 50), (100, 30), Ok((160, 50)), true),
+            None,
+            "reflowing panes under an open dialog is what the guard is for",
+        );
+        assert_eq!(
+            stale_node_size((160, 50), (100, 30), Ok((160, 50)), false),
+            Some((160, 50)),
+        );
+    }
+
+    #[test]
+    fn a_node_already_told_the_drawn_size_is_left_alone() {
+        assert_eq!(
+            stale_node_size((160, 50), (160, 50), Ok((160, 50)), false),
+            None
+        );
+    }
+
+    /// A window that moved out from under the UI still heals while a modal is open —
+    /// that path keeps the UI drawing at the right size, and only the node message waits.
+    #[test]
+    fn a_window_that_grew_without_an_event_heals_even_under_a_modal() {
+        assert_eq!(
+            stale_node_size((100, 30), (100, 30), Ok((160, 50)), true),
+            Some((160, 50)),
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ use crate::{
             remote_input_decision,
         },
         render::vt::{VtScreen, render_guest_screen, render_host_screen},
-        terminal::{TerminalGuard, enable_keyboard_enhancement},
+        terminal::{TerminalGuard, clear_before_first_frame, enable_keyboard_enhancement},
     },
 };
 
@@ -75,6 +75,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(fixed_area),
         },
     )?;
+    clear_before_first_frame(&mut terminal, fixed_area)?;
     let mut dirty = true;
     let mut last_draw: Option<Instant> = None;
     let mut sync_gate = SyncGate::default();
@@ -174,6 +175,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
+    clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
     let footer = CONTROL_HELP.to_owned();
     let mut dirty = true;
     let mut last_draw: Option<Instant> = None;
@@ -352,6 +354,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
+    clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
     let mut remote = GuestScreen::new();
     let mut footer = String::from("controller: waiting spectator");
     let mut lease = None;

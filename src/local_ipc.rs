@@ -74,6 +74,13 @@ pub enum ClientMessage {
         status: String,
         #[serde(default)]
         cwd: String,
+        /// What the agent is doing, in its own words.
+        ///
+        /// Stops at the node that owns the pane: the roster published to peers
+        /// has no field for it. `#[serde(default)]` so a producer from an older
+        /// build, which sends no message at all, still reports its status.
+        #[serde(default)]
+        message: String,
     },
     Shutdown {
         generation: u64,
@@ -192,6 +199,13 @@ pub struct AgentOverlaySnapshotRow {
     pub working_since_unix_ms: u64,
     pub host: String,
     pub controller: String,
+    /// The agent's own words, for panes this machine hosts.
+    ///
+    /// This channel is a Unix socket to the local client, so it carries what the
+    /// peer-facing `AgentRosterEntry` deliberately will not. Empty for a pane
+    /// hosted by another member: their node never sent it, and never should.
+    #[serde(default)]
+    pub message: String,
 }
 
 impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
@@ -204,6 +218,7 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
             working_since_unix_ms: row.working_since_unix_ms,
             host: row.host.clone(),
             controller: row.controller.clone(),
+            message: row.message.clone(),
         }
     }
 }
