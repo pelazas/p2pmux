@@ -48,9 +48,7 @@ impl SharedLayoutRuntime {
             }
             LayoutControlEvent::Reservation(reservation) => self.accept_reservation(reservation)?,
             LayoutControlEvent::Reject(reject) => self.reject_request(reject.request_id),
-            LayoutControlEvent::Disconnected => {
-                self.status = String::from("layout coordinator disconnected")
-            }
+            LayoutControlEvent::Disconnected => self.note_coordinator_lost(),
         }
         Ok(())
     }
@@ -271,6 +269,22 @@ impl SharedLayoutRuntime {
     }
 
     pub(in crate::tui) fn handle_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
+        // Refused here rather than sent and forgotten. Only the coordinator commits any of
+        // these, so with it missing the request would go into a channel with nothing on the
+        // other end -- and a split, worse, would spawn a local PTY first and leave it
+        // orphaned when the commit that was meant to adopt it never came. Moving focus and
+        // switching tabs are this member's own business and stay available.
+        if self.structural_edits_frozen()
+            && !matches!(
+                intent,
+                UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. }
+            )
+        {
+            self.footer_notice = Some(String::from(
+                "coordinator unreachable; layout changes are paused",
+            ));
+            return Ok(());
+        }
         match intent {
             UiIntent::CreatePane {
                 target_pane_id,

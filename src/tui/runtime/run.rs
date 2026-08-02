@@ -481,6 +481,7 @@ impl SharedLayoutRuntime {
             }
             changed = true;
         }
+        changed |= self.tick_failover()?;
         changed |= self.refresh_local_views();
         changed |= self.refresh_agent_rows();
         Ok(changed)

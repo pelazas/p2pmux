@@ -130,7 +130,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     // Before the first pane spawns: every PTY this node opens inherits the
     // socket path from here, and pane 1 is created a few lines below.
     crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
-    let (mut node, dispatcher_task, published_code) = match bootstrap.kind {
+    let (mut node, published_code) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -182,11 +182,11 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                 host, panes, layout, initial, ticket, code, handle,
             )?;
             runtime.set_session_id(session_id);
-            (
-                SharedLayoutNode::new(runtime),
-                dispatcher_task,
-                published_code,
-            )
+            // The runtime owns the accept loop from here: losing every member is one of the
+            // shapes a coordinator's own failover takes, and stepping down means this
+            // endpoint has to stop answering joins and start behaving like a member.
+            runtime.set_accept_task(dispatcher_task);
+            (SharedLayoutNode::new(runtime), published_code)
         }
         NodeBootstrapKind::Join {
             ticket,
@@ -225,14 +225,17 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             panes.replace_roster_from_layout(&state)?;
             let acceptor = panes.clone();
             let dispatcher_task = tokio::spawn(async move { acceptor.accept_loop().await });
-            let runtime = crate::tui::SharedLayoutRuntime::member_from_state(
+            let mut runtime = crate::tui::SharedLayoutRuntime::member_from_state(
                 member,
                 panes,
                 ticket.session_id().to_vec(),
                 state,
                 tokio::runtime::Handle::current(),
             )?;
-            (SharedLayoutNode::new(runtime), dispatcher_task, None)
+            // Handed over for the same reason as on the coordinator, in the other direction:
+            // a member that gets promoted has to start answering joins on this endpoint.
+            runtime.set_accept_task(dispatcher_task);
+            (SharedLayoutNode::new(runtime), None)
         }
     };
     let store = SessionStore::for_current_user()?;
@@ -244,8 +247,6 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
     // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
     tokio::task::block_in_place(|| node.shutdown());
-    dispatcher_task.abort();
-    let _ = dispatcher_task.await;
     if let Some(published) = published_code {
         published.retire().await;
     }

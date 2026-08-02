@@ -31,14 +31,14 @@ use crate::{
     lease::LeaseState,
     ledger::{IntentSigner, LedgerVerifier, LedgerWriter, verify_intent},
     protocol::{
-        AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
-        Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
-        LayoutSplit, LayoutState, LedgerEntryKind, MarkPaneExited, MemberDescriptor,
-        MembershipEvent, MembershipRecord, NewPanePosition as ProtocolNewPanePosition,
-        PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-        Presence, PresenceRoster, ReleaseControl, RenamePane, RenameTab, SessionSnapshot,
-        SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
-        UpdatePaneGrids, Welcome, envelope,
+        AgentRoster, ControlLease, CoordinatorChangeRecord, CreatePane, CreateTab, DeletePane,
+        DeleteTab, Delta, Envelope, Input, Join, LayoutCommit, LayoutNode, LayoutReject,
+        LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, LedgerEntryKind,
+        MarkPaneExited, MemberDescriptor, MembershipEvent, MembershipRecord,
+        NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
+        PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ReleaseControl,
+        RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
+        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -1018,6 +1018,26 @@ impl LayoutCoordinator {
         .encode_to_vec();
         let author = self.coordinator_peer_id.clone();
         self.layout_commit(author, LedgerEntryKind::Membership, payload, Vec::new())
+    }
+
+    /// Seal this takeover into the ledger.
+    ///
+    /// The layout does not change -- the room is looking at exactly what it was looking at a
+    /// moment ago -- so the entry is the entire point. It is what makes the handover part of
+    /// the record instead of something that happened to the session off the books, and it is
+    /// what a member that reconnects later reads to find out the session changed hands while
+    /// it was away.
+    pub fn seal_coordinator_change(
+        &mut self,
+        record: &CoordinatorChangeRecord,
+    ) -> Result<LayoutCommit, CoordinatorError> {
+        let author = self.coordinator_peer_id.clone();
+        self.layout_commit(
+            author,
+            LedgerEntryKind::CoordinatorChange,
+            record.encode_to_vec(),
+            Vec::new(),
+        )
     }
 
     fn protocol_layout_state(&self) -> Result<LayoutState, CoordinatorError> {
@@ -2483,6 +2503,8 @@ pub struct SharedLayoutMember {
     pub coordinator_peer_id: Vec<u8>,
     /// The epoch this member is following, which is what a promotion has to move past.
     pub coordinator_epoch: u64,
+    /// Shared with the reader task, so a promoted member can read the chain head it verified.
+    verifier: Arc<Mutex<LedgerVerifier>>,
     pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
     signer: IntentSigner,
@@ -2502,6 +2524,19 @@ impl SharedLayoutMember {
     /// The endpoint that owns this member's locally hosted panes and outbound subscriptions.
     pub fn transport(&self) -> Transport {
         self.transport.clone()
+    }
+
+    /// Where in the ledger this member had got to, for a successor resuming the chain.
+    ///
+    /// A member that dropped early holds an earlier head than one that kept up. That is
+    /// fine: whichever of them is promoted, everyone re-anchors on the first entry the new
+    /// epoch produces, so the chain stays checkable from that point on without needing the
+    /// room to have agreed on where it was when the coordinator vanished.
+    pub fn ledger_head(&self) -> (u64, [u8; crate::protocol::LEDGER_HASH_BYTES]) {
+        self.verifier
+            .lock()
+            .map(|verifier| verifier.head())
+            .unwrap_or((1, crate::ledger::GENESIS_PREV_HASH))
     }
 
     pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
@@ -2640,8 +2675,109 @@ impl SharedLayoutHost {
         })
     }
 
+    /// Take over a session that already exists, keeping the pane service already serving it.
+    ///
+    /// The pane server is passed in rather than built, and that is the whole point: the
+    /// promoted member is already hosting PTYs and already serving subscriptions to them. A
+    /// fresh one would be an empty registry, and every pane this machine runs would vanish
+    /// from the session at the instant it took charge of it.
+    ///
+    /// The ledger resumes at `ledger_head` under `epoch`, so the entries this coordinator
+    /// seals extend the history the room already holds instead of forking one beside it.
+    pub fn take_over(
+        host: HostSession,
+        pane_server: PaneServer,
+        snapshot: LayoutSnapshot,
+        ledger_head: (u64, [u8; crate::protocol::LEDGER_HASH_BYTES]),
+        reservation_timeout: Duration,
+    ) -> Result<Self, SessionError> {
+        let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let session_id = host.ticket().session_id().to_vec();
+        let (next_seq, prev_hash) = ledger_head;
+        let ledger = LedgerWriter::resume(
+            session_id.clone(),
+            host.transport.secret_key(),
+            next_seq,
+            prev_hash,
+            host.coordinator_epoch(),
+        );
+        let coordinator =
+            LayoutCoordinator::restore(coordinator_peer_id, snapshot, ledger, reservation_timeout)?;
+        let signer = IntentSigner::new(session_id, host.transport.secret_key());
+        Ok(Self {
+            host,
+            pane_server,
+            coordinator: Arc::new(Mutex::new(coordinator)),
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
+            reservation_timeout,
+            signer,
+        })
+    }
+
+    /// Announce this takeover into the ledger, so it is part of the record like any change.
+    ///
+    /// Authored on the successor's own account: the coordinator it replaces is not there to
+    /// author anything, which is the situation this whole path exists for. What makes the
+    /// entry believable is not its contents but that every member reached the same
+    /// conclusion independently before accepting the key that signs it.
+    pub fn announce_takeover(
+        &self,
+        replaced_peer_id: Vec<u8>,
+    ) -> Result<LayoutCommit, SessionError> {
+        let record = CoordinatorChangeRecord {
+            coordinator_peer_id: self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+            endpoint_addr: serde_json::to_vec(self.host.ticket().endpoint_addr())
+                .map_err(|_| SessionError::InvalidPostWelcome)?,
+            epoch: self.host.coordinator_epoch(),
+            replaced_peer_id,
+        };
+        let mut coordinator = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?;
+        let commit = coordinator.seal_coordinator_change(&record)?;
+        broadcast_envelope(
+            &self.peers,
+            coordinator_envelope(
+                self.host.ticket().endpoint_addr().id.as_bytes(),
+                envelope::Body::LayoutCommit(commit.clone()),
+            ),
+        );
+        Ok(commit)
+    }
+
     pub fn ticket(&self) -> &JoinTicket {
         self.host.ticket()
+    }
+
+    /// How many takeovers this session has been through, this one included.
+    pub fn coordinator_epoch(&self) -> u64 {
+        self.host.coordinator_epoch()
+    }
+
+    /// How many members currently hold a control stream to this coordinator.
+    ///
+    /// Zero in a session that has other members in it is the coordinator's own version of
+    /// losing the coordinator: from here there is no way to tell "everyone left" from "my
+    /// network dropped", and the second one means the room is off electing a successor.
+    pub fn connected_peers(&self) -> usize {
+        self.peers.lock().map(|peers| peers.len()).unwrap_or(0)
+    }
+
+    /// Drop every member's control stream, on the way to giving the role up.
+    ///
+    /// Called by a coordinator that was isolated long enough for the room to elect somebody
+    /// else. Any peer still attached here is following a coordinator that no longer is one,
+    /// and leaving those streams open would let it keep sealing entries onto a ledger the
+    /// session has already moved past.
+    pub fn disconnect_peers(&self) {
+        let peers = match self.peers.lock() {
+            Ok(mut peers) => std::mem::take(&mut *peers),
+            Err(_) => return,
+        };
+        for (_, peer) in peers {
+            peer.shutdown();
+        }
     }
 
     pub fn address_ready(&self) -> bool {
@@ -3419,17 +3555,20 @@ pub async fn join_layout_with_display_name(
         // The epoch comes from the welcome rather than starting at zero: a member joining a
         // session that has already changed hands has no way to read the takeovers it missed,
         // and entries sealed under the current epoch would otherwise all look wrong to it.
-        let verifier = LedgerVerifier::at_epoch(
+        // Shared rather than owned by the reader task: a member that ends up promoted has to
+        // resume the ledger from the head it actually verified, and the reader is the only
+        // thing that knows where that is.
+        let verifier = Arc::new(Mutex::new(LedgerVerifier::at_epoch(
             ticket.session_id().to_vec(),
             ticket.endpoint_addr().id,
             receipt.coordinator_epoch,
-        );
+        )));
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
                 events_tx,
                 coordinator_peer_id.clone(),
-                verifier,
+                Arc::clone(&verifier),
             )),
             tokio::spawn(layout_member_writer_task(
                 writer,
@@ -3441,6 +3580,7 @@ pub async fn join_layout_with_display_name(
             peer_id,
             coordinator_peer_id,
             coordinator_epoch: receipt.coordinator_epoch,
+            verifier,
             session_name,
             events,
             signer: IntentSigner::new(ticket.session_id().to_vec(), transport.secret_key()),
@@ -3631,7 +3771,7 @@ async fn layout_member_reader_task(
     mut reader: crate::transport::FrameReader,
     events_tx: mpsc::Sender<LayoutControlEvent>,
     coordinator_peer_id: Vec<u8>,
-    mut verifier: LedgerVerifier,
+    verifier: Arc<Mutex<LedgerVerifier>>,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != coordinator_peer_id {
@@ -3653,7 +3793,11 @@ async fn layout_member_reader_task(
                 let Some(entry) = commit.entry.as_ref() else {
                     break;
                 };
-                if verifier.accept(entry).is_err() {
+                let accepted = verifier
+                    .lock()
+                    .map(|mut verifier| verifier.accept(entry).is_ok())
+                    .unwrap_or(false);
+                if !accepted {
                     break;
                 }
                 LayoutControlEvent::Commit(commit)
