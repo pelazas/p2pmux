@@ -2211,6 +2211,15 @@ enum LayoutClientMessage {
 
 const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
 
+/// Outbound layout commits held per peer while its writer catches up.
+///
+/// Deeper than the targeted queue because these arrive in bursts: a storm of structural
+/// edits from several members seals one commit each, back to back, and every one of them
+/// has to reach every peer. Overflowing costs the peer its session (see
+/// `broadcast_commit`), so the queue is sized to make that a genuine stall rather than
+/// ordinary burst traffic.
+const COMMIT_CONTROL_QUEUE_CAPACITY: usize = 256;
+
 /// Latest-wins outbound classes, in the order their slots appear in `pending_watch`.
 /// Each is its own watch channel so a newer message of one class never discards a
 /// pending message of another.
@@ -2219,6 +2228,15 @@ const WATCH_ROSTER: usize = 1;
 const WATCH_PRESENCE: usize = 2;
 const WATCH_CLASSES: usize = 3;
 
+/// Outbound classes that are queued rather than superseded: every message has to arrive,
+/// in the order it was published. Sequences are unique per peer, so two of these never
+/// tie with each other and the order below is only a tie-break against the watch classes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OrderedLane {
+    Targeted,
+    Commit,
+}
+
 #[derive(Clone)]
 struct ControlMailbox {
     initial_tx: mpsc::Sender<Envelope>,
@@ -2226,6 +2244,7 @@ struct ControlMailbox {
     roster_tx: watch::Sender<Option<SequencedEnvelope>>,
     presence_tx: watch::Sender<Option<SequencedEnvelope>>,
     targeted_tx: mpsc::Sender<SequencedEnvelope>,
+    commit_tx: mpsc::Sender<SequencedEnvelope>,
     next_sequence: Arc<AtomicU64>,
 }
 
@@ -2235,6 +2254,7 @@ struct ControlMailboxReceivers {
     roster_rx: watch::Receiver<Option<SequencedEnvelope>>,
     presence_rx: watch::Receiver<Option<SequencedEnvelope>>,
     targeted_rx: mpsc::Receiver<SequencedEnvelope>,
+    commit_rx: mpsc::Receiver<SequencedEnvelope>,
 }
 
 #[derive(Clone)]
@@ -2250,6 +2270,7 @@ impl ControlMailbox {
         let (roster_tx, roster_rx) = watch::channel(None);
         let (presence_tx, presence_rx) = watch::channel(None);
         let (targeted_tx, targeted_rx) = mpsc::channel(TARGETED_CONTROL_QUEUE_CAPACITY);
+        let (commit_tx, commit_rx) = mpsc::channel(COMMIT_CONTROL_QUEUE_CAPACITY);
         (
             Self {
                 initial_tx,
@@ -2257,6 +2278,7 @@ impl ControlMailbox {
                 roster_tx,
                 presence_tx,
                 targeted_tx,
+                commit_tx,
                 next_sequence: Arc::new(AtomicU64::new(1)),
             },
             ControlMailboxReceivers {
@@ -2265,6 +2287,7 @@ impl ControlMailbox {
                 roster_rx,
                 presence_rx,
                 targeted_rx,
+                commit_rx,
             },
         )
     }
@@ -2288,6 +2311,16 @@ impl ControlMailbox {
 
     fn enqueue_targeted(&self, envelope: Envelope) -> bool {
         self.targeted_tx.try_send(self.sequenced(envelope)).is_ok()
+    }
+
+    /// Queue one layout commit. Never coalesces, unlike `publish_state`.
+    ///
+    /// A commit is a link in a signed chain, so the peer needs every one of them in
+    /// order: drop a link and the next commit fails `prev_hash`, which the member reads
+    /// as an unverifiable chain and answers by leaving the session. Latest-wins delivery
+    /// is right for a revisioned snapshot and wrong for a chain.
+    fn enqueue_commit(&self, envelope: Envelope) -> bool {
+        self.commit_tx.try_send(self.sequenced(envelope)).is_ok()
     }
 
     fn sequenced(&self, envelope: Envelope) -> SequencedEnvelope {
@@ -2993,7 +3026,7 @@ impl SharedLayoutHost {
     }
 
     fn broadcast_commit(&self, commit: LayoutCommit) {
-        broadcast_envelope(
+        broadcast_commit_envelope(
             &self.peers,
             coordinator_envelope(
                 self.host.ticket().endpoint_addr().id.as_bytes(),
@@ -3145,9 +3178,32 @@ fn broadcast_envelope(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelo
     };
     for peer in peers.values() {
         // Full-state broadcasts are revisioned and supersede older ones, so each peer needs only
-        // the latest state while its writer catches up.
+        // the latest state while its writer catches up. Layout commits are NOT in this class --
+        // they are chain links and go through `broadcast_commit_envelope`.
         peer.mailbox.publish_state(envelope.clone());
     }
+}
+
+/// Queue one layout commit for every peer, losslessly and in order.
+///
+/// A commit used to ride the latest-wins state slot, from when a layout broadcast was a
+/// full revisioned snapshot and dropping a superseded one was free. It is now a link in a
+/// signed chain: a peer that misses one fails `prev_hash` on the next and leaves the
+/// session rather than draw a layout it cannot account for. Under a storm of structural
+/// edits the coalescing slot dropped links exactly when commits were most frequent, so a
+/// burst of edits could evict members.
+///
+/// A peer whose queue is full is disconnected deliberately. It is that far behind, and the
+/// alternative -- skipping a link -- is the failure this exists to prevent.
+fn broadcast_commit_envelope(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    envelope: Envelope,
+) {
+    let mut peers = match peers.lock() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+    peers.retain(|_, peer| peer.mailbox.enqueue_commit(envelope.clone()));
 }
 
 fn broadcast_roster(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelope: Envelope) {
@@ -3310,6 +3366,7 @@ async fn layout_peer_writer_task<W>(
         mut roster_rx,
         mut presence_rx,
         mut targeted_rx,
+        mut commit_rx,
     }: ControlMailboxReceivers,
     peer_id: Vec<u8>,
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
@@ -3332,10 +3389,12 @@ async fn layout_peer_writer_task<W>(
         }
     }
     let mut targeted_open = true;
+    let mut commit_open = true;
     let mut state_open = true;
     let mut roster_open = true;
     let mut presence_open = true;
     let mut pending_targeted = None;
+    let mut pending_commit: Option<SequencedEnvelope> = None;
     // Every latest-wins class shares one shape, so the send order below stays a
     // min-by-sequence over an array. Adding a class is one more slot here, not another
     // branch in a hand-written comparison that has to stay in sync with itself.
@@ -3345,6 +3404,13 @@ async fn layout_peer_writer_task<W>(
             match targeted_rx.try_recv() {
                 Ok(targeted) => pending_targeted = Some(targeted),
                 Err(mpsc::error::TryRecvError::Disconnected) => targeted_open = false,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        if pending_commit.is_none() {
+            match commit_rx.try_recv() {
+                Ok(commit) => pending_commit = Some(commit),
+                Err(mpsc::error::TryRecvError::Disconnected) => commit_open = false,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
         }
@@ -3372,15 +3438,27 @@ async fn layout_peer_writer_task<W>(
             .enumerate()
             .filter_map(|(class, pending)| pending.as_ref().map(|item| (item.sequence, class)))
             .min();
-        let next = match (
-            earliest_watch,
-            pending_targeted.as_ref().map(|i| i.sequence),
-        ) {
+        let earliest_ordered = [
+            pending_targeted
+                .as_ref()
+                .map(|i| (i.sequence, OrderedLane::Targeted)),
+            pending_commit
+                .as_ref()
+                .map(|i| (i.sequence, OrderedLane::Commit)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let next = match (earliest_watch, earliest_ordered) {
             (None, None) => {
                 tokio::select! {
                     targeted = targeted_rx.recv(), if targeted_open => match targeted {
                         Some(targeted) => pending_targeted = Some(targeted),
                         None => targeted_open = false,
+                    },
+                    commit = commit_rx.recv(), if commit_open => match commit {
+                        Some(commit) => pending_commit = Some(commit),
+                        None => commit_open = false,
                     },
                     changed = state_rx.changed(), if state_open => match changed {
                         Ok(()) => pending_watch[WATCH_STATE] = state_rx.borrow_and_update().clone(),
@@ -3401,12 +3479,19 @@ async fn layout_peer_writer_task<W>(
                 }
                 continue;
             }
-            // Targeted messages win ties: they are point-to-point replies whose ordering a
-            // peer is waiting on, while every watch class is latest-wins state.
-            (Some((watch_sequence, _)), Some(targeted)) if targeted <= watch_sequence => {
-                pending_targeted.take()
+            // Queued messages win ties: a targeted reply and a layout commit are both
+            // sequences a peer is waiting on in order, while every watch class is
+            // latest-wins state a newer message would have replaced anyway.
+            (Some((watch_sequence, _)), Some((ordered, lane))) if ordered <= watch_sequence => {
+                match lane {
+                    OrderedLane::Targeted => pending_targeted.take(),
+                    OrderedLane::Commit => pending_commit.take(),
+                }
             }
-            (None, Some(_)) => pending_targeted.take(),
+            (None, Some((_, lane))) => match lane {
+                OrderedLane::Targeted => pending_targeted.take(),
+                OrderedLane::Commit => pending_commit.take(),
+            },
             (Some((_, class)), _) => pending_watch[class].take(),
         };
         let Some(next) = next else {
