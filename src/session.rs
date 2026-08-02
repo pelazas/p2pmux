@@ -3628,9 +3628,15 @@ pub async fn join_layout_with_display_name(
         })
     }
     .await;
+    // The connection is this function's to clean up. The transport is not, and used to be
+    // closed here as well: harmless while the only caller bound one immediately beforehand
+    // and gave up if the join failed, catastrophic once a running node reuses its own to
+    // look for a coordinator. A single failed dial took the whole endpoint down with it --
+    // every pane subscription, and any chance of this node going on to serve the session
+    // itself -- and the only trace was panes reporting "Endpoint is closed" while the
+    // takeover silently never happened.
     if result.is_err() {
         connection.close(0u8.into(), b"");
-        transport.close().await;
     }
     result
 }
