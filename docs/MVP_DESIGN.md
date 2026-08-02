@@ -39,8 +39,9 @@ Installable macOS and Linux terminal mux: each pane’s process runs on its host
 - **Pane lock:** a pane host may toggle its own pane to host-only. All members still see its
   screen, but only its host may input or claim control. Locking clears a guest controller and does
   not claim control for the host.
-- **Later-spike disconnect behavior:** 5-minute unavailable placeholders and coordinator failover
-  are MVP goals, not implemented by Spike 3.
+- **Later-spike disconnect behavior:** coordinator failover landed in Spike 5 (2026-08-02); the
+  5-minute reaping of an absent host's panes is still open — they stay in the layout as
+  unavailable placeholders instead.
 - **Layout:** nested binary 50/50; **depth ≤ 4**; **≤ 8 panes/tab**; max **9 tabs**.
 - **Latency:** ≈ same-region SSH; relay normal
 - **Non-goals:** cloud VM execution, sandbox/ACL tiers, Win/Linux, drag-resize, mosh prediction, private panes, per-person ticket revocation in v1
@@ -55,7 +56,9 @@ Installable macOS and Linux terminal mux: each pane’s process runs on its host
 4. Any member can split an available pane or create a tab; the requester hosts the new PTY, but is
    not its controller and the new pane starts free. Only the host can delete a pane. A member can
    delete a tab only when it owns every pane in that tab.
-5. Spike 3 is localhost layout/control work. Disconnect grace and coordinator failover remain later spikes.
+5. If the coordinator's machine goes away, the session stays up: panes on other machines keep
+   running and keep taking input, structural edits pause, and after a grace window the
+   earliest-joined survivor takes the role over and reissues the invite.
 
 ## 4. Architecture
 
@@ -82,8 +85,10 @@ without stopping the node. `--resume` shows live sessions and `attach <name>` re
 The durable finder descriptor lives in `~/Library/Application Support/p2pmux/sessions` on macOS
 and `$XDG_STATE_HOME/p2pmux/sessions` (default `~/.local/state`) on Linux; its socket lives in
 `$XDG_RUNTIME_DIR/p2pmux` where Linux provides one and `/tmp/p2pmux-$UID` otherwise. Finder records contain no ticket, PTY, screen, layout, or focus state.
-There is no local-client takeover, launchd registration, disk screen restore, coordinator failover,
-or offline-pane grace in this implementation. Offline host placeholders/grace remain follow-up work.
+There is no local-client takeover, launchd registration, disk screen restore, or offline-pane
+grace in this implementation. Offline host placeholders remain, but are not reaped on a timer.
+Coordinator failover is implemented (Spike 5); a promoted node rewrites its own durable record,
+so `--resume`, `ls` and `ticket <name>` follow the role across a takeover.
 
 **Screen:** pane host keeps vt100 canonical state; sequenced snapshot+deltas to all members; gap → resync; never stall PTY on slow viewers.
 
@@ -102,6 +107,21 @@ If coordinator disconnects:
 - During **5-minute grace:** pane-level control on *available* panes still works; **structural edits paused** (split/close/join admission).
 - If coordinator returns within grace → they remain coordinator; structural edits resume.
 - If grace expires: promote connected member with **earliest join order** as coordinator in a new **coordinator epoch**. Returning old coordinator rejoins as ordinary member (does not auto-reclaim).
+
+**As built (2026-08-02), three refinements to the above:**
+
+- *"Connected"* is not knowable. A member hosting no panes may hold no connections to its peers
+  at all, so there is no shared view of who survived to take a vote over. Join order becomes
+  staggered time instead: earliest survivor acts at the end of grace, each one behind it waits
+  another few seconds, and a takeover arriving first is what stops the rest from starting their
+  own. If the earliest survivor is gone too, the next one's turn simply comes.
+- *The coordinator's panes are not evicted at promotion.* They stay in the layout as unavailable
+  placeholders. Removing them would rearrange the layout under people mid-sentence, and in a
+  two-person session where only the coordinator hosted anything it would leave no layout at all.
+- *The invite does not survive.* The join code is sealed under a secret only the session's
+  creator holds, so the successor mints a new ticket and a new code; an invite already pasted
+  into a chat stops working. Replicating that secret to every member would hand each of them the
+  power to redirect the session's invite, which contradicts §0.
 
 ### Input control
 

@@ -48,9 +48,7 @@ impl SharedLayoutRuntime {
             }
             LayoutControlEvent::Reservation(reservation) => self.accept_reservation(reservation)?,
             LayoutControlEvent::Reject(reject) => self.reject_request(reject.request_id),
-            LayoutControlEvent::Disconnected => {
-                self.status = String::from("layout coordinator disconnected")
-            }
+            LayoutControlEvent::Disconnected => self.note_coordinator_lost(),
         }
         Ok(())
     }
@@ -271,6 +269,26 @@ impl SharedLayoutRuntime {
     }
 
     pub(in crate::tui) fn handle_intent(&mut self, intent: UiIntent) -> Result<(), Box<dyn Error>> {
+        // Refused here rather than sent and forgotten. Only the coordinator commits any of
+        // these, so with it missing the request would go into a channel with nothing on the
+        // other end -- and a split, worse, would spawn a local PTY first and leave it
+        // orphaned when the commit that was meant to adopt it never came. Moving focus and
+        // switching tabs are this member's own business and stay available.
+        if self.structural_edits_frozen()
+            && !matches!(
+                intent,
+                UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. }
+            )
+        {
+            let notice = String::from("coordinator unreachable; layout changes are paused");
+            self.footer_notice = Some(notice.clone());
+            // Also as status, which is the only one of the two that survives the trip to an
+            // attached client: the node is headless and forwards `status`, so a refusal that
+            // lived in `footer_notice` alone would be invisible to everybody not running the
+            // old foreground path -- which is to say, to everybody.
+            self.status = notice;
+            return Ok(());
+        }
         match intent {
             UiIntent::CreatePane {
                 target_pane_id,

@@ -44,6 +44,12 @@ pub enum LedgerError {
     BadCoordinatorSignature,
     /// The named author did not sign the request the entry attributes to them.
     BadAuthorSignature,
+    /// Sealed under a coordinator epoch this member has not accepted.
+    ///
+    /// Distinct from [`Self::BadCoordinatorSignature`] on purpose: a deposed coordinator
+    /// that reconnects and keeps writing is a normal thing to survive, not an attack, and
+    /// the two need different responses.
+    WrongEpoch { current: u64, found: u64 },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -63,6 +69,12 @@ impl std::fmt::Display for LedgerError {
             Self::BadAuthorSignature => {
                 formatter.write_str("ledger entry's author did not sign the change it claims")
             }
+            Self::WrongEpoch { current, found } => {
+                write!(
+                    formatter,
+                    "ledger entry from coordinator epoch {found} arrived under epoch {current}"
+                )
+            }
         }
     }
 }
@@ -75,6 +87,7 @@ pub struct LedgerWriter {
     secret: SecretKey,
     next_seq: u64,
     prev_hash: [u8; LEDGER_HASH_BYTES],
+    epoch: u64,
 }
 
 impl LedgerWriter {
@@ -84,7 +97,35 @@ impl LedgerWriter {
             secret,
             next_seq: 1,
             prev_hash: GENESIS_PREV_HASH,
+            epoch: 0,
         }
+    }
+
+    /// Continue an existing chain under a new coordinator.
+    ///
+    /// The successor picks up at the head it last verified rather than starting over at
+    /// `seq` 1, so the entries it seals extend the history members already hold instead of
+    /// forking a second one beside it. `epoch` must be past the epoch being replaced; the
+    /// caller gets that from its own promotion decision, never from a peer's claim.
+    pub fn resume(
+        session_id: Vec<u8>,
+        secret: SecretKey,
+        next_seq: u64,
+        prev_hash: [u8; LEDGER_HASH_BYTES],
+        epoch: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            secret,
+            next_seq: next_seq.max(1),
+            prev_hash,
+            epoch,
+        }
+    }
+
+    /// The epoch every entry this writer seals is stamped with.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The session these entries belong to, which the coordinator also needs in order to
@@ -119,6 +160,7 @@ impl LedgerWriter {
             payload,
             author_signature,
             coordinator_signature: Vec::new(),
+            coordinator_epoch: self.epoch,
         };
         let hash = entry_hash(&self.session_id, &entry);
         entry.coordinator_signature = self.secret.sign(&hash).to_bytes().to_vec();
@@ -187,16 +229,67 @@ pub struct LedgerVerifier {
     coordinator: PublicKey,
     expected_seq: Option<u64>,
     prev_hash: Option<[u8; LEDGER_HASH_BYTES]>,
+    epoch: u64,
 }
 
 impl LedgerVerifier {
     pub fn new(session_id: Vec<u8>, coordinator: PublicKey) -> Self {
+        Self::at_epoch(session_id, coordinator, 0)
+    }
+
+    /// A verifier for a member that joined after a takeover, so its first entry is already
+    /// past epoch `0` and the welcome is where it learned that.
+    pub fn at_epoch(session_id: Vec<u8>, coordinator: PublicKey, epoch: u64) -> Self {
         Self {
             session_id,
             coordinator,
             expected_seq: None,
             prev_hash: None,
+            epoch,
         }
+    }
+
+    /// The epoch whose entries this verifier currently accepts.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Trust a new coordinator from `epoch` onwards.
+    ///
+    /// Nothing in the entry stream can call this: the caller must have decided for itself
+    /// that this peer is the rightful successor, which is the whole reason a takeover is
+    /// safe without the departed coordinator's cooperation. Passing a claim straight from
+    /// the wire into here would hand the session to whoever asked loudest.
+    ///
+    /// Position is cleared, not carried. The successor resumes from *its* head, which may
+    /// sit ahead of a member that was lagging when the old coordinator dropped, so the
+    /// member re-anchors on the first entry of the new epoch exactly as a mid-session
+    /// joiner anchors on the first entry it is sent.
+    pub fn rotate(&mut self, coordinator: PublicKey, epoch: u64) -> Result<(), LedgerError> {
+        if epoch <= self.epoch {
+            return Err(LedgerError::WrongEpoch {
+                current: self.epoch,
+                found: epoch,
+            });
+        }
+        self.coordinator = coordinator;
+        self.epoch = epoch;
+        self.expected_seq = None;
+        self.prev_hash = None;
+        Ok(())
+    }
+
+    /// Where a successor should pick the chain up, if this member is the one promoted.
+    ///
+    /// A member that has not yet seen an entry answers the genesis position, the same place
+    /// [`LedgerWriter::new`] starts. That is not a fork in practice: every member clears its
+    /// position in [`Self::rotate`], so they all re-anchor on whatever the new coordinator
+    /// seals first.
+    pub fn head(&self) -> (u64, [u8; LEDGER_HASH_BYTES]) {
+        (
+            self.expected_seq.unwrap_or(1),
+            self.prev_hash.unwrap_or(GENESIS_PREV_HASH),
+        )
     }
 
     /// Check one entry and, if it holds up, advance to it.
@@ -225,6 +318,16 @@ impl LedgerVerifier {
         }
         let kind =
             LedgerEntryKind::try_from(entry.kind).map_err(|_| LedgerError::Malformed("kind"))?;
+        // Ahead of the signature check on purpose. An entry from an epoch this member has
+        // not accepted is signed by a key it is not holding, so the signature would fail
+        // either way -- but "the wrong coordinator wrote this" is a diagnosis, and
+        // "somebody forged this" is an alarm, and they should not arrive as the same error.
+        if entry.coordinator_epoch != self.epoch {
+            return Err(LedgerError::WrongEpoch {
+                current: self.epoch,
+                found: entry.coordinator_epoch,
+            });
+        }
         if let Some(expected) = self.expected_seq
             && entry.seq != expected
         {
@@ -294,6 +397,7 @@ pub fn entry_hash(session_id: &[u8], entry: &LedgerEntry) -> [u8; LEDGER_HASH_BY
     hasher.update(&entry.kind.to_le_bytes());
     absorb(&mut hasher, &entry.payload);
     absorb(&mut hasher, &entry.author_signature);
+    hasher.update(&entry.coordinator_epoch.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -351,6 +455,95 @@ mod tests {
             assert_eq!(entry.seq, u64::from(step) + 1);
             assert_eq!(verifier.accept(&entry), Ok(()));
         }
+    }
+
+    #[test]
+    fn a_successor_carries_on_the_chain_the_departed_coordinator_left() {
+        // The point of failover: the history does not restart. A member that was following
+        // the old coordinator keeps the same ledger, one epoch further on.
+        let mut old = writer(1);
+        let mut member = verifier(1);
+        let last = append(&mut old, b"before");
+        assert_eq!(member.accept(&last), Ok(()));
+
+        let (next_seq, prev_hash) = member.head();
+        let mut new = LedgerWriter::resume(b"session".to_vec(), key(2), next_seq, prev_hash, 1);
+        member
+            .rotate(key(2).public(), 1)
+            .expect("a member that decided on this successor accepts its key");
+        let first = new.append(
+            key(2).public().as_bytes().to_vec(),
+            LedgerEntryKind::CoordinatorChange,
+            b"takeover".to_vec(),
+            Vec::new(),
+        );
+
+        assert_eq!(first.seq, last.seq + 1);
+        assert_eq!(first.prev_hash, entry_hash(b"session", &last).to_vec());
+        assert_eq!(member.accept(&first), Ok(()));
+    }
+
+    #[test]
+    fn the_deposed_coordinator_writing_on_is_a_stale_epoch_not_a_forgery() {
+        // A coordinator that comes back from a network drop does not know it was replaced,
+        // and its next entry is perfectly well signed -- by the wrong key. Reporting that as
+        // a bad signature would put a returning laptop and an attacker in the same bucket.
+        let mut old = writer(1);
+        let mut member = verifier(1);
+        assert_eq!(member.accept(&append(&mut old, b"before")), Ok(()));
+        member.rotate(key(2).public(), 1).expect("promotion");
+
+        assert_eq!(
+            member.accept(&append(&mut old, b"after")),
+            Err(LedgerError::WrongEpoch {
+                current: 1,
+                found: 0
+            })
+        );
+    }
+
+    #[test]
+    fn a_takeover_cannot_reuse_or_rewind_an_epoch() {
+        // Two members promoting themselves at once must not both land on epoch 1, and a
+        // replayed takeover must not walk the session back to a coordinator it has left.
+        let mut member = verifier(1);
+        member.rotate(key(2).public(), 1).expect("first takeover");
+
+        assert_eq!(
+            member.rotate(key(3).public(), 1),
+            Err(LedgerError::WrongEpoch {
+                current: 1,
+                found: 1
+            })
+        );
+        assert_eq!(
+            member.rotate(key(3).public(), 0),
+            Err(LedgerError::WrongEpoch {
+                current: 1,
+                found: 0
+            })
+        );
+        assert_eq!(member.epoch(), 1);
+    }
+
+    #[test]
+    fn the_epoch_is_covered_by_the_signature() {
+        // Otherwise a stale entry could be relabelled into the current epoch in flight,
+        // which is the one edit that would make the check above meaningless.
+        let mut entry = LedgerEntry {
+            seq: 1,
+            prev_hash: GENESIS_PREV_HASH.to_vec(),
+            author_peer_id: b"peer".to_vec(),
+            kind: LedgerEntryKind::LayoutChange as i32,
+            payload: b"payload".to_vec(),
+            author_signature: Vec::new(),
+            coordinator_signature: Vec::new(),
+            coordinator_epoch: 0,
+        };
+        let at_zero = entry_hash(b"session", &entry);
+        entry.coordinator_epoch = 1;
+
+        assert_ne!(at_zero, entry_hash(b"session", &entry));
     }
 
     #[test]
@@ -536,6 +729,7 @@ mod tests {
             payload,
             author_signature: Vec::new(),
             coordinator_signature: Vec::new(),
+            coordinator_epoch: 0,
         };
 
         assert_ne!(intent, entry_hash(b"session", &entry));
@@ -553,6 +747,7 @@ mod tests {
             payload: b"c".to_vec(),
             author_signature: Vec::new(),
             coordinator_signature: Vec::new(),
+            coordinator_epoch: 0,
         };
         let right = LedgerEntry {
             author_peer_id: b"a".to_vec(),

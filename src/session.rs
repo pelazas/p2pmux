@@ -31,14 +31,14 @@ use crate::{
     lease::LeaseState,
     ledger::{IntentSigner, LedgerVerifier, LedgerWriter, verify_intent},
     protocol::{
-        AgentRoster, ControlLease, CreatePane, CreateTab, DeletePane, DeleteTab, Delta, Envelope,
-        Input, Join, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest,
-        LayoutSplit, LayoutState, LedgerEntryKind, MarkPaneExited, MemberDescriptor,
-        MembershipEvent, MembershipRecord, NewPanePosition as ProtocolNewPanePosition,
-        PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe,
-        Presence, PresenceRoster, ReleaseControl, RenamePane, RenameTab, SessionSnapshot,
-        SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
-        UpdatePaneGrids, Welcome, envelope,
+        AgentRoster, ControlLease, CoordinatorChangeRecord, CreatePane, CreateTab, DeletePane,
+        DeleteTab, Delta, Envelope, Input, Join, LayoutCommit, LayoutNode, LayoutReject,
+        LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, LedgerEntryKind,
+        MarkPaneExited, MemberDescriptor, MembershipEvent, MembershipRecord,
+        NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
+        PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ReleaseControl,
+        RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
+        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -149,6 +149,8 @@ pub enum CoordinatorError {
     EndpointIdentityMismatch,
     InvalidEndpointAddress,
     EndpointSerialization(serde_json::Error),
+    /// A takeover by a peer the layout being taken over does not list as a member.
+    NotAMember,
 }
 
 impl fmt::Display for CoordinatorError {
@@ -163,6 +165,9 @@ impl fmt::Display for CoordinatorError {
             }
             Self::EndpointSerialization(error) => {
                 write!(formatter, "endpoint address serialization failed: {error}")
+            }
+            Self::NotAMember => {
+                formatter.write_str("cannot take over a session this peer is not a member of")
             }
         }
     }
@@ -293,6 +298,54 @@ impl LayoutCoordinator {
         })
     }
 
+    /// Take authority over a session that already exists, from its last committed layout.
+    ///
+    /// The counterpart to the constructors above, which all begin a session. This one
+    /// inherits one: the tabs, panes and join order every member is already looking at, and
+    /// a ledger resumed at the head this member last verified rather than restarted.
+    ///
+    /// Everyone in that member list is pre-admitted. They were admitted by the coordinator
+    /// that left, and a takeover is not the moment to make a room full of people knock
+    /// again -- especially in a locked session, where the lock exists to keep strangers out
+    /// rather than to expel the people already inside.
+    ///
+    /// The session lock itself is not inherited. It is the departed coordinator's live
+    /// setting, not a fact about the layout, so it is not in the snapshot to read; a
+    /// successor that guessed wrong would either leak a locked session open or wall a
+    /// deliberately open one shut. Starting unlocked is the recoverable half of that, and
+    /// the new coordinator can lock it again in one keystroke.
+    pub fn restore(
+        coordinator_peer_id: Vec<u8>,
+        snapshot: LayoutSnapshot,
+        ledger: LedgerWriter,
+        reservation_timeout: Duration,
+    ) -> Result<Self, CoordinatorError> {
+        let state = SessionState::restore(snapshot)?;
+        if !state
+            .members()
+            .iter()
+            .any(|member| member.peer_id == coordinator_peer_id)
+        {
+            return Err(CoordinatorError::NotAMember);
+        }
+        let mut roster = MemberRoster::default();
+        for member in state.members() {
+            roster.admit(member.peer_id.clone());
+        }
+        Ok(Self {
+            state,
+            coordinator_peer_id,
+            ledger,
+            reservations: BTreeMap::new(),
+            agent_rosters: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_epoch: 0,
+            reservation_timeout,
+            locked: false,
+            roster,
+        })
+    }
+
     /// Whether the session has no room for another member.
     ///
     /// Checked before the coordinator welcomes a joiner: `add_member` enforces the same
@@ -300,6 +353,20 @@ impl LayoutCoordinator {
     /// peer it is admitted and then drop it.
     pub fn is_full(&self) -> bool {
         self.state.members().len() >= MAX_MEMBERS
+    }
+
+    /// Whether this peer would take a new seat, or is simply coming back to the one it has.
+    ///
+    /// A full session must still let its own members reconnect. Otherwise the cap turns into
+    /// a trap: eight people, one dropped stream, and the peer that owns half the panes can
+    /// never get back in -- and after a takeover, where every survivor rejoins, nobody could.
+    pub fn is_full_for(&self, peer_id: &[u8]) -> bool {
+        self.is_full()
+            && !self
+                .state
+                .members()
+                .iter()
+                .any(|member| member.peer_id == peer_id)
     }
 
     /// Whether the host has closed the session to newcomers.
@@ -457,6 +524,16 @@ impl LayoutCoordinator {
         self.admit_with_display_name(peer_id, endpoint_addr, String::new())
     }
 
+    /// Admit a peer, or readmit one the layout already lists.
+    ///
+    /// Rejoining is ordinary, not exceptional. A member whose control stream dropped comes
+    /// back through this door, and after a takeover every survivor does -- the successor
+    /// inherited a member list with all of them already in it, and refusing them would leave
+    /// a coordinator that no member could attach to.
+    ///
+    /// The readmission is an endpoint refresh rather than a fresh join, because that is what
+    /// actually happened and because a rejoin is exactly when an address is likely to have
+    /// changed: the usual reason a stream dropped is that the network underneath it moved.
     pub fn admit_with_display_name(
         &mut self,
         peer_id: Vec<u8>,
@@ -464,6 +541,27 @@ impl LayoutCoordinator {
         display_name: String,
     ) -> Result<MembershipChange, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
+        if let Some(existing) = self
+            .state
+            .members()
+            .iter()
+            .find(|member| member.peer_id == peer_id)
+        {
+            // Only touch the layout if the address actually moved. A member whose network is
+            // flapping comes back through here every couple of seconds, and rewriting an
+            // identical address would advance the revision every time -- a burst of layout
+            // commits caused by nothing, at exactly the moment the session is least able to
+            // absorb one.
+            if existing.endpoint_addr == endpoint_addr {
+                return self.membership_change(peer_id, MembershipEvent::Joined, None);
+            }
+            let invalidated = self.state.update_member_endpoint(
+                self.state.revision(),
+                &peer_id,
+                endpoint_addr,
+            )?;
+            return self.membership_change(peer_id, MembershipEvent::EndpointChanged, invalidated);
+        }
         let invalidated = self.state.add_member_with_display_name(
             self.state.revision(),
             peer_id.clone(),
@@ -967,6 +1065,26 @@ impl LayoutCoordinator {
         self.layout_commit(author, LedgerEntryKind::Membership, payload, Vec::new())
     }
 
+    /// Seal this takeover into the ledger.
+    ///
+    /// The layout does not change -- the room is looking at exactly what it was looking at a
+    /// moment ago -- so the entry is the entire point. It is what makes the handover part of
+    /// the record instead of something that happened to the session off the books, and it is
+    /// what a member that reconnects later reads to find out the session changed hands while
+    /// it was away.
+    pub fn seal_coordinator_change(
+        &mut self,
+        record: &CoordinatorChangeRecord,
+    ) -> Result<LayoutCommit, CoordinatorError> {
+        let author = self.coordinator_peer_id.clone();
+        self.layout_commit(
+            author,
+            LedgerEntryKind::CoordinatorChange,
+            record.encode_to_vec(),
+            Vec::new(),
+        )
+    }
+
     fn protocol_layout_state(&self) -> Result<LayoutState, CoordinatorError> {
         let snapshot = self.state.snapshot();
         SessionState::validate_snapshot(&snapshot)?;
@@ -1064,7 +1182,8 @@ fn layout_error(error: CoordinatorError) -> LayoutError {
         CoordinatorError::Layout(error) => error,
         CoordinatorError::EndpointIdentityMismatch
         | CoordinatorError::InvalidEndpointAddress
-        | CoordinatorError::EndpointSerialization(_) => LayoutError::InvalidSnapshot,
+        | CoordinatorError::EndpointSerialization(_)
+        | CoordinatorError::NotAMember => LayoutError::InvalidSnapshot,
     }
 }
 
@@ -1788,6 +1907,7 @@ pub struct HostSession {
     ticket: JoinTicket,
     address_ready: bool,
     session_name: String,
+    coordinator_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1798,6 +1918,9 @@ pub struct JoinReceipt {
     pub endpoint_addr: EndpointAddr,
     pub display_name: String,
     pub session_name: String,
+    /// How many takeovers this session has been through, so a joiner knows which
+    /// coordinator's signatures to expect without having to read the history it missed.
+    pub coordinator_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -1899,6 +2022,7 @@ impl HostSession {
             ticket,
             address_ready,
             session_name,
+            coordinator_epoch: 0,
         })
     }
 
@@ -1916,11 +2040,40 @@ impl HostSession {
             ticket,
             address_ready: true,
             session_name,
+            coordinator_epoch: 0,
+        })
+    }
+
+    /// The host end of a session that already existed, taken over by this endpoint.
+    ///
+    /// The session id is carried across rather than minted, because every live pane
+    /// subscription is keyed on it: a successor that invented a new one would be a new
+    /// session that happened to have the same people in it. What changes is the address the
+    /// ticket points at, which is this endpoint now, and the epoch that says so.
+    pub fn resume_with_session_name(
+        transport: Transport,
+        session_id: Vec<u8>,
+        session_name: String,
+        coordinator_epoch: u64,
+    ) -> Result<Self, SessionError> {
+        let ticket = JoinTicket::from_parts(session_id, transport.endpoint_addr())
+            .map_err(SessionError::Ticket)?;
+        Ok(Self {
+            transport,
+            ticket,
+            address_ready: true,
+            session_name,
+            coordinator_epoch,
         })
     }
 
     pub fn ticket(&self) -> &JoinTicket {
         &self.ticket
+    }
+
+    /// How many takeovers this session has been through, stamped into every welcome.
+    pub fn coordinator_epoch(&self) -> u64 {
+        self.coordinator_epoch
     }
 
     pub fn address_ready(&self) -> bool {
@@ -2072,6 +2225,7 @@ impl HostSession {
             endpoint_addr,
             display_name: join.display_name,
             session_name: self.session_name.clone(),
+            coordinator_epoch: self.coordinator_epoch,
         };
         self.transport
             .write_frame(
@@ -2084,6 +2238,7 @@ impl HostSession {
                         admitted_peer_id: receipt.admitted_peer_id.clone(),
                         coordinator_peer_id: receipt.coordinator_peer_id.clone(),
                         session_name: receipt.session_name.clone(),
+                        coordinator_epoch: receipt.coordinator_epoch,
                     })),
                 },
             )
@@ -2391,6 +2546,10 @@ impl ControlFrameSink for crate::transport::FrameWriter {
 pub struct SharedLayoutMember {
     pub peer_id: Vec<u8>,
     pub coordinator_peer_id: Vec<u8>,
+    /// The epoch this member is following, which is what a promotion has to move past.
+    pub coordinator_epoch: u64,
+    /// Shared with the reader task, so a promoted member can read the chain head it verified.
+    verifier: Arc<Mutex<LedgerVerifier>>,
     pub session_name: String,
     pub events: mpsc::Receiver<LayoutControlEvent>,
     signer: IntentSigner,
@@ -2410,6 +2569,19 @@ impl SharedLayoutMember {
     /// The endpoint that owns this member's locally hosted panes and outbound subscriptions.
     pub fn transport(&self) -> Transport {
         self.transport.clone()
+    }
+
+    /// Where in the ledger this member had got to, for a successor resuming the chain.
+    ///
+    /// A member that dropped early holds an earlier head than one that kept up. That is
+    /// fine: whichever of them is promoted, everyone re-anchors on the first entry the new
+    /// epoch produces, so the chain stays checkable from that point on without needing the
+    /// room to have agreed on where it was when the coordinator vanished.
+    pub fn ledger_head(&self) -> (u64, [u8; crate::protocol::LEDGER_HASH_BYTES]) {
+        self.verifier
+            .lock()
+            .map(|verifier| verifier.head())
+            .unwrap_or((1, crate::ledger::GENESIS_PREV_HASH))
     }
 
     pub fn try_request(&self, request: LayoutRequest) -> Result<(), LayoutControlQueueError> {
@@ -2548,8 +2720,109 @@ impl SharedLayoutHost {
         })
     }
 
+    /// Take over a session that already exists, keeping the pane service already serving it.
+    ///
+    /// The pane server is passed in rather than built, and that is the whole point: the
+    /// promoted member is already hosting PTYs and already serving subscriptions to them. A
+    /// fresh one would be an empty registry, and every pane this machine runs would vanish
+    /// from the session at the instant it took charge of it.
+    ///
+    /// The ledger resumes at `ledger_head` under `epoch`, so the entries this coordinator
+    /// seals extend the history the room already holds instead of forking one beside it.
+    pub fn take_over(
+        host: HostSession,
+        pane_server: PaneServer,
+        snapshot: LayoutSnapshot,
+        ledger_head: (u64, [u8; crate::protocol::LEDGER_HASH_BYTES]),
+        reservation_timeout: Duration,
+    ) -> Result<Self, SessionError> {
+        let coordinator_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let session_id = host.ticket().session_id().to_vec();
+        let (next_seq, prev_hash) = ledger_head;
+        let ledger = LedgerWriter::resume(
+            session_id.clone(),
+            host.transport.secret_key(),
+            next_seq,
+            prev_hash,
+            host.coordinator_epoch(),
+        );
+        let coordinator =
+            LayoutCoordinator::restore(coordinator_peer_id, snapshot, ledger, reservation_timeout)?;
+        let signer = IntentSigner::new(session_id, host.transport.secret_key());
+        Ok(Self {
+            host,
+            pane_server,
+            coordinator: Arc::new(Mutex::new(coordinator)),
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
+            reservation_timeout,
+            signer,
+        })
+    }
+
+    /// Announce this takeover into the ledger, so it is part of the record like any change.
+    ///
+    /// Authored on the successor's own account: the coordinator it replaces is not there to
+    /// author anything, which is the situation this whole path exists for. What makes the
+    /// entry believable is not its contents but that every member reached the same
+    /// conclusion independently before accepting the key that signs it.
+    pub fn announce_takeover(
+        &self,
+        replaced_peer_id: Vec<u8>,
+    ) -> Result<LayoutCommit, SessionError> {
+        let record = CoordinatorChangeRecord {
+            coordinator_peer_id: self.host.ticket().endpoint_addr().id.as_bytes().to_vec(),
+            endpoint_addr: serde_json::to_vec(self.host.ticket().endpoint_addr())
+                .map_err(|_| SessionError::InvalidPostWelcome)?,
+            epoch: self.host.coordinator_epoch(),
+            replaced_peer_id,
+        };
+        let mut coordinator = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?;
+        let commit = coordinator.seal_coordinator_change(&record)?;
+        broadcast_envelope(
+            &self.peers,
+            coordinator_envelope(
+                self.host.ticket().endpoint_addr().id.as_bytes(),
+                envelope::Body::LayoutCommit(commit.clone()),
+            ),
+        );
+        Ok(commit)
+    }
+
     pub fn ticket(&self) -> &JoinTicket {
         self.host.ticket()
+    }
+
+    /// How many takeovers this session has been through, this one included.
+    pub fn coordinator_epoch(&self) -> u64 {
+        self.host.coordinator_epoch()
+    }
+
+    /// How many members currently hold a control stream to this coordinator.
+    ///
+    /// Zero in a session that has other members in it is the coordinator's own version of
+    /// losing the coordinator: from here there is no way to tell "everyone left" from "my
+    /// network dropped", and the second one means the room is off electing a successor.
+    pub fn connected_peers(&self) -> usize {
+        self.peers.lock().map(|peers| peers.len()).unwrap_or(0)
+    }
+
+    /// Drop every member's control stream, on the way to giving the role up.
+    ///
+    /// Called by a coordinator that was isolated long enough for the room to elect somebody
+    /// else. Any peer still attached here is following a coordinator that no longer is one,
+    /// and leaving those streams open would let it keep sealing entries onto a ledger the
+    /// session has already moved past.
+    pub fn disconnect_peers(&self) {
+        let peers = match self.peers.lock() {
+            Ok(mut peers) => std::mem::take(&mut *peers),
+            Err(_) => return,
+        };
+        for (_, peer) in peers {
+            peer.shutdown();
+        }
     }
 
     pub fn address_ready(&self) -> bool {
@@ -2857,7 +3130,7 @@ impl SharedLayoutHost {
                 .coordinator
                 .lock()
                 .map_err(|_| SessionError::PeerTask)?
-                .is_full()
+                .is_full_for(connection.remote_id().as_bytes())
             {
                 self.host
                     .refuse_join(join_writer, LayoutRejectReason::Limit)
@@ -3324,13 +3597,23 @@ pub async fn join_layout_with_display_name(
         // Anchored on the endpoint key the ticket named and QUIC proved on this very
         // connection, rather than on the coordinator id the Welcome claimed: a peer that
         // could lie about the latter is exactly the one this verifier exists to catch.
-        let verifier = LedgerVerifier::new(ticket.session_id().to_vec(), ticket.endpoint_addr().id);
+        // The epoch comes from the welcome rather than starting at zero: a member joining a
+        // session that has already changed hands has no way to read the takeovers it missed,
+        // and entries sealed under the current epoch would otherwise all look wrong to it.
+        // Shared rather than owned by the reader task: a member that ends up promoted has to
+        // resume the ledger from the head it actually verified, and the reader is the only
+        // thing that knows where that is.
+        let verifier = Arc::new(Mutex::new(LedgerVerifier::at_epoch(
+            ticket.session_id().to_vec(),
+            ticket.endpoint_addr().id,
+            receipt.coordinator_epoch,
+        )));
         let tasks = vec![
             tokio::spawn(layout_member_reader_task(
                 reader,
                 events_tx,
                 coordinator_peer_id.clone(),
-                verifier,
+                Arc::clone(&verifier),
             )),
             tokio::spawn(layout_member_writer_task(
                 writer,
@@ -3341,6 +3624,8 @@ pub async fn join_layout_with_display_name(
         Ok(SharedLayoutMember {
             peer_id,
             coordinator_peer_id,
+            coordinator_epoch: receipt.coordinator_epoch,
+            verifier,
             session_name,
             events,
             signer: IntentSigner::new(ticket.session_id().to_vec(), transport.secret_key()),
@@ -3351,9 +3636,15 @@ pub async fn join_layout_with_display_name(
         })
     }
     .await;
+    // The connection is this function's to clean up. The transport is not, and used to be
+    // closed here as well: harmless while the only caller bound one immediately beforehand
+    // and gave up if the join failed, catastrophic once a running node reuses its own to
+    // look for a coordinator. A single failed dial took the whole endpoint down with it --
+    // every pane subscription, and any chance of this node going on to serve the session
+    // itself -- and the only trace was panes reporting "Endpoint is closed" while the
+    // takeover silently never happened.
     if result.is_err() {
         connection.close(0u8.into(), b"");
-        transport.close().await;
     }
     result
 }
@@ -3531,7 +3822,7 @@ async fn layout_member_reader_task(
     mut reader: crate::transport::FrameReader,
     events_tx: mpsc::Sender<LayoutControlEvent>,
     coordinator_peer_id: Vec<u8>,
-    mut verifier: LedgerVerifier,
+    verifier: Arc<Mutex<LedgerVerifier>>,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != coordinator_peer_id {
@@ -3553,7 +3844,11 @@ async fn layout_member_reader_task(
                 let Some(entry) = commit.entry.as_ref() else {
                     break;
                 };
-                if verifier.accept(entry).is_err() {
+                let accepted = verifier
+                    .lock()
+                    .map(|mut verifier| verifier.accept(entry).is_ok())
+                    .unwrap_or(false);
+                if !accepted {
                     break;
                 }
                 LayoutControlEvent::Commit(commit)
@@ -4174,6 +4469,7 @@ async fn join_handshake_with_display_name(
         endpoint_addr: ticket.endpoint_addr().clone(),
         display_name: String::new(),
         session_name: welcome.session_name,
+        coordinator_epoch: welcome.coordinator_epoch,
     })
 }
 

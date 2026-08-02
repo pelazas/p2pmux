@@ -3,7 +3,7 @@
 use prost::Message;
 use std::{collections::HashSet, fmt};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_560;
 pub const MAX_PEER_ID_BYTES: usize = 64;
@@ -200,6 +200,13 @@ pub struct Welcome {
     pub coordinator_peer_id: Vec<u8>,
     #[prost(string, tag = "4")]
     pub session_name: String,
+    /// How many times this session has changed coordinator, `0` for the one that created it.
+    ///
+    /// A member joining mid-session has no ledger history to read the current epoch out of,
+    /// so the welcome states it. Everything after that arrives as a
+    /// [`LedgerEntryKind::CoordinatorChange`] entry.
+    #[prost(uint64, tag = "5")]
+    pub coordinator_epoch: u64,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -559,6 +566,14 @@ pub struct LedgerEntry {
     /// The coordinator's signature over this entry, which is what fixes its position.
     #[prost(bytes = "vec", tag = "7")]
     pub coordinator_signature: Vec<u8>,
+    /// Which coordinator sealed this, counted from `0` for the one that created the session.
+    ///
+    /// Covered by the signed hash, so it cannot be edited in flight. Without it, an entry
+    /// from a coordinator the receiver has not accepted fails as a bad signature, which is
+    /// indistinguishable from tampering; with it, the receiver can say *stale epoch* and
+    /// keep the two apart.
+    #[prost(uint64, tag = "8")]
+    pub coordinator_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
@@ -570,6 +585,31 @@ pub enum LedgerEntryKind {
     PaneReady = 2,
     /// Somebody joining, leaving, or moving to a new address.
     Membership = 3,
+    /// A new coordinator taking over the session, which every later entry is signed by.
+    CoordinatorChange = 4,
+}
+
+/// The payload of a [`LedgerEntryKind::CoordinatorChange`] entry.
+///
+/// Authored by the successor on its own account: the coordinator it replaces is, by
+/// definition, not there to ask. That is why nothing here is trusted on its face — a member
+/// accepts the entry only once it has independently reached the same conclusion about who
+/// should take over (see `crate::failover`), and this record is what it checks that
+/// conclusion against.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CoordinatorChangeRecord {
+    /// The endpoint public key now sealing this session's ledger.
+    #[prost(bytes = "vec", tag = "1")]
+    pub coordinator_peer_id: Vec<u8>,
+    /// Where to reach it, so a member can re-establish its control stream.
+    #[prost(bytes = "vec", tag = "2")]
+    pub endpoint_addr: Vec<u8>,
+    /// The epoch this takeover opens, one past the epoch it replaces.
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    /// The coordinator whose departure caused this, for members reporting what happened.
+    #[prost(bytes = "vec", tag = "4")]
+    pub replaced_peer_id: Vec<u8>,
 }
 
 /// The payload of a [`LedgerEntryKind::Membership`] entry.

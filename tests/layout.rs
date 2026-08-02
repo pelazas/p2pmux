@@ -38,6 +38,95 @@ fn removing_a_member_atomically_prunes_its_panes_and_empty_tabs() {
     SessionState::validate_snapshot(&snapshot).expect("departure leaves a valid snapshot");
 }
 
+#[test]
+fn a_restored_state_is_the_one_the_room_was_already_looking_at() {
+    // What a promoted member inherits. Not a fresh session that happens to have the same
+    // people in it -- the same tabs, panes and join order, at the same revision.
+    let mut original = state();
+    original
+        .add_member(original.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    original
+        .create_tab(HOST_B, original.revision(), 24, 80)
+        .expect("B creates a tab");
+    let before = snapshot(&original);
+
+    let restored = SessionState::restore(before.clone()).expect("a committed layout restores");
+
+    assert_eq!(snapshot(&restored), before);
+    assert_eq!(restored.revision(), original.revision());
+    assert_eq!(
+        restored
+            .members()
+            .iter()
+            .map(|member| member.peer_id.clone())
+            .collect::<Vec<_>>(),
+        vec![HOST_A.to_vec(), HOST_B.to_vec()],
+        "join order is the succession order, so it has to survive verbatim"
+    );
+}
+
+#[test]
+fn a_restored_state_issues_ids_past_the_ones_already_in_use() {
+    // Resuming the counters from zero would hand a new pane the id of one somebody is
+    // currently typing into.
+    let mut original = state();
+    original
+        .add_member(original.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    original
+        .create_tab(HOST_B, original.revision(), 24, 80)
+        .expect("B creates a tab");
+    let highest_pane = *snapshot(&original).panes.keys().max().expect("panes exist");
+
+    let mut restored = SessionState::restore(snapshot(&original)).expect("restores");
+    let reservation = restored
+        .reserve_tab(HOST_A, restored.revision(), 24, 80)
+        .expect("the new coordinator can still create");
+
+    assert!(
+        reservation.pane_id > highest_pane,
+        "a pane created after the takeover must not collide with one created before it"
+    );
+}
+
+#[test]
+fn a_restored_state_keeps_the_departed_coordinator_and_its_panes() {
+    // The design calls for unavailable placeholders, not a layout that rearranges itself
+    // under people. It also has to hold in the two-person case, where evicting the
+    // coordinator's panes would leave the survivor looking at nothing at all.
+    let mut original = state();
+    original
+        .add_member(original.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    let before = snapshot(&original);
+    assert!(
+        before
+            .panes
+            .values()
+            .all(|pane| pane.host_peer_id == HOST_A),
+        "only the coordinator hosts anything, which is the case that would break"
+    );
+
+    let restored = SessionState::restore(before).expect("restores");
+
+    assert_eq!(restored.members().len(), 2);
+    assert_eq!(restored.panes().count(), 1);
+}
+
+#[test]
+fn a_layout_that_would_be_refused_from_a_peer_is_refused_from_a_successor_too() {
+    // A takeover is not a way to smuggle in a layout the validator would reject: the
+    // successor is a member like any other and does not get to invent state.
+    let mut malformed = snapshot(&state());
+    malformed.revision = 0;
+
+    assert_eq!(
+        SessionState::restore(malformed),
+        Err(LayoutError::InvalidSnapshot)
+    );
+}
+
 fn tab(snapshot: &LayoutSnapshot, tab_id: u64) -> &p2pmux::layout::Tab {
     snapshot
         .tabs

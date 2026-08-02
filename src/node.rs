@@ -130,7 +130,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     // Before the first pane spawns: every PTY this node opens inherits the
     // socket path from here, and pane 1 is created a few lines below.
     crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
-    let (mut node, dispatcher_task, published_code) = match bootstrap.kind {
+    let (mut node, published_code) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -182,11 +182,11 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                 host, panes, layout, initial, ticket, code, handle,
             )?;
             runtime.set_session_id(session_id);
-            (
-                SharedLayoutNode::new(runtime),
-                dispatcher_task,
-                published_code,
-            )
+            // The runtime owns the accept loop from here: losing every member is one of the
+            // shapes a coordinator's own failover takes, and stepping down means this
+            // endpoint has to stop answering joins and start behaving like a member.
+            runtime.set_accept_task(dispatcher_task);
+            (SharedLayoutNode::new(runtime), published_code)
         }
         NodeBootstrapKind::Join {
             ticket,
@@ -225,14 +225,17 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             panes.replace_roster_from_layout(&state)?;
             let acceptor = panes.clone();
             let dispatcher_task = tokio::spawn(async move { acceptor.accept_loop().await });
-            let runtime = crate::tui::SharedLayoutRuntime::member_from_state(
+            let mut runtime = crate::tui::SharedLayoutRuntime::member_from_state(
                 member,
                 panes,
                 ticket.session_id().to_vec(),
                 state,
                 tokio::runtime::Handle::current(),
             )?;
-            (SharedLayoutNode::new(runtime), dispatcher_task, None)
+            // Handed over for the same reason as on the coordinator, in the other direction:
+            // a member that gets promoted has to start answering joins on this endpoint.
+            runtime.set_accept_task(dispatcher_task);
+            (SharedLayoutNode::new(runtime), None)
         }
     };
     let store = SessionStore::for_current_user()?;
@@ -240,12 +243,10 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     let listener = UnixListener::bind(&descriptor.socket_path)?;
     listener.set_nonblocking(true)?;
     store.write(&descriptor)?;
-    let result = run_socket_loop(&mut node, listener, &descriptor);
+    let result = run_socket_loop(&mut node, listener, &mut descriptor, &store);
     // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
     // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
     tokio::task::block_in_place(|| node.shutdown());
-    dispatcher_task.abort();
-    let _ = dispatcher_task.await;
     if let Some(published) = published_code {
         published.retire().await;
     }
@@ -293,7 +294,8 @@ fn configure_accepted(stream: UnixStream) -> Option<UnixStream> {
 fn run_socket_loop(
     node: &mut SharedLayoutNode,
     listener: UnixListener,
-    descriptor: &SessionDescriptor,
+    descriptor: &mut SessionDescriptor,
+    store: &SessionStore,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
     let mut client: Option<AttachedClient> = None;
@@ -424,6 +426,22 @@ fn run_socket_loop(
                 .drain()
                 .map_err(|error| io::Error::other(error.to_string()))?;
             drain_elapsed = drain_started.elapsed();
+        }
+        // A takeover or a step-down changes what this machine is advertising about itself.
+        // `p2pmux ls` and `p2pmux ticket <name>` read the record out of process, so until it
+        // is rewritten they hand out a ticket for an endpoint that stopped answering.
+        if let Some(role) = node.take_role_persist() {
+            descriptor.role = if role.coordinating {
+                SessionRole::Coordinator
+            } else {
+                SessionRole::Member
+            };
+            descriptor.ticket = role.ticket;
+            descriptor.join_code = role.join_code;
+            if let Err(error) = store.write(descriptor) {
+                eprintln!("p2pmux node: failed to record the new session role: {error}");
+            }
+            did_work = true;
         }
         did_work |= changed;
         let mut detached = false;
@@ -919,9 +937,12 @@ fn snapshot_message(
         .collect::<Vec<_>>();
     let message = NodeMessage::Snapshot {
         room_name: descriptor.name.clone(),
-        role: match descriptor.role {
-            SessionRole::Coordinator => "coordinator",
-            SessionRole::Member => "member",
+        // Read live rather than from the record this node started with: the role can change
+        // under a running session, and the attached client draws it every frame.
+        role: if node.is_coordinating() {
+            "coordinator"
+        } else {
+            "member"
         }
         .into(),
         summary: SessionSummary {
@@ -1413,6 +1434,16 @@ impl SharedLayoutNode {
         self.runtime
             .apply_agent_status(pane_id, kind, status, cwd, message)
     }
+    /// Whether this node currently serializes the session, for the attached client's header.
+    pub fn is_coordinating(&self) -> bool {
+        self.runtime.is_coordinating()
+    }
+
+    /// A role change the durable session record still has to be told about, once.
+    pub fn take_role_persist(&mut self) -> Option<crate::tui::RolePersist> {
+        self.runtime.take_role_persist()
+    }
+
     pub fn shutdown(self) {
         self.runtime.shutdown_node();
     }

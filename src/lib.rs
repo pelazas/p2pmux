@@ -6,6 +6,7 @@ pub mod agent_setup;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod failover;
 pub mod hosted_rendezvous;
 pub mod kitty_keyboard;
 pub mod layout;

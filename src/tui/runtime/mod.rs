@@ -3,12 +3,18 @@
 //!
 //! The inherent impl is split by concern across this module's files.
 
+mod failover;
 mod forward;
 mod layout;
 mod node;
 mod run;
 
-use std::{collections::BTreeMap, error::Error, io, time::Instant};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    io,
+    time::{Duration, Instant},
+};
 
 use iroh::EndpointAddr;
 
@@ -72,6 +78,45 @@ pub struct SharedLayoutRuntime {
     /// coordinator advances it: a member is handed rosters by the broadcast instead.
     pub(in crate::tui) seen_agent_generations: BTreeMap<Vec<u8>, u64>,
     pub(in crate::tui) presence: Vec<Presence>,
+    /// When the coordinator stopped answering, and `None` while it is answering.
+    ///
+    /// A coordinator sets this too, for the mirror-image case: one whose network dropped
+    /// cannot tell that from every member leaving at once, and both are the same state --
+    /// this node is alone and the session may have moved on without it.
+    pub(in crate::tui) coordinator_lost_at: Option<Instant>,
+    pub(in crate::tui) grace: Duration,
+    /// The endpoint's accept loop, which serves joins on a coordinator and pane
+    /// subscriptions on a member. Held here because a promotion has to swap it.
+    pub(in crate::tui) accept_task:
+        Option<tokio::task::JoinHandle<Result<(), crate::session::SessionError>>>,
+    pub(in crate::tui) rejoin_tx: tokio::sync::mpsc::UnboundedSender<failover::Rejoin>,
+    pub(in crate::tui) rejoin_rx: tokio::sync::mpsc::UnboundedReceiver<failover::Rejoin>,
+    pub(in crate::tui) rejoin_in_flight: bool,
+    pub(in crate::tui) rejoin_deadline: Option<Instant>,
+    pub(in crate::tui) rejoin_cursor: usize,
+    /// A short code this runtime published for itself, after taking the role over.
+    ///
+    /// The one a session starts with belongs to whoever created it; this is the replacement,
+    /// and holding it here is what lets it be retired when this node stops.
+    pub(in crate::tui) published_code: Option<crate::hosted_rendezvous::PublishedCode>,
+    pub(in crate::tui) code_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::hosted_rendezvous::PublishedCode>,
+    pub(in crate::tui) code_rx:
+        tokio::sync::mpsc::UnboundedReceiver<crate::hosted_rendezvous::PublishedCode>,
+    /// A role change the durable session record has not caught up with yet.
+    ///
+    /// `p2pmux ls` and `p2pmux ticket <name>` read that record out of process, so a takeover
+    /// that never reached it leaves the machine advertising a ticket for an endpoint that
+    /// stopped answering and a role that is no longer true.
+    pub(in crate::tui) pending_role_persist: Option<RolePersist>,
+}
+
+/// What the durable session record has to be updated to after a role change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RolePersist {
+    pub coordinating: bool,
+    pub ticket: Option<String>,
+    pub join_code: Option<String>,
 }
 impl SharedLayoutRuntime {
     pub fn host(
@@ -146,6 +191,8 @@ impl SharedLayoutRuntime {
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, Box<dyn Error>> {
         let (subscription_tx, subscription_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (rejoin_tx, rejoin_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (code_tx, code_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut local = BTreeMap::new();
         if let Some(initial) = initial {
             local.insert(initial.pane_id, initial);
@@ -189,6 +236,18 @@ impl SharedLayoutRuntime {
             seen_presence_epoch: 0,
             seen_agent_generations: BTreeMap::new(),
             presence: Vec::new(),
+            coordinator_lost_at: None,
+            grace: crate::failover::configured_grace(),
+            accept_task: None,
+            rejoin_tx,
+            rejoin_rx,
+            rejoin_in_flight: false,
+            rejoin_deadline: None,
+            rejoin_cursor: 0,
+            published_code: None,
+            code_tx,
+            code_rx,
+            pending_role_persist: None,
         };
         value.refresh_local_views();
         Ok(value)
@@ -196,6 +255,38 @@ impl SharedLayoutRuntime {
 
     pub fn set_session_id(&mut self, session_id: Vec<u8>) {
         self.session_id = session_id;
+    }
+
+    /// Hand over the endpoint's accept loop, which a promotion has to be able to replace.
+    ///
+    /// Owned here rather than by the caller that spawned it because the runtime is where the
+    /// role changes: a member serving only pane subscriptions becomes a coordinator that must
+    /// also answer joins, and the two loops cannot both be reading the same endpoint.
+    pub fn set_accept_task(
+        &mut self,
+        task: tokio::task::JoinHandle<Result<(), crate::session::SessionError>>,
+    ) {
+        if let Some(previous) = self.accept_task.replace(task) {
+            previous.abort();
+        }
+    }
+
+    /// Shorten the wait before a missing coordinator is replaced. For tests.
+    pub fn set_failover_grace(&mut self, grace: Duration) {
+        self.grace = grace;
+    }
+
+    /// Whether this node currently serializes the session.
+    ///
+    /// Read rather than remembered: after a takeover or a step-down the role on the record
+    /// this node started with is stale, and the attached client draws it every frame.
+    pub fn is_coordinating(&self) -> bool {
+        matches!(self.control, SharedControl::Host(_))
+    }
+
+    /// A role change the durable session record still has to be told about, once.
+    pub fn take_role_persist(&mut self) -> Option<RolePersist> {
+        self.pending_role_persist.take()
     }
 
     pub fn local_focus(&self) -> (u64, u64) {
@@ -265,6 +356,12 @@ impl SharedLayoutRuntime {
     }
 
     pub(in crate::tui) fn shutdown(mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+        }
+        if let Some(published) = self.published_code.take() {
+            self.runtime.block_on(published.retire());
+        }
         self.agent_sampler.shutdown();
         for (_, mut pane) in std::mem::take(&mut self.local) {
             let _ = self.panes.remove_local_pane(pane.pane_id);
