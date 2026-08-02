@@ -772,6 +772,33 @@ class Harness:
 LINK_BADGE = re.compile(r"(?:locked · )?(?:direct|relayed|other)(?: (?:<1|\d+)ms)?(?: ×\d+)?")
 
 
+def agent_panel(screen: str) -> str:
+    """Just the rows inside the Agents overlay panel.
+
+    Any assertion about a detected agent has to be scoped to the panel. The scenarios
+    launch their fake agent as `exec -a claude ...`, often after `cd`-ing into the
+    directory they then look for, so the kind *and* the working directory both appear in
+    the shell's own command line on the screen behind the overlay. A bare
+    `"claude" in screen` passes whether or not detection ever fired -- the exact opposite
+    of what those scenarios exist to prove.
+
+    Note the panel prints the lowercase kind (`claude`, `codex`), not the display label:
+    `AgentKind::display_label` is no longer what the overlay renders. The panel drawing
+    in docs/USAGE.md is the reference.
+    """
+    rows: list[str] = []
+    inside = False
+    for line in screen.split("\n"):
+        if not inside and "Agents" in line and "┌" in line:
+            inside = True
+            continue
+        if inside:
+            if "└" in line:
+                break
+            rows.append(line)
+    return "\n".join(rows)
+
+
 def mask_link_badge(screen: str) -> str:
     """Blank the tab bar's connectivity badge so two screens can be compared.
 

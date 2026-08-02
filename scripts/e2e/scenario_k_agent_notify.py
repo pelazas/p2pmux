@@ -3,12 +3,18 @@
 
 The completion notification used to fire on any two seconds of pane silence, so a
 real agent -- which pauses for much longer than that while waiting on a model
-response or running a quiet tool -- rang the bell repeatedly mid-task. This drives
-a fake agent that pauses exactly like a real one and asserts the notification count
-directly, rather than trusting the state machine to be described correctly.
+response or running a quiet tool -- announced completion repeatedly mid-task. This
+drives a fake agent that pauses exactly like a real one and asserts the notification
+count directly, rather than trusting the state machine to be described correctly.
+
+Agent state is now hooks-only: nothing is inferred from output or from timing. The
+fake agent therefore reports through `p2pmux notify`, the same path a real Claude
+Code registration uses. An earlier version of this scenario rang the terminal bell
+instead, which the old inference read as "done" -- a bell is just a byte in the
+stream now, so that version asserted a mechanism the product no longer has.
 
 The count is read from the UI debug log (`P2PMUX_DEBUG_UI`), where the client
-records every announcement, because a scenario cannot hear `afplay`.
+records every announcement.
 
 Run: python3 scripts/e2e/scenario_k_agent_notify.py [repeats]
 """
@@ -21,8 +27,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from driver import (  # noqa: E402
+    BINARY,
     DeadlineExceeded,
     Harness,
+    agent_panel,
     p2pmux_pids,
     orphans_after,
 )
@@ -33,17 +41,25 @@ CTRL_P = b"\x10"
 # enough to keep a run under a minute. Must stay below the 20s default quiet window.
 PAUSE_SECONDS = 6
 
-# The pause before the bell is load-bearing: without it the completion lands in the
-# same instant as the last step, and a sample taken "mid-task" would already include
-# the bell's announcement and report a false failure.
+# The pause before the completion is load-bearing: without it the completion lands in
+# the same instant as the last step, and a sample taken "mid-task" would already include
+# its announcement and report a false failure.
+#
+# The agent reports through `p2pmux notify`, not by ringing the terminal bell. Agent
+# state is hooks-only: nothing is inferred from output or from timing, so a bell is just
+# a byte in the stream now and a fake agent that only rings one is never "done". Hooks
+# are what a real Claude Code registration sends, so this is also the path users run.
 FAKE_AGENT = """
+notify() {{ printf '{{}}' | {binary} notify claude --status "$1" >/dev/null 2>&1 || true; }}
 echo AGENT-START
+notify running
 sleep {pause}
 echo AGENT-STEP-1
 sleep {pause}
 echo AGENT-STEP-2
 sleep {pause}
-printf 'AGENT-DONE\\a'
+notify done
+echo AGENT-DONE
 sleep 300
 """.strip()
 
@@ -60,7 +76,7 @@ def install_fake_agent(home: Path) -> str:
     bindir = home / "fakebin"
     bindir.mkdir(parents=True, exist_ok=True)
     script = bindir / "agent.sh"
-    script.write_text(FAKE_AGENT.format(pause=PAUSE_SECONDS) + "\n")
+    script.write_text(FAKE_AGENT.format(pause=PAUSE_SECONDS, binary=BINARY) + "\n")
     return f"/bin/sh -c 'exec -a claude /bin/sh {script}'"
 
 
@@ -145,17 +161,17 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             f"samples after each pause: {first}, {second}, {third}",
         )
 
-        # The bell is the agent saying it is done, so the announcement must not wait
-        # out the silence window.
+        # The `done` hook is the agent saying it has finished, so the announcement must
+        # not wait out the silence window.
         guest.wait_for("AGENT-DONE", timeout=15)
-        rang_at = time.monotonic()
-        while announcements(guest_log) == 0 and time.monotonic() - rang_at < 12:
+        reported_at = time.monotonic()
+        while announcements(guest_log) == 0 and time.monotonic() - reported_at < 12:
             time.sleep(0.5)
-        after_bell = announcements(guest_log)
+        after_done = announcements(guest_log)
         check(
-            "the bell announces the completion",
-            after_bell == 1,
-            f"{after_bell} announcements, {time.monotonic() - rang_at:.1f}s after the bell",
+            "the done hook announces the completion",
+            after_done == 1,
+            f"{after_done} announcements, {time.monotonic() - reported_at:.1f}s after the hook",
         )
 
         # The agent repaints after ringing and then goes quiet for longer than the
@@ -190,10 +206,16 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         # scenario depends on, so a detection failure is not reported as a timing bug.
         host.send(b"\x01")
         time.sleep(1.5)
+        # Scoped to the panel: the pane underneath is running `exec -a claude ...`, so
+        # searching the whole screen would match the shell's own command line and pass
+        # whether or not detection fired. The overlay prints the lowercase kind, not the
+        # display label -- see the panel drawing in docs/USAGE.md.
+        overlay = host.snapshot()
+        panel = agent_panel(overlay)
         check(
-            "the fake agent is classified as Claude Code",
-            "Claude Code" in host.snapshot(),
-            host.snapshot()[:400],
+            "the fake agent is classified as a claude agent",
+            "claude" in panel,
+            overlay[:400],
         )
 
         for peer in (host, guest):

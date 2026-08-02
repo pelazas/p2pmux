@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from driver import Harness  # noqa: E402
+from driver import Harness, agent_panel  # noqa: E402
 from remote import RemoteHost, spawn_remote  # noqa: E402
 
 CTRL_A = b"\x01"
@@ -82,19 +82,21 @@ def main() -> int:
             guest.send(CTRL_A)
             time.sleep(3.0)
             own = guest.settle(quiet_for=1.0, timeout=20)
-            check("the machine hosting the agent lists it", "Claude Code" in own, own[:400])
+            own_panel = agent_panel(own)
+            check("the machine hosting the agent lists it", "claude" in own_panel, own[:400])
             guest.send(b"\x1b")
             time.sleep(1.2)
 
             host.send(CTRL_A)
             time.sleep(3.0)
             overlay = host.settle(quiet_for=1.0, timeout=20)
+            panel = agent_panel(overlay)
             check("the coordinator's overlay opened", "Agents" in overlay, overlay[:200])
             check("an agent running on the other machine is listed",
-                  "Claude Code" in overlay, overlay[:600])
-            check("the overlay attributes it to the droplet", "droplet" in overlay, overlay[:600])
+                  "claude" in panel, overlay[:600])
+            check("the overlay attributes it to the droplet", "droplet" in panel, overlay[:600])
             check("the overlay shows a working directory from the other machine",
-                  "agentcwd" in overlay, overlay[:600])
+                  "agentcwd" in panel, overlay[:600])
 
             host.send(b"\x1b")
             time.sleep(1.0)

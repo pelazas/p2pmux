@@ -105,7 +105,12 @@ impl AgentKind {
         }
     }
 
-    /// Human-readable label for the overlay.
+    /// Human-readable label for this kind.
+    ///
+    /// Not what the agents overlay prints: that renders the lowercase kind through
+    /// `tui::render::agents::overlay_kind_label`, so a row reads `claude`, not
+    /// `Claude Code`. Assertions that look for this string on a rendered screen are
+    /// testing something the overlay does not draw.
     pub const fn display_label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
