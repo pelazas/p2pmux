@@ -227,10 +227,11 @@ fn notify_reports_a_blocked_agent_to_the_pane_socket() {
     assert_eq!(message["kind"], "claude");
     assert_eq!(message["status"], "pending");
     assert_eq!(message["cwd"], "/repo");
-    // The assistant's message decided the status but must not ride along: a
-    // session is shared with every member.
-    assert!(message.get("msg").is_none());
-    assert!(!line.contains("Should I push"));
+    // One line of the assistant's message rides along to the node that owns the
+    // pane — this socket. That is as far as it goes: the roster the node then
+    // publishes to peers has no field for it. See
+    // `agent_roster_entry_never_carries_the_agents_message`.
+    assert_eq!(message["message"], "Done. Should I push?");
 
     fs::remove_dir_all(&directory).expect("temporary directory should remove");
 }

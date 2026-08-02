@@ -87,10 +87,30 @@ enum Command {
         #[command(subcommand)]
         agent: NotifyAgent,
     },
+    /// Wire an agent's hooks up so its status reaches the Ctrl+A overlay.
+    Setup {
+        #[command(subcommand)]
+        agent: SetupAgent,
+    },
+    /// Report whether each agent's hooks are wired up.
+    Doctor,
     #[command(name = "__node", hide = true)]
     Node {
         #[arg(long)]
         bootstrap: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SetupAgent {
+    /// Claude Code, via marker-owned entries in ~/.claude/settings.json.
+    Claude {
+        /// Remove the hooks p2pmux installed, leaving your own alone.
+        #[arg(long)]
+        uninstall: bool,
+        /// Say what would change without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -166,6 +186,14 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
         }),
         // Reading the finder records is a directory scan; it needs no runtime either.
         Some(Command::Ls) => Some(print_sessions()),
+        // Editing a settings file and reporting on it are both plain filesystem
+        // work, and a user running them wants an answer, not a thread pool.
+        Some(Command::Setup { agent }) => Some(match agent {
+            SetupAgent::Claude { uninstall, dry_run } => {
+                crate::agent_setup::setup_claude(*uninstall, *dry_run)
+            }
+        }),
+        Some(Command::Doctor) => Some(crate::agent_setup::doctor()),
         _ => None,
     }
 }
@@ -225,26 +253,10 @@ fn format_uptime(seconds: u64) -> String {
     format!("{}d{:02}h", hours / 24, hours % 24)
 }
 
-/// Hand this machine's completion tuning to the detector, once per process.
-///
-/// Panes are hosted by the detached node, which reaches this same dispatch, so every process
-/// that can own a PTY passes through here. A config that cannot be read is not worth failing a
-/// session over — the built-in defaults are the ones most users want anyway.
-fn apply_notification_tuning() {
-    let notifications = crate::config::load_config()
-        .map(|config| config.ui.notifications)
-        .unwrap_or_default();
-    crate::agent_detect::set_notification_tuning(crate::agent_detect::NotificationTuning {
-        quiet_before_done: Duration::from_secs(notifications.quiet_seconds),
-        require_bell: notifications.require_bell,
-    });
-}
-
 pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if let Some(result) = run_without_runtime(&cli) {
         return result;
     }
-    apply_notification_tuning();
     if cli.resume {
         return resume_picker(true);
     }
@@ -265,7 +277,11 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         // Already handled by the `run_without_runtime` call above; reaching
         // here would mean the two dispatches disagreed.
-        Some(Command::Notify { .. }) | Some(Command::Ls) => Ok(()),
+        // Handled in `run_without_runtime`, which returns before this dispatch.
+        Some(Command::Notify { .. })
+        | Some(Command::Ls)
+        | Some(Command::Setup { .. })
+        | Some(Command::Doctor) => Ok(()),
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
             ConfigCommand::Init => {

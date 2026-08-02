@@ -366,7 +366,7 @@ mod tests {
         .expect("runtime");
 
         assert!(
-            runtime.apply_agent_status(1, "claude", "pending", "/repo"),
+            runtime.apply_agent_status(1, "claude", "pending", "/repo", ""),
             "a producer may report for a pane this node hosts"
         );
         assert_eq!(
@@ -375,23 +375,32 @@ mod tests {
                 .get_mut(&1)
                 .expect("local pane")
                 .agent_tracker
-                .listed_agent(Instant::now(), 1_000)
-                .map(|(agent, state)| (agent.kind, state)),
+                .listed_agent()
+                .map(|listed| (listed.agent.kind, listed.state)),
             Some((AgentKind::Claude, AgentState::Pending))
         );
+
+        // And the overlay actually gets a row for it. The tracker holding the
+        // status is not the same thing as the overlay showing it: the roster
+        // has to be published and read back before anything reaches the screen.
+        runtime.publish_local_agent_roster();
+        let rows = runtime.agent_overlay_rows();
+        assert_eq!(rows.len(), 1, "the pushed status reached the overlay");
+        assert_eq!(rows[0].pane_id, 1);
+        assert_eq!(rows[0].state, crate::protocol::AgentRosterState::Pending);
 
         // A pane id this node does not host is refused outright. This is the
         // local half of `Coordinator::accept_agent_roster`: without it, any
         // process on this machine could publish status for a peer's pane under
         // this node's authenticated peer id.
         assert!(
-            !runtime.apply_agent_status(99, "claude", "pending", "/repo"),
+            !runtime.apply_agent_status(99, "claude", "pending", "/repo", ""),
             "a producer may not report for a pane hosted elsewhere"
         );
 
         // Unparseable kinds and statuses are refused rather than coerced.
-        assert!(!runtime.apply_agent_status(1, "gemini", "pending", "/repo"));
-        assert!(!runtime.apply_agent_status(1, "claude", "pendign", "/repo"));
+        assert!(!runtime.apply_agent_status(1, "gemini", "pending", "/repo", ""));
+        assert!(!runtime.apply_agent_status(1, "claude", "pendign", "/repo", ""));
 
         // An over-long cwd is cut at intake: letting it through would fail
         // `validate_agent_roster` and drop this host's entire roster.
@@ -399,7 +408,8 @@ mod tests {
             1,
             "claude",
             "working",
-            &"/x".repeat(MAX_AGENT_CWD_BYTES)
+            &"/x".repeat(MAX_AGENT_CWD_BYTES),
+            ""
         ));
         let cwd = runtime
             .local

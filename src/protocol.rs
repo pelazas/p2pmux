@@ -19,6 +19,12 @@ pub const MAX_AGENT_ROSTER_ENTRIES: usize = 32;
 pub const MAX_PRESENCE_ENTRIES: usize = 8;
 pub const MAX_AGENT_KIND_BYTES: usize = 32;
 pub const MAX_AGENT_CWD_BYTES: usize = 512;
+/// Cap on an agent's activity message.
+///
+/// Not a wire limit: the message never leaves the machine that produced it (see
+/// `SharedLocalPane::agent_roster_entry`). It is a render limit — one overlay
+/// line — and a bound on what a producer can make a node hold per pane.
+pub const MAX_AGENT_MESSAGE_BYTES: usize = 256;
 pub const MAX_LAYOUT_TITLE_BYTES: usize = 128;
 pub const MAX_SESSION_NAME_BYTES: usize = 48;
 /// Length of a BLAKE3 ledger hash.
@@ -670,6 +676,13 @@ pub enum AgentRosterState {
     Pending = 3,
     /// The agent's turn failed.
     Error = 4,
+    /// An agent is running in the pane and nothing has reported what it is
+    /// doing — its hooks are not wired up, or none has fired yet.
+    ///
+    /// Numbered after `Error` because the earlier variants are already on the
+    /// wire. A peer on an older build folds this to `Idle` through
+    /// [`Self::from_wire`], which is the right degradation: quiet, not alarming.
+    Unknown = 5,
 }
 
 impl AgentRosterState {
@@ -684,11 +697,15 @@ impl AgentRosterState {
     /// declaration order and severity order are permanently divorced.
     pub fn severity(self) -> u8 {
         match self {
-            Self::Idle => 0,
-            Self::Done => 1,
-            Self::Working => 2,
-            Self::Pending => 3,
-            Self::Error => 4,
+            // Quieter than `Idle`: an idle agent is known to be doing nothing,
+            // while this one is merely unreported, and guessing loudly about it
+            // is what the inference path used to get wrong.
+            Self::Unknown => 0,
+            Self::Idle => 1,
+            Self::Done => 2,
+            Self::Working => 3,
+            Self::Pending => 4,
+            Self::Error => 5,
         }
     }
 

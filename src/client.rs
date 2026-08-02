@@ -145,9 +145,6 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
         ))
     })?;
     let theme = config.ui.theme;
-    let sound_enabled = config.ui.notifications.sound_enabled;
-    let notification_sound =
-        crate::notify_sound::NotificationSound::new(config.ui.notifications.sound_path);
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
@@ -258,11 +255,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         apply_leases(view, leases);
                         view.set_presence(presence);
                         apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
-                        announce_agent_completions(
-                            apply_rosters(view, rosters),
-                            sound_enabled,
-                            &notification_sound,
-                        );
+                        announce_agent_completions(apply_rosters(view, rosters));
                         let apply_elapsed = apply_started.elapsed();
                         if crate::perf::enabled() && apply_elapsed >= Duration::from_millis(5) {
                             crate::perf::log(&format!(
@@ -427,11 +420,7 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                     }
                     NodeMessage::Rosters { rosters } => {
                         if let Some(view) = tui.as_mut() {
-                            announce_agent_completions(
-                                apply_rosters(view, rosters),
-                                sound_enabled,
-                                &notification_sound,
-                            );
+                            announce_agent_completions(apply_rosters(view, rosters));
                             dirty = true;
                         }
                     }
@@ -932,24 +921,16 @@ fn apply_leases(view: &mut MultiPaneTui, leases: Vec<crate::local_ipc::PaneLease
     }
 }
 
-/// Ring for panes whose agent just finished, and record the decision.
+/// Record that a pane's agent finished.
 ///
-/// The log line matters: a spurious notification is otherwise invisible after the fact, and
-/// the last round of false positives had to be diagnosed by reasoning about the state machine
-/// rather than by reading what it actually did.
-fn announce_agent_completions(
-    panes: Vec<u64>,
-    sound_enabled: bool,
-    sound: &crate::notify_sound::NotificationSound,
-) {
+/// This used to also play a sound. It no longer does — a completion that a hook
+/// reported is already unmissable in the overlay and the pane's unread mark, and
+/// the chime fired on the inference path that could not tell a finished turn from
+/// a quiet one. The log line stays: a completion that arrives at the wrong moment
+/// is otherwise invisible after the fact.
+fn announce_agent_completions(panes: Vec<u64>) {
     for pane_id in panes {
-        crate::tui::ui_debug_log(
-            "agent_completion",
-            format_args!("pane={pane_id} sound={sound_enabled}"),
-        );
-        if sound_enabled {
-            sound.play();
-        }
+        crate::tui::ui_debug_log("agent_completion", format_args!("pane={pane_id}"));
     }
 }
 
@@ -972,6 +953,7 @@ fn apply_rosters(
                 working_since_unix_ms: row.working_since_unix_ms,
                 host: row.host,
                 controller: row.controller,
+                message: row.message,
             })
             .collect(),
     )
@@ -1322,6 +1304,7 @@ mod tests {
 
     fn roster_row(pane_id: u64, state: i32) -> AgentOverlaySnapshotRow {
         AgentOverlaySnapshotRow {
+            message: String::new(),
             pane_id,
             kind: String::from("codex"),
             cwd: String::from("/repo"),
@@ -1729,7 +1712,9 @@ mod tests {
             ],
         );
         let tui = tui.as_mut().unwrap();
-        let area = Rect::new(0, 0, 24, 8);
+        // Short enough that three rows do not fit, so there is something to scroll:
+        // the overlay grows to fit its list whenever the terminal lets it.
+        let area = Rect::new(0, 0, 24, 6);
         tui.set_agent_overlay_viewport(area);
         tui.handle_key(
             crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),

@@ -14,7 +14,9 @@ use crate::{
     agent_detect::{AgentKind, AgentState},
     layout::{LayoutSnapshot, PaneId, TabId},
     local_ipc::AgentOverlaySnapshotRow,
-    protocol::{AgentRoster, AgentRosterState, MAX_AGENT_CWD_BYTES, Presence},
+    protocol::{
+        AgentRoster, AgentRosterState, MAX_AGENT_CWD_BYTES, MAX_AGENT_MESSAGE_BYTES, Presence,
+    },
     tui::{
         AgentOverlayRow, LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot,
         NodeScreenSnapshots, UiIntent,
@@ -171,6 +173,7 @@ impl SharedLayoutRuntime {
         kind: &str,
         status: &str,
         cwd: &str,
+        message: &str,
     ) -> bool {
         let (Some(kind), Some(state)) = (AgentKind::from_wire(kind), AgentState::from_wire(status))
         else {
@@ -185,8 +188,18 @@ impl SharedLayoutRuntime {
         // Capped here rather than at publish time: an over-long cwd would fail
         // `validate_agent_roster` and silently drop this host's whole roster.
         let cwd = truncate_bytes(sanitize_single_line(cwd), MAX_AGENT_CWD_BYTES);
-        pane.agent_tracker
-            .record_pushed_status(kind, cwd, state, Instant::now(), unix_ms_now());
+        // The message never reaches `validate_agent_roster` — it is stripped
+        // before the roster goes to peers — but it is agent-authored text
+        // heading for a terminal, so it gets the same sanitizing treatment.
+        let message = truncate_bytes(sanitize_single_line(message), MAX_AGENT_MESSAGE_BYTES);
+        pane.agent_tracker.record_pushed_status(
+            kind,
+            cwd,
+            state,
+            message,
+            Instant::now(),
+            unix_ms_now(),
+        );
         true
     }
 
@@ -209,9 +222,9 @@ impl SharedLayoutRuntime {
         let now = Instant::now();
         let entries = self
             .local
-            .values_mut()
+            .values()
             .filter(|pane| !pane.exited)
-            .filter_map(|pane| pane.agent_roster_entry(now))
+            .filter_map(crate::tui::SharedLocalPane::agent_roster_entry)
             .collect::<Vec<_>>();
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
             return false;
@@ -341,6 +354,17 @@ impl SharedLayoutRuntime {
                         working_since_unix_ms: entry.working_since_unix_ms,
                         host,
                         controller,
+                        // Read from the pane rather than the roster entry, and
+                        // so only ever present for a pane this node hosts: the
+                        // roster is the peer-facing shape and has no field for
+                        // it. A member's agent reports its message to its own
+                        // node, where it stays.
+                        message: self
+                            .local
+                            .get(&entry.pane_id)
+                            .and_then(crate::tui::SharedLocalPane::listed_agent)
+                            .map(|listed| listed.message)
+                            .unwrap_or_default(),
                     })
                 })
             })

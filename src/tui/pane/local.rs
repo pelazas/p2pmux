@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self as sync_mpsc, Receiver},
     },
     thread::{self, JoinHandle},
@@ -18,7 +18,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     agent_detect::{
-        AgentScan, PaneAgentTracker, ProcessSnapshot, SysinfoSampler, sample_global_snapshot,
+        AgentScan, AgentState, ListedAgent, PaneAgentTracker, ProcessSnapshot, SysinfoSampler,
+        sample_global_snapshot,
     },
     layout::PaneId,
     lease::{LeaseDecision, LeaseManager, LeaseState},
@@ -26,17 +27,32 @@ use crate::{
     pty_host::PtyHost,
     screen::{HostScreen, ScreenFrame, SyncGate},
     session::{HostControlEvent, HostPaneChannels, pane_wire_id},
-    tui::{PaneViewState, clock::unix_ms_now},
+    tui::PaneViewState,
 };
 
-/// Scan cadence while any pane's agent state is being inferred from output
-/// timing. Inference has to notice silence promptly, so this is the floor.
-pub(in crate::tui) const AGENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-/// Scan cadence when nothing needs inference — no agents at all, or every agent
-/// reporting through a hook. The scan is then only watching for a process to
-/// appear or exit, and a full `sysinfo` refresh of every process on the machine
-/// once a second to do that is most of this process's idle cost.
+/// How often the process scan runs.
+///
+/// One cadence, because the scan now has one job: noticing that an agent process
+/// appeared in a pane or left it. State comes from hooks, which arrive when they
+/// arrive and owe nothing to how often anything is sampled. There used to be a
+/// second, one-second cadence for panes whose state was being inferred from
+/// output silence — that inference is gone, and with it the reason to refresh
+/// every process on the machine every second.
 pub(in crate::tui) const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the sampler thread looks up from its sleep to see if it should stop.
+const SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Map an agent state onto its wire value.
+fn roster_state(state: AgentState) -> AgentRosterState {
+    match state {
+        AgentState::Unknown => AgentRosterState::Unknown,
+        AgentState::Idle => AgentRosterState::Idle,
+        AgentState::Working => AgentRosterState::Working,
+        AgentState::Done => AgentRosterState::Done,
+        AgentState::Pending => AgentRosterState::Pending,
+        AgentState::Error => AgentRosterState::Error,
+    }
+}
 /// One fixed-grid PTY owned by this process. Its watch channels are registered with the pane
 /// service before the layout coordinator is told that the pane is ready.
 pub struct SharedLocalPane {
@@ -205,10 +221,6 @@ impl SharedLocalPane {
             };
             pending.extend_from_slice(&bytes);
         }
-        if !pending.is_empty() {
-            self.agent_tracker
-                .record_output(Instant::now(), unix_ms_now());
-        }
         let ready = if pending.is_empty() {
             self.sync_gate.flush_stale(Instant::now())
         } else {
@@ -218,11 +230,6 @@ impl SharedLocalPane {
             // One parse/snapshot/diff for the whole batch: process_pty clones the
             // screen per call, so per-chunk calls dominated CPU under output floods.
             let frame = self.screen.process_pty(&ready)?;
-            // Read after parsing: the bell is a parser callback, so the count only reflects
-            // this batch once the batch has been fed through.
-            if self.screen.take_bell_count() > 0 {
-                self.agent_tracker.record_completion_signal(Instant::now());
-            }
             if let Some(reply) = self.screen.take_kitty_keyboard_query_reply()
                 && self.host.write_input(&reply).is_err()
             {
@@ -246,42 +253,35 @@ impl SharedLocalPane {
         scan: &AgentScan<'_>,
         now: Instant,
     ) -> bool {
-        let unix_ms_now = unix_ms_now();
-        let before = self.agent_tracker.listed_agent(now, unix_ms_now);
+        let before = self.agent_tracker.listed_agent();
         let session_child = self.host.process_id();
         let detected = session_child.and_then(|pid| scan.classify(pid));
-        self.agent_tracker.update(detected, now, unix_ms_now);
+        self.agent_tracker.update(detected);
         self.agent_tracker
             .observe_pane_liveness(session_child.is_some_and(|pid| scan.has_children(pid)), now);
-        self.agent_tracker.listed_agent(now, unix_ms_now) != before
+        self.agent_tracker.listed_agent() != before
     }
 
-    /// Whether this pane's reported state comes from output-timing inference
-    /// rather than a producer inside it — the only case that needs the fast
-    /// sampler cadence, since only inference has to notice silence promptly.
-    pub(in crate::tui) fn agent_state_is_inferred(&self) -> bool {
-        self.agent_tracker.active_agent.is_some() && !self.agent_tracker.has_owning_push()
-    }
-
-    pub(in crate::tui) fn agent_roster_entry(&mut self, now: Instant) -> Option<AgentRosterEntry> {
-        let (agent, state) = self.agent_tracker.listed_agent(now, unix_ms_now())?;
+    /// This pane's row for the roster published to peers.
+    ///
+    /// Deliberately without [`ListedAgent::message`]: that is the agent talking,
+    /// and a session is shared with everyone holding the ticket. The message
+    /// reaches this machine's own overlay through the local IPC roster and stops
+    /// there — see `local_ipc::AgentOverlaySnapshotRow`.
+    pub(in crate::tui) fn agent_roster_entry(&self) -> Option<AgentRosterEntry> {
+        let listed = self.agent_tracker.listed_agent()?;
         Some(AgentRosterEntry {
             pane_id: self.pane_id,
-            agent_kind: agent.kind.wire_value().into(),
-            cwd: agent.cwd,
-            state: match state {
-                crate::agent_detect::AgentState::Idle => AgentRosterState::Idle as i32,
-                crate::agent_detect::AgentState::Working => AgentRosterState::Working as i32,
-                crate::agent_detect::AgentState::Done => AgentRosterState::Done as i32,
-                crate::agent_detect::AgentState::Pending => AgentRosterState::Pending as i32,
-                crate::agent_detect::AgentState::Error => AgentRosterState::Error as i32,
-            },
-            working_since_unix_ms: if state == crate::agent_detect::AgentState::Working {
-                self.agent_tracker.reported_working_since_unix_ms()
-            } else {
-                0
-            },
+            agent_kind: listed.agent.kind.wire_value().into(),
+            cwd: listed.agent.cwd,
+            state: roster_state(listed.state) as i32,
+            working_since_unix_ms: listed.working_since_unix_ms,
         })
+    }
+
+    /// This pane's agent, with everything the local overlay may show.
+    pub(in crate::tui) fn listed_agent(&self) -> Option<ListedAgent> {
+        self.agent_tracker.listed_agent()
     }
 
     pub(in crate::tui) fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
@@ -384,16 +384,13 @@ pub(in crate::tui) struct LocalPaneDrain {
 pub(in crate::tui) struct AgentSamplingWorker {
     pub(in crate::tui) snapshots: Receiver<Vec<ProcessSnapshot>>,
     pub(in crate::tui) stop: Arc<AtomicBool>,
-    pub(in crate::tui) interval_ms: Arc<AtomicU64>,
     pub(in crate::tui) join: Option<JoinHandle<()>>,
 }
 impl AgentSamplingWorker {
     pub(in crate::tui) fn spawn() -> Self {
         let (snapshot_tx, snapshots) = sync_mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let interval_ms = Arc::new(AtomicU64::new(AGENT_SAMPLE_INTERVAL.as_millis() as u64));
         let worker_stop = stop.clone();
-        let worker_interval = interval_ms.clone();
         let join = thread::spawn(move || {
             let mut sampler = SysinfoSampler::default();
             while !worker_stop.load(Ordering::Relaxed) {
@@ -403,31 +400,22 @@ impl AgentSamplingWorker {
                 {
                     break;
                 }
-                thread::sleep(Duration::from_millis(
-                    worker_interval.load(Ordering::Relaxed),
-                ));
+                // Slept in slices rather than in one go, because `shutdown`
+                // joins this thread: sleeping the whole interval would make
+                // every exit wait out however long the scan cadence happens to
+                // be. That cost nothing when the cadence was a second and cost
+                // five once it was not.
+                let until = Instant::now() + AGENT_WATCH_INTERVAL;
+                while Instant::now() < until && !worker_stop.load(Ordering::Relaxed) {
+                    thread::sleep(SHUTDOWN_CHECK_INTERVAL);
+                }
             }
         });
         Self {
             snapshots,
             stop,
-            interval_ms,
             join: Some(join),
         }
-    }
-
-    /// Set how often the global process scan runs.
-    ///
-    /// The scan is the single most expensive thing this process does when
-    /// nothing is happening — a full `sysinfo` refresh of every process on the
-    /// machine, with exe, cmdline and cwd. It only needs the fast cadence when
-    /// a pane's state is being *inferred* from output timing, which is the one
-    /// case that depends on noticing silence promptly. Panes whose agent
-    /// reports through a hook, and panes with no agent at all, only need the
-    /// scan for liveness and for spotting a new launch.
-    pub(in crate::tui) fn set_interval(&self, interval: Duration) {
-        self.interval_ms
-            .store(interval.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub(in crate::tui) fn latest_snapshot(&self) -> Option<Vec<ProcessSnapshot>> {
@@ -666,6 +654,47 @@ mod tests {
             "first input was not delivered to the PTY: {:?}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    /// The privacy boundary, pinned where it actually lives.
+    ///
+    /// The producer sends one line of what the agent said, because the local
+    /// overlay is worth it. The roster is where that stops: it is the shape that
+    /// goes out to every member holding the ticket, and it has no field for the
+    /// agent's words. A future field added to `AgentRosterEntry` that happened to
+    /// carry them would be a silent leak, so assert on the encoded bytes rather
+    /// than on the absence of a struct member.
+    #[test]
+    fn agent_roster_entry_never_carries_the_agents_message() {
+        use prost::Message as _;
+
+        let mut pane = SharedLocalPane::spawn(7, 1, 1, b"host".to_vec()).expect("local pane");
+        pane.agent_tracker.record_pushed_status(
+            crate::agent_detect::AgentKind::Claude,
+            "/repo".into(),
+            crate::agent_detect::AgentState::Pending,
+            "shall I force-push to main?".into(),
+            Instant::now(),
+            1_000,
+        );
+
+        // The message is there for this machine's own overlay.
+        assert_eq!(
+            pane.listed_agent().expect("a pushed row").message,
+            "shall I force-push to main?"
+        );
+
+        // And nowhere in what the peers receive.
+        let entry = pane.agent_roster_entry().expect("a roster row");
+        let encoded = entry.encode_to_vec();
+        let wire = String::from_utf8_lossy(&encoded);
+        assert!(
+            !wire.contains("force-push"),
+            "the agent's words reached the peer-facing roster: {wire:?}"
+        );
+        assert!(wire.contains("/repo"), "the cwd is still published");
+
+        pane.shutdown().expect("shutdown local pane");
     }
 
     #[test]

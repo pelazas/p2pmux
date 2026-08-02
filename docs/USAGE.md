@@ -211,54 +211,78 @@ changed host-owned grids. Guests only receive the resulting commit and screen sn
 
 `Ctrl+A` opens the Agents overlay, which lists supported coding agents running below hosted pane
 shells: Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv),
-Pi (including Node-based launches), and OpenCode (`opencode`). Each agent is a two-line card: the
-first line shows its kind and best-effort working directory; the second shows its state, chrome
-location (`Tab #N · Pane #M`), host, and control holder. Working cards have an animated spinner
-and live duration; `○ idle`, `✓ done`, `◆ needs you`, and `✗ error` use distinct visuals. The panel
-title counts the agents blocked on a human (`Agents · 2 need you`).
+Pi (including Node-based launches), and OpenCode (`opencode`).
 
-Press `Esc` to close, use arrows or `j`/`k` to select, and press Enter or left-click a card to jump
+Each agent is one line: a state glyph, the agent, the tail of its working directory, its state (with
+elapsed time while working or blocked), and what it last said it was doing. The selected row adds a
+detail line underneath with its chrome location (`Tab #N · Pane #M`), host, and control holder. The
+panel is sized to its contents, and its title counts the agents blocked on a human
+(`Agents · 2 need you`).
+
+```
+┌ Agents · 1 needs you ──────────────────────────────────────────────────────┐
+│›⠼ claude     Desktop/p2pmux        working 4s   refactoring the sync gate…  │
+│ ◆ claude     Desktop/api           needs you    Should I force-push to main?│
+│ ● claude     Desktop/dtc-landing   done         All 310 tests pass.         │
+│ Tab #1 · Pane #1 · host: devmid · control: free                            │
+│ <↑↓> MOVE   <Enter> FOCUS                                                  │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+Press `Esc` to close, use arrows or `j`/`k` to select, and press Enter or left-click a row to jump
 to that pane (including on another tab). Scroll the overlay with the mouse wheel while it is open.
 To retain readline's beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one
 Ctrl+A to the focused PTY instead.
 
 Working directories are shared with every member as part of the existing trusted shared-shell
-model, so do not use a session with people who should not see repository paths.
+model, so do not use a session with people who should not see repository paths. What the agent
+*said* is not: that line reaches your own overlay and stops there, because a session is shared with
+everyone holding the ticket. A row for a pane hosted by another member shows their agent's state
+but never its words.
 
-`idle`, `working`, and `done` are inferred from PTY output timing, so they need no setup and work
-for every agent above. `needs you` and `error` cannot be inferred at all — silence looks identical
-whether an agent is thinking or waiting on a permission prompt — so they only appear for an agent
-that reports its own state through a hook.
+### Every state comes from a hook
+
+p2pmux does not guess what an agent is doing. It used to infer `working` and `done` from how long a
+pane had been quiet, and that could not work: silence looks identical whether an agent is thinking,
+waiting on a permission prompt, or finished. The guess fired completions mid-task and could never
+once report `needs you`, the state that actually costs you time.
+
+So the process scan answers one question — *which* agent is running in a pane — and the agent's own
+hooks answer the rest. Until a hook reports, a row reads `· not reporting`, which is the honest
+answer, and the overlay says so:
+
+```
+no agent hooks wired — run: p2pmux setup
+```
 
 ### Wiring up Claude Code
 
-Add this to `~/.claude/settings.json`. Each hook pipes its payload to `p2pmux notify`, which writes
-one line to the pane's session and exits. Outside a p2pmux pane it is a silent no-op, so it is safe
-to leave registered everywhere.
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status running", "timeout": 5 }] }],
-    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "p2pmux notify claude --status running", "timeout": 5 }] }],
-    "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "p2pmux notify claude --status running", "timeout": 5 }] }],
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status pending", "timeout": 5 }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status done", "timeout": 5 }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "p2pmux notify claude --status idle", "timeout": 5 }] }]
-  }
-}
+```
+p2pmux setup claude          # write the hooks
+p2pmux doctor                # check they are wired
+p2pmux setup claude --uninstall
 ```
 
-A turn that ends by asking a question reports `needs you` rather than `done`, since a green card on
+`setup` writes six marker-owned entries into `~/.claude/settings.json` — one per lifecycle event —
+through a temporary file and a rename. Every entry it writes carries `"owner": "p2pmux"`, so
+installing replaces exactly its own entries and removing takes exactly those: your own hooks on the
+same events (a completion chime on `Stop`, say) survive both untouched. Running it twice is the same
+as running it once. It refuses to rewrite a `settings.json` it cannot parse rather than clobber it,
+and `--dry-run` says what it would do.
+
+Each hook pipes its payload to `p2pmux notify`, which writes one line to the pane's session and
+exits. Outside a p2pmux pane it is a silent no-op, so it is safe to leave registered everywhere.
+Restart any running Claude Code sessions to pick the hooks up.
+
+A turn that ends by asking a question reports `needs you` rather than `done`, since a green row on
 a turn that is actually waiting reads as safe to ignore. A hook only ever reports for the pane it
-runs in, on the machine it runs on; the node refuses a pane it does not host itself. The agent's
-messages and your prompts are read to decide the status but never leave the machine — only the
-state, the agent kind, and the working directory are shared with the session. A pushed state is
+runs in, on the machine it runs on; the node refuses a pane it does not host itself. Your prompts
+and the tools being run are read to decide the status and never leave the process. A pushed state is
 dropped 20 seconds after its pane returns to a shell prompt, so an agent killed mid-turn stops
 asking for attention.
 
-Hooks also make the mux cheaper: the process scan that infers state drops from every second to
-every five when no pane needs inference.
+Dropping the inference also made the mux cheaper: the process scan no longer refreshes every
+process on the machine once a second, only once every five.
 
 ## Configuration
 
@@ -286,23 +310,15 @@ would read as an alert.
 
 ### Notifications
 
-Agent-completion notifications live under `[ui.notifications]`. `sound_enabled = false` keeps the
-local unread stars while silencing sound. By default p2pmux plays
-`/System/Library/Sounds/Tink.aiff` on macOS and
-`/usr/share/sounds/freedesktop/stereo/complete.oga` on Linux; set the optional `sound_path` to any
-local sound file. Playback goes through `afplay` on macOS, and on Linux through the first of
-`pw-play`, `paplay`, `canberra-gtk-play` or `aplay` that is installed. A machine with none of them
-— a server, typically, which also has no sound theme to play — rings the terminal bell instead, so
-the notification still reaches whoever is sitting at the terminal. These settings are client-local
-and load when the client attaches.
+A pane is marked unread — the `*` on its title and its tab — when its agent arrives at a state that
+wants you: `done`, `needs you`, or `error`, reported by a hook, while you are looking somewhere
+else. Focusing the pane clears the mark, and that does not re-arm it for work you have already seen.
 
-An agent counts as finished when it rings the terminal bell, or failing that after `quiet_seconds`
-of silence (default 20, clamped to 5-3600). The bell is by far the better signal — silence cannot
-distinguish an agent that finished from one waiting on a model response — so configure your agent
-to ring when it completes if it supports that. Set `require_bell = true` to notify *only* on the
-bell; that removes every false notification, at the cost of showing an agent that never rings as
-working until it exits. Each pane is announced once per work episode, so revisiting a pane does not
-replay its notification.
+There is no completion sound. p2pmux used to play one, driven by the output-timing inference that
+could not tell a finished turn from a quiet one, so it fired mid-task; the `[ui.notifications]`
+config block that tuned it is gone with it. A hook-reported completion is already unmissable in the
+overlay and the unread mark, and an agent that should make a noise can do it from its own `Stop`
+hook, where it knows it has actually finished.
 
 ## Performance logging
 

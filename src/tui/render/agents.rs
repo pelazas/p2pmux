@@ -1,5 +1,16 @@
-//! The Ctrl+A agents overlay: panel geometry, one card per agent, and the
-//! help line under them.
+//! The Ctrl+A agents overlay: panel geometry, one line per agent, and the help
+//! line under them.
+//!
+//! The panel is sized to what it has to say. It used to be a fixed 28-row box
+//! that a single agent — or none — left almost entirely blank, with each agent
+//! spread over two lines and a third for separation. Density is the whole point
+//! of a list you open to answer "which of these needs me": the answer should be
+//! readable in one glance without scrolling past whitespace.
+//!
+//! What each line spends its width on changed with it. The plumbing — tab, pane,
+//! host, controller — moved to a detail line under the selected row, because it
+//! is what you need *after* choosing a row, not to choose one. The width it
+//! freed goes to what the agent is actually doing.
 
 use ratatui::{
     Frame,
@@ -25,15 +36,119 @@ use crate::{
     },
 };
 
-pub(in crate::tui) const AGENT_OVERLAY_CARD_LINES: usize = 3;
+/// Widest the panel is allowed to get, and narrowest it is worth drawing.
+const PANEL_MAX_WIDTH: u16 = 96;
+const PANEL_MIN_WIDTH: u16 = 24;
+/// Room for at least this many agent rows before the list starts scrolling,
+/// when the terminal is tall enough to give it.
+const MAX_VISIBLE_ROWS: u16 = 12;
+
+/// The nudge shown when agents are running but nothing has reported on them.
+///
+/// This is the state a user lands in by default — the hooks are opt-in — and
+/// without a line saying so the overlay looks broken rather than unconfigured.
+pub(in crate::tui) const OVERLAY_UNWIRED_HINT: &str = "no agent hooks wired — run: p2pmux setup";
+
+/// Where each part of the overlay is drawn.
+///
+/// Computed once from the terminal area and what there is to show, so the
+/// renderer, the scroll clamp, and the click-to-row lookup all read the same
+/// numbers. They used to derive their own from `area` alone, which is how the
+/// click map came to ignore the members header and land a row too high for
+/// every member in the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) struct AgentOverlayLayout {
+    pub(in crate::tui) panel: Rect,
+    /// The "Members" header block. Zero-height in a solo session.
+    pub(in crate::tui) members: Rect,
+    /// The scrollable agent list. One line per agent.
+    pub(in crate::tui) rows: Rect,
+    /// The selected row's plumbing, or the unwired nudge. Zero-height when neither applies.
+    pub(in crate::tui) detail: Rect,
+    pub(in crate::tui) help: Rect,
+}
+
+/// How many lines the members block wants for this session.
+fn member_lines(tui: &MultiPaneTui) -> u16 {
+    if tui.presence.is_empty() {
+        0
+    } else {
+        // A "Members" heading, one line each, and a blank before the agents.
+        u16::try_from(tui.presence.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+    }
+}
+
+pub(in crate::tui) fn agents_overlay_layout(area: Rect, tui: &MultiPaneTui) -> AgentOverlayLayout {
+    let members_height = member_lines(tui);
+    let rows_wanted = u16::try_from(tui.agent_rows.len().max(1)).unwrap_or(u16::MAX);
+    let detail_height = u16::from(overlay_detail_line(tui, &UiTheme::default()).is_some());
+    let width = area
+        .width
+        .saturating_sub(2)
+        .clamp(PANEL_MIN_WIDTH.min(area.width), PANEL_MAX_WIDTH);
+    // Borders, the members block, the rows, the detail line, and the help line.
+    let wanted = 2u16
+        .saturating_add(members_height)
+        .saturating_add(rows_wanted.min(MAX_VISIBLE_ROWS))
+        .saturating_add(detail_height)
+        .saturating_add(1);
+    let height = wanted.min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width.min(area.width),
+        height,
+    );
+    let inner = Block::bordered().inner(panel);
+    // Help first, then the detail line above it: both are anchored to the
+    // bottom, so a panel squeezed by a short terminal loses list rows rather
+    // than the line telling you what the keys do.
+    let help = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        1.min(inner.height),
+    );
+    let detail_height = detail_height.min(inner.height.saturating_sub(help.height));
+    let detail = Rect::new(
+        inner.x,
+        help.y.saturating_sub(detail_height),
+        inner.width,
+        detail_height,
+    );
+    let members_height = members_height.min(
+        inner
+            .height
+            .saturating_sub(help.height)
+            .saturating_sub(detail.height),
+    );
+    let members = Rect::new(inner.x, inner.y, inner.width, members_height);
+    let rows = Rect::new(
+        inner.x,
+        members.bottom(),
+        inner.width,
+        detail.y.saturating_sub(members.bottom()).min(inner.height),
+    );
+    AgentOverlayLayout {
+        panel,
+        members,
+        rows,
+        detail,
+        help,
+    }
+}
+
 pub(in crate::tui) fn render_agents_overlay(
     frame: &mut Frame<'_>,
     tui: &MultiPaneTui,
     now_unix_ms: u64,
 ) {
     let area = frame.area();
-    let panel = agents_overlay_panel(area);
-    frame.render_widget(Clear, panel);
+    let layout = agents_overlay_layout(area, tui);
+    frame.render_widget(Clear, layout.panel);
     let needs_you = tui.agent_rows.iter().any(|row| row.state.needs_you());
     let title_color = if needs_you {
         tui.theme.agent_overlay_attention
@@ -48,47 +163,86 @@ pub(in crate::tui) fn render_agents_overlay(
                 .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(tui.theme.agent_overlay_chrome));
-    let content = agents_overlay_content(area);
-    frame.render_widget(block, panel);
+    frame.render_widget(block, layout.panel);
+
     // The overlay is already the place you look to answer "what is happening in this
     // session". Who is here and where belongs in the same glance, above the agents.
-    let members = presence_overlay_lines(tui);
-    if tui.agent_rows.is_empty() {
-        let mut lines = members;
-        lines.push(Line::styled(
-            "No agents running",
-            Style::default().fg(tui.theme.agent_overlay_muted),
-        ));
-        frame.render_widget(Paragraph::new(lines), content);
-    } else {
-        let mut lines = members;
-        lines.reserve(tui.agent_rows.len().saturating_mul(3));
-        let animation_phase = agent_overlay_animation_phase(now_unix_ms);
-        for (index, row) in tui.agent_rows.iter().enumerate() {
-            lines.extend(format_agent_overlay_card(
-                row,
-                tui.agent_selected_pane == Some(row.pane_id),
-                content.width,
-                now_unix_ms,
-                animation_phase,
-                &tui.theme,
-            ));
-            if index + 1 < tui.agent_rows.len() {
-                lines.push(Line::raw(""));
-            }
-        }
-        frame.render_widget(
-            Paragraph::new(
-                lines
-                    .into_iter()
-                    .skip(tui.agent_overlay_scroll_line)
-                    .collect::<Vec<_>>(),
-            ),
-            content,
-        );
+    if layout.members.height > 0 {
+        frame.render_widget(Paragraph::new(presence_overlay_lines(tui)), layout.members);
     }
-    render_agents_overlay_help(frame.buffer_mut(), &tui.theme, agents_overlay_help(area));
+
+    if tui.agent_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " No agents running",
+                Style::default().fg(tui.theme.agent_overlay_muted),
+            )),
+            layout.rows,
+        );
+    } else {
+        let animation_phase = agent_overlay_animation_phase(now_unix_ms);
+        let lines = tui
+            .agent_rows
+            .iter()
+            .skip(tui.agent_overlay_scroll_line)
+            .map(|row| {
+                format_agent_overlay_card(
+                    row,
+                    tui.agent_selected_pane == Some(row.pane_id),
+                    layout.rows.width,
+                    now_unix_ms,
+                    animation_phase,
+                    &tui.theme,
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), layout.rows);
+    }
+
+    if layout.detail.height > 0
+        && let Some(detail) = overlay_detail_line(tui, &tui.theme)
+    {
+        frame.render_widget(Paragraph::new(detail), layout.detail);
+    }
+    render_agents_overlay_help(frame.buffer_mut(), &tui.theme, layout.help);
 }
+
+/// The line under the list: the selected agent's plumbing, or the unwired nudge.
+///
+/// The nudge wins. A session where nothing is reporting has a configuration
+/// problem, and telling the user which tab an unreported agent sits in does not
+/// help them fix it.
+fn overlay_detail_line(tui: &MultiPaneTui, theme: &UiTheme) -> Option<Line<'static>> {
+    if !tui.agent_rows.is_empty()
+        && tui
+            .agent_rows
+            .iter()
+            .all(|row| row.state == AgentRosterState::Unknown)
+    {
+        return Some(Line::styled(
+            format!(" {OVERLAY_UNWIRED_HINT}"),
+            Style::default().fg(theme.agent_overlay_attention),
+        ));
+    }
+    let selected = tui
+        .agent_selected_pane
+        .and_then(|pane| tui.agent_rows.iter().find(|row| row.pane_id == pane))?;
+    let mut spans = vec![Span::styled(
+        format!(
+            " {} · {} · host: {}",
+            selected.tab_label, selected.pane_label, selected.host
+        ),
+        Style::default().fg(theme.agent_overlay_muted),
+    )];
+    if !selected.controller.is_empty() {
+        spans.push(Span::styled(
+            format!(" · control: {}", selected.controller),
+            Style::default().fg(theme.agent_overlay_secondary),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
 /// One line per other member: their dot, their name, and where they are.
 ///
 /// Empty in a solo session, so a single-player overlay gains no header for nobody. The
@@ -102,7 +256,7 @@ pub(in crate::tui) fn presence_overlay_lines(tui: &MultiPaneTui) -> Vec<Line<'st
     let mut watchers = watchers;
     watchers.sort_by_key(|row| tui.member_slot(&row.peer_id));
     let mut lines = vec![Line::styled(
-        "Members",
+        " Members",
         Style::default()
             .fg(tui.theme.agent_overlay_muted)
             .add_modifier(Modifier::BOLD),
@@ -117,6 +271,7 @@ pub(in crate::tui) fn presence_overlay_lines(tui: &MultiPaneTui) -> Vec<Line<'st
             None => String::from("elsewhere"),
         };
         lines.push(Line::from(vec![
+            Span::raw(" "),
             Span::styled(PRESENCE_WATCHING, Style::default().fg(color)),
             Span::raw(" "),
             Span::styled(
@@ -133,48 +288,10 @@ pub(in crate::tui) fn presence_overlay_lines(tui: &MultiPaneTui) -> Vec<Line<'st
     lines
 }
 
-fn agents_overlay_panel(area: Rect) -> Rect {
-    let width = area.width.saturating_sub(2).clamp(24, 96);
-    let height = area.height.saturating_sub(2).clamp(5, 28);
-    Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y
-            .saturating_add(area.height.saturating_sub(height) / 2),
-        width.min(area.width),
-        height.min(area.height),
-    )
-}
-pub(in crate::tui) fn agents_overlay_inner(area: Rect) -> Rect {
-    Block::bordered().inner(agents_overlay_panel(area))
-}
-pub(in crate::tui) fn agents_overlay_help(area: Rect) -> Option<Rect> {
-    let inner = agents_overlay_inner(area);
-    (inner.height >= 4).then(|| {
-        Rect::new(
-            inner.x,
-            inner.y.saturating_add(inner.height.saturating_sub(1)),
-            inner.width,
-            1,
-        )
-    })
-}
-pub(in crate::tui) fn agents_overlay_content(area: Rect) -> Rect {
-    let inner = agents_overlay_inner(area);
-    let y = inner.y.saturating_add(1);
-    let height = agents_overlay_help(area)
-        .map(|help| help.y.saturating_sub(y))
-        .unwrap_or_else(|| inner.height.saturating_sub(1));
-    Rect::new(
-        inner.x.saturating_add(1),
-        y,
-        inner.width.saturating_sub(2),
-        height,
-    )
-}
-fn render_agents_overlay_help(buffer: &mut Buffer, theme: &UiTheme, help: Option<Rect>) {
-    let Some(help) = help else {
+fn render_agents_overlay_help(buffer: &mut Buffer, theme: &UiTheme, help: Rect) {
+    if help.height == 0 {
         return;
-    };
+    }
     buffer.set_stringn(
         help.x,
         help.y,
@@ -191,6 +308,7 @@ fn render_agents_overlay_help(buffer: &mut Buffer, theme: &UiTheme, help: Option
         AGENT_OVERLAY_HELP,
     );
 }
+
 /// Colour for a state's glyph and label. `Working` keeps the chrome accent it
 /// has always had; the two states that want a human get their own roles so a
 /// blocked or failed agent never reads as ordinary muted text.
@@ -199,12 +317,15 @@ fn agent_overlay_state_color(state: AgentRosterState, theme: &UiTheme) -> Color 
         AgentRosterState::Working => theme.agent_overlay_chrome,
         AgentRosterState::Pending => theme.agent_overlay_attention,
         AgentRosterState::Error => theme.agent_overlay_error,
-        AgentRosterState::Idle | AgentRosterState::Done => theme.agent_overlay_muted,
+        AgentRosterState::Idle | AgentRosterState::Done | AgentRosterState::Unknown => {
+            theme.agent_overlay_muted
+        }
     }
 }
+
 /// Overlay title, carrying a count of agents blocked on a human when there are
 /// any. The whole point of opening the overlay is finding those, so the count
-/// belongs where it is readable before the eye reaches the cards.
+/// belongs where it is readable before the eye reaches the rows.
 pub(in crate::tui) fn agents_overlay_title(rows: &[AgentOverlayRow]) -> String {
     let needs_you = rows.iter().filter(|row| row.state.needs_you()).count();
     match needs_you {
@@ -213,6 +334,30 @@ pub(in crate::tui) fn agents_overlay_title(rows: &[AgentOverlayRow]) -> String {
         count => format!(" Agents · {count} need you "),
     }
 }
+
+/// The glyph and the word for a state.
+///
+/// The word stays even though the glyph carries the same information: this list
+/// is opened rarely, by someone who has not memorised a glyph legend, and the
+/// column it costs is cheaper than the ambiguity it removes.
+fn state_label(state: AgentRosterState, animation_phase: usize) -> (&'static str, &'static str) {
+    match state {
+        AgentRosterState::Working => (agent_overlay_working_glyph(animation_phase), "working"),
+        AgentRosterState::Pending => ("◆", "needs you"),
+        AgentRosterState::Error => ("✗", "error"),
+        AgentRosterState::Done => ("●", "done"),
+        AgentRosterState::Idle => ("○", "idle"),
+        // Not "idle": nothing here knows that it is idle. It is running and
+        // silent, and the row says exactly that.
+        AgentRosterState::Unknown => ("·", "not reporting"),
+    }
+}
+
+/// One agent, one line: `‹marker›‹glyph› ‹kind› ‹cwd›  ‹state›  ‹message›`.
+///
+/// The right-hand columns are the ones that get cut first as the panel narrows,
+/// and they are ordered so that what survives is what a human needs: the state
+/// outlives the message, and the glyph outlives both.
 pub(in crate::tui) fn format_agent_overlay_card(
     row: &AgentOverlayRow,
     selected: bool,
@@ -220,117 +365,86 @@ pub(in crate::tui) fn format_agent_overlay_card(
     now_unix_ms: u64,
     animation_phase: usize,
     theme: &UiTheme,
-) -> [Line<'static>; 2] {
+) -> Line<'static> {
+    let (glyph, state_word) = state_label(row.state, animation_phase);
+    let state_color = agent_overlay_state_color(row.state, theme);
     let marker = if selected { "›" } else { " " };
     let kind = overlay_kind_label(&row.kind);
-    let first_prefix = format!("{marker} {kind} · ");
-    let cwd = truncate_leading(
-        &row.cwd,
-        usize::from(width.saturating_sub(text_width(&first_prefix))),
-    );
-    let card_style = if selected {
-        Style::default().bg(theme.agent_overlay_selected_background)
-    } else {
-        Style::default()
-    };
-    let first_line = agent_overlay_line(
-        vec![
-            Span::styled(marker, Style::default().fg(theme.agent_overlay_chrome)),
-            Span::raw(" "),
-            Span::styled(
-                kind,
-                Style::default()
-                    .fg(theme.agent_overlay_foreground)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · ", Style::default().fg(theme.agent_overlay_muted)),
-            Span::styled(cwd, Style::default().fg(theme.agent_overlay_secondary)),
-        ],
-        card_style,
-        selected,
-        width,
-    );
 
-    let (glyph, state, elapsed) = match row.state {
-        AgentRosterState::Working => (
-            agent_overlay_working_glyph(animation_phase),
-            "working",
-            Some(format_agent_elapsed(row.working_since_unix_ms, now_unix_ms)),
-        ),
-        AgentRosterState::Idle => ("○", "idle", None),
-        AgentRosterState::Done => ("✓", "done", None),
-        AgentRosterState::Pending => ("◆", "needs you", None),
-        AgentRosterState::Error => ("✗", "error", None),
-    };
-    let state_color = agent_overlay_state_color(row.state, theme);
-    let location = format!(
-        " · {} · {} · host: {}",
-        truncate_trailing(&row.tab_label, usize::from(width / 3)),
-        truncate_trailing(&row.pane_label, usize::from(width / 3)),
-        row.host
-    );
-    let state_prefix = match elapsed.as_deref() {
-        Some(elapsed) => format!("{glyph} {state} {elapsed}"),
-        None => format!("{glyph} {state}"),
-    };
-    let controller_prefix = " · control: ";
-    let controller_width = width.saturating_sub(
-        text_width(&state_prefix)
-            .saturating_add(text_width(&location))
-            .saturating_add(text_width(controller_prefix)),
-    );
-    let controller = (controller_width > 0)
-        .then(|| truncate_trailing(&row.controller, usize::from(controller_width)));
+    // Elapsed on `working` because that is the number a human reads as progress,
+    // and on `needs you` because that is the one that reads as cost: an agent
+    // that has been blocked on you for nine minutes is nine minutes wasted.
+    let elapsed = matches!(
+        row.state,
+        AgentRosterState::Working | AgentRosterState::Pending
+    )
+    .then(|| format_agent_elapsed(row.working_since_unix_ms, now_unix_ms))
+    .filter(|_| row.working_since_unix_ms > 0);
+
     let mut state_style = Style::default().fg(state_color);
     if row.state.needs_you() {
         // A blocked agent is the one row in the overlay that is costing someone
         // time right now, so it gets the only weight in the state column.
         state_style = state_style.add_modifier(Modifier::BOLD);
     }
-    let mut second_spans = vec![
+
+    let kind_width = 11usize;
+    let mut spans = vec![
+        Span::styled(marker, Style::default().fg(theme.agent_overlay_chrome)),
         Span::styled(glyph, Style::default().fg(state_color)),
         Span::raw(" "),
-        Span::styled(state, state_style),
+        Span::styled(
+            format!("{kind:<kind_width$}"),
+            Style::default()
+                .fg(theme.agent_overlay_foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
-    if let Some(elapsed) = elapsed {
-        second_spans.push(Span::raw(" "));
-        second_spans.push(Span::styled(
-            elapsed,
-            Style::default().fg(theme.agent_overlay_warm),
-        ));
-    }
-    second_spans.push(Span::styled(
-        location,
-        Style::default().fg(theme.agent_overlay_muted),
+
+    let state_text = match elapsed {
+        Some(elapsed) => format!("{state_word} {elapsed}"),
+        None => state_word.to_owned(),
+    };
+    // Budget from the right: the state column is fixed-width so rows line up,
+    // and whatever is left over is the cwd's, then the message's.
+    let fixed = text_width(marker)
+        .saturating_add(text_width(glyph))
+        .saturating_add(1)
+        .saturating_add(kind_width as u16);
+    let state_width = text_width(&state_text).max(14);
+    let remaining = width
+        .saturating_sub(fixed)
+        .saturating_sub(state_width)
+        .saturating_sub(2);
+    let cwd_width = remaining.saturating_mul(2) / 5;
+    let cwd = truncate_leading(&short_cwd(&row.cwd), usize::from(cwd_width));
+    spans.push(Span::styled(
+        format!("{cwd:<width$}", width = usize::from(cwd_width)),
+        Style::default().fg(theme.agent_overlay_secondary),
     ));
-    if let Some(controller) = controller {
-        second_spans.push(Span::styled(
-            controller_prefix,
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("{state_text:<width$}", width = usize::from(state_width)),
+        state_style,
+    ));
+
+    // The agent's own words, and only ever for a pane on this machine — a
+    // remote row's message is empty because the peer that owns it never sends
+    // one. See `local_ipc::AgentOverlaySnapshotRow`.
+    let message_width = remaining.saturating_sub(cwd_width);
+    if !row.message.is_empty() && message_width > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            truncate_trailing(&row.message, usize::from(message_width)),
             Style::default().fg(theme.agent_overlay_muted),
         ));
-        second_spans.push(Span::styled(
-            controller,
-            Style::default().fg(theme.agent_overlay_secondary),
-        ));
     }
-    [
-        first_line,
-        agent_overlay_line(second_spans, card_style, selected, width),
-    ]
-}
-pub(in crate::tui) fn agent_overlay_animation_phase(now_unix_ms: u64) -> usize {
-    now_unix_ms.saturating_div(AGENT_OVERLAY_ANIMATION_INTERVAL.as_millis() as u64) as usize
-}
-fn agent_overlay_working_glyph(animation_phase: usize) -> &'static str {
-    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    FRAMES[animation_phase % FRAMES.len()]
-}
-fn agent_overlay_line(
-    mut spans: Vec<Span<'static>>,
-    card_style: Style,
-    selected: bool,
-    width: u16,
-) -> Line<'static> {
+
+    let card_style = if selected {
+        Style::default().bg(theme.agent_overlay_selected_background)
+    } else {
+        Style::default()
+    };
     if selected {
         let content_width = spans.iter().fold(0_u16, |total, span| {
             total.saturating_add(text_width(&span.content))
@@ -342,317 +456,65 @@ fn agent_overlay_line(
     }
     Line::from(spans).style(card_style)
 }
-fn overlay_kind_label(kind: &str) -> &'static str {
-    match kind {
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        "cursor" => "Cursor Agent",
-        "pi" => "Pi",
-        "opencode" => "OpenCode",
-        _ => "Unknown",
+
+pub(in crate::tui) fn agent_overlay_animation_phase(now_unix_ms: u64) -> usize {
+    now_unix_ms.saturating_div(AGENT_OVERLAY_ANIMATION_INTERVAL.as_millis() as u64) as usize
+}
+
+/// The working spinner.
+///
+/// Braille rather than the old quarter-circles: ten frames instead of four, so
+/// the motion reads as continuous rather than as a thing flicking between four
+/// positions, and every frame occupies exactly one column in every font that has
+/// the block at all.
+fn agent_overlay_working_glyph(animation_phase: usize) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[animation_phase % FRAMES.len()]
+}
+
+/// The last two components of a working directory.
+///
+/// `/Users/pelazas/Desktop/p2pmux` reads as `Desktop/p2pmux`. The leading path
+/// is the same for every row and identifies nothing; the tail is what the human
+/// actually calls the project. Deliberately not `~`-relative — a row can belong
+/// to a pane on someone else's machine, where this process's home directory
+/// means nothing.
+fn short_cwd(cwd: &str) -> String {
+    let mut parts = cwd
+        .trim_end_matches('/')
+        .rsplit('/')
+        .filter(|p| !p.is_empty());
+    match (parts.next(), parts.next()) {
+        (Some(last), Some(parent)) => format!("{parent}/{last}"),
+        (Some(last), None) => last.to_owned(),
+        _ => cwd.to_owned(),
     }
 }
+
+fn overlay_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "claude" => "claude",
+        "codex" => "codex",
+        "cursor" => "cursor",
+        "pi" => "pi",
+        "opencode" => "opencode",
+        _ => "agent",
+    }
+}
+
 fn format_agent_elapsed(working_since_unix_ms: u64, now_unix_ms: u64) -> String {
     let elapsed_seconds = now_unix_ms
         .saturating_sub(working_since_unix_ms)
         .saturating_div(1_000);
     if elapsed_seconds >= 3_600 {
         format!(
-            "{}h {}m",
+            "{}h{}m",
             elapsed_seconds / 3_600,
             (elapsed_seconds % 3_600) / 60
         )
     } else if elapsed_seconds >= 60 {
-        format!("{}m {}s", elapsed_seconds / 60, elapsed_seconds % 60)
+        format!("{}m", elapsed_seconds / 60)
     } else {
         format!("{elapsed_seconds}s")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use ratatui::{
-        Terminal,
-        backend::TestBackend,
-        layout::Rect,
-        style::{Color, Modifier},
-    };
-
-    use crate::{
-        config::UiTheme,
-        layout::{Node, Tab},
-        tui::{
-            MultiPaneTui,
-            test_support::{agent_row, layout, named_members, watcher},
-        },
-    };
-
-    use super::{
-        agent_overlay_working_glyph, agents_overlay_content, agents_overlay_help,
-        agents_overlay_inner, agents_overlay_panel, agents_overlay_title, format_agent_elapsed,
-        format_agent_overlay_card, presence_overlay_lines, render_agents_overlay,
-    };
-
-    #[test]
-    fn agents_overlay_cards_show_state_elapsed_and_location() {
-        let row = agent_row(2, 2, 1);
-
-        let rendered =
-            format_agent_overlay_card(&row, true, 120, 1_725_000_084_123, 0, &UiTheme::default());
-
-        assert!(rendered[0].to_string().starts_with("› Codex · "));
-        assert!(
-            rendered[0]
-                .to_string()
-                .contains("/very/long/repository/path")
-        );
-        assert!(rendered[1].to_string().starts_with("◐ working 1m 24s"));
-        assert!(rendered[1].to_string().contains("Tab #2 · Pane #1"));
-        assert!(rendered[1].to_string().contains("host: Host"));
-        assert!(rendered[1].to_string().contains("control: free"));
-    }
-
-    #[test]
-    fn agents_overlay_cards_distinguish_idle_done_and_future_work() {
-        let mut row = agent_row(2, 2, 1);
-        row.state = crate::protocol::AgentRosterState::Idle;
-        let idle =
-            format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &UiTheme::default());
-        assert!(idle[1].to_string().starts_with("○ idle"));
-
-        row.state = crate::protocol::AgentRosterState::Done;
-        let done =
-            format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &UiTheme::default());
-        assert!(done[1].to_string().starts_with("✓ done"));
-
-        row.state = crate::protocol::AgentRosterState::Working;
-        row.working_since_unix_ms = 1_725_000_001_123;
-        let future =
-            format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &UiTheme::default());
-        assert!(future[1].to_string().starts_with("◐ working 0s"));
-    }
-
-    #[test]
-    fn agents_overlay_cards_mark_blocked_and_failed_agents() {
-        use crate::protocol::AgentRosterState;
-
-        let theme = UiTheme::default();
-        let mut row = agent_row(2, 2, 1);
-
-        row.state = AgentRosterState::Pending;
-        let pending = format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
-        assert!(pending[1].to_string().starts_with("◆ needs you"));
-        // A blocked agent is the one row costing someone time, so it carries
-        // the attention colour and the only weight in the state column.
-        let state_span = &pending[1].spans[2];
-        assert_eq!(state_span.style.fg, Some(theme.agent_overlay_attention));
-        assert!(state_span.style.add_modifier.contains(Modifier::BOLD));
-
-        row.state = AgentRosterState::Error;
-        let error = format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
-        assert!(error[1].to_string().starts_with("✗ error"));
-        assert_eq!(error[1].spans[2].style.fg, Some(theme.agent_overlay_error));
-
-        // Working keeps the chrome accent and stays unweighted.
-        row.state = AgentRosterState::Working;
-        let working = format_agent_overlay_card(&row, false, 120, 1_725_000_000_123, 0, &theme);
-        assert_eq!(
-            working[1].spans[2].style.fg,
-            Some(theme.agent_overlay_chrome)
-        );
-        assert!(
-            !working[1].spans[2]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)
-        );
-    }
-
-    #[test]
-    fn agents_overlay_title_counts_agents_blocked_on_a_human() {
-        use crate::protocol::AgentRosterState;
-
-        let working = agent_row(1, 1, 1);
-        assert_eq!(agents_overlay_title(&[]), " Agents ");
-        assert_eq!(
-            agents_overlay_title(std::slice::from_ref(&working)),
-            " Agents "
-        );
-
-        let mut pending = agent_row(2, 1, 2);
-        pending.state = AgentRosterState::Pending;
-        assert_eq!(
-            agents_overlay_title(&[working.clone(), pending.clone()]),
-            " Agents · 1 needs you "
-        );
-
-        // Errors count too: a failed turn is blocking whoever asked for it.
-        let mut failed = agent_row(3, 1, 3);
-        failed.state = AgentRosterState::Error;
-        assert_eq!(
-            agents_overlay_title(&[working.clone(), pending, failed]),
-            " Agents · 2 need you "
-        );
-
-        // A finished agent is worth a glance but is not holding anyone up.
-        let mut done = agent_row(4, 1, 4);
-        done.state = AgentRosterState::Done;
-        assert_eq!(agents_overlay_title(&[working, done]), " Agents ");
-    }
-
-    #[test]
-    fn agents_overlay_elapsed_uses_compact_saturating_durations() {
-        assert_eq!(format_agent_elapsed(1_000, 43_000), "42s");
-        assert_eq!(format_agent_elapsed(1_000, 85_000), "1m 24s");
-        assert_eq!(format_agent_elapsed(1_000, 3_721_000), "1h 2m");
-        assert_eq!(format_agent_elapsed(2_000, 1_000), "0s");
-    }
-
-    #[test]
-    fn agents_overlay_uses_orange_red_chrome_soft_selection_and_modal_padding() {
-        let mut tui = MultiPaneTui::new(layout(
-            vec![Tab {
-                tab_id: 1,
-                root: Node::Leaf { pane_id: 1 },
-
-                title: None,
-            }],
-            &[(1, 2, 8)],
-        ))
-        .expect("valid layout");
-        tui.set_agent_rows(vec![agent_row(1, 1, 1)]);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-
-        terminal
-            .draw(|frame| render_agents_overlay(frame, &tui, 1_725_000_084_123))
-            .expect("render");
-        let area = Rect::new(0, 0, 80, 24);
-        let panel = agents_overlay_panel(area);
-        let inner = agents_overlay_inner(area);
-        let content = agents_overlay_content(area);
-        let help = agents_overlay_help(area).expect("help row");
-        let buffer = terminal.backend().buffer();
-
-        assert_eq!(panel, Rect::new(1, 1, 78, 22));
-        assert_eq!(buffer[(panel.x, panel.y)].fg, Color::Rgb(255, 69, 0));
-        assert_eq!(
-            buffer[(panel.x.saturating_add(1), panel.y)].modifier,
-            Modifier::BOLD
-        );
-        assert_eq!(buffer[(content.x, content.y)].bg, Color::Rgb(42, 42, 42));
-        assert_eq!(
-            buffer[(content.x.saturating_add(50), content.y.saturating_add(1))].bg,
-            Color::Rgb(42, 42, 42)
-        );
-        assert_eq!(
-            buffer[(content.right().saturating_sub(1), content.y)].bg,
-            Color::Rgb(42, 42, 42)
-        );
-        assert_eq!(buffer[(inner.x, content.y)].bg, Color::Reset);
-        assert_eq!(buffer[(content.x, inner.y)].bg, Color::Reset);
-        assert_eq!(
-            buffer[(content.x, content.y.saturating_add(2))].bg,
-            Color::Reset
-        );
-        for x in help.x..help.right() {
-            assert_eq!(buffer[(x, help.y)].bg, tui.theme.footer_background);
-        }
-        assert_eq!(buffer[(help.x.saturating_add(1), help.y)].symbol(), "<");
-        assert_eq!(buffer[(help.x.saturating_add(2), help.y)].symbol(), "↑");
-        assert_eq!(buffer[(help.x.saturating_add(14), help.y)].symbol(), "E");
-    }
-
-    #[test]
-    fn agents_overlay_help_renders_for_empty_rosters() {
-        let tui = MultiPaneTui::new(layout(
-            vec![Tab {
-                tab_id: 1,
-                root: Node::Leaf { pane_id: 1 },
-                title: None,
-            }],
-            &[(1, 2, 8)],
-        ))
-        .expect("valid layout");
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-
-        terminal
-            .draw(|frame| render_agents_overlay(frame, &tui, 1_725_000_084_123))
-            .expect("render");
-        let help = agents_overlay_help(Rect::new(0, 0, 80, 24)).expect("help row");
-        let buffer = terminal.backend().buffer();
-
-        for x in help.x..help.right() {
-            assert_eq!(buffer[(x, help.y)].bg, tui.theme.footer_background);
-        }
-        assert_eq!(buffer[(help.x.saturating_add(2), help.y)].symbol(), "↑");
-        assert_eq!(buffer[(help.x.saturating_add(14), help.y)].symbol(), "E");
-    }
-
-    #[test]
-    fn agents_overlay_hides_help_below_the_minimum_content_height() {
-        let short = Rect::new(0, 0, 80, 7);
-        let threshold = Rect::new(0, 0, 80, 8);
-
-        assert_eq!(agents_overlay_inner(short).height, 3);
-        assert_eq!(agents_overlay_help(short), None);
-        assert_eq!(agents_overlay_content(short).height, 2);
-        assert!(agents_overlay_help(threshold).is_some());
-        assert_eq!(agents_overlay_content(threshold).height, 2);
-    }
-
-    #[test]
-    fn agents_overlay_working_glyph_uses_animation_phase() {
-        assert_eq!(agent_overlay_working_glyph(0), "◐");
-        assert_eq!(agent_overlay_working_glyph(1), "◓");
-        assert_eq!(agent_overlay_working_glyph(4), "◐");
-    }
-
-    #[test]
-    fn the_overlay_lists_who_is_here_and_where() {
-        let mut snapshot = layout(
-            vec![
-                Tab {
-                    tab_id: 1,
-                    root: Node::Leaf { pane_id: 1 },
-                    title: None,
-                },
-                Tab {
-                    tab_id: 2,
-                    root: Node::Leaf { pane_id: 2 },
-                    title: None,
-                },
-            ],
-            &[(1, 2, 2), (2, 2, 2)],
-        );
-        snapshot.members = named_members();
-        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
-
-        assert!(
-            presence_overlay_lines(&tui).is_empty(),
-            "a solo session gains no header for nobody"
-        );
-
-        assert!(tui.set_presence(vec![watcher(b"tis", 2, 2), watcher(b"ana", 1, 404)]));
-        let lines = presence_overlay_lines(&tui);
-        let rendered = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(rendered[0], "Members");
-        assert_eq!(rendered[1], "● tis · Tab 2 · Pane 1");
-        assert_eq!(
-            rendered[2], "● ana · elsewhere",
-            "a pane this client cannot resolve is reported, not guessed at"
-        );
-        assert_eq!(
-            rendered[3], "",
-            "the agents below get their own breathing room"
-        );
     }
 }

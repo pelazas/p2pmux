@@ -263,12 +263,30 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
 /// session, so any `p2pmux attach`, `ls`, `ticket` or `--resume` — every caller of
 /// `list_live` — killed every live session on the machine.
 fn configure_accepted(stream: UnixStream) -> Option<UnixStream> {
-    stream.set_nonblocking(false).ok()?;
-    stream.set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT)).ok()?;
-    // Prevent stalled clients from wedging the node on large Snapshot writes.
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
+    if stream.set_nonblocking(false).is_err() {
+        return None;
+    }
+    // A producer writes one line and exits — `p2pmux notify` is a hook on the
+    // agent's critical path and has nothing to wait around for — so by the time
+    // the node accepts, its peer is usually already gone. macOS answers EINVAL
+    // to `setsockopt` on a socket in that state, and treating that as "not worth
+    // keeping" threw away the payload sitting readable in the socket's own
+    // buffer. Every agent status pushed by a hook was lost this way, which is
+    // why wiring the hooks up appeared to do nothing at all.
+    //
+    // A peer that has gone cannot make us wait: the read returns what was
+    // buffered and then EOF. Switching to non-blocking makes that a guarantee
+    // rather than an assumption — the timeouts exist to stop a *live* client
+    // wedging the loop, and there is no live client here to wedge it.
+    if stream
+        .set_read_timeout(Some(FIRST_MESSAGE_TIMEOUT))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .is_err()
+    {
+        stream.set_nonblocking(true).ok()?;
+    }
     Some(stream)
 }
 
@@ -310,8 +328,10 @@ fn run_socket_loop(
                             kind,
                             status,
                             cwd,
+                            message,
                         })) => {
-                            did_work |= node.apply_agent_status(pane_id, &kind, &status, &cwd);
+                            did_work |=
+                                node.apply_agent_status(pane_id, &kind, &status, &cwd, &message);
                         }
                         Ok(Some(ClientMessage::Shutdown { generation })) => {
                             let _ = write_message(
@@ -1388,8 +1408,10 @@ impl SharedLayoutNode {
         kind: &str,
         status: &str,
         cwd: &str,
+        message: &str,
     ) -> bool {
-        self.runtime.apply_agent_status(pane_id, kind, status, cwd)
+        self.runtime
+            .apply_agent_status(pane_id, kind, status, cwd, message)
     }
     pub fn shutdown(self) {
         self.runtime.shutdown_node();
@@ -1443,6 +1465,54 @@ mod tests {
             "a hung-up peer poisoned the listener for the next client"
         );
         drop(live);
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The shape of every agent hook: write one line, exit immediately.
+    ///
+    /// `p2pmux notify` runs on the agent's critical path and has nothing to wait
+    /// for, so its socket is almost always closed before the node gets round to
+    /// accepting it. macOS answers EINVAL to `setsockopt` on such a socket, and
+    /// refusing the connection on that basis discarded the payload already
+    /// sitting in its buffer — silently, on every single hook. Wiring the hooks
+    /// up looked like it did nothing, because nothing is what it did.
+    #[test]
+    fn a_producer_that_exits_before_being_accepted_still_delivers_its_status() {
+        let directory =
+            std::env::temp_dir().join(format!("p2pmux-producer-{}", std::process::id()));
+        let _ = fs::create_dir_all(&directory);
+        let path = directory.join("node.sock");
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("listener should bind");
+
+        {
+            let mut producer = UnixStream::connect(&path).expect("producer should connect");
+            let mut line = serde_json::to_vec(&ClientMessage::AgentStatus {
+                pane_id: 3,
+                kind: "claude".into(),
+                status: "pending".into(),
+                cwd: "/repo".into(),
+                message: "shall I force-push?".into(),
+            })
+            .expect("encodes");
+            line.push(b'\n');
+            producer.write_all(&line).expect("producer writes one line");
+            producer.flush().expect("producer flushes");
+        } // and exits, exactly as the hook binary does
+
+        let (accepted, _) = listener.accept().expect("accept should succeed");
+        let stream = configure_accepted(accepted)
+            .expect("a producer that already exited is still worth reading");
+        let mut reader = BufReader::new(stream);
+        assert!(
+            matches!(
+                read_message(&mut reader).expect("the buffered line is still readable"),
+                Some(ClientMessage::AgentStatus { pane_id, status, .. })
+                    if pane_id == 3 && status == "pending"
+            ),
+            "the hook's status was dropped with its connection"
+        );
 
         let _ = fs::remove_dir_all(&directory);
     }

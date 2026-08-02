@@ -18,7 +18,7 @@ use crate::{
     session::GuestPane,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, KeyHandling, ShareView, TerminalGuard,
-        enable_keyboard_enhancement,
+        clear_before_first_frame, enable_keyboard_enhancement,
         input::{
             events::{
                 MAX_EVENTS_PER_CYCLE, begin_synchronized_output, collect_pending_events,
@@ -27,10 +27,7 @@ use crate::{
             keys::PendingEscape,
         },
         missed_resize,
-        pane::{
-            local::{AGENT_SAMPLE_INTERVAL, AGENT_WATCH_INTERVAL},
-            remote::{RemotePaneDrain, SharedRemotePane},
-        },
+        pane::remote::{RemotePaneDrain, SharedRemotePane},
         render::{
             panes::render_shared_multi_pane,
             vt::{available_scrollback, viewed_screen},
@@ -116,6 +113,7 @@ impl SharedLayoutRuntime {
                 viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
             },
         )?;
+        clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
         self.tui
             .set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
         let mut dirty = true;
@@ -451,18 +449,11 @@ impl SharedLayoutRuntime {
             let now = Instant::now();
             // One scan for the whole session, not one per pane.
             let scan = AgentScan::new(&snapshot);
-            let mut inferred_agents = false;
             for pane in self.local.values_mut() {
                 if !pane.exited {
                     changed |= pane.apply_agent_snapshot(&scan, now);
-                    inferred_agents |= pane.agent_state_is_inferred();
                 }
             }
-            self.agent_sampler.set_interval(if inferred_agents {
-                AGENT_SAMPLE_INTERVAL
-            } else {
-                AGENT_WATCH_INTERVAL
-            });
         }
         changed |= self.publish_local_agent_roster();
         // Cheap: returns immediately unless the focused pane actually moved since the last

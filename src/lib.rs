@@ -2,6 +2,7 @@
 
 pub mod agent_detect;
 pub mod agent_notify;
+pub mod agent_setup;
 pub mod cli;
 pub mod client;
 pub mod config;
@@ -12,7 +13,6 @@ pub mod lease;
 pub mod ledger;
 pub mod local_ipc;
 pub mod node;
-pub mod notify_sound;
 mod perf;
 pub mod protocol;
 pub mod pty_host;
