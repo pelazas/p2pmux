@@ -541,12 +541,20 @@ impl LayoutCoordinator {
         display_name: String,
     ) -> Result<MembershipChange, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
-        if self
+        if let Some(existing) = self
             .state
             .members()
             .iter()
-            .any(|member| member.peer_id == peer_id)
+            .find(|member| member.peer_id == peer_id)
         {
+            // Only touch the layout if the address actually moved. A member whose network is
+            // flapping comes back through here every couple of seconds, and rewriting an
+            // identical address would advance the revision every time -- a burst of layout
+            // commits caused by nothing, at exactly the moment the session is least able to
+            // absorb one.
+            if existing.endpoint_addr == endpoint_addr {
+                return self.membership_change(peer_id, MembershipEvent::Joined, None);
+            }
             let invalidated = self.state.update_member_endpoint(
                 self.state.revision(),
                 &peer_id,
