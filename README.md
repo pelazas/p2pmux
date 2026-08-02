@@ -87,7 +87,7 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.2 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.3 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. Coordinator failover and disconnect grace are not
 built yet, so a coordinator that dies ends the session.
 
