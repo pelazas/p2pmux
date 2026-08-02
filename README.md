@@ -81,11 +81,13 @@ not an agent orchestration platform.
 - One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
   that contacts no service at all, for when our rendezvous is down.
 - An agents overlay (`Ctrl+A`) tracking Claude Code, Codex, Cursor, Pi and OpenCode across every
-  machine in the session — including which ones are blocked waiting on a human.
+  machine in the session — including which ones are blocked waiting on a human. Every state comes
+  from the agent's own hooks, never from guessing at output timing: run `p2pmux setup claude` once,
+  and `p2pmux doctor` to check.
 
 ## Status
 
-**Early, but real.** v0.1.1 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.2 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. Coordinator failover and disconnect grace are not
 built yet, so a coordinator that dies ends the session.
 
@@ -102,6 +104,18 @@ for anyone who would rather not run an installer at all.
 
 Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up. A musl system
 has to build from source.
+
+Updating is however you installed:
+
+```sh
+brew update && brew upgrade p2pmux                                   # Homebrew tap
+curl -fsSL https://p2pmux.com/install.sh | sh                        # the install script, again
+cargo install --git https://github.com/pelazas/p2pmux --locked --force  # from source
+```
+
+`p2pmux --version` says what you are running. Sessions already running keep the binary they
+started with — the node is a long-lived process — so `p2pmux kill <name>` and start again to pick
+a new version up.
 
 ## Trust
 
