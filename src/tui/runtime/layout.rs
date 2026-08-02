@@ -280,9 +280,13 @@ impl SharedLayoutRuntime {
                 UiIntent::FocusPane { .. } | UiIntent::SwitchTab { .. }
             )
         {
-            self.footer_notice = Some(String::from(
-                "coordinator unreachable; layout changes are paused",
-            ));
+            let notice = String::from("coordinator unreachable; layout changes are paused");
+            self.footer_notice = Some(notice.clone());
+            // Also as status, which is the only one of the two that survives the trip to an
+            // attached client: the node is headless and forwards `status`, so a refusal that
+            // lived in `footer_notice` alone would be invisible to everybody not running the
+            // old foreground path -- which is to say, to everybody.
+            self.status = notice;
             return Ok(());
         }
         match intent {

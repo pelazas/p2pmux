@@ -42,6 +42,24 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(300);
 /// session anything in the rare case where the earliest survivor is gone too.
 pub const PROMOTION_STAGGER: Duration = Duration::from_secs(3);
 
+/// Override for [`DEFAULT_GRACE`], in whole seconds.
+///
+/// Exists for the end-to-end runs. A cross-machine test of a takeover has to actually wait
+/// out the window, and five real minutes per scenario is the difference between a check that
+/// gets run and one that gets skipped. Out of range or unparseable values are ignored rather
+/// than clamped, so a typo cannot quietly shorten a real session's grace to nothing.
+pub const GRACE_ENV: &str = "P2PMUX_FAILOVER_GRACE_SECS";
+
+/// The grace this process should use: the environment's, if it named a sane one.
+pub fn configured_grace() -> Duration {
+    std::env::var(GRACE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (1..=3600).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_GRACE)
+}
+
 /// What this member should do about the coordinator right now.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Role {
@@ -263,6 +281,20 @@ mod tests {
             second_takeover.role_after(Some(DEFAULT_GRACE), DEFAULT_GRACE),
             Role::Promote { epoch: 2 }
         );
+    }
+
+    #[test]
+    fn a_nonsense_grace_override_leaves_the_real_one_alone() {
+        // Reads the process environment, so it asserts the fallback rather than setting the
+        // variable -- a test that mutated it would change what every other test in this
+        // binary sees. The parse and range rules are the point: a typo must not be able to
+        // shorten a real session's grace to nothing.
+        assert_eq!(
+            std::env::var(GRACE_ENV).ok().as_deref(),
+            None,
+            "this test only means anything with the override unset"
+        );
+        assert_eq!(configured_grace(), DEFAULT_GRACE);
     }
 
     #[test]

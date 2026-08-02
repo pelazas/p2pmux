@@ -237,7 +237,7 @@ impl SharedLayoutRuntime {
             seen_agent_generations: BTreeMap::new(),
             presence: Vec::new(),
             coordinator_lost_at: None,
-            grace: crate::failover::DEFAULT_GRACE,
+            grace: crate::failover::configured_grace(),
             accept_task: None,
             rejoin_tx,
             rejoin_rx,
