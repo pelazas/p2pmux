@@ -380,6 +380,9 @@ impl SharedLayoutRuntime {
                 Some(election) => {
                     (rejoin.peer_id == election.coordinator() && epoch == election.epoch())
                         || matches!(election.verdict_on(&rejoin.peer_id, epoch), Verdict::Accept)
+                        // Two coordinators on one epoch, which a healed partition can
+                        // produce. Join order settles it identically on both machines.
+                        || election.concedes_to(&rejoin.peer_id, epoch)
                 }
             };
             if !acceptable {

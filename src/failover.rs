@@ -142,6 +142,31 @@ impl Election {
         self.candidates().position(|candidate| candidate == peer)
     }
 
+    /// Where a peer sits in join order, coordinator included.
+    ///
+    /// Unlike [`Self::rank`], which is about succession and so skips the coordinator being
+    /// replaced, this is the raw order -- the thing to compare when two peers both believe
+    /// they hold the role.
+    pub fn order_of(&self, peer: &[u8]) -> Option<usize> {
+        self.members.iter().position(|member| member == peer)
+    }
+
+    /// Whether `claimant` has a better claim than this member does to the same epoch.
+    ///
+    /// The stagger makes two members promoting at once unlikely, not impossible: a partition
+    /// that heals can leave two coordinators on the same epoch, and neither would accept the
+    /// other under [`Self::verdict_on`], which requires the epoch to move forward. Join order
+    /// settles it, and settles it the same way on both machines, so exactly one steps down.
+    pub fn concedes_to(&self, claimant: &[u8], epoch: u64) -> bool {
+        if epoch != self.epoch {
+            return false;
+        }
+        match (self.order_of(claimant), self.order_of(&self.me)) {
+            (Some(theirs), Some(mine)) => theirs < mine,
+            _ => false,
+        }
+    }
+
     /// How long this member waits, from the coordinator going quiet, before acting.
     ///
     /// `None` when it is not a candidate at all, which means it always waits.
@@ -334,6 +359,29 @@ mod tests {
     #[test]
     fn a_stranger_cannot_claim_the_role() {
         assert_eq!(election(3).verdict_on(&peer(9), 1), Verdict::NotAMember);
+    }
+
+    #[test]
+    fn two_coordinators_on_one_epoch_are_settled_by_join_order() {
+        // A partition that heals can leave two members both believing they took over at
+        // epoch 1, and neither would accept the other -- `verdict_on` needs the epoch to
+        // move forward. Both compute this from the same member list, so exactly one of them
+        // concedes and the session converges without a round of messages about it.
+        let earlier = Election::new(vec![peer(1), peer(2), peer(3)], peer(2), 1, peer(2));
+        let later = Election::new(vec![peer(1), peer(2), peer(3)], peer(3), 1, peer(3));
+
+        assert!(later.concedes_to(&peer(2), 1));
+        assert!(!earlier.concedes_to(&peer(3), 1));
+    }
+
+    #[test]
+    fn conceding_is_only_ever_about_the_epoch_in_force() {
+        // A claim from a past or future epoch is `verdict_on`'s business. Answering it here
+        // as well would give a stale claimant two chances to be believed.
+        let held = Election::new(vec![peer(1), peer(2)], peer(2), 1, peer(2));
+
+        assert!(!held.concedes_to(&peer(1), 0));
+        assert!(!held.concedes_to(&peer(1), 2));
     }
 
     #[test]
