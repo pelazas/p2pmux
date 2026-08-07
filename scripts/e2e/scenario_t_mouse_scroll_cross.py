@@ -124,6 +124,12 @@ def main() -> int:
                 host.wheel_down(right_col, 10)
                 time.sleep(0.2)
             time.sleep(2.0)
+            # The flood claimed the pane's lease for the droplet, and input from anyone
+            # else is dropped in silence until it goes idle (`lease.rs`: 30 seconds).
+            # Waiting for that here is what makes the next line a test of the viewport
+            # instead of a race against the lease: when the flood arrives quickly, the
+            # scrolling above takes well under 30s and the echo is simply discarded.
+            lease_free = wait_free(host)
             host.send(b"echo BACK-AT-LIVE-EDGE\r")
             try:
                 host.wait_for("BACK-AT-LIVE-EDGE", timeout=30)
@@ -133,7 +139,7 @@ def main() -> int:
                       False, str(error)[:200])
 
             # ------------------------------------------------------------ mouse
-            check("the remote pane frees up before the Mac drives it", wait_free(host))
+            check("the remote pane frees up before the Mac drives it", lease_free)
             host.send(b"python3 /root/mouse_reader.py\r")
             try:
                 host.wait_for("MOUSE-READER-READY", timeout=30)
