@@ -77,6 +77,9 @@ not an agent orchestration platform.
   so there is no forced takeover.
 - Zellij-like tabs, panes, and nested splits, shared live: up to 8 members, 9 tabs, 8 panes a tab.
 - Presence — a color per member, showing who is on which tab and watching which pane.
+- The session outlives the machine that started it. If the coordinator's laptop closes, every pane
+  on every other machine keeps running and keeps taking input; only structural edits pause, and
+  after five minutes the earliest-joined survivor takes the role over.
 - End-to-end encrypted peer-to-peer streaming, over an iroh relay when NAT requires it. The tab bar
   says which you got: `direct 55ms` or `relayed 120ms`.
 - One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
@@ -89,8 +92,9 @@ not an agent orchestration platform.
 ## Status
 
 **Early, but real.** v0.1.3 runs sessions between machines on different networks and different
-continents. macOS and Linux, both architectures. Coordinator failover and disconnect grace are not
-built yet, so a coordinator that dies ends the session.
+continents. macOS and Linux, both architectures. A coordinator that dies no longer ends the
+session — a survivor takes the role over, with a new join code — but a pane whose host is gone
+stays in the layout as a placeholder rather than being reaped on a timer.
 
 ## Install
 

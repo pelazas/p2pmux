@@ -92,6 +92,33 @@ credential. `join` still parses `p2pmux-v1:` and `p2pmux-v2:` tickets, in which 
 *was* the coordinator's endpoint public key — a value published to discovery, so those tickets
 grant a session no secret ever protected.
 
+## When the coordinator goes away
+
+The coordinator is the member that orders layout changes, admits joiners, and seals the ledger.
+Losing it does not end the session: every pane runs on the machine hosting it, control leases are
+settled there, and screen data travels peer to peer, so panes keep running and keep taking input.
+What stops is everything structural — splits, new tabs, renames, deletes, and new joiners — and
+the footer says so rather than leaving a request to hang.
+
+After five minutes without the coordinator, the earliest-joined survivor takes the role over and
+structure works again. Members further down the join order wait an extra three seconds each and
+follow the first takeover they see instead of starting their own, so a room settles on one
+coordinator without anyone voting. A coordinator that merely blinked — a relay hiccup, a lid
+closed for a minute — keeps the role, and one peer reattaching cancels the clock. A coordinator
+that comes back after the grace window rejoins as an ordinary member; it does not reclaim the
+role.
+
+Two consequences worth knowing before you need them:
+
+- **The join code changes.** The old code is sealed under a secret only the session's creator
+  holds, so the successor mints a fresh ticket and a fresh code. An invite already pasted into a
+  chat stops working — press `Ctrl+S` on the new coordinator for the current one.
+- **The departed machine's panes stay put**, as unavailable placeholders. They are not reaped on
+  a timer, because removing them would rearrange the grid under people mid-sentence.
+
+`P2PMUX_FAILOVER_GRACE_SECS` overrides the five-minute window for a session, which is mostly of
+interest to the end-to-end tests.
+
 ## Control
 
 Only one peer controls a pane while they are actively typing. After about thirty seconds without
