@@ -668,6 +668,9 @@ mod tests {
             );
             assert_ne!(color, theme.tab_active_background);
             assert_ne!(color, theme.footer_accent);
+            // Slot one is warm by design, so this one is worth stating outright: a
+            // chord-armed border must never read as the member holding that pane.
+            assert_ne!(color, theme.pane_border_chord_focused);
         }
     }
     #[test]

@@ -121,7 +121,7 @@ MEMBERS = {
     "userA": Member(
         "userA",
         "· session host",
-        "#4fc3f7",
+        "#ff6a13",
         "userA@mac %%",
         ("Desktop/", "Documents/", "Projects/", "notes.md"),
     ),

@@ -331,9 +331,10 @@ editing the file to reload it.
 
 `member_colors` under `[ui.theme]` is a list of up to eight colors, one per member slot in join
 order, used for the presence dots and chips. Listing fewer than eight overrides from the front and
-leaves the rest at their built-in color. The defaults are cool hues on purpose: warm colors are
-reserved for the active tab and for a pane under remote control, so a member tinted like either
-would read as an alert.
+leaves the rest at their built-in color. The first slot — the session host — defaults to a vivid
+red-orange so the host is easy to pick out; the rest are cool hues on purpose, because the
+remaining warm colors are reserved for the active tab, for a chord-armed pane, and for a pane whose
+controller has left, so a member tinted like any of those would read as an alert.
 
 ### Notifications
 

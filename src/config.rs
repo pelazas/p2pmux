@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane,\n# and coloring the border of any pane that member is driving.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#4fc3f7\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane,\n# and coloring the border of any pane that member is driving.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#ff6a13\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -86,12 +86,14 @@ pub struct UiTheme {
 /// Kept in step with `crate::layout::MAX_MEMBERS` by a unit test.
 pub const MEMBER_COLOR_SLOTS: usize = 8;
 
-/// Cool hues only. Warm colors are taken: the active tab is `#dc322f` and an actively
-/// controlled pane border is `#ff4500`, and a member tinted like either reads as an
-/// alert. Every color here also carries the member's initial at the call site, so the
-/// palette never has to survive on hue alone.
+/// Slot one is a vivid red-orange so the session host stands out; the rest are cool hues,
+/// which keeps them clear of the colors that mean something else: the active tab is
+/// `#dc322f`, a departed controller's pane border is `#ff4500`, and a chord-armed pane
+/// border is `#ff1a1a`. Slot one stays a readable step off all three. Every color here
+/// also carries the member's initial at the call site, so the palette never has to
+/// survive on hue alone.
 const DEFAULT_MEMBER_COLORS: [Color; MEMBER_COLOR_SLOTS] = [
-    Color::Rgb(79, 195, 247),
+    Color::Rgb(255, 106, 19),
     Color::Rgb(126, 214, 126),
     Color::Rgb(240, 98, 146),
     Color::Rgb(121, 134, 203),
@@ -537,7 +539,7 @@ mod tests {
 
     #[test]
     fn member_colors_override_from_the_front_and_keep_the_rest() {
-        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# member_colors = [\"#4fc3f7\""));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# member_colors = [\"#ff6a13\""));
 
         let path = temp_config_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
