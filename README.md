@@ -91,7 +91,7 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.3 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.4 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. A coordinator that dies no longer ends the
 session — a survivor takes the role over, with a new join code — but a pane whose host is gone
 stays in the layout as a placeholder rather than being reaped on a timer.

@@ -40,6 +40,11 @@ never restored from disk. The node survives terminal closure but is managed by n
 systemd. Local IPC is intentionally versioned as an implementation detail, so restart an existing
 session after upgrading when attach protocol changes are present.
 
+Everyone in a session runs the same wire protocol. It is pinned per release and never negotiated
+down, so a peer on a different one fails its join — reported as an unsupported protocol version —
+rather than entering a session it only half understands. v0.1.4 moved that pin, so a v0.1.3 peer
+cannot join a v0.1.4 session or the reverse: upgrade together.
+
 To dogfood the shared layout on one machine:
 
 ```text
