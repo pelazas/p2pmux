@@ -867,7 +867,7 @@ async fn rejoin_paired_session(
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let ticket = resolve_join_ticket(ticket).await?;
     let display_name = display_name_or_hostname()?;
-    let (cols, rows) = crossterm::terminal::size()?;
+    let (cols, rows) = terminal_size_or_default();
     launch_background_node(
         crate::node::NodeBootstrapKind::Join {
             ticket: ticket.to_string(),
@@ -886,7 +886,7 @@ async fn rejoin_paired_session(
 /// `create` and `pair` — the two commands that do that — both print it.
 fn start_solo_session() -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let display_name = display_name_or_hostname()?;
-    let (cols, rows) = crossterm::terminal::size()?;
+    let (cols, rows) = terminal_size_or_default();
     launch_background_node(
         crate::node::NodeBootstrapKind::Create {
             display_name,
@@ -1085,6 +1085,16 @@ fn display_name_or_hostname() -> Result<String, Box<dyn Error>> {
     // Saved rather than used once, so the machine keeps the same name across
     // restarts and peers do not watch it rename itself.
     Ok(crate::config::save(&hostname)?)
+}
+
+/// The terminal's size, or a default when there is no terminal to ask.
+///
+/// `pair` starts a session and never draws anything, so it has to work from a
+/// script and over a plain ssh command with no PTY. The first client to attach
+/// resizes the panes to its own window anyway, which makes this only the size
+/// the first shell is born at.
+fn terminal_size_or_default() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
 }
 
 /// The machine's short hostname, cleaned up enough to be a display name.
