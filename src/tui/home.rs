@@ -66,6 +66,16 @@ impl MultiPaneTui {
             self.modal = ModalState::None;
             self.exit_chord_mode();
             self.machines_expanded = false;
+            // Arriving puts the cursor back on the top row, which is the one
+            // that most wants a human. That is the whole reason for the sort
+            // order, and a cursor left where a previous visit happened to end
+            // would mean Enter on arrival opens whatever was urgent last time.
+            //
+            // Only on arrival. While Home is open the cursor stays exactly
+            // where the user put it, and a row changing state under it must
+            // never drag it somewhere else.
+            self.home_selected = None;
+            self.home_scroll_line = 0;
             self.repair_home_selection();
         }
         ui_debug_log(
@@ -725,6 +735,36 @@ mod tests {
 
         tui.set_home_open(true, "test");
         assert_eq!(tui.handle_key(q, AREA), KeyHandling::Quit);
+    }
+
+    #[test]
+    fn opening_home_puts_the_cursor_on_the_row_that_most_wants_a_human() {
+        let mut tui = home_tui(&[
+            ("laptop", "claude", AgentRosterState::Working),
+            ("desktop", "codex", AgentRosterState::Working),
+        ]);
+        tui.set_home_open(true, "test");
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
+        let moved = tui.home_selected.expect("a row is selected");
+        tui.set_home_open(false, "test");
+
+        // A blocked agent appears while the user is elsewhere -- and it is not
+        // the row the cursor was parked on.
+        let mut rows = tui.agent_rows.clone();
+        let other = rows
+            .iter_mut()
+            .find(|row| row.pane_id != moved)
+            .expect("a row the cursor is not on");
+        other.state = AgentRosterState::Pending;
+        tui.set_agent_rows(rows);
+        tui.set_home_open(true, "test");
+
+        assert_ne!(tui.home_selected, Some(moved));
+        assert_eq!(
+            tui.home_selected,
+            tui.home_rows().first().map(|row| row.pane_id),
+            "Enter on arrival has to open the row the sort order put on top"
+        );
     }
 
     #[test]
