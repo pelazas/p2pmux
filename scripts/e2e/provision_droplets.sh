@@ -52,6 +52,25 @@ droplet_ip() {
     awk -v name="$1" '$1 == name { print $2 }'
 }
 
+# `create --wait` returns before the address is readable back out of the list API,
+# so a droplet can be active and still list a blank IP for a few seconds. Reading
+# it once handed `wait_for_bootstrap` an empty host, which then spent ten minutes
+# failing to ssh to `root@` before the run died — with the droplets already paid
+# for and no binary on either.
+require_droplet_ip() {
+  local name="$1" ip
+  for _ in $(seq 1 20); do
+    ip="$(droplet_ip "$name")"
+    if [[ -n "$ip" ]]; then
+      echo "$ip"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "no address for droplet $name after 100s" >&2
+  return 1
+}
+
 cloud_init() {
   cat <<'YAML'
 #cloud-config
@@ -70,6 +89,10 @@ YAML
 
 wait_for_bootstrap() {
   local ip="$1" tries=40
+  if [[ -z "$ip" ]]; then
+    echo "wait_for_bootstrap called with no address" >&2
+    return 1
+  fi
   for _ in $(seq 1 $tries); do
     if ssh_to "$ip" 'test -f /root/.p2pmux-bootstrap-done' 2>/dev/null; then
       return 0
@@ -111,8 +134,8 @@ create() {
   done
 
   local ip_a ip_b
-  ip_a="$(droplet_ip "$NAME_A")"
-  ip_b="$(droplet_ip "$NAME_B")"
+  ip_a="$(require_droplet_ip "$NAME_A")"
+  ip_b="$(require_droplet_ip "$NAME_B")"
   echo "waiting for cloud-init on $ip_a and $ip_b"
   wait_for_bootstrap "$ip_a"
   wait_for_bootstrap "$ip_b"
