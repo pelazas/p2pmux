@@ -58,6 +58,11 @@ const TARGET_SCREEN_URGENCY_TTL: Duration = Duration::from_millis(64);
 // frames that were immediately superseded, so pace the periodic drain to the publish
 // cadence. Input still drains immediately, which is what keystroke echo depends on.
 const PERIODIC_DRAIN_INTERVAL: Duration = TARGET_SCREEN_PUBLISH_INTERVAL;
+// How often the node re-reads which machines are in the session and how many
+// agents each is running, for `p2pmux machines` and the pairing record. Both
+// are answers a human reads at human speed, and the sampler that produces the
+// agent counts only runs every five seconds anyway.
+const PEER_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FROZEN_SCROLLBACK_SESSIONS: usize = 8;
 const OUTBOUND_QUEUE: usize = 64;
 
@@ -306,6 +311,7 @@ fn run_socket_loop(
     // Compared rather than rewritten, so a membership that has not changed
     // costs one vector compare per drain and no file write at all.
     let mut last_known_peers: Vec<crate::session_store::SessionPeer> = Vec::new();
+    let mut last_peer_scan: Option<Instant> = None;
     let mut last_work = Instant::now();
     loop {
         let mut shutdown = false;
@@ -456,7 +462,15 @@ fn run_socket_loop(
         // Only ever in a session pairing already knows about. A guest who joined
         // with a code you handed out is a collaborator, not a machine you own,
         // and must never end up in your fleet.
-        if changed {
+        //
+        // Sampled on a timer rather than on every drain. `changed` is true on
+        // essentially every frame a pane is producing output, and this loop
+        // turns about a hundred times a second; recomputing member labels and
+        // agent counts at that rate would put string allocation on the path
+        // keystroke echo runs down, to keep a status column fresher than any
+        // human could read it.
+        if changed && peer_scan_due(last_peer_scan, drain_started) {
+            last_peer_scan = Some(drain_started);
             let peers = node.session_peers();
             if peers != last_known_peers {
                 last_known_peers.clone_from(&peers);
@@ -711,6 +725,10 @@ impl FrozenScrollback {
 /// keystrokes never waits on this.
 fn periodic_drain_due(last_drain: Option<Instant>, now: Instant) -> bool {
     last_drain.is_none_or(|last| now.duration_since(last) >= PERIODIC_DRAIN_INTERVAL)
+}
+
+fn peer_scan_due(last_scan: Option<Instant>, now: Instant) -> bool {
+    last_scan.is_none_or(|last| now.duration_since(last) >= PEER_SCAN_INTERVAL)
 }
 
 fn socket_loop_backoff(
