@@ -24,7 +24,10 @@ use crate::{
         render::{
             footer::render_contextual_footer,
             home::render_home,
-            modals::{render_delete_tab_confirmation, render_rename_prompt, render_share_modal},
+            modals::{
+                render_delete_tab_confirmation, render_quit_prompt, render_rename_prompt,
+                render_share_modal,
+            },
             vt::{VtScreen, viewed_screen},
         },
         text::{text_width, truncate_trailing},
@@ -463,6 +466,11 @@ pub(in crate::tui) fn render_shared_multi_pane(
     // frame.
     if tui.home_open() {
         render_home(frame, tui, crate::tui::clock::unix_ms_now());
+        // Home replaces the session chrome but not the question Ctrl+Q asks:
+        // `q` opens the same prompt from here, so it has to be drawn here too.
+        if tui.quit_open() {
+            render_quit_prompt(frame, theme);
+        }
         return;
     }
 
@@ -585,6 +593,9 @@ pub(in crate::tui) fn render_shared_multi_pane(
     }
     if let ModalState::ConfirmDeleteTab { pane_count, .. } = &tui.modal {
         render_delete_tab_confirmation(frame, *pane_count, &tui.theme);
+    }
+    if tui.quit_open() {
+        render_quit_prompt(frame, &tui.theme);
     }
 }
 

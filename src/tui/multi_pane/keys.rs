@@ -9,8 +9,8 @@ use ratatui::layout::Rect;
 use crate::{
     layout::{Axis, NewPanePosition},
     tui::{
-        ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, ModalState, MultiPaneTui, RenameTarget,
-        UiIntent,
+        ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, ModalState, MultiPaneTui, QuitAction,
+        RenameTarget, UiIntent,
         geometry::{
             direction_distance, grid_for_pane, is_in_direction, rect_center, visible_leaf_panes,
         },
@@ -52,11 +52,25 @@ impl MultiPaneTui {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
+        // Ctrl+Q outranks every other modal: it is the way out of a dialog you
+        // opened by accident as much as the way out of the session.
         if is_quit(key) {
-            self.modal = ModalState::None;
             self.pending_home_toggle = None;
             self.exit_chord_mode();
-            return KeyHandling::Quit;
+            // A second Ctrl+Q backs out, the way a second Ctrl+S closes the
+            // share panel. Answering "quit?" with the quit key should not quit.
+            if self.quit_open() {
+                self.modal = ModalState::None;
+                return KeyHandling::Consumed(vec![]);
+            }
+            if !self.detachable {
+                self.modal = ModalState::None;
+                return KeyHandling::Quit(QuitAction::Detach);
+            }
+            return self.open_quit_prompt();
+        }
+        if matches!(self.modal, ModalState::Quit) {
+            return self.handle_quit_key(key);
         }
         if matches!(self.modal, ModalState::Rename(_)) {
             return self.handle_rename_key(key);
@@ -352,7 +366,7 @@ mod tests {
     use crate::{
         layout::{Axis, NewPanePosition, Node, Tab},
         tui::{
-            ChordMode, KeyHandling, MultiPaneTui, UiIntent,
+            ChordMode, KeyHandling, MultiPaneTui, QuitAction, UiIntent,
             input::keys::{
                 ESC_PREFIX_WINDOW, PendingEscape, is_chord_command, is_chord_navigation,
             },
@@ -983,7 +997,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                 area,
             ),
-            KeyHandling::Quit
+            KeyHandling::Quit(QuitAction::Detach)
         );
     }
 

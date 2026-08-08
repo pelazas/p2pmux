@@ -99,7 +99,7 @@ pub enum UiIntent {
 pub enum KeyHandling {
     Forward,
     Consumed(Vec<UiIntent>),
-    Quit,
+    Quit(QuitAction),
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MouseHandling {
@@ -202,6 +202,20 @@ pub(in crate::tui) enum ModalState {
         tab_id: TabId,
         pane_count: usize,
     },
+    /// Ctrl+Q, asking which of the two leavings was meant.
+    Quit,
+}
+/// The two ways out, which one keystroke used to conflate.
+///
+/// Detaching and ending a session look identical from the keyboard and could
+/// not be less alike afterwards, so Ctrl+Q asks rather than picks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuitAction {
+    /// Leave. Every pane keeps running and `p2pmux attach` comes back to it.
+    Detach,
+    /// Stop this machine's node. Its panes die with it, and a session with
+    /// nobody left hosting a pane is over.
+    Kill,
 }
 /// Rectangles for one rendered terminal frame.
 #[derive(Clone, Debug, Eq, PartialEq)]

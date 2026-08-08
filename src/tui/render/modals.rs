@@ -1,11 +1,11 @@
-//! Centred overlay panels: the share invite, the rename prompt, and the
-//! delete-tab confirmation.
+//! Centred overlay panels: the share invite, the rename prompt, the delete-tab
+//! confirmation, and the quit prompt.
 
 use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
 
@@ -225,6 +225,60 @@ pub(in crate::tui) fn render_delete_tab_confirmation(
             Line::raw(""),
             Line::styled(
                 "Enter/y yes · Esc/n no",
+                Style::default().fg(theme.footer_muted),
+            ),
+        ]),
+        inner,
+    );
+}
+
+/// Ctrl+Q, asking which of the two leavings was meant.
+///
+/// They are one keystroke apart and could not be less alike afterwards: one is
+/// undone by typing `p2pmux attach`, the other takes every running pane with
+/// it. So each answer is labelled with its consequence rather than its verb,
+/// and the reflex answer — Enter — is the reversible one.
+pub(in crate::tui) fn render_quit_prompt(frame: &mut Frame<'_>, theme: &UiTheme) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(8).clamp(36, 60).min(area.width);
+    let height = 9_u16.min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::bordered().border_style(Style::default().fg(theme.footer_accent)),
+        panel,
+    );
+    let inner = Block::bordered().inner(panel);
+    let key = Style::default()
+        .fg(theme.footer_accent)
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "Leave this session?",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("d", key),
+                Span::raw("  detach — leave it running"),
+            ]),
+            Line::from(vec![
+                Span::styled("k", key),
+                Span::styled(
+                    "  kill — end it, panes and all",
+                    Style::default().fg(theme.agent_overlay_warm),
+                ),
+            ]),
+            Line::raw(""),
+            Line::styled(
+                "Enter detach · Esc cancel",
                 Style::default().fg(theme.footer_muted),
             ),
         ]),

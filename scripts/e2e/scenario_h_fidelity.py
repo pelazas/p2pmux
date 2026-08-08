@@ -138,9 +138,12 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         )
         check("found the guest's session record", member is not None)
 
+        # Ctrl+Q asks which leaving was meant; `d` is detach.
         guest.send(CTRL_Q)
+        time.sleep(0.5)
+        guest.send(b"d")
         time.sleep(3.0)
-        check("guest client exits on Ctrl+Q", not guest.alive, f"exit={guest.exit_code}")
+        check("guest client exits on Ctrl+Q then d", not guest.alive, f"exit={guest.exit_code}")
 
         if member is not None:
             again = harness.spawn("rejoin", ["attach", member["name"]], cols=100, rows=28)

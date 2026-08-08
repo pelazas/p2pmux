@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Detach and re-attach a member, across machines.
 
-USAGE.md: "Ctrl+Q detaches that client without stopping shells, Iroh, or hosted panes."
+USAGE.md: "Ctrl+Q asks which leaving you meant: `d` detaches that client without stopping
+shells, Iroh, or hosted panes."
 That is a README-level promise with unit coverage (tests/detach_resume_node.rs) and no
 cross-machine test at all. The interesting part is what the *other* machine sees: a
 detached member still hosts its panes, so the coordinator must keep rendering them and
@@ -65,9 +66,12 @@ def main() -> int:
             host.wait_for("DROPLET-PANE-ALIVE", timeout=25)
             check("the droplet's pane and its output reached the coordinator", True)
 
+            # Ctrl+Q asks which leaving was meant; `d` is detach.
             guest.send(CTRL_Q)
+            time.sleep(0.5)
+            guest.send(b"d")
             time.sleep(6.0)
-            check("the droplet's client exited on Ctrl+Q", not guest.alive,
+            check("the droplet's client exited on Ctrl+Q then d", not guest.alive,
                   f"exit={guest.exit_code}")
 
             listing = remote.cli("ls").strip()

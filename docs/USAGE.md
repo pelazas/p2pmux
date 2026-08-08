@@ -10,8 +10,11 @@ or rejoins the one your pairing recorded, or starts a fresh one — and lands yo
 either way. The commands below are for naming a specific session out loud.
 
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
-Ctrl+Q detaches that client without stopping shells, Iroh, or hosted panes. It prints the exact
-`--resume`, `attach`, and `kill` commands needed to return. Use `p2pmux --resume` for the
+Ctrl+Q asks which leaving you meant: `d` detaches that client without stopping shells, Iroh, or
+hosted panes, and `k` ends the session on this machine — its panes die with it, and a session
+nobody is left hosting a pane in is over. Enter is `d` and Esc backs out, so a reflex press never
+destroys work. Detaching prints the exact `--resume`, `attach`, and `kill` commands needed to
+return. Use `p2pmux --resume` for the
 live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <old> <new>` to
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
 for confirmation; use `--yes` for non-interactive scripts.
@@ -134,8 +137,8 @@ Only one peer controls a pane while they are actively typing. After about thirty
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key
 claims the free pane and is delivered as its first input; active typing is protected, so there is
 no forced takeover. A pane's host owns its PTY, not its control lease: newly created split and tab
-panes start free. Ctrl+Q detaches only the local p2pmux view and releases its local control
-leases; F9 and F10 continue through to the focused PTY.
+panes start free. Ctrl+Q answered with `d` detaches only the local p2pmux view and releases its
+local control leases; F9 and F10 continue through to the focused PTY.
 
 Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key

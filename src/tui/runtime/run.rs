@@ -48,7 +48,11 @@ impl SharedLayoutRuntime {
     ) -> Result<bool, Box<dyn Error>> {
         let previously_focused = self.tui.focused_pane();
         let quit = match self.tui.handle_key(key, area) {
-            KeyHandling::Quit => Ok::<bool, Box<dyn Error>>(true),
+            // Nothing behind this process to leave running, so both answers
+            // mean the same thing here. The prompt that distinguishes them is
+            // only offered where the distinction exists — see
+            // `MultiPaneTui::set_detachable`.
+            KeyHandling::Quit(_) => Ok::<bool, Box<dyn Error>>(true),
             KeyHandling::Consumed(intents) => {
                 for intent in intents {
                     self.handle_intent(intent)?;

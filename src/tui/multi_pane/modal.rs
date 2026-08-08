@@ -1,11 +1,14 @@
 //! Key handling while a modal owns the keyboard: the rename prompt, the share
-//! panel, and the delete-tab confirmation.
+//! panel, the delete-tab confirmation, and the quit prompt.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     layout::{TabId, normalize_title},
-    tui::{KeyHandling, ModalState, MultiPaneTui, RenamePrompt, RenameTarget, ShareCopy, UiIntent},
+    tui::{
+        KeyHandling, ModalState, MultiPaneTui, QuitAction, RenamePrompt, RenameTarget, ShareCopy,
+        UiIntent,
+    },
 };
 
 impl MultiPaneTui {
@@ -121,6 +124,40 @@ impl MultiPaneTui {
             _ => KeyHandling::Consumed(vec![]),
         }
     }
+
+    pub(in crate::tui) fn open_quit_prompt(&mut self) -> KeyHandling {
+        self.modal = ModalState::Quit;
+        self.clear_selection();
+        self.cancel_resize_drag();
+        KeyHandling::Consumed(vec![])
+    }
+
+    /// `d` leaves, `k` ends it, anything else backs out.
+    ///
+    /// Enter is detach rather than the other one, and there is no `y`: this is
+    /// not a yes/no question, and a prompt where the reflex answer destroys
+    /// work is a prompt that has failed at the only job it has. The two letters
+    /// are the initials of the two words on screen, so neither is a guess.
+    pub(in crate::tui) fn handle_quit_key(&mut self, key: KeyEvent) -> KeyHandling {
+        if !key.modifiers.is_empty() && key.modifiers != KeyModifiers::SHIFT {
+            return KeyHandling::Consumed(vec![]);
+        }
+        match key.code {
+            KeyCode::Char('d' | 'D') | KeyCode::Enter => {
+                self.modal = ModalState::None;
+                KeyHandling::Quit(QuitAction::Detach)
+            }
+            KeyCode::Char('k' | 'K') => {
+                self.modal = ModalState::None;
+                KeyHandling::Quit(QuitAction::Kill)
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                self.modal = ModalState::None;
+                KeyHandling::Consumed(vec![])
+            }
+            _ => KeyHandling::Consumed(vec![]),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,7 +171,7 @@ mod tests {
         layout::{Node, Tab},
         tui::{
             ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, MouseHandling, MultiPaneTui,
-            PaneMouseProtocol, ShareCopy, UiIntent,
+            PaneMouseProtocol, QuitAction, ShareCopy, UiIntent,
             render::panes::render_multi_pane,
             test_support::{agent_row, layout, split_layout},
         },
@@ -313,7 +350,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                 area
             ),
-            KeyHandling::Quit
+            KeyHandling::Quit(QuitAction::Detach)
         );
         assert!(matches!(tui.modal, super::ModalState::None));
     }
@@ -388,6 +425,95 @@ mod tests {
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 1 }])
+        );
+        assert!(!tui.modal_open());
+    }
+
+    /// Detaching and ending a session were one keystroke and no question.
+    #[test]
+    pub(in crate::tui) fn ctrl_q_asks_which_leaving_was_meant_and_defaults_to_the_reversible_one() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        tui.set_detachable(true);
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+
+        assert_eq!(tui.handle_key(ctrl_q, area), KeyHandling::Consumed(vec![]));
+        assert!(tui.quit_open());
+        assert!(
+            tui.modal_open(),
+            "the prompt owns the keyboard while it is up"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let mut rendered = String::new();
+        for row in 0..24 {
+            for column in 0..80 {
+                rendered.push_str(terminal.backend().buffer()[(column, row)].symbol());
+            }
+        }
+        assert!(rendered.contains("Leave this session?"), "{rendered:?}");
+        assert!(rendered.contains("detach — leave it running"));
+        assert!(rendered.contains("kill — end it, panes and all"));
+
+        // A key the prompt does not claim leaves it up rather than falling
+        // through to a pane the user cannot see.
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.quit_open());
+
+        // Answering "quit?" with the quit key backs out, the way a second
+        // Ctrl+S closes the share panel.
+        assert_eq!(tui.handle_key(ctrl_q, area), KeyHandling::Consumed(vec![]));
+        assert!(!tui.modal_open());
+
+        // Esc cancels too.
+        let _ = tui.handle_key(ctrl_q, area);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(!tui.modal_open());
+
+        // Enter is the reversible answer: a reflex press must not end a session.
+        let _ = tui.handle_key(ctrl_q, area);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
+            KeyHandling::Quit(QuitAction::Detach)
+        );
+        assert!(!tui.modal_open());
+
+        let _ = tui.handle_key(ctrl_q, area);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), area),
+            KeyHandling::Quit(QuitAction::Detach)
+        );
+
+        let _ = tui.handle_key(ctrl_q, area);
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), area),
+            KeyHandling::Quit(QuitAction::Kill)
+        );
+        assert!(!tui.modal_open());
+    }
+
+    /// A foreground session owns its panes outright, so there is no second
+    /// answer to offer and no question worth asking.
+    #[test]
+    pub(in crate::tui) fn ctrl_q_still_leaves_at_once_where_nothing_outlives_the_client() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Quit(QuitAction::Detach)
         );
         assert!(!tui.modal_open());
     }

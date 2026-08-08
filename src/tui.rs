@@ -59,7 +59,7 @@ pub(crate) use snapshot::{
 };
 pub use state::{
     AgentOverlayRow, ChordMode, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
-    PaneViewState, ShareCopy, ShareView, UiIntent,
+    PaneViewState, QuitAction, ShareCopy, ShareView, UiIntent,
 };
 pub(in crate::tui) use state::{
     Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,

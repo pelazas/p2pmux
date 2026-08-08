@@ -150,8 +150,8 @@ out of shared panes.
 Run `p2pmux` with no arguments and you land on the inbox. `Ctrl+O` returns to it from anywhere,
 including from inside a live terminal; `Ctrl+A` does the same, for the muscle memory the old
 agents overlay built. `Ctrl+S` shares, `Ctrl+P` is pane mode, `Ctrl+T` is tab mode, and `Ctrl+Q`
-detaches your view while the session keeps running. `p2pmux --resume` brings back a specific
-session by name.
+asks whether to detach — leaving the session running — or to end it. `p2pmux --resume` brings back
+a specific session by name.
 
 Full walkthrough — keys, control leases, presence, mouse, scrollback, agent hooks and every config
 key — is in [docs/USAGE.md](./docs/USAGE.md).

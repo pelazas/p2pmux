@@ -361,7 +361,16 @@ impl MultiPaneTui {
                 self.toggle_machines_expanded();
                 KeyHandling::Consumed(vec![])
             }
-            KeyCode::Char('q') if key.modifiers.is_empty() => KeyHandling::Quit,
+            // The same question Ctrl+Q asks, asked the same way. Home is the
+            // one screen where a bare `q` is free, but it should not be the one
+            // screen where leaving skips the prompt.
+            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                if self.detachable {
+                    self.open_quit_prompt()
+                } else {
+                    KeyHandling::Quit(crate::tui::QuitAction::Detach)
+                }
+            }
             KeyCode::Tab | KeyCode::Right if key.modifiers.is_empty() => {
                 // Home sits left of Tab #1, so stepping right off it lands on
                 // the tabs — the second path in, for people who navigate by tab.
@@ -764,7 +773,25 @@ mod tests {
         assert_eq!(tui.handle_key(q, AREA), KeyHandling::Forward);
 
         tui.set_home_open(true, "test");
-        assert_eq!(tui.handle_key(q, AREA), KeyHandling::Quit);
+        assert_eq!(
+            tui.handle_key(q, AREA),
+            KeyHandling::Quit(crate::tui::QuitAction::Detach)
+        );
+    }
+
+    /// Home is the one screen where a bare `q` is free. It should not also be
+    /// the one screen where leaving skips the question Ctrl+Q asks.
+    #[test]
+    fn q_on_a_detachable_home_asks_the_same_question_ctrl_q_does() {
+        let mut tui = home_tui(&[]);
+        tui.set_detachable(true);
+        tui.set_home_open(true, "test");
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), AREA),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.quit_open());
     }
 
     #[test]

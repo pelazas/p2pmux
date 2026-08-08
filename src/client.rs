@@ -32,7 +32,7 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
-        PaneMouseProtocol, PaneViewState, ShareView, clear_before_first_frame,
+        PaneMouseProtocol, PaneViewState, QuitAction, ShareView, clear_before_first_frame,
         copy_selection_to_clipboard, render_multi_pane_with_copy_feedback, resize_recheck_due,
         share_copy_result, stale_node_size,
     },
@@ -210,6 +210,7 @@ pub fn run_on(
     let mut node_ended = false;
     let mut attach_error = None;
     let mut detach_sent = false;
+    let mut killed = false;
     let mut last_agent_overlay_animation = Instant::now();
     let mut pending_focus = None;
     let mut pending_resync = BTreeSet::new();
@@ -312,6 +313,10 @@ pub fn run_on(
                             // say which peer this client is.
                             tui.set_local_peer_id(local_peer_id.clone());
                             tui.set_paired_machines(paired_machines.clone());
+                            // The node outlives this client, so here — and only
+                            // here — leaving and ending the session are two
+                            // different things worth asking about.
+                            tui.set_detachable(true);
                             // Deferred to the first snapshot rather than done at
                             // construction: the view does not exist until a
                             // layout arrives, and landing on Home is a decision
@@ -594,9 +599,19 @@ pub fn run_on(
                 // screen after it has ended.
                 let chord_before = tui.chord_mode();
                 match tui.handle_key(key, terminal.size()?.into()) {
-                    KeyHandling::Quit => {
+                    KeyHandling::Quit(QuitAction::Detach) => {
                         write_message(&mut stream, &ClientMessage::Detach { generation })?;
                         detach_sent = true;
+                        break;
+                    }
+                    // The node stops, so its panes stop with it. The record is
+                    // removed here rather than left for the finder to reap, so
+                    // `p2pmux ls` does not list a session that is already gone
+                    // — the same order `p2pmux kill` uses.
+                    KeyHandling::Quit(QuitAction::Kill) => {
+                        write_message(&mut stream, &ClientMessage::Shutdown { generation })?;
+                        detach_sent = true;
+                        killed = true;
                         break;
                     }
                     KeyHandling::Consumed(intents) => {
@@ -775,7 +790,11 @@ pub fn run_on(
     if let Some(error) = attach_error {
         eprintln!("p2pmux attach error: {error}");
     }
-    if node_ended {
+    if killed {
+        let _ = crate::session_store::SessionStore::for_current_user()
+            .and_then(|store| store.remove(&descriptor.id));
+        println!("Killed {}", descriptor.name);
+    } else if node_ended {
         println!("p2pmux node ended");
     } else {
         println!(

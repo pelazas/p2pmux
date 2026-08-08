@@ -71,6 +71,9 @@ def smoke_local() -> None:
             check("deadlines fire", 1.4 < elapsed < 4.0, f"{elapsed:.2f}s")
 
         peer.key("ctrl_q")
+        time.sleep(0.5)
+        # Ctrl+Q asks detach-or-kill; `d` is detach.
+        peer.send(b"d")
         time.sleep(1.0)
 
 

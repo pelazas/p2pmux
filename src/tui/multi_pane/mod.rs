@@ -87,6 +87,9 @@ pub struct MultiPaneTui {
     /// This client's own peer id, so the machine list can mark which row is
     /// the machine you are sitting at.
     pub(in crate::tui) local_peer_id: Option<Vec<u8>>,
+    /// Whether leaving and ending the session are different things here.
+    /// See [`MultiPaneTui::set_detachable`].
+    pub(in crate::tui) detachable: bool,
     pub(in crate::tui) resize_drag: Option<ResizeDrag>,
     /// Set while a press forwarded to a child owns the drag and release that follow.
     pub(in crate::tui) mouse_forwarding: bool,
@@ -141,6 +144,7 @@ impl MultiPaneTui {
             zoomed_pane: None,
             paired_machines: Vec::new(),
             local_peer_id: None,
+            detachable: false,
             resize_drag: None,
             session_locked: false,
             mouse_forwarding: false,
@@ -177,8 +181,25 @@ impl MultiPaneTui {
     pub fn modal_open(&self) -> bool {
         matches!(
             self.modal,
-            ModalState::Rename(_) | ModalState::ConfirmDeleteTab { .. } | ModalState::Share
+            ModalState::Rename(_)
+                | ModalState::ConfirmDeleteTab { .. }
+                | ModalState::Share
+                | ModalState::Quit
         )
+    }
+
+    pub fn quit_open(&self) -> bool {
+        matches!(self.modal, ModalState::Quit)
+    }
+
+    /// Tells this client it is attached to a node that outlives it.
+    ///
+    /// Only then are detaching and ending the session two different things, and
+    /// only then is there a question for Ctrl+Q to ask. A foreground session
+    /// owns its panes outright: leaving is ending, and a dialog offering to
+    /// "leave it running" would be offering something that cannot happen.
+    pub fn set_detachable(&mut self, detachable: bool) {
+        self.detachable = detachable;
     }
 
     /// Replace where the other members are looking. Returns whether anything moved, so a
