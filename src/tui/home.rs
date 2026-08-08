@@ -345,24 +345,23 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
         .snapshot
         .members
         .iter()
-        .map(|member| MachineRow {
-            name: crate::tui::member_label(&member.peer_id, &tui.snapshot.members),
-            reachable: true,
-            accepts_work: tui
-                .paired_machines
-                .iter()
-                .find(|paired| {
-                    paired.name == member.display_name && !member.display_name.is_empty()
-                })
-                .is_some_and(|paired| paired.accepts_work),
-            agents: tui
-                .agent_rows
-                .iter()
-                .filter(|row| {
-                    row.host == crate::tui::member_label(&member.peer_id, &tui.snapshot.members)
-                })
-                .count(),
-            this_machine: tui.local_peer_id.as_deref() == Some(member.peer_id.as_slice()),
+        .map(|member| {
+            // Keyed on the member *label*, not the raw display name, because
+            // that is what the agent rows carry and what the strip prints. Two
+            // machines that chose the same name get disambiguated there, and
+            // matching on the raw name would credit one's agents to the other.
+            let name = crate::tui::member_label(&member.peer_id, &tui.snapshot.members);
+            MachineRow {
+                accepts_work: tui
+                    .paired_machines
+                    .iter()
+                    .find(|paired| paired.name == name)
+                    .and_then(|paired| paired.accepts_work),
+                agents: tui.agent_rows.iter().filter(|row| row.host == name).count(),
+                this_machine: tui.local_peer_id.as_deref() == Some(member.peer_id.as_slice()),
+                reachable: true,
+                name,
+            }
         })
         .collect::<Vec<_>>();
     for paired in &tui.paired_machines {
@@ -381,13 +380,18 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
 }
 
 /// One line of the machine strip, and one row of `p2pmux machines`.
+///
+/// Public because the CLI builds these too: the `m` key on Home and the command
+/// print the same rows through the same formatter, so the two can never drift
+/// into describing the same fleet differently.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::tui) struct MachineRow {
-    pub(in crate::tui) name: String,
-    pub(in crate::tui) reachable: bool,
-    pub(in crate::tui) accepts_work: bool,
-    pub(in crate::tui) agents: usize,
-    pub(in crate::tui) this_machine: bool,
+pub struct MachineRow {
+    pub name: String,
+    pub reachable: bool,
+    /// `None` when that machine has never said. See [`crate::tui::PairedMachine`].
+    pub accepts_work: Option<bool>,
+    pub agents: usize,
+    pub this_machine: bool,
 }
 
 /// How many lines the machine block wants.
@@ -558,7 +562,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("oldbox"),
-            accepts_work: true,
+            accepts_work: Some(true),
         }];
 
         let machines = machine_rows(&tui);
@@ -568,7 +572,7 @@ mod tests {
             .find(|machine| machine.name == "oldbox")
             .expect("the paired machine is listed");
         assert!(!oldbox.reachable);
-        assert!(oldbox.accepts_work);
+        assert_eq!(oldbox.accepts_work, Some(true));
         assert_eq!(machine_lines(&tui), 2);
     }
 
@@ -656,7 +660,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            accepts_work: false,
+            accepts_work: None,
         }];
         tui.set_home_open(true, "test");
         assert_eq!(machine_lines(&tui), 2);

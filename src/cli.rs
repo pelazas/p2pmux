@@ -52,6 +52,29 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Pair this machine with another one you own, once and permanently.
+    ///
+    /// With no code, prints one for the other machine to type. With a code,
+    /// pairs with the machine that printed it. After either, bare `p2pmux`
+    /// rejoins on both with no code typed again.
+    Pair {
+        /// The pairing code printed by `p2pmux pair` on your other machine.
+        code: Option<String>,
+        /// Answer the accepts-work question without being asked. Only recorded;
+        /// nothing acts on it yet.
+        #[arg(long = "accept-work")]
+        accept_work: bool,
+        /// Refuse the accepts-work question without being asked.
+        #[arg(long = "no-accept-work", conflicts_with = "accept_work")]
+        no_accept_work: bool,
+    },
+    /// List the machines paired with this one.
+    Machines,
+    /// Forget a paired machine.
+    Unpair {
+        /// The machine's name, as listed by `p2pmux machines`.
+        name: String,
+    },
     /// List the live sessions on this machine.
     Ls,
     /// Print the full reusable join ticket for a session hosted on this machine.
@@ -455,6 +478,27 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             guest_result.map_err(io::Error::other)?;
             Ok(())
         }
+        Some(Command::Pair {
+            code,
+            accept_work,
+            no_accept_work,
+        }) => {
+            let answer = accepts_work_answer(accept_work, no_accept_work)?;
+            match code {
+                Some(code) => pair_with_code(&code, answer).await,
+                None => offer_pairing(answer).await,
+            }
+        }
+        Some(Command::Machines) => print_machines(),
+        Some(Command::Unpair { name }) => {
+            let mut pairing = crate::pairing::load()?;
+            if !pairing.forget(&name) {
+                return Err(CliError("no paired machine with that name").into());
+            }
+            crate::pairing::save(&pairing)?;
+            println!("unpaired: {name}");
+            Ok(())
+        }
         Some(Command::Ticket { session }) => print_join_ticket(session),
         Some(Command::Code { session }) => print_join_code(session),
         Some(Command::Attach { name }) => crate::client::run(&find_live(&name)?),
@@ -498,6 +542,265 @@ fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<
         .into_iter()
         .find(|descriptor| descriptor.name == name || descriptor.id == name)
         .ok_or_else(|| CliError("no live session with that name").into())
+}
+
+/// The accepts-work answer, asked once during pairing rather than left to a
+/// separate configuration step nobody would find.
+///
+/// Default-deny, and the wording matters: it means *accepts work from me*,
+/// never *from anyone in the session*. Otherwise a join code you hand to a
+/// colleague becomes remote code execution on your desktop. Nothing acts on the
+/// flag yet — it is only recorded, and it is the consent primitive that will
+/// later make starting a terminal on another machine legal without widening the
+/// trust model.
+fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error>> {
+    if accept {
+        return Ok(true);
+    }
+    if refuse || !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    print!("Let your other machines start work here? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// `p2pmux pair` with no code: print one for the other machine to type.
+///
+/// Pairing needs a session to be about, so this makes one if none is live here.
+/// The code is the existing short-code-to-ticket mechanism, unchanged — pairing
+/// is mostly persistence plus auto-join on start.
+async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
+    {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{TRUST_WARNING}\n")?;
+        stdout.flush()?;
+    }
+    let store = crate::session_store::SessionStore::for_current_user()?;
+    let descriptor = match newest_live(&store.list_live()?) {
+        Some(descriptor) => descriptor,
+        None => start_solo_session()?,
+    };
+    // The node publishes the code a moment after it starts, so a session
+    // created two lines ago has not necessarily got one yet.
+    let descriptor = wait_for_invite(&store, &descriptor.id).await?;
+    let ticket = descriptor.ticket.clone().ok_or(CliError(
+        "this machine is not hosting the session; pair from the machine that is",
+    ))?;
+    let mut pairing = crate::pairing::load()?;
+    pairing.ticket = Some(ticket.clone());
+    pairing.accepts_work = accepts_work;
+    crate::pairing::save(&pairing)?;
+
+    let mut stdout = io::stdout().lock();
+    match descriptor.join_code.as_deref() {
+        Some(code) => {
+            writeln!(stdout, "pairing code: {code}")?;
+            writeln!(
+                stdout,
+                "\nOn your other machine, run:\n  p2pmux pair {code}"
+            )?;
+        }
+        // A rendezvous outage costs the short code, not the pairing: the ticket
+        // is the real address and works without the service.
+        None => {
+            writeln!(
+                stdout,
+                "the rendezvous service was unreachable, so there is no short code."
+            )?;
+            writeln!(
+                stdout,
+                "\nOn your other machine, run:\n  p2pmux pair {ticket}"
+            )?;
+        }
+    }
+    writeln!(
+        stdout,
+        "\naccepts work from your machines: {}",
+        if accepts_work { "yes" } else { "no" }
+    )?;
+    Ok(())
+}
+
+/// `p2pmux pair <code>`: join the machine that printed it, permanently.
+async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Error>> {
+    {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{TRUST_WARNING}\n")?;
+        stdout.flush()?;
+    }
+    let ticket = resolve_join_ticket(code).await?;
+    let ticket_text = ticket.to_string();
+    // Recorded before the join rather than after it. A join that connects and
+    // then drops has still paired the machines, and losing the ticket to a
+    // network blip would mean typing the code again for a pairing that
+    // succeeded.
+    let mut pairing = crate::pairing::load()?;
+    pairing.ticket = Some(ticket_text.clone());
+    pairing.accepts_work = accepts_work;
+    crate::pairing::save(&pairing)?;
+
+    let descriptor = rejoin_paired_session(&ticket_text).await?;
+    let peers = wait_for_peers(&descriptor).await;
+    let mut pairing = crate::pairing::load()?;
+    for peer in &peers {
+        pairing.remember(peer, None);
+    }
+    crate::pairing::save(&pairing)?;
+
+    let mut stdout = io::stdout().lock();
+    if peers.is_empty() {
+        // The session answered — the ticket resolved and the node started — but
+        // no member has been seen yet. Say what is true rather than claiming a
+        // machine by a name nobody sent.
+        writeln!(
+            stdout,
+            "paired, but the other machine has not answered yet."
+        )?;
+        writeln!(stdout, "Run `p2pmux machines` once it is awake.")?;
+    } else {
+        for peer in peers {
+            writeln!(stdout, "paired: {peer}")?;
+        }
+    }
+    writeln!(stdout, "\nFrom now on, bare `p2pmux` rejoins with no code.")?;
+    Ok(())
+}
+
+/// Wait for the node to publish the session's invite material.
+async fn wait_for_invite(
+    store: &crate::session_store::SessionStore,
+    id: &str,
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    const INVITE_TIMEOUT: Duration = Duration::from_secs(20);
+    let deadline = Instant::now() + INVITE_TIMEOUT;
+    let mut last = None;
+    while Instant::now() < deadline {
+        if let Some(descriptor) = store
+            .list_live()?
+            .into_iter()
+            .find(|descriptor| descriptor.id == id)
+        {
+            if descriptor.ticket.is_some() && descriptor.join_code.is_some() {
+                return Ok(descriptor);
+            }
+            last = Some(descriptor);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // A ticket with no code still pairs, so a rendezvous outage falls through
+    // here rather than failing.
+    last.ok_or_else(|| CliError("the session did not start").into())
+}
+
+/// The other machines in the session this node just joined.
+///
+/// Bounded and best-effort: the pairing is already recorded, so an empty answer
+/// costs a name in the printout and nothing else.
+async fn wait_for_peers(descriptor: &crate::session_store::SessionDescriptor) -> Vec<String> {
+    const PEER_TIMEOUT: Duration = Duration::from_secs(15);
+    let deadline = Instant::now() + PEER_TIMEOUT;
+    while Instant::now() < deadline {
+        let peers = crate::pairing::load_or_empty().machines;
+        if !peers.is_empty() {
+            return peers.into_iter().map(|machine| machine.name).collect();
+        }
+        // A node that died takes the pairing's chance of learning a name with
+        // it, so stop waiting for an answer that is not coming.
+        if !crate::session_store::SessionStore::for_current_user()
+            .and_then(|store| store.list_live())
+            .is_ok_and(|live| live.iter().any(|session| session.id == descriptor.id))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Vec::new()
+}
+
+/// `p2pmux machines`: the fleet, and whether each part of it is answering.
+///
+/// Reachability comes from the live session records, which the node keeps up to
+/// date out of process. A machine paired but not in any of them is one you own
+/// that is not answering — off, asleep, or without a node running — and it
+/// keeps its row rather than vanishing. Saying `asleep` is the whole point.
+fn print_machines() -> Result<(), Box<dyn Error>> {
+    let rows = machine_rows()?;
+    if rows.len() < 2 {
+        println!("No machines paired yet. Run `p2pmux pair` to add one.");
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<8} {:<14} RUNNING",
+        "NAME", "STATUS", "ACCEPTS WORK"
+    );
+    for row in &rows {
+        println!("{}", crate::tui::machine_line(row));
+    }
+    Ok(())
+}
+
+/// Every machine this one knows about, session members first.
+///
+/// Shared with the `m` key on Home, so the two can never drift into describing
+/// the same fleet differently.
+fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
+    let pairing = crate::pairing::load()?;
+    let live = crate::session_store::SessionStore::for_current_user()?.list_live()?;
+    let here = crate::config::load()?.unwrap_or_else(hostname_label);
+    let accepts_work = |name: &str| {
+        pairing
+            .machines
+            .iter()
+            .find(|machine| machine.name == name)
+            .and_then(|machine| machine.accepts_work)
+    };
+
+    let mut rows = vec![crate::tui::MachineRow {
+        agents: live
+            .iter()
+            .flat_map(|session| session.peers.iter())
+            .filter(|peer| peer.this_machine)
+            .map(|peer| peer.agents)
+            .sum(),
+        name: here.clone(),
+        reachable: true,
+        // The one row whose answer is genuinely known here: it was given on
+        // this machine, about this machine.
+        accepts_work: Some(pairing.accepts_work),
+        this_machine: true,
+    }];
+    for peer in live
+        .iter()
+        .flat_map(|session| session.peers.iter())
+        .filter(|peer| !peer.this_machine)
+    {
+        if rows.iter().any(|row| row.name == peer.name) {
+            continue;
+        }
+        rows.push(crate::tui::MachineRow {
+            name: peer.name.clone(),
+            reachable: true,
+            accepts_work: accepts_work(&peer.name),
+            agents: peer.agents,
+            this_machine: false,
+        });
+    }
+    for machine in &pairing.machines {
+        if rows.iter().any(|row| row.name == machine.name) {
+            continue;
+        }
+        rows.push(crate::tui::MachineRow {
+            name: machine.name.clone(),
+            reachable: false,
+            accepts_work: machine.accepts_work,
+            agents: 0,
+            this_machine: false,
+        });
+    }
+    Ok(rows)
 }
 
 /// What bare `p2pmux` does: open the inbox.

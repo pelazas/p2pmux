@@ -44,10 +44,12 @@ pub(crate) use debug_log::ui_debug_log;
 pub(crate) use geometry::{
     initial_root_pane_grid, missed_resize, resize_recheck_due, stale_node_size,
 };
+pub use home::MachineRow;
 pub use host::HostPaneRuntime;
 pub use input::mouse::PaneMouseProtocol;
 pub use multi_pane::MultiPaneTui;
 pub use pane::local::SharedLocalPane;
+pub use render::home::machine_line;
 pub use render::panes::{render_multi_pane, render_multi_pane_with_copy_feedback};
 pub use runtime::{RolePersist, SharedLayoutRuntime};
 pub(crate) use selection::copy_selection_to_clipboard;

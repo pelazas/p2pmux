@@ -134,13 +134,22 @@ pub struct AgentOverlayRow {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PairedMachine {
     pub name: String,
-    /// Whether this machine may start work on that one. Off by default, asked
-    /// once during pairing, and — for now — only ever recorded: nothing acts on
-    /// it yet. It is the consent primitive that will later make starting a
-    /// terminal on another machine legal without widening the trust model, and
-    /// it means *accepts work from me*, never *from anyone in the session*.
-    #[serde(default)]
-    pub accepts_work: bool,
+    /// Whether that machine accepts work from this one — or `None` when it has
+    /// never said.
+    ///
+    /// The answer is given on the machine it is about, during its own pairing,
+    /// and there is no channel back: the only thing that crosses machines is
+    /// the shared layout, whose member list is signed and hash-chained, and the
+    /// inbox is built on never touching that. So a machine knows its own answer
+    /// and nothing about anyone else's, and the column says `—` rather than
+    /// guessing `no` — which would read as a refusal that was never made.
+    ///
+    /// Nothing acts on it either way yet. It is the consent primitive that will
+    /// later make starting a terminal on another machine legal without widening
+    /// the trust model, and it means *accepts work from me*, never *from anyone
+    /// in the session*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_work: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

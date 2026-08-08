@@ -115,6 +115,48 @@ impl SharedLayoutRuntime {
         )
     }
 
+    /// Every machine in this session, with how many agents each is running.
+    ///
+    /// Deliberately separate from [`Self::node_snapshot`], which clones every
+    /// pane's screen: this is read on a hot loop to notice a membership change,
+    /// and the whole point is that noticing has to be nearly free.
+    ///
+    /// This is what makes `p2pmux machines` able to answer "is that machine
+    /// awake" without attaching to the session. Only the node knows, and only
+    /// the node is always running.
+    pub(crate) fn session_peers(&self) -> Vec<crate::session_store::SessionPeer> {
+        let local = self.local_peer_id();
+        let members = &self.tui.snapshot().members;
+        let mut agents_by_host: BTreeMap<String, usize> = BTreeMap::new();
+        for roster in self.agent_rosters.values() {
+            for entry in &roster.entries {
+                let Some(pane) = self.tui.snapshot().panes.get(&entry.pane_id) else {
+                    continue;
+                };
+                if pane.exited {
+                    continue;
+                }
+                *agents_by_host
+                    .entry(sanitize_single_line(&member_label(
+                        &pane.host_peer_id,
+                        members,
+                    )))
+                    .or_default() += 1;
+            }
+        }
+        members
+            .iter()
+            .map(|member| {
+                let name = sanitize_single_line(&member_label(&member.peer_id, members));
+                crate::session_store::SessionPeer {
+                    agents: agents_by_host.get(&name).copied().unwrap_or_default(),
+                    this_machine: member.peer_id == local,
+                    name,
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn node_local_scrollback(&self, pane_id: PaneId) -> Option<LocalScrollbackWindow> {
         let pane = self.local.get(&pane_id)?;
         let (total_rows, _) = pane.screen.history_metadata();

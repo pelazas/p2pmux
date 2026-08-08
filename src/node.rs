@@ -302,6 +302,10 @@ fn run_socket_loop(
     let mut frozen_scrollback = BTreeMap::<u64, FrozenScrollback>::new();
     let mut next_history_id = 1_u64;
     let mut last_periodic_drain: Option<Instant> = None;
+    // The member names this node has already written to the pairing record.
+    // Compared rather than rewritten, so a membership that has not changed
+    // costs one vector compare per drain and no file write at all.
+    let mut last_known_peers: Vec<crate::session_store::SessionPeer> = Vec::new();
     let mut last_work = Instant::now();
     loop {
         let mut shutdown = false;
@@ -442,6 +446,36 @@ fn run_socket_loop(
                 eprintln!("p2pmux node: failed to record the new session role: {error}");
             }
             did_work = true;
+        }
+        // Both machines remember each other, and neither of them is necessarily
+        // being looked at when the other arrives. The node is the only part that
+        // is always running, so it is what writes the pairing record: a machine
+        // that joins while nobody is at the keyboard is still remembered, and
+        // still reads as `asleep` rather than vanishing once it switches off.
+        //
+        // Only ever in a session pairing already knows about. A guest who joined
+        // with a code you handed out is a collaborator, not a machine you own,
+        // and must never end up in your fleet.
+        if changed {
+            let peers = node.session_peers();
+            if peers != last_known_peers {
+                last_known_peers.clone_from(&peers);
+                // Out of process, so `p2pmux machines` can say whether a
+                // machine is awake without attaching to the session and
+                // bumping whatever client is already on it.
+                descriptor.peers.clone_from(&peers);
+                if let Err(error) = store.write(descriptor) {
+                    eprintln!("p2pmux node: failed to record the session's machines: {error}");
+                }
+                let names = peers
+                    .iter()
+                    .filter(|peer| !peer.this_machine)
+                    .map(|peer| peer.name.clone())
+                    .collect::<Vec<_>>();
+                if let Err(error) = crate::pairing::remember_peers(&names) {
+                    eprintln!("p2pmux node: failed to record paired machines: {error}");
+                }
+            }
         }
         did_work |= changed;
         let mut detached = false;
@@ -1374,6 +1408,9 @@ impl SharedLayoutNode {
     }
     pub fn local_peer_id(&self) -> Vec<u8> {
         self.runtime.local_peer_id()
+    }
+    pub(crate) fn session_peers(&self) -> Vec<crate::session_store::SessionPeer> {
+        self.runtime.session_peers()
     }
     pub fn release_all_local_control(&mut self) -> Result<(), Box<dyn Error>> {
         self.runtime.release_all_local_control()

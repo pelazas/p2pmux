@@ -408,16 +408,15 @@ pub(in crate::tui) fn machine_block(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<
 
 /// One machine, formatted identically on Home and in `p2pmux machines`, so the
 /// two can never drift into describing the same fleet differently.
-pub(in crate::tui) fn machine_line(machine: &MachineRow) -> String {
+pub fn machine_line(machine: &MachineRow) -> String {
     let status = if machine.reachable { "ready" } else { "asleep" };
-    // A dash, not "no": you were never asked about this machine, because you
-    // are on it. `accepts work` is a thing your *other* machines are granted.
-    let accepts = if machine.this_machine {
-        "—"
-    } else if machine.accepts_work {
-        "yes"
-    } else {
-        "no"
+    // A dash means "never said", not "no". The answer is given on the machine
+    // it is about and has no way back here, so printing `no` would show a
+    // refusal nobody made.
+    let accepts = match machine.accepts_work {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "—",
     };
     let running = match machine.agents {
         0 if !machine.reachable => String::from("—"),
@@ -598,23 +597,26 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_is_never_asked_whether_it_accepts_work_from_itself() {
+    fn an_unanswered_accepts_work_column_reads_as_a_dash_not_a_refusal() {
         let here = MachineRow {
             name: String::from("laptop"),
             reachable: true,
-            accepts_work: false,
+            accepts_work: None,
             agents: 2,
             this_machine: true,
         };
         let there = MachineRow {
             this_machine: false,
-            accepts_work: true,
+            accepts_work: Some(true),
             agents: 1,
             ..here.clone()
         };
 
         let line = machine_line(&here);
-        assert!(line.contains('—'), "a dash, not a no: {line:?}");
+        assert!(
+            line.contains('—'),
+            "a dash means never said, not a refusal nobody made: {line:?}"
+        );
         assert!(line.contains("2 agents"), "{line:?}");
         assert!(line.contains("(this machine)"), "{line:?}");
         assert!(machine_line(&there).contains("yes"));
@@ -626,7 +628,7 @@ mod tests {
         let asleep = MachineRow {
             name: String::from("oldbox"),
             reachable: false,
-            accepts_work: true,
+            accepts_work: Some(true),
             agents: 0,
             this_machine: false,
         };

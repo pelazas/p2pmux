@@ -143,6 +143,25 @@ pub struct SessionDescriptor {
     /// Absent on a member, and on a coordinator that could not reach the service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_code: Option<String>,
+    /// The machines currently in this session, with how many agents each is
+    /// running. Written by the node whenever membership changes.
+    ///
+    /// This exists so a command can answer "is that machine awake" without
+    /// attaching: attaching would bump the generation and detach whatever
+    /// client is already on the session, which is far too high a price for a
+    /// question as small as a status column.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<SessionPeer>,
+}
+
+/// One machine in a live session, as the record describes it out of process.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionPeer {
+    pub name: String,
+    pub agents: usize,
+    /// Whether this row is the machine holding the record.
+    #[serde(default)]
+    pub this_machine: bool,
 }
 
 impl SessionDescriptor {
@@ -163,6 +182,7 @@ impl SessionDescriptor {
             created_at: now_secs(),
             ticket: None,
             join_code: None,
+            peers: Vec::new(),
         }
     }
 

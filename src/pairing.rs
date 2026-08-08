@@ -12,11 +12,19 @@
 //!   is mostly persistence plus auto-join on start.
 //! - **The names of the machines paired with this one**, so the inbox can say
 //!   `asleep` about a machine that is switched off rather than forgetting it.
-//! - **Whether each machine accepts work.** Off by default, asked once during
+//! - **Whether this machine accepts work.** Off by default, asked once during
 //!   pairing rather than as a separate configuration step. Nothing acts on it
 //!   yet: it is the consent primitive that will later make starting a terminal
 //!   on another machine legal without widening the trust model, and it means
 //!   *accepts work from me*, never *from anyone with the join code*.
+//!
+//!   The answer is given on the machine it is about, and there is no channel
+//!   back: the only thing that crosses machines is the shared layout, whose
+//!   member list is signed and hash-chained, and the inbox is built on never
+//!   touching that. So each machine knows its own answer and records `None` for
+//!   everyone else, which the fleet list prints as `—` rather than as a refusal
+//!   nobody made. Carrying it between machines is a protocol change, and a
+//!   deliberate non-goal until something actually acts on the flag.
 //!
 //! It deliberately holds no keys of its own. The ticket is the session's
 //! existing cryptographic address, and a machine that can read this file could
@@ -70,8 +78,8 @@ pub struct Pairing {
     /// completes, which is exactly when bare `p2pmux` stops needing a code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
-    /// Whether this machine agreed to let the others start work on it.
-    /// Recorded during pairing and, for now, only recorded.
+    /// Whether this machine agreed to let your other machines start work on
+    /// it. Recorded during pairing and, for now, only recorded.
     #[serde(default)]
     pub accepts_work: bool,
     #[serde(default, rename = "machine")]
@@ -89,7 +97,7 @@ impl Pairing {
     /// Pairing twice with the same machine is a re-pair, not a second machine:
     /// a user who re-runs `p2pmux pair` after moving house should end up with
     /// one desktop, not two.
-    pub fn remember(&mut self, name: &str, accepts_work: bool) {
+    pub fn remember(&mut self, name: &str, accepts_work: Option<bool>) {
         let name = name.trim();
         if name.is_empty() {
             return;
@@ -99,7 +107,14 @@ impl Pairing {
             .iter_mut()
             .find(|machine| machine.name == name)
         {
-            Some(machine) => machine.accepts_work = accepts_work,
+            Some(machine) => {
+                // Only ever upgraded from "never said" to an answer. A machine
+                // that told us once must not be silently un-told by a later
+                // sighting that carried nothing.
+                if accepts_work.is_some() {
+                    machine.accepts_work = accepts_work;
+                }
+            }
             None => self.machines.push(PairedMachine {
                 name: name.to_owned(),
                 accepts_work,
@@ -150,6 +165,38 @@ pub fn load() -> Result<Pairing, PairingError> {
 
 pub fn save(pairing: &Pairing) -> Result<(), PairingError> {
     save_to(&pairing_path()?, pairing)
+}
+
+/// Record the machines currently in the session, if this machine is paired.
+///
+/// Called by the node when the member list changes. It is a no-op on a session
+/// pairing knows nothing about, and that guard is the whole security of it: a
+/// guest who joined with a code you handed out is a collaborator, not a machine
+/// you own, and must never end up in your fleet or inherit an `accepts work`
+/// answer you gave about your own desktop.
+///
+/// Machines are only ever added. A paired machine that is switched off stops
+/// being a member and must keep its row — saying `asleep` is the entire reason
+/// the record exists. Unpairing is `p2pmux unpair`, an explicit act.
+pub fn remember_peers(names: &[String]) -> Result<(), PairingError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let path = pairing_path()?;
+    let mut pairing = load_from(&path)?;
+    if !pairing.can_rejoin() {
+        return Ok(());
+    }
+    let before = pairing.machines.clone();
+    for name in names {
+        if !pairing.machines.iter().any(|machine| &machine.name == name) {
+            pairing.remember(name, None);
+        }
+    }
+    if pairing.machines == before {
+        return Ok(());
+    }
+    save_to(&path, &pairing)
 }
 
 /// Best-effort read for the paths where a failure must not stop the UI.
@@ -218,8 +265,8 @@ mod tests {
             accepts_work: true,
             machines: Vec::new(),
         };
-        pairing.remember("desktop", false);
-        pairing.remember("droplet", true);
+        pairing.remember("desktop", Some(false));
+        pairing.remember("droplet", Some(true));
 
         save_to(&path, &pairing).expect("save");
         assert_eq!(load_from(&path).expect("load"), pairing);
@@ -229,15 +276,16 @@ mod tests {
     #[test]
     fn pairing_twice_with_a_machine_updates_it_rather_than_duplicating_it() {
         let mut pairing = Pairing::default();
-        pairing.remember("desktop", false);
-        pairing.remember("desktop", true);
+        pairing.remember("desktop", None);
+        pairing.remember("desktop", Some(true));
 
         assert_eq!(
             pairing.machines,
             vec![PairedMachine {
                 name: String::from("desktop"),
-                accepts_work: true,
-            }]
+                accepts_work: Some(true),
+            }],
+            "a later sighting upgrades an unanswered machine and never downgrades one"
         );
         assert!(pairing.forget("desktop"));
         assert!(!pairing.forget("desktop"));
