@@ -84,10 +84,14 @@ not an agent orchestration platform.
   says which you got: `direct 55ms` or `relayed 120ms`.
 - One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
   that contacts no service at all, for when our rendezvous is down.
-- An agents overlay (`Ctrl+A`) tracking Claude Code, Codex, Cursor, Pi and OpenCode across every
-  machine in the session — including which ones are blocked waiting on a human. Every state comes
-  from the agent's own hooks, never from guessing at output timing: run `p2pmux setup claude` once,
-  and `p2pmux doctor` to check.
+- An inbox — the screen bare `p2pmux` opens — listing every Claude Code, Codex, Cursor, Pi and
+  OpenCode agent running on every machine in the session, sorted by which one is blocking you.
+  Press Enter on a row and you are typing in that terminal; `Ctrl+O` brings you back. `needs you`
+  comes only from the agent's own hooks, never from guessing at output timing: run
+  `p2pmux setup claude` once, and `p2pmux doctor` to check. An agent with no hooks says
+  *state unknown — no hooks* on its own row rather than being guessed about.
+- `p2pmux pair` associates two machines you own, once and permanently. After that, bare `p2pmux`
+  rejoins on either with no code typed, and `p2pmux machines` says which of them are awake.
 
 ## Status
 
@@ -143,8 +147,11 @@ out of shared panes.
 
 ## Using it
 
-`Ctrl+S` shares, `Ctrl+P` is pane mode, `Ctrl+T` is tab mode, `Ctrl+A` opens the agents overlay,
-and `Ctrl+Q` detaches your view while the session keeps running. `p2pmux --resume` brings it back.
+Run `p2pmux` with no arguments and you land on the inbox. `Ctrl+O` returns to it from anywhere,
+including from inside a live terminal; `Ctrl+A` does the same, for the muscle memory the old
+agents overlay built. `Ctrl+S` shares, `Ctrl+P` is pane mode, `Ctrl+T` is tab mode, and `Ctrl+Q`
+detaches your view while the session keeps running. `p2pmux --resume` brings back a specific
+session by name.
 
 Full walkthrough — keys, control leases, presence, mouse, scrollback, agent hooks and every config
 key — is in [docs/USAGE.md](./docs/USAGE.md).

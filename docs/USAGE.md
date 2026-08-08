@@ -5,6 +5,10 @@ Everything the README does not need to say on first read. Start with
 
 ## Sessions
 
+`p2pmux` with no arguments needs none of what follows. It attaches the newest live session here,
+or rejoins the one your pairing recorded, or starts a fresh one — and lands you on the inbox
+either way. The commands below are for naming a specific session out loud.
+
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
 Ctrl+Q detaches that client without stopping shells, Iroh, or hosted panes. It prints the exact
 `--resume`, `attach`, and `kill` commands needed to return. Use `p2pmux --resume` for the
@@ -195,8 +199,7 @@ tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc
 Presence shows where every other member is looking. Each member gets a color from their slot in
 the session's member list, and that color identifies them everywhere: a dot per member on each tab
 they are on, their initial on the bottom border of the pane they are watching, the border of any
-pane they are driving, and a members block in the agents overlay listing everyone with their tab
-and pane. Watching is not controlling — a watcher only ever leaves an initial on the bottom
+pane they are driving. Watching is not controlling — a watcher only ever leaves an initial on the bottom
 border, and the member holding the control lease is drawn as a reversed chip.
 
 Presence is silent when nobody moves. A member publishes their focus only when it changes, the
@@ -266,36 +269,59 @@ elsewhere has no single such terminal at all. An invented answer would make an a
 palette against the wrong background, so these stay silent. Programs that use them for light/dark
 detection fall back to their default.
 
-## Agents overlay
+## The inbox
 
-`Ctrl+A` opens the Agents overlay, which lists supported coding agents running below hosted pane
-shells: Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv),
-Pi (including Node-based launches), and OpenCode (`opencode`).
-
-Each agent is one line: a state glyph, the agent, the tail of its working directory, its state (with
-elapsed time while working or blocked), and what it last said it was doing. The selected row adds a
-detail line underneath with its chrome location (`Tab #N · Pane #M`), host, and control holder. The
-panel is sized to its contents, and its title counts the agents blocked on a human
-(`Agents · 2 need you`).
+`p2pmux` with no arguments opens the inbox: one screen listing every supported coding agent
+running on every machine in the session, sorted by which one is blocking you. Supported agents
+are Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv), Pi
+(including Node-based launches), and OpenCode (`opencode`).
 
 ```
-┌ Agents · 1 needs you ──────────────────────────────────────────────────────┐
-│›⠼ claude     Desktop/p2pmux        working 4s   refactoring the sync gate…  │
-│ ◆ claude     Desktop/api           needs you    Should I force-push to main?│
-│ ● claude     Desktop/dtc-landing   done         All 310 tests pass.         │
-│ Tab #1 · Pane #1 · host: devmid · control: free                            │
-│ <↑↓> MOVE   <Enter> FOCUS                                                  │
-└────────────────────────────────────────────────────────────────────────────┘
+p2pmux (paris) │ inbox 2 │ Tab #1 · Tab #2
+
+ Agents · 2 need you
+
+ ● desktop   claude   needs you   wants to run: rm -rf node_modules     2m
+ ● droplet   codex    needs you   permission: write to /etc/hosts      12m
+ ✓ laptop    codex    done        6 files changed, tests pass          31m
+ ○ laptop    claude   running     editing the auth handler              4m
+ ○ droplet   claude   running     running tests                        18m
+ ○ desktop   cursor   running     state unknown — no hooks              7m
+
+ laptop ✓   desktop ✓   droplet ✓   oldbox asleep
+
+ enter open · n new terminal · m machines · q quit
 ```
 
-Press `Esc` to close, use arrows or `j`/`k` to select, and press Enter or left-click a row to jump
-to that pane (including on another tab). Scroll the overlay with the mouse wheel while it is open.
-To retain readline's beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one
-Ctrl+A to the focused PTY instead.
+Each row is a status dot, the machine the agent is on, the agent, its state, what it last said it
+was doing, and how long it has been in that state. Rows sort blocked → done → running → idle: a
+row that needs you never appears below one that does not, and that is the point of the screen.
+
+| Key | Does |
+|-----|------|
+| `Ctrl+O` | The inbox, from anywhere including inside a live terminal |
+| `Ctrl+A` | The same, kept for the muscle memory the old agents overlay built |
+| `Enter` | Open the selected agent's terminal, full screen |
+| `n` | New terminal on this machine |
+| `m` | Expand the machine list |
+| `↑` `↓` | Move the selection |
+| `q` | Quit |
+
+`Esc` is deliberately **not** the way back. Claude Code interrupts on it and vim needs it
+constantly, so swallowing it would break the terminal you just opened. Inside a pane every
+unmodified key belongs to the program running there.
+
+Left-clicking a row opens it. The mouse wheel scrolls the list. To retain readline's
+beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A to the focused
+PTY instead.
+
+The `inbox` badge in the tab bar carries the count of agents blocked on a human, in amber, so it
+stays visible while you are deep inside a terminal. It never shows a zero: absence is quieter and
+means the same thing.
 
 Working directories are shared with every member as part of the existing trusted shared-shell
 model, so do not use a session with people who should not see repository paths. What the agent
-*said* is not: that line reaches your own overlay and stops there, because a session is shared with
+*said* is not: that line reaches your own inbox and stops there, because a session is shared with
 everyone holding the ticket. A row for a pane hosted by another member shows their agent's state
 but never its words.
 
@@ -307,12 +333,22 @@ waiting on a permission prompt, or finished. The guess fired completions mid-tas
 once report `needs you`, the state that actually costs you time.
 
 So the process scan answers one question — *which* agent is running in a pane — and the agent's own
-hooks answer the rest. Until a hook reports, a row reads `· not reporting`, which is the honest
-answer, and the overlay says so:
+hooks answer the rest. Watching processes may report `running` or `idle` and nothing else; only a
+hook may ever say `needs you`. Until a hook reports, the row says so in its own description column:
 
 ```
-no agent hooks wired — run: p2pmux setup
+ ○ desktop   cursor   running     state unknown — no hooks              7m
 ```
+
+The label is per row rather than a banner over the list, so the warning sits exactly where the
+doubt is. When nothing at all is reporting, the inbox adds one line under the rows:
+
+```
+Run `p2pmux setup` to see which agents need you.
+```
+
+Row text is the agent's own words, never a model-written summary. A richer sentence that can lie
+about what an agent did would defeat the entire point of not reading the terminal yourself.
 
 ### Wiring up Claude Code
 
@@ -342,6 +378,42 @@ asking for attention.
 
 Dropping the inference also made the mux cheaper: the process scan no longer refreshes every
 process on the machine once a second, only once every five.
+
+## Pairing machines
+
+Pairing associates two machines you own, once and permanently. After it, bare `p2pmux` rejoins on
+either with no code typed again.
+
+```text
+On the new machine:   p2pmux pair
+                      → pairing code: 4KP7Q-M2XRW
+                      → Let your other machines start work here? [y/N]
+
+On your laptop:       p2pmux pair 4KP7Q-M2XRW
+                      → paired: desktop
+```
+
+`p2pmux machines` lists the fleet and whether each part of it is answering:
+
+```text
+NAME         STATUS   ACCEPTS WORK   RUNNING
+laptop       ready    no             2 agents      (this machine)
+desktop      ready    —              1 agent
+oldbox       asleep   —              —
+```
+
+A machine is `ready` when it is in a live session here and `asleep` when it is paired but not
+answering — off, sleeping, or without a node running. `p2pmux unpair <name>` forgets one.
+
+`accepts work` is asked once, during pairing, and defaults to no. It means *accepts work from your
+other machines*, never *from anyone with the join code* — otherwise handing out a code would be
+handing out remote code execution. **Nothing acts on it yet**: it is recorded now so that starting
+a terminal on another machine can later be legal without widening the trust model. It reads `—`
+for a machine that has never answered the question, because the answer is given on the machine it
+is about and there is no channel back; printing `no` would show a refusal nobody made.
+
+Pairing is stored in `$XDG_CONFIG_HOME/p2pmux/pairing.toml`. It holds the shared session's ticket
+and the names of the paired machines, and no keys of its own.
 
 ## Configuration
 
