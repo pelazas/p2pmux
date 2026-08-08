@@ -482,7 +482,7 @@ mod tests {
         // has to be published and read back before anything reaches the screen.
         runtime.publish_local_agent_roster();
         let rows = runtime.agent_overlay_rows();
-        assert_eq!(rows.len(), 1, "the pushed status reached the overlay");
+        assert_eq!(rows.len(), 1, "the pushed status reached the roster");
         assert_eq!(rows[0].pane_id, 1);
         assert_eq!(rows[0].state, crate::protocol::AgentRosterState::Pending);
 

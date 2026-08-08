@@ -1,10 +1,10 @@
 //! `p2pmux setup` and `p2pmux doctor` — wiring an agent's hooks up, and saying
 //! whether they are wired.
 //!
-//! Every status in the agents overlay comes from a hook. Nothing is inferred
+//! Every status in the inbox comes from a hook. Nothing is inferred
 //! from output timing any more, because timing could never tell a thinking agent
 //! from one blocked on a permission prompt. That makes hook installation the
-//! difference between an overlay that works and one that lists processes it
+//! difference between an inbox that works and one that lists processes it
 //! knows nothing about — far too important to leave as six JSON objects for a
 //! human to paste into the right place in `settings.json`.
 //!
@@ -274,10 +274,10 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
         .unwrap_or_default();
     println!("{:<8} {:<14} {path}", "claude", claude.label());
     match claude {
-        Wiring::Wired => println!("\nAgent states in Ctrl+A come from these hooks."),
+        Wiring::Wired => println!("\nThe inbox reads agent state from these hooks."),
         Wiring::Unwired => println!(
-            "\nCtrl+A can see that an agent is running but not what it is doing.\n\
-             Run `p2pmux setup claude` to fix that."
+            "\nThe inbox can see that an agent is running but not what it is doing,\n\
+             and can never say `needs you`. Run `p2pmux setup` to fix that."
         ),
         Wiring::Absent => println!("\nNothing to wire up on this machine."),
     }

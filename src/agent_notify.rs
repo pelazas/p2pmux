@@ -18,7 +18,7 @@
 //!
 //! One line of the assistant's message *is* sent, and travels exactly as far as
 //! the Unix socket this writes to. The node that owns the pane keeps it for its
-//! own overlay and strips it from the roster it publishes — see
+//! own inbox and strips it from the roster it publishes — see
 //! `SharedLocalPane::agent_roster_entry`. A p2pmux session is shared with every
 //! member, and the agent's conversation is still not the mux's to publish; it is
 //! only the local user's to read, on their own machine, about their own pane.

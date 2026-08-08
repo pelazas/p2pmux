@@ -110,10 +110,15 @@ enum Command {
         #[command(subcommand)]
         agent: NotifyAgent,
     },
-    /// Wire an agent's hooks up so its status reaches the Ctrl+A overlay.
+    /// Wire an agent's hooks up so its real state reaches the inbox.
+    ///
+    /// With no agent named, wires up every agent p2pmux knows how to. That is
+    /// the form the inbox's own nudge tells people to run, and a user who has
+    /// just been told their agents are unreported should not then have to pick
+    /// which of them to fix.
     Setup {
         #[command(subcommand)]
-        agent: SetupAgent,
+        agent: Option<SetupAgent>,
     },
     /// Report whether each agent's hooks are wired up.
     Doctor,
@@ -212,9 +217,13 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
         // Editing a settings file and reporting on it are both plain filesystem
         // work, and a user running them wants an answer, not a thread pool.
         Some(Command::Setup { agent }) => Some(match agent {
-            SetupAgent::Claude { uninstall, dry_run } => {
+            Some(SetupAgent::Claude { uninstall, dry_run }) => {
                 crate::agent_setup::setup_claude(*uninstall, *dry_run)
             }
+            // Every agent with a hook surface, which today is one. When a
+            // second lands, this is the line that has to grow -- not the
+            // sentence the inbox shows a first-time user.
+            None => crate::agent_setup::setup_claude(false, false),
         }),
         Some(Command::Doctor) => Some(crate::agent_setup::doctor()),
         _ => None,

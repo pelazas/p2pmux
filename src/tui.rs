@@ -7,7 +7,7 @@
 //! - [`state`], [`snapshot`] — the value types the UI keeps and hands back
 //! - [`input`], [`geometry`], [`text`], [`selection`] — key and mouse
 //!   encoding, rect math, width-aware strings, clipboard
-//! - [`render`] — every pixel: pane chrome, footer, overlays, modals, vt100
+//! - [`render`] — every pixel: pane chrome, footer, the inbox, modals, vt100
 //! - [`multi_pane`] — `MultiPaneTui`, the local view of a shared layout
 //! - [`pane`], [`runtime`] — the panes a session owns and the loop over them
 //! - [`app`], [`host`], [`terminal`] — the blocking entry points and their
