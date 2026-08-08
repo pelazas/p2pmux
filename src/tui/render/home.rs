@@ -480,3 +480,157 @@ fn pad(value: &str, width: u16) -> String {
     let value = truncate_leading(value, usize::from(width));
     format!("{value:<width$}", width = usize::from(width))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::{
+        HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS, format_home_row, header_line,
+        machine_line,
+    };
+    use crate::{
+        agent_detect::{AgentKind, AgentState, DetectedAgent, PaneAgentTracker},
+        config::UiTheme,
+        protocol::AgentRosterState,
+        tui::{home::MachineRow, test_support::agent_row},
+    };
+
+    fn rendered(state: AgentRosterState, message: &str) -> String {
+        let mut row = agent_row(1, 1, 1);
+        row.state = state;
+        row.host = String::from("droplet");
+        row.kind = String::from("claude");
+        row.message = message.to_owned();
+        format_home_row(&row, false, 100, 0, 0, &UiTheme::default()).to_string()
+    }
+
+    /// The rule, checked at the boundary where it is consumed rather than only
+    /// where it is enforced. Watching processes may say `running` and nothing
+    /// more; only a hook may say `needs you`.
+    #[test]
+    fn a_scanned_agent_with_no_hook_can_only_ever_reach_the_screen_as_running() {
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(Some(DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: String::from("/repo"),
+        }));
+
+        let listed = tracker.listed_agent().expect("a detected agent has a row");
+        assert_eq!(
+            listed.state,
+            AgentState::Unknown,
+            "detection knows an agent exists and nothing else"
+        );
+        assert!(
+            listed.message.is_empty(),
+            "there is no sentence to show, and inventing one is what the rule forbids"
+        );
+
+        let line = rendered(AgentRosterState::Unknown, "");
+        assert!(line.contains("running"), "{line:?}");
+        assert!(!line.contains("needs you"), "{line:?}");
+        assert!(
+            line.contains(HOME_ROW_NO_HOOKS),
+            "the doubt is labelled on the row it belongs to: {line:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_pushed_status_can_put_needs_you_on_a_row() {
+        let mut tracker = PaneAgentTracker::default();
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            String::from("/repo"),
+            AgentState::Pending,
+            String::from("permission: write to /etc/hosts"),
+            Instant::now(),
+            0,
+        );
+
+        assert_eq!(
+            tracker.listed_agent().expect("a pushed row").state,
+            AgentState::Pending
+        );
+        let line = rendered(AgentRosterState::Pending, "permission: write to /etc/hosts");
+        assert!(line.contains("needs you"), "{line:?}");
+        assert!(
+            line.contains("permission: write to /etc/hosts"),
+            "the row carries the agent's own words, not a summary of them: {line:?}"
+        );
+        assert!(!line.contains(HOME_ROW_NO_HOOKS), "{line:?}");
+    }
+
+    #[test]
+    fn a_row_falls_back_to_its_directory_rather_than_inventing_a_sentence() {
+        // No hook text for a state a hook did report. The honest filler is a
+        // fact the row already has -- never a model-written summary, which is
+        // richer and can lie about what an agent did, which defeats the entire
+        // point of not reading the terminal yourself.
+        let line = rendered(AgentRosterState::Working, "");
+        assert!(line.contains("repository/path"), "{line:?}");
+    }
+
+    #[test]
+    fn the_header_says_the_count_in_words_a_notification_could_reuse() {
+        let theme = UiTheme::default();
+        assert_eq!(header_line(0, &theme).to_string().trim(), "Agents");
+        assert_eq!(
+            header_line(1, &theme).to_string().trim(),
+            "Agents · 1 needs you"
+        );
+        assert_eq!(
+            header_line(2, &theme).to_string().trim(),
+            "Agents · 2 need you"
+        );
+    }
+
+    #[test]
+    fn the_empty_states_say_what_to_do_rather_than_what_is_missing() {
+        assert_eq!(
+            HOME_EMPTY_NO_AGENTS,
+            "Start an agent in any terminal and it appears here."
+        );
+        assert_eq!(
+            HOME_EMPTY_NO_HOOKS,
+            "Run `p2pmux setup` to see which agents need you."
+        );
+    }
+
+    #[test]
+    fn this_machine_is_never_asked_whether_it_accepts_work_from_itself() {
+        let here = MachineRow {
+            name: String::from("laptop"),
+            reachable: true,
+            accepts_work: false,
+            agents: 2,
+            this_machine: true,
+        };
+        let there = MachineRow {
+            this_machine: false,
+            accepts_work: true,
+            agents: 1,
+            ..here.clone()
+        };
+
+        let line = machine_line(&here);
+        assert!(line.contains('—'), "a dash, not a no: {line:?}");
+        assert!(line.contains("2 agents"), "{line:?}");
+        assert!(line.contains("(this machine)"), "{line:?}");
+        assert!(machine_line(&there).contains("yes"));
+        assert!(machine_line(&there).contains("1 agent"));
+    }
+
+    #[test]
+    fn an_unreachable_machine_reads_asleep() {
+        let asleep = MachineRow {
+            name: String::from("oldbox"),
+            reachable: false,
+            accepts_work: true,
+            agents: 0,
+            this_machine: false,
+        };
+
+        assert!(machine_line(&asleep).contains("asleep"));
+    }
+}
