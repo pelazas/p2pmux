@@ -24,8 +24,8 @@ const NORMAL_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::Text("> PANE   <"),
     FooterSegment::Key("t"),
     FooterSegment::Text("> TAB   <"),
-    FooterSegment::Key("a"),
-    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("o"),
+    FooterSegment::Text("> INBOX   <"),
     FooterSegment::Key("s"),
     FooterSegment::Text("> SHARE   <"),
     FooterSegment::Key("q"),
@@ -44,8 +44,8 @@ const NORMAL_FOOTER_NO_FOCUS: &[FooterSegment] = &[
     FooterSegment::Text("> PANE   <"),
     FooterSegment::Key("t"),
     FooterSegment::Text("> TAB   <"),
-    FooterSegment::Key("a"),
-    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("o"),
+    FooterSegment::Text("> INBOX   <"),
     FooterSegment::Key("s"),
     FooterSegment::Text("> SHARE   <"),
     FooterSegment::Key("q"),
@@ -58,8 +58,8 @@ const NORMAL_FOOTER_NO_SHARE: &[FooterSegment] = &[
     FooterSegment::Text("> PANE   <"),
     FooterSegment::Key("t"),
     FooterSegment::Text("> TAB   <"),
-    FooterSegment::Key("a"),
-    FooterSegment::Text("> AGENTS   <"),
+    FooterSegment::Key("o"),
+    FooterSegment::Text("> INBOX   <"),
     FooterSegment::Key("q"),
     FooterSegment::Text("> QUIT"),
 ];
@@ -551,7 +551,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <a> AGENTS   <s> SHARE   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
+                "Ctrl+ <p> PANE   <t> TAB   <o> INBOX   <s> SHARE   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
             ),
             (
                 ChordMode::Pane,

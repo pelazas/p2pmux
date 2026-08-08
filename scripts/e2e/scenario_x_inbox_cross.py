@@ -147,7 +147,11 @@ def main() -> int:
             # An agent, in a terminal on beta.
             b.send(b"n")
             time.sleep(2.5)
-            b.run_in_shell(f"/bin/sh -c 'exec -a claude /bin/sh {beta.home}/agent.sh'")
+            # `exec -a` is a bashism and the droplet's /bin/sh is dash, so the
+            # launcher has to be bash even though the script itself is POSIX.
+            # Detection matches the process's own name, and this is the only way
+            # to give /bin/sh an argv[0] of `claude` without copying a binary.
+            b.run_in_shell(f"bash -c 'exec -a claude /bin/sh {beta.home}/agent.sh'")
             b.wait_for("REMOTE-AGENT-BLOCKED", timeout=45)
 
             a = spawn_remote(harness, alpha, "alpha", [], cols=COLS, rows=ROWS)
