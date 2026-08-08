@@ -327,6 +327,14 @@ impl MultiPaneTui {
             .iter()
             .position(|tab| tab.tab_id == self.current_tab)?;
         let len = self.snapshot.tabs.len();
+        // Home sits left of Tab #1 in the bar, so stepping left off the first
+        // tab lands on it rather than wrapping to the last. A second path in,
+        // for people who navigate by tab rather than by keybinding.
+        if !forward && index == 0 {
+            self.set_home_open(true, "tab_left");
+            self.clear_zoom();
+            return None;
+        }
         let next = if forward {
             (index + 1) % len
         } else {

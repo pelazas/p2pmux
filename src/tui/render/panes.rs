@@ -36,6 +36,39 @@ use crate::{
 pub(in crate::tui) const TOP_BAR_BRAND: &str = "p2pmux";
 pub(in crate::tui) const TOP_BAR_BRAND_SEPARATOR: &str = " │ ";
 pub(in crate::tui) const TAB_BAR_SEPARATOR: &str = " · ";
+/// The widest the session label is allowed to be before the bar starts cutting
+/// it.
+///
+/// The truncation order across the whole bar, decided once here rather than at
+/// tab seven: the session label gives way first, then tab names, and the inbox
+/// badge never gives way at all. You already know which session you are in; the
+/// badge is the one thing on the bar that is telling you something you do not.
+pub(in crate::tui) const TOP_BAR_TITLE_MAX_WIDTH: usize = 22;
+/// The inbox segment, between the session label and the tabs.
+///
+/// Fixed width so the separator after it does not shuffle sideways every time
+/// an agent gets blocked or unblocked — a bar that twitches is a bar the eye
+/// stops trusting.
+const INBOX_SEGMENT_MIN_WIDTH: usize = 7;
+
+/// `inbox` with its count, or `inbox` alone.
+///
+/// Never `inbox 0`. Absence is quieter than a zero and means exactly the same
+/// thing, and a zero on screen is a number the eye has to read before it can
+/// discard it.
+pub(in crate::tui) fn inbox_segment(needs_you: usize) -> String {
+    let text = if needs_you == 0 {
+        String::from("inbox")
+    } else {
+        format!("inbox {needs_you}")
+    };
+    format!("{text:<INBOX_SEGMENT_MIN_WIDTH$}")
+}
+
+/// The whole width the inbox segment and its trailing separator occupy.
+pub(in crate::tui) fn inbox_segment_width(needs_you: usize) -> u16 {
+    text_width(&inbox_segment(needs_you)).saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR))
+}
 pub(in crate::tui) fn tab_label(
     title: Option<&str>,
     index: usize,
@@ -260,11 +293,57 @@ pub(in crate::tui) fn render_shared_multi_pane(
             .set_stringn(
                 geometry.tab_bar.x,
                 geometry.tab_bar.y,
-                tui.title(),
+                truncate_trailing(tui.title(), TOP_BAR_TITLE_MAX_WIDTH),
                 usize::from(geometry.tab_bar.width),
                 Style::default()
                     .fg(theme.tab_foreground)
                     .bg(theme.footer_background),
+            )
+            .0;
+        x = buffer
+            .set_stringn(
+                x,
+                geometry.tab_bar.y,
+                TOP_BAR_BRAND_SEPARATOR,
+                usize::from(geometry.tab_bar.right().saturating_sub(x)),
+                Style::default()
+                    .fg(theme.tab_separator)
+                    .bg(theme.footer_background),
+            )
+            .0;
+        // The inbox badge. It lives in the tab bar for one reason: the count
+        // stays visible while you are deep inside a terminal. An ambient alert,
+        // with no notification system behind it yet.
+        //
+        // Two colors doing two different jobs. Amber says "this wants you"; the
+        // active-tab red says "you are looking at this". One color for both
+        // would make being *on* Home indistinguishable from being *called* to
+        // it, and the count would keep shouting at someone already reading it —
+        // so once Home is focused the number drops amber and takes the tab
+        // label's own treatment.
+        let needs_you = tui.home_needs_you_count();
+        let inbox_style = if tui.home_open() {
+            Style::default()
+                .fg(theme.tab_foreground)
+                .bg(theme.tab_active_background)
+                .add_modifier(Modifier::BOLD)
+        } else if needs_you > 0 {
+            Style::default()
+                .fg(theme.agent_overlay_attention)
+                .bg(theme.footer_background)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.tab_foreground)
+                .bg(theme.footer_background)
+        };
+        x = buffer
+            .set_stringn(
+                x,
+                geometry.tab_bar.y,
+                inbox_segment(needs_you),
+                usize::from(geometry.tab_bar.right().saturating_sub(x)),
+                inbox_style,
             )
             .0;
         x = buffer
@@ -292,7 +371,7 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     )
                     .0;
             }
-            let active = tab.tab_id == tui.current_tab;
+            let active = tui.is_active_tab(tab.tab_id);
             let style = if active {
                 Style::default()
                     .fg(theme.tab_foreground)
@@ -527,14 +606,16 @@ mod tests {
         tui::{
             ChordMode, MultiPaneTui, PaneViewState, ShareView,
             geometry::visible_leaf_panes,
-            test_support::{layout, named_members, split_layout, two_tab_presence_tui, watcher},
+            test_support::{
+                home_tui, layout, named_members, split_layout, two_tab_presence_tui, watcher,
+            },
             text::text_width,
         },
     };
 
     use super::{
-        PRESENCE_WATCHING, member_color, pane_border_color, pane_presence_chips, pane_title,
-        render_multi_pane, render_shared_multi_pane,
+        PRESENCE_WATCHING, inbox_segment, member_color, pane_border_color, pane_presence_chips,
+        pane_title, render_multi_pane, render_shared_multi_pane,
     };
 
     #[test]
@@ -1264,39 +1345,98 @@ mod tests {
             &[(1, 2, 2), (2, 2, 2)],
         ))
         .expect("valid layout");
-        let mut terminal = Terminal::new(TestBackend::new(32, 4)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(44, 4)).expect("test terminal");
 
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         let buffer = terminal.backend().buffer();
-        let tab_bar = (0..32).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        let tab_bar = (0..44).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
-        assert!(tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2"));
+        assert!(
+            tab_bar.starts_with("p2pmux │ inbox   │  Tab #1  · Tab #2"),
+            "{tab_bar:?}"
+        );
         assert!(tab_bar.contains("Tab #1"));
         assert!(tab_bar.contains("Tab #2"));
         assert_eq!(buffer[(0, 0)].fg, Color::White);
         assert_eq!(buffer[(0, 0)].bg, Color::Rgb(30, 30, 30));
-        assert_eq!(buffer[(9, 0)].fg, Color::White);
-        assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
-        assert_eq!(buffer[(20, 0)].fg, Color::White);
-        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
+        assert_eq!(buffer[(19, 0)].fg, Color::White);
+        assert_eq!(buffer[(19, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(30, 0)].fg, Color::White);
+        assert_eq!(buffer[(30, 0)].bg, Color::Rgb(30, 30, 30));
 
         tui.chord_mode = ChordMode::Tab;
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(9, 0)].fg, Color::White);
-        assert_eq!(buffer[(9, 0)].bg, Color::Rgb(220, 50, 47));
-        assert_eq!(buffer[(20, 0)].fg, Color::DarkGray);
-        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(30, 30, 30));
+        assert_eq!(buffer[(19, 0)].fg, Color::White);
+        assert_eq!(buffer[(19, 0)].bg, Color::Rgb(220, 50, 47));
+        assert_eq!(buffer[(30, 0)].fg, Color::DarkGray);
+        assert_eq!(buffer[(30, 0)].bg, Color::Rgb(30, 30, 30));
 
         tui.chord_mode = ChordMode::None;
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
-        assert_eq!(terminal.backend().buffer()[(20, 0)].fg, Color::White);
+        assert_eq!(terminal.backend().buffer()[(30, 0)].fg, Color::White);
+    }
+
+    /// The badge's two colours do two different jobs, and one colour for both
+    /// would make being *on* Home indistinguishable from being *called* to it.
+    #[test]
+    fn the_inbox_badge_carries_an_amber_count_and_turns_red_only_when_focused() {
+        let theme = UiTheme::default();
+        let mut tui = home_tui(&[
+            (
+                "laptop",
+                "claude",
+                crate::protocol::AgentRosterState::Working,
+            ),
+            (
+                "desktop",
+                "codex",
+                crate::protocol::AgentRosterState::Pending,
+            ),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(44, 6)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let tab_bar = (0..44).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert!(tab_bar.starts_with("p2pmux │ inbox 1 │"), "{tab_bar:?}");
+        assert_eq!(buffer[(9, 0)].fg, theme.agent_overlay_attention);
+        assert_eq!(buffer[(9, 0)].bg, theme.footer_background);
+
+        // Focused: the ambient alert has done its job once you are reading the
+        // list, so the number drops amber and takes the tab label's treatment.
+        tui.set_home_open(true, "test");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(9, 0)].bg, theme.tab_active_background);
+        assert_ne!(buffer[(9, 0)].fg, theme.agent_overlay_attention);
+        assert_eq!(
+            buffer[(19, 0)].bg,
+            theme.footer_background,
+            "no tab is the one being looked at while Home is"
+        );
+    }
+
+    #[test]
+    fn the_badge_never_renders_a_zero() {
+        // Absence is quieter than a zero and means exactly the same thing.
+        assert_eq!(inbox_segment(0), "inbox  ");
+        assert_eq!(inbox_segment(1), "inbox 1");
+        assert_eq!(
+            text_width(&inbox_segment(0)),
+            text_width(&inbox_segment(9)),
+            "a fixed-width segment keeps the separator after it from twitching"
+        );
     }
 
     #[test]
@@ -1307,19 +1447,19 @@ mod tests {
             tab_id: 20,
             pane_id: 2,
         }]));
-        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(52, 4)).expect("test terminal");
 
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         let buffer = terminal.backend().buffer();
-        let tab_bar = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        let tab_bar = (0..52).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
         assert!(
-            tab_bar.starts_with("p2pmux │  Tab #1  · Tab #2 ●"),
+            tab_bar.starts_with("p2pmux │ inbox   │  Tab #1  · Tab #2 ●"),
             "the dot belongs to the tab that member is on: {tab_bar:?}"
         );
-        let dots = (0..40)
+        let dots = (0..52)
             .filter(|x| buffer[(*x, 0)].symbol() == PRESENCE_WATCHING)
             .collect::<Vec<u16>>();
         assert_eq!(dots.len(), 1, "one member on one tab draws one dot");
@@ -1335,7 +1475,7 @@ mod tests {
         // render path. If the dots were added to only one of them, every tab click after
         // a member moved would land on the wrong tab.
         let mut tui = two_tab_presence_tui();
-        let area = Rect::new(0, 0, 40, 4);
+        let area = Rect::new(0, 0, 52, 4);
         let before = tui.geometry(area).tab_labels[&20];
 
         assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
@@ -1351,7 +1491,7 @@ mod tests {
             "a dot on tab one shifts tab two's click target by the space plus the dot"
         );
 
-        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(52, 4)).expect("test terminal");
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
@@ -1372,14 +1512,14 @@ mod tests {
             tab_id: 20,
             pane_id: 2,
         }]));
-        // Wide enough for the brand and the active tab, and then almost nothing.
-        let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
+        // Wide enough for the chrome and the active tab, and then almost nothing.
+        let mut terminal = Terminal::new(TestBackend::new(36, 4)).expect("test terminal");
 
         terminal
             .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
             .expect("render");
         let buffer = terminal.backend().buffer();
-        let tab_bar = (0..24).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        let tab_bar = (0..36).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
         assert!(
             tab_bar.contains('●'),

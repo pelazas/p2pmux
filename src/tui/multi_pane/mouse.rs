@@ -220,11 +220,22 @@ impl MultiPaneTui {
         row: u16,
         area: Rect,
     ) -> Option<UiIntent> {
-        let tab_id = self
-            .geometry(area)
+        let geometry = self.geometry(area);
+        // The badge is drawn to look like a tab, so it has to answer a click
+        // like one. Anything else makes the one clickable-looking thing on the
+        // bar the one thing that does nothing.
+        if rect_contains(self.inbox_rect(geometry.tab_bar), column, row) {
+            self.set_home_open(true, "mouse");
+            self.clear_zoom();
+            return None;
+        }
+        let tab_id = geometry
             .tab_labels
             .iter()
             .find_map(|(tab_id, rect)| rect_contains(*rect, column, row).then_some(*tab_id))?;
+        // Clicking a tab is a way out of Home as well as a way between tabs.
+        self.set_home_open(false, "mouse");
+        self.clear_zoom();
         self.select_tab(tab_id)
             .expect("tab came from current snapshot");
         Some(UiIntent::SwitchTab { tab_id })

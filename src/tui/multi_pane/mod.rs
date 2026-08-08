@@ -29,10 +29,10 @@ use crate::{
             fixed_grid_viewport, pane_content_rect, visible_leaf_panes,
         },
         render::panes::{
-            TAB_BAR_SEPARATOR, TOP_BAR_BRAND, TOP_BAR_BRAND_SEPARATOR, tab_label,
-            tab_presence_width,
+            TAB_BAR_SEPARATOR, TOP_BAR_BRAND, TOP_BAR_BRAND_SEPARATOR, TOP_BAR_TITLE_MAX_WIDTH,
+            inbox_segment, inbox_segment_width, tab_label, tab_presence_width,
         },
-        text::text_width,
+        text::{text_width, truncate_trailing},
     },
 };
 
@@ -392,11 +392,43 @@ impl MultiPaneTui {
         }
     }
 
+    /// Where the `inbox` badge sits in the tab bar, so a click can find it and
+    /// the tab labels can start after it.
+    pub(in crate::tui) fn inbox_rect(&self, tab_bar: Rect) -> Rect {
+        let x = tab_bar
+            .x
+            .saturating_add(self.tab_bar_title_width())
+            .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR));
+        let width = text_width(&inbox_segment(self.home_needs_you_count()));
+        Rect::new(
+            x,
+            tab_bar.y,
+            width.min(tab_bar.right().saturating_sub(x)),
+            tab_bar.height,
+        )
+    }
+
+    /// Whether a tab is the one being looked at.
+    ///
+    /// Nothing is, while Home is open: Home is above the tabs, so lighting one
+    /// up would claim the user is inside a tab they cannot see. The active-tab
+    /// treatment moves to the `inbox` badge instead.
+    pub(in crate::tui) fn is_active_tab(&self, tab_id: TabId) -> bool {
+        tab_id == self.current_tab && !self.home_open
+    }
+
+    /// The session label's drawn width, after the bar's truncation order has
+    /// been applied to it.
+    pub(in crate::tui) fn tab_bar_title_width(&self) -> u16 {
+        text_width(&truncate_trailing(&self.title, TOP_BAR_TITLE_MAX_WIDTH))
+    }
+
     pub(in crate::tui) fn tab_label_rects(&self, tab_bar: Rect) -> BTreeMap<TabId, Rect> {
         let mut x = tab_bar
             .x
-            .saturating_add(text_width(&self.title))
-            .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR));
+            .saturating_add(self.tab_bar_title_width())
+            .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR))
+            .saturating_add(inbox_segment_width(self.home_needs_you_count()));
         let right = tab_bar.x.saturating_add(tab_bar.width);
         self.snapshot
             .tabs
@@ -409,7 +441,7 @@ impl MultiPaneTui {
                 let label_width = text_width(&tab_label(
                     tab.title.as_deref(),
                     index + 1,
-                    tab.tab_id == self.current_tab,
+                    self.is_active_tab(tab.tab_id),
                     self.tab_has_unread_agent_pane(tab),
                 ))
                 .saturating_add(tab_presence_width(self.tab_watchers(tab.tab_id).len()));
