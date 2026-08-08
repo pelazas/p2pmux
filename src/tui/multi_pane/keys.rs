@@ -14,7 +14,9 @@ use crate::{
         geometry::{
             direction_distance, grid_for_pane, is_in_direction, rect_center, visible_leaf_panes,
         },
-        input::keys::{is_chord_command, is_chord_navigation, is_option_arrow, is_quit},
+        input::keys::{
+            ends_chord_mode, is_chord_command, is_chord_navigation, is_option_arrow, is_quit,
+        },
     },
 };
 
@@ -181,7 +183,11 @@ impl MultiPaneTui {
             }
             KeyHandling::Consumed(intent.into_iter().collect())
         } else {
-            self.exit_chord_mode();
+            // Typing leaves the mode; a modified key just passes through it.
+            // See [`ends_chord_mode`].
+            if ends_chord_mode(key) {
+                self.exit_chord_mode();
+            }
             KeyHandling::Forward
         }
     }
@@ -669,28 +675,38 @@ mod tests {
     }
 
     /// Ctrl+F is not a binding here — it reaches the shell, where it is `forward-char`
-    /// and prints nothing. That makes it the key that exposes a repaint gap: the pane
-    /// sends back no output for the client to redraw on, so if the client does not
-    /// notice the mode ending on its own, the footer keeps advertising PANE MODE long
-    /// after the mode is gone.
+    /// and prints nothing. It used to end pane mode on the way past, which is what
+    /// "Ctrl+F exits a pane" was: no pane went anywhere, but the mode the user was
+    /// standing in did, for a keystroke never aimed at the mux.
     #[test]
-    fn a_modified_key_the_chord_does_not_claim_still_ends_the_mode() {
+    fn a_modified_key_the_chord_does_not_claim_reaches_the_pane_without_taking_the_mode() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
 
-        let _ = tui.handle_key(
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-            area,
-        );
-        assert_eq!(tui.chord_mode(), ChordMode::Pane);
+        for modified in [
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        ] {
+            let _ = tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            );
+            assert_eq!(tui.chord_mode(), ChordMode::Pane);
 
-        assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
-                area
-            ),
-            KeyHandling::Forward
-        );
+            assert_eq!(tui.handle_key(modified, area), KeyHandling::Forward);
+            assert_eq!(
+                tui.chord_mode(),
+                ChordMode::Pane,
+                "{modified:?} is not somebody typing their way out of the mode"
+            );
+        }
+
+        // The mode still clears itself; it just does so on the idle timeout
+        // rather than under a keystroke the user aimed at their shell.
+        let now = Instant::now();
+        tui.chord_last_activity = now.checked_sub(CHORD_IDLE_TIMEOUT);
+        assert!(tui.expire_chord_mode(now));
         assert_eq!(tui.chord_mode(), ChordMode::None);
     }
 

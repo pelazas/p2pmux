@@ -594,9 +594,9 @@ pub fn run_on(
                 // A forwarded key can still have ended chord mode on its way past, and the
                 // footer names the mode it is in. Redrawing on every keystroke would be a
                 // frame per character; redrawing when the mode actually moved is one frame
-                // per chord. Without it a key the chord does not claim — Ctrl+F, say, which
-                // reaches the shell and produces nothing to redraw for — leaves PANE MODE on
-                // screen after it has ended.
+                // per chord. Without it a key the chord does not claim — one that produces
+                // nothing on screen for the client to redraw on, a space at an empty prompt
+                // say — leaves PANE MODE on the footer after the mode has ended.
                 let chord_before = tui.chord_mode();
                 match tui.handle_key(key, terminal.size()?.into()) {
                     KeyHandling::Quit(QuitAction::Detach) => {

@@ -142,7 +142,10 @@ local control leases; F9 and F10 continue through to the focused PTY.
 
 Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
-to leave the mode and send that key to the focused PTY.
+to leave the mode and send that key to the focused PTY. A key held with Ctrl or Option passes
+through to the PTY without ending the mode — `Ctrl+F` is `forward-char` and `Ctrl+C` is an
+interrupt, neither aimed at the mux — and the mode still clears itself two seconds after the last
+command.
 
 ## Keys
 

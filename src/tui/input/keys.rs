@@ -54,6 +54,22 @@ impl PendingEscape {
         self.started.take().is_some()
     }
 }
+/// Whether an unclaimed key ends a sticky chord mode on its way to the pane.
+///
+/// The escape hatch is "type any normal key to leave the mode and send that key
+/// to the focused PTY", and *type* is the operative word. A key held with Ctrl
+/// or Option is not somebody typing: Ctrl+F is `forward-char`, Ctrl+C is an
+/// interrupt, Option+B steps back a word. Ending pane mode on those made the
+/// mux move under the user for a keystroke that was never aimed at it — which
+/// is exactly what "Ctrl+F exits a pane" turned out to be. They still reach the
+/// pane; they simply no longer take the mode with them, and the idle timeout
+/// still clears it two seconds later.
+///
+/// Shift does not count. That is how a capital letter is typed, and rejecting
+/// it would make the escape hatch unreachable for half the alphabet.
+pub(in crate::tui) fn ends_chord_mode(key: KeyEvent) -> bool {
+    (key.modifiers - KeyModifiers::SHIFT).is_empty()
+}
 pub(in crate::tui) fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
     // An uppercase chord letter arrives with SHIFT held, which is not a modifier the user
     // added on purpose -- it is how the letter is typed. Rejecting it outright would make
