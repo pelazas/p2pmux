@@ -543,6 +543,17 @@ pub(in crate::tui) fn render_shared_multi_pane(
                 Line::from(truncate_trailing(&badge, badge_width)).alignment(Alignment::Right),
             );
         }
+        // A zoomed pane looks exactly like a tab with one pane in it, so
+        // without a mark there is no way to tell whether the siblings are
+        // hidden or were never there. Bottom-left, because the top border is
+        // already carrying the metadata and a right-aligned lock badge, and a
+        // pane can be locked and zoomed at once.
+        if tui.zoomed_pane() == Some(pane_id) {
+            block = block.title_bottom(
+                Line::styled(" zoom ", Style::default().fg(theme.footer_accent))
+                    .alignment(Alignment::Left),
+            );
+        }
         if let Some(chips) = pane_presence_chips(
             &tui.pane_watchers(pane_id),
             view.controller_peer_id.as_deref(),
@@ -906,6 +917,38 @@ mod tests {
             .collect::<String>();
         assert!(chrome.contains("locked by Host"), "{chrome}");
         assert!(!chrome.contains("Pane #1"));
+    }
+
+    /// A zoomed pane is indistinguishable from a tab with one pane in it, so
+    /// without a mark there is no telling whether siblings are hidden or absent.
+    #[test]
+    fn a_zoomed_pane_says_so_on_its_bottom_border() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("draw");
+        let plain = rendered(terminal.backend().buffer(), 60, 12);
+        assert!(!plain.contains(" zoom "), "{plain}");
+
+        tui.toggle_zoom();
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("draw");
+        let zoomed = rendered(terminal.backend().buffer(), 60, 12);
+        assert!(zoomed.contains(" zoom "), "{zoomed}");
+    }
+
+    fn rendered(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> String {
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

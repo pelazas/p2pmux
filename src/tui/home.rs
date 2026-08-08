@@ -293,6 +293,32 @@ impl MultiPaneTui {
         self.zoomed_pane = None;
     }
 
+    /// Give the focused pane the whole content area, or give it back.
+    ///
+    /// The same local view state Home already uses to hand you into an agent,
+    /// reachable on purpose rather than only as a side effect of arriving from
+    /// the inbox. Nothing about the layout changes: the pane keeps the grid the
+    /// session gave it and simply stops sharing the screen with its siblings,
+    /// so no other member sees anything happen.
+    ///
+    /// A tab with one pane is already zoomed, so the key does nothing there
+    /// rather than lighting a badge that describes no change.
+    pub(in crate::tui) fn toggle_zoom(&mut self) -> bool {
+        if self.zoomed_pane().is_some() {
+            self.clear_zoom();
+            return true;
+        }
+        let siblings = self
+            .current_tab_layout()
+            .map(|tab| crate::tui::geometry::visible_leaf_panes(&tab.root).len())
+            .unwrap_or_default();
+        if siblings < 2 {
+            return false;
+        }
+        self.zoomed_pane = Some(self.focused_pane);
+        true
+    }
+
     pub(in crate::tui) fn toggle_machines_expanded(&mut self) {
         self.machines_expanded = !self.machines_expanded;
     }

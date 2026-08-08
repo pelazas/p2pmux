@@ -220,6 +220,12 @@ impl MultiPaneTui {
             KeyCode::Char('u') if key.modifiers.is_empty() => {
                 self.create_pane(Axis::TopBottom, NewPanePosition::First, area)
             }
+            // `z`, the letter tmux taught a decade of users. Local to this
+            // client, so it never reaches the layout and no peer sees it.
+            KeyCode::Char('z') if key.modifiers.is_empty() => {
+                self.toggle_zoom();
+                None
+            }
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(UiIntent::DeletePane {
                 pane_id: self.focused_pane,
             }),
@@ -300,11 +306,27 @@ impl MultiPaneTui {
         }
     }
 
+    /// Moving focus is a decision to look somewhere else, and a zoom exists to
+    /// hide somewhere else — so the zoom stands down first.
+    ///
+    /// Without this the arrows are silently inert while a pane is zoomed: the
+    /// zoomed geometry holds exactly one pane, so there is never anything to
+    /// move to. Put back if the move had nowhere to go, so a right arrow at the
+    /// right-hand edge does not quietly unzoom instead of doing nothing.
     pub(in crate::tui) fn move_focus(
         &mut self,
         direction: KeyCode,
         area: Rect,
     ) -> Option<UiIntent> {
+        let zoomed = self.zoomed_pane.take();
+        let moved = self.move_focus_within_layout(direction, area);
+        if moved.is_none() {
+            self.zoomed_pane = zoomed;
+        }
+        moved
+    }
+
+    fn move_focus_within_layout(&mut self, direction: KeyCode, area: Rect) -> Option<UiIntent> {
         let geometry = self.geometry(area);
         let source = *geometry.panes.get(&self.focused_pane)?;
         let source_center = rect_center(source);
@@ -640,7 +662,7 @@ mod tests {
             area,
         );
         assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+            tui.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), area),
             KeyHandling::Forward
         );
         assert_eq!(tui.chord_mode(), ChordMode::None);
@@ -781,7 +803,7 @@ mod tests {
                 KeyHandling::Consumed(vec![])
             );
             assert_eq!(
-                tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area),
+                tui.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), area),
                 KeyHandling::Forward
             );
             assert_eq!(tui.chord_mode(), ChordMode::None);
@@ -999,6 +1021,91 @@ mod tests {
             ),
             KeyHandling::Quit(QuitAction::Detach)
         );
+    }
+
+    /// The zoom state Home already used to hand you into an agent, reachable
+    /// on purpose rather than only as a side effect of arriving from the inbox.
+    #[test]
+    fn ctrl_p_z_gives_the_focused_pane_the_whole_screen_and_gives_it_back() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+
+        assert_eq!(tui.geometry(area).panes.len(), 3);
+
+        let _ = tui.handle_key(ctrl_p, area);
+        assert_eq!(tui.handle_key(z, area), KeyHandling::Consumed(vec![]));
+        assert_eq!(tui.zoomed_pane(), Some(tui.focused_pane()));
+        assert_eq!(
+            tui.geometry(area).panes.len(),
+            1,
+            "the siblings stop sharing the screen"
+        );
+        assert_eq!(
+            tui.geometry(area).panes[&tui.focused_pane()],
+            tui.geometry(area).content,
+            "and the zoomed pane gets the whole content area"
+        );
+
+        let _ = tui.handle_key(ctrl_p, area);
+        assert_eq!(tui.handle_key(z, area), KeyHandling::Consumed(vec![]));
+        assert_eq!(tui.zoomed_pane(), None);
+        assert_eq!(tui.geometry(area).panes.len(), 3);
+    }
+
+    /// Nothing is hidden on a tab with one pane, so lighting a `zoom` badge
+    /// there would describe a change that did not happen.
+    #[test]
+    fn z_does_nothing_on_a_tab_that_is_already_one_pane() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 4, 10)],
+        ))
+        .expect("valid layout");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area);
+        assert_eq!(tui.zoomed_pane(), None);
+    }
+
+    /// A zoomed geometry holds one pane, so without this the arrows are
+    /// silently inert while a zoom is up.
+    #[test]
+    fn moving_focus_stands_the_zoom_down_but_only_when_it_has_somewhere_to_go() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        tui.select_pane(1, 1, "test");
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), area);
+        assert_eq!(tui.zoomed_pane(), Some(1));
+
+        // Pane 1 is the left half; nothing lies further left.
+        assert_eq!(tui.move_focus(KeyCode::Left, area), None);
+        assert_eq!(
+            tui.zoomed_pane(),
+            Some(1),
+            "an arrow with nowhere to go must not quietly unzoom"
+        );
+
+        assert_eq!(
+            tui.move_focus(KeyCode::Right, area),
+            Some(UiIntent::FocusPane { pane_id: 2 })
+        );
+        assert_eq!(tui.zoomed_pane(), None);
+        assert_eq!(tui.geometry(area).panes.len(), 3);
     }
 
     #[test]

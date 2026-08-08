@@ -164,6 +164,12 @@ to leave the mode and send that key to the focused PTY.
   bar reads `locked` while it holds. Coordinator only; a guest is told so.
 - `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
   cancels; a blank title restores `Pane #N`.
+- `Ctrl+P`, then `z` — zoom the focused pane to the whole content area, and again to give the
+  siblings their space back. Purely a local view choice: the pane keeps the grid the session gave
+  it, no other member sees anything happen, and its bottom border reads `zoom` so a zoomed pane is
+  never mistaken for a tab with one pane in it. Moving focus stands the zoom down, since looking
+  elsewhere and hiding elsewhere cannot both be what you meant. Nothing to zoom on a tab that is
+  already one pane, so the key does nothing there.
 - `Ctrl+P`, then arrows — move focus.
 - `Ctrl+T`, then `N` — create a tab with a local PTY on the requester's machine.
 - `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
@@ -194,7 +200,7 @@ to switch tabs without claiming control or sending input.
 The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`;
 pane mode is
-`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <i> INVITE   <Esc> BACK`;
+`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <L> SESSION   <Esc> BACK`, dropping `<L> SESSION` on a terminal too narrow to hold it whole rather than clipping the bar mid-word;
 tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 ## Presence

@@ -96,7 +96,7 @@ const NORMAL_FOOTER_TIERS: &[&[FooterSegment]] = &[
     NORMAL_FOOTER_CORE,
     NORMAL_FOOTER_KEYS_ONLY,
 ];
-const PANE_FOOTER: &[FooterSegment] = &[
+const PANE_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
     FooterSegment::Key("←↓↑→"),
     FooterSegment::Text("> FOCUS   <"),
@@ -106,15 +106,40 @@ const PANE_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("> NEW   <"),
     FooterSegment::Key("r/l/d/u"),
     FooterSegment::Text("> SPLIT   <"),
+    FooterSegment::Key("z"),
+    FooterSegment::Text("> ZOOM   <"),
     FooterSegment::Key("x"),
     FooterSegment::Text("> CLOSE   <"),
     FooterSegment::Key("k"),
     FooterSegment::Text("> LOCK   <"),
     FooterSegment::Key("L"),
-    FooterSegment::Text("> LOCK SESSION   <"),
+    FooterSegment::Text("> SESSION   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
+/// The session lock is the first thing to go when the bar will not fit: it is
+/// the rarest of these keys and the only one with a modal of its own to explain
+/// itself. Everything else here is a per-pane action taken constantly.
+const PANE_FOOTER_NO_SESSION_LOCK: &[FooterSegment] = &[
+    FooterSegment::Text("  <"),
+    FooterSegment::Key("←↓↑→"),
+    FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("e"),
+    FooterSegment::Text("> RENAME   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("r/l/d/u"),
+    FooterSegment::Text("> SPLIT   <"),
+    FooterSegment::Key("z"),
+    FooterSegment::Text("> ZOOM   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("k"),
+    FooterSegment::Text("> LOCK   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
+];
+const PANE_FOOTER_TIERS: &[&[FooterSegment]] = &[PANE_FOOTER_FULL, PANE_FOOTER_NO_SESSION_LOCK];
 const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
     FooterSegment::Key("←→"),
@@ -157,8 +182,10 @@ pub(in crate::tui) const SHARE_HELP_GUEST: &[FooterSegment] = &[
 ];
 /// The help segments for a chord mode, narrowed to the widest tier `width` can hold.
 ///
-/// Only normal mode has tiers. The chord footers already fall back atomically through
-/// `chord_footer_badge`, which hides the whole bar rather than showing half a chord.
+/// Pane mode has tiers because its bar is the longest one here and adding a key
+/// to it pushed `Esc BACK` off the end of a 120-column terminal — clipped
+/// mid-word, which teaches a binding that does not exist. Tab mode is short
+/// enough not to need them.
 pub(in crate::tui) fn contextual_footer(
     chord_mode: ChordMode,
     width: u16,
@@ -169,7 +196,11 @@ pub(in crate::tui) fn contextual_footer(
             .copied()
             .find(|tier| footer_segments_width(tier) <= width)
             .unwrap_or(NORMAL_FOOTER_KEYS_ONLY),
-        ChordMode::Pane => PANE_FOOTER,
+        ChordMode::Pane => PANE_FOOTER_TIERS
+            .iter()
+            .copied()
+            .find(|tier| footer_segments_width(tier) <= width)
+            .unwrap_or(PANE_FOOTER_NO_SESSION_LOCK),
         ChordMode::Tab => TAB_FOOTER,
     }
 }
@@ -554,8 +585,10 @@ mod tests {
                 "Ctrl+ <p> PANE   <t> TAB   <o> INBOX   <s> SHARE   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
             ),
             (
+                // 120 columns cannot hold the session lock as well, so the tier
+                // below it is what renders here. See `contextual_footer`.
                 ChordMode::Pane,
-                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <x> CLOSE   <k> LOCK   <L> LOCK SESSION   <Esc> BACK",
+                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
@@ -598,7 +631,10 @@ mod tests {
                 .expect("render");
             let footer = terminal.backend().buffer();
             assert_eq!(footer[(0, 3)].bg, Color::Rgb(30, 30, 30));
-            let segments = contextual_footer(mode, 120);
+            // The tier is chosen from what is left after the badge, so asking
+            // for 120 here would compare against a bar that was never drawn.
+            let badge_width = chord_footer_badge(mode, 120).map_or(0, crate::tui::text::text_width);
+            let segments = contextual_footer(mode, 120 - badge_width);
             let mut x = 0;
             if let Some(badge) = chord_footer_badge(mode, 120) {
                 for character in badge.chars() {
