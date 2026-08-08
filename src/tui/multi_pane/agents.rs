@@ -55,6 +55,10 @@ impl MultiPaneTui {
         }
         self.clamp_agent_overlay_scroll();
         self.ensure_agent_selection_visible();
+        // Home reads the same rows in its own order, so its cursor has to be
+        // repaired from the same place. Doing it here rather than at each call
+        // site is what keeps the two selections from drifting apart.
+        self.repair_home_selection();
         true
     }
 

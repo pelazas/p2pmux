@@ -261,7 +261,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         return resume_picker(true);
     }
     match cli.command {
-        None => resume_picker(false),
+        None => open_home().await,
         Some(Command::Node { bootstrap }) => {
             // This process has no terminal and its stderr is /dev/null, so a startup
             // failure would otherwise be invisible and the launcher could only report
@@ -500,6 +500,92 @@ fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<
         .ok_or_else(|| CliError("no live session with that name").into())
 }
 
+/// What bare `p2pmux` does: open the inbox.
+///
+/// Not a session picker. The question the command answers is "which of my
+/// agents needs me", and making someone choose a session first is asking them
+/// to answer a question they did not have in order to be shown the one they
+/// did. `--resume` still reaches the picker for anyone who wants it.
+///
+/// Three cases, in order, and all of them end on Home:
+///
+/// 1. A session is already live here — attach it.
+/// 2. This machine is paired — rejoin the session the pairing recorded, with
+///    no code typed. That is the whole point of pairing once.
+/// 3. Nothing yet — start a solo session, so a first run has a real terminal
+///    behind `n` rather than an empty screen and an error.
+async fn open_home() -> Result<(), Box<dyn Error>> {
+    let store = crate::session_store::SessionStore::for_current_user()?;
+    if let Some(descriptor) = newest_live(&store.list_live()?) {
+        return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
+    }
+    let pairing = crate::pairing::load_or_empty();
+    if let Some(ticket) = pairing.ticket.as_deref() {
+        match rejoin_paired_session(ticket).await {
+            Ok(descriptor) => {
+                return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
+            }
+            // A paired machine that is asleep, or a session whose coordinator
+            // is gone, must not leave the user with nothing. Say so and open a
+            // session here — the inbox still has this machine's agents on it.
+            Err(error) => {
+                let mut stderr = io::stderr().lock();
+                writeln!(stderr, "could not rejoin the paired session: {error}")?;
+                writeln!(stderr, "starting a session on this machine instead")?;
+            }
+        }
+    }
+    let descriptor = start_solo_session()?;
+    crate::client::run_on(&descriptor, crate::client::StartScreen::Home)
+}
+
+/// The most recently created live session, which is the one a bare command
+/// means. Deterministic rather than "the first one the store listed".
+fn newest_live(
+    sessions: &[crate::session_store::SessionDescriptor],
+) -> Option<crate::session_store::SessionDescriptor> {
+    sessions
+        .iter()
+        .max_by_key(|session| session.created_at)
+        .cloned()
+}
+
+async fn rejoin_paired_session(
+    ticket: &str,
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    let ticket = resolve_join_ticket(ticket).await?;
+    let display_name = display_name_or_hostname()?;
+    let (cols, rows) = crossterm::terminal::size()?;
+    launch_background_node(
+        crate::node::NodeBootstrapKind::Join {
+            ticket: ticket.to_string(),
+            display_name,
+            cols,
+            rows,
+        },
+        crate::session_store::generate_name()?,
+        crate::session_store::SessionRole::Member,
+    )
+}
+
+/// A session with only this machine in it.
+///
+/// No trust warning: nothing is shared until the user hands out a code, and
+/// `create` and `pair` — the two commands that do that — both print it.
+fn start_solo_session() -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    let display_name = display_name_or_hostname()?;
+    let (cols, rows) = crossterm::terminal::size()?;
+    launch_background_node(
+        crate::node::NodeBootstrapKind::Create {
+            display_name,
+            cols,
+            rows,
+        },
+        crate::session_store::generate_name()?,
+        crate::session_store::SessionRole::Coordinator,
+    )
+}
+
 fn resume_picker(always_picker: bool) -> Result<(), Box<dyn Error>> {
     let sessions = crate::session_store::SessionStore::for_current_user()?.list_live()?;
     if sessions.is_empty() {
@@ -669,6 +755,49 @@ pub(crate) fn launch_background_node(
         "background node did not become ready",
     )
     .into())
+}
+
+/// The display name to use without ever asking.
+///
+/// Bare `p2pmux` is meant to be install-to-value in under a minute, and a name
+/// prompt is a question before the first answer. The machine's own hostname is
+/// both a good default and the right one: the inbox shows this column as the
+/// *machine* an agent is on, so `desktop` and `droplet` are exactly what a user
+/// would have typed anyway. A name typed later with `p2pmux config set name`
+/// still wins, and so does one already saved.
+fn display_name_or_hostname() -> Result<String, Box<dyn Error>> {
+    if let Some(name) = crate::config::load()? {
+        return Ok(name);
+    }
+    let hostname = hostname_label();
+    // Saved rather than used once, so the machine keeps the same name across
+    // restarts and peers do not watch it rename itself.
+    Ok(crate::config::save(&hostname)?)
+}
+
+/// The machine's short hostname, cleaned up enough to be a display name.
+///
+/// `laptop.local` is `laptop`: the mDNS suffix is noise in a column that has
+/// ten characters to spend. Falls back to a fixed word rather than failing —
+/// a nameless machine should still get an inbox.
+fn hostname_label() -> String {
+    let raw = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .unwrap_or_default();
+    let trimmed = raw.trim().split('.').next().unwrap_or("").trim();
+    let cleaned = trimmed
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(32)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        String::from("this-machine")
+    } else {
+        cleaned
+    }
 }
 
 fn resolve_display_name(override_name: Option<String>) -> Result<String, Box<dyn Error>> {

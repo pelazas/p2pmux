@@ -136,7 +136,27 @@ fn next_scroll_target(
     }
 }
 
+/// Which screen an attaching client lands on.
+///
+/// Bare `p2pmux` opens the inbox: the question it answers is "which of my
+/// agents needs me", and answering it should not require picking a session
+/// first. Every other entry point named a session out loud — `create`, `join`,
+/// `attach` — so it lands in the terminal the user asked for.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StartScreen {
+    #[default]
+    Session,
+    Home,
+}
+
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
+    run_on(descriptor, StartScreen::Session)
+}
+
+pub fn run_on(
+    descriptor: &SessionDescriptor,
+    start: StartScreen,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::config::config_path()?;
     let config = crate::config::load_config_from(&config_path).map_err(|error| {
         io::Error::other(format!(
@@ -195,6 +215,11 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
     let mut pending_resync = BTreeSet::new();
     let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
+    // Read once at attach: pairing changes when the user runs `p2pmux pair`,
+    // which is a different process and a rare event, so re-reading it on every
+    // snapshot would be a file read several times a second for nothing.
+    let paired_machines = crate::pairing::load_or_empty().machines;
+    let mut started_on_home = false;
     // Carried on the snapshot rather than looked up here: only the node holds the ticket,
     // and a member's node has none to send.
     let mut share_ticket: Option<String> = None;
@@ -282,6 +307,19 @@ pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Err
                         share_code = next_code;
                         if let Some(tui) = tui.as_mut() {
                             tui.set_agent_overlay_viewport(terminal.size()?.into());
+                            // The machine list needs to know which row is the
+                            // machine you are sitting at, and only the node can
+                            // say which peer this client is.
+                            tui.set_local_peer_id(local_peer_id.clone());
+                            tui.set_paired_machines(paired_machines.clone());
+                            // Deferred to the first snapshot rather than done at
+                            // construction: the view does not exist until a
+                            // layout arrives, and landing on Home is a decision
+                            // about the first frame, not about every one.
+                            if start == StartScreen::Home && !started_on_home {
+                                started_on_home = true;
+                                tui.open_home_on_start();
+                            }
                         }
                         dirty = true;
                     }

@@ -240,6 +240,30 @@ impl MultiPaneTui {
         self.machines_expanded = !self.machines_expanded;
     }
 
+    /// Which peer this client is, so the machine list can mark the row for the
+    /// machine the user is sitting at. Only the node knows it.
+    pub fn set_local_peer_id(&mut self, peer_id: Vec<u8>) {
+        self.local_peer_id = Some(peer_id);
+    }
+
+    /// The machines paired with this one, read from the pairing record.
+    ///
+    /// A paired machine that is not a session member is one you own that is not
+    /// answering, and the strip says `asleep` rather than dropping it.
+    pub fn set_paired_machines(&mut self, machines: Vec<crate::tui::PairedMachine>) -> bool {
+        if self.paired_machines == machines {
+            return false;
+        }
+        self.paired_machines = machines;
+        true
+    }
+
+    /// Land on Home rather than in the session. Set once, before the first
+    /// frame, by a client that was started with no session named.
+    pub fn open_home_on_start(&mut self) {
+        self.set_home_open(true, "start");
+    }
+
     /// Keys on Home.
     ///
     /// Unmodified letters are safe to claim here in a way they never are inside
