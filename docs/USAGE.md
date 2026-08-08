@@ -325,6 +325,13 @@ model, so do not use a session with people who should not see repository paths. 
 everyone holding the ticket. A row for a pane hosted by another member shows their agent's state
 but never its words.
 
+**Known gap.** That makes a remote row read `needs you` with nothing after it, so you have to
+press Enter to find out what the agent wants — on exactly the rows where knowing first would save
+the trip. The fix is not to broadcast the words to the session, which would hand them to any human
+collaborator holding the code; it is to send them only to machines you have *paired* with, which
+is a distinction the wire cannot currently draw. Until it can, the inbox stays quiet rather than
+generous.
+
 ### Every state comes from a hook
 
 p2pmux does not guess what an agent is doing. It used to infer `working` and `done` from how long a
