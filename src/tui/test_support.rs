@@ -90,6 +90,41 @@ pub(in crate::tui) fn agent_row(
     }
 }
 
+/// A tui with one pane per agent, each on its own tab, and rows whose machine,
+/// agent kind and state are set from the caller's table. Home is what the rows
+/// are for, so the fixture speaks in the columns Home draws.
+pub(in crate::tui) fn home_tui(
+    rows: &[(&str, &str, crate::protocol::AgentRosterState)],
+) -> MultiPaneTui {
+    // A validated layout always has a tab, so an agentless fixture is one empty
+    // terminal — exactly what a first run looks like.
+    let count = rows.len().max(1) as u64;
+    let tabs = (1..=count)
+        .map(|pane_id| Tab {
+            tab_id: pane_id,
+            root: Node::Leaf { pane_id },
+            title: None,
+        })
+        .collect();
+    let panes = (1..=count)
+        .map(|pane_id| (pane_id, 2, 8))
+        .collect::<Vec<_>>();
+    let mut tui = MultiPaneTui::new(layout(tabs, &panes)).expect("valid layout");
+    tui.set_agent_rows(
+        rows.iter()
+            .enumerate()
+            .map(|(index, (host, kind, state))| AgentOverlayRow {
+                host: (*host).to_owned(),
+                kind: (*kind).to_owned(),
+                state: *state,
+                ..agent_row(index as u64 + 1, index + 1, 1)
+            })
+            .collect(),
+    );
+    tui.repair_home_selection();
+    tui
+}
+
 pub(in crate::tui) fn agent_overlay_tui(count: u64) -> MultiPaneTui {
     let tabs = (1..=count)
         .map(|pane_id| Tab {

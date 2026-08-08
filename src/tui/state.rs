@@ -126,6 +126,23 @@ pub struct AgentOverlayRow {
     /// always empty.
     pub message: String,
 }
+/// A machine this one is paired with.
+///
+/// Pairing is permanent and mutual, so this is a record of a decision rather
+/// than a connection: a paired machine that is switched off is still paired,
+/// and the inbox says `asleep` rather than forgetting it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PairedMachine {
+    pub name: String,
+    /// Whether this machine may start work on that one. Off by default, asked
+    /// once during pairing, and — for now — only ever recorded: nothing acts on
+    /// it yet. It is the consent primitive that will later make starting a
+    /// terminal on another machine legal without widening the trust model, and
+    /// it means *accepts work from me*, never *from anyone in the session*.
+    #[serde(default)]
+    pub accepts_work: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::tui) enum RenameTarget {
     Pane(PaneId),

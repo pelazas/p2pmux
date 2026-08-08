@@ -21,8 +21,8 @@ use crate::{
     layout::{LayoutError, LayoutSnapshot, PaneId, TabId},
     protocol::AgentRosterState,
     tui::{
-        AgentOverlayRow, ChordMode, ModalState, PaneGeometry, PaneTextSelection, PaneViewState,
-        ShareCopy,
+        AgentOverlayRow, ChordMode, ModalState, PairedMachine, PaneGeometry, PaneTextSelection,
+        PaneViewState, ShareCopy,
         debug_log::ui_debug_log,
         geometry::{
             ResizeDrag, ResizePreview, allocate_node_with_preview, contains_leaf, first_leaf,
@@ -68,6 +68,27 @@ pub struct MultiPaneTui {
     pub(in crate::tui) agent_overlay_scroll_line: usize,
     pub(in crate::tui) agent_overlay_viewport_lines: u16,
     pub(in crate::tui) pending_agent_toggle: Option<Instant>,
+    /// Whether Home — the inbox — is the screen on display.
+    ///
+    /// Local to this client and never replicated: see [`crate::tui::home`].
+    pub(in crate::tui) home_open: bool,
+    pub(in crate::tui) home_selected: Option<PaneId>,
+    pub(in crate::tui) home_scroll_line: usize,
+    pub(in crate::tui) home_viewport_lines: u16,
+    /// Whether `m` has expanded the machine strip into the full list.
+    pub(in crate::tui) machines_expanded: bool,
+    /// The pane Home handed the user into, drawn alone in the content area.
+    ///
+    /// A local view choice, so it never reaches the layout: the pane keeps the
+    /// grid the shared layout gave it and is simply the only thing on screen.
+    pub(in crate::tui) zoomed_pane: Option<PaneId>,
+    /// Machines paired with this one. Filled by the client from the pairing
+    /// record; a machine that is paired but not a session member is one you own
+    /// that is not answering.
+    pub(in crate::tui) paired_machines: Vec<PairedMachine>,
+    /// This client's own peer id, so the machine list can mark which row is
+    /// the machine you are sitting at.
+    pub(in crate::tui) local_peer_id: Option<Vec<u8>>,
     pub(in crate::tui) resize_drag: Option<ResizeDrag>,
     /// Set while a press forwarded to a child owns the drag and release that follow.
     pub(in crate::tui) mouse_forwarding: bool,
@@ -117,6 +138,14 @@ impl MultiPaneTui {
             agent_overlay_scroll_line: 0,
             agent_overlay_viewport_lines: 0,
             pending_agent_toggle: None,
+            home_open: false,
+            home_selected: None,
+            home_scroll_line: 0,
+            home_viewport_lines: 0,
+            machines_expanded: false,
+            zoomed_pane: None,
+            paired_machines: Vec::new(),
+            local_peer_id: None,
             resize_drag: None,
             session_locked: false,
             mouse_forwarding: false,
@@ -332,7 +361,13 @@ impl MultiPaneTui {
                 .saturating_sub(tab_bar.height + tab_bar_gap + footer_height),
         );
         let mut panes = BTreeMap::new();
-        if let Some(tab) = self.current_tab_layout() {
+        // A pane opened from Home gets the whole content area to itself. This is
+        // a local view choice and never reaches the layout, so the pane keeps
+        // the fixed grid the shared layout gave it and simply stops sharing the
+        // screen with its siblings.
+        if let Some(pane_id) = self.zoomed_pane() {
+            panes.insert(pane_id, content);
+        } else if let Some(tab) = self.current_tab_layout() {
             allocate_node_with_preview(
                 &tab.root,
                 content,

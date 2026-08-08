@@ -20,6 +20,7 @@ mod app;
 mod clock;
 mod debug_log;
 mod geometry;
+mod home;
 mod host;
 mod input;
 mod multi_pane;
@@ -55,8 +56,8 @@ pub(crate) use snapshot::{
     LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot, NodeScreenSnapshots,
 };
 pub use state::{
-    AgentOverlayRow, ChordMode, KeyHandling, MouseHandling, PaneGeometry, PaneViewState, ShareCopy,
-    ShareView, UiIntent,
+    AgentOverlayRow, ChordMode, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
+    PaneViewState, ShareCopy, ShareView, UiIntent,
 };
 pub(in crate::tui) use state::{
     Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,

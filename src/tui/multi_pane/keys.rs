@@ -65,6 +65,23 @@ impl MultiPaneTui {
         if matches!(self.modal, ModalState::ConfirmDeleteTab { .. }) {
             return self.handle_confirm_delete_tab_key(key);
         }
+        // Home, from anywhere — including from inside a live pane, which is the
+        // only reason it is claimed this early. `Ctrl+O` is free in shells and
+        // transmits in every terminal. `Esc` deliberately is not the way back:
+        // Claude Code interrupts on it and vim needs it constantly, so
+        // swallowing it would break the pane the user just entered. `Ctrl+H` is
+        // backspace and `Ctrl+0` does not transmit in most terminals.
+        if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
+            let open = !self.home_open;
+            self.set_home_open(open, "ctrl_o");
+            if open {
+                self.clear_zoom();
+            }
+            return KeyHandling::Consumed(vec![]);
+        }
+        if self.home_open {
+            return self.handle_home_key(key, area);
+        }
         // Ctrl+S is claimed before the pane sees it, so a pane never receives XOFF from this
         // binding — the same trade already made for Ctrl+A.
         if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {

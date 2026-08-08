@@ -25,6 +25,7 @@ use crate::{
         render::{
             agents::render_agents_overlay,
             footer::render_contextual_footer,
+            home::render_home,
             modals::{render_delete_tab_confirmation, render_rename_prompt, render_share_modal},
             vt::{VtScreen, viewed_screen},
         },
@@ -375,6 +376,15 @@ pub(in crate::tui) fn render_shared_multi_pane(
             }
         }
     }
+    // Home replaces the content area and the footer wholesale. It is not an
+    // overlay: there is no session chrome underneath it to see around, and
+    // drawing panes behind a screen that covers them is wasted work on every
+    // frame.
+    if tui.home_open() {
+        render_home(frame, tui, crate::tui::clock::unix_ms_now());
+        return;
+    }
+
     if geometry.footer.width > 0 && geometry.footer.height > 0 {
         render_contextual_footer(
             frame.buffer_mut(),
