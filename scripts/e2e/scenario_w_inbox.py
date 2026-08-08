@@ -138,6 +138,26 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         # Two agents in two panes: one that reports, one that never will.
         peer.run_in_shell(bare)
         peer.wait_for("BARE-AGENT-START", timeout=20)
+
+        # With only the unhooked agent running, every row is unreported -- the
+        # state a default install lands in, and the one line that decides
+        # whether anyone opens the inbox twice.
+        peer.send(CTRL_O)
+        time.sleep(3.0)
+        screen = peer.snapshot()
+        check(
+            "an install with no hooks is told exactly what to run",
+            "Run `p2pmux setup` to see which agents need you." in screen,
+            screen[:600],
+        )
+        check(
+            "nothing is said about machines until there are two",
+            "asleep" not in screen and " ✓ " not in screen,
+            screen[:600],
+        )
+        peer.send(CTRL_O)
+        time.sleep(1.0)
+
         peer.send(CTRL_P)
         time.sleep(0.3)
         peer.send(b"n")
