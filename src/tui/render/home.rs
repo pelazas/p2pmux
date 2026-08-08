@@ -374,7 +374,9 @@ fn home_kind_label(kind: &str) -> &'static str {
 /// The machine strip: fleet health in one line, without a second screen.
 pub(in crate::tui) fn machine_block(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
     let machines = machine_rows(tui);
-    if machines.len() < 2 {
+    // Empty only before the member list has arrived — the machine this is
+    // running on is a machine, and once it is known it is always in the strip.
+    if machines.is_empty() {
         return Vec::new();
     }
     if !tui.machines_expanded {

@@ -412,6 +412,16 @@ oldbox       asleep   —              —
 A machine is `ready` when it is in a live session here and `asleep` when it is paired but not
 answering — off, sleeping, or without a node running. `p2pmux unpair <name>` forgets one.
 
+This machine is always in the list, so a fresh install shows a fleet of one rather than an empty
+table, with the pairing nudge under it:
+
+```text
+NAME         STATUS   ACCEPTS WORK   RUNNING
+laptop       ready    no             —             (this machine)
+
+No other machines paired yet. Run `p2pmux pair` to add one.
+```
+
 `accepts work` is asked once, during pairing, and defaults to no. It means *accepts work from your
 other machines*, never *from anyone with the join code* — otherwise handing out a code would be
 handing out remote code execution. **Nothing acts on it yet**: it is recorded now so that starting

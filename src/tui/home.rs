@@ -388,7 +388,7 @@ pub(in crate::tui) struct HomeLayout {
     /// The `p2pmux setup` nudge. Zero-height unless every row is unreported.
     pub(in crate::tui) hint: Rect,
     /// The one-line machine strip, or the expanded list under `m`.
-    /// Zero-height until there are two machines.
+    /// Zero-height only before the member list has arrived.
     pub(in crate::tui) machines: Rect,
 }
 
@@ -453,12 +453,13 @@ pub struct MachineRow {
 
 /// How many lines the machine block wants.
 ///
-/// Nothing at all until there are two machines: on a single-machine install the
-/// strip would be one row saying "you are here", which teaches nobody anything
-/// and makes the screen look like it is missing something.
+/// One machine still gets a strip. Hiding it until a second machine appeared
+/// made a fleet of one look like a fleet of none — the screen said "no
+/// machines" about the machine it was being read on. A strip with one name in
+/// it says the fleet is up and has room for more, which is the truth.
 pub(in crate::tui) fn machine_lines(tui: &MultiPaneTui) -> u16 {
     let machines = machine_rows(tui).len();
-    if machines < 2 {
+    if machines == 0 {
         return 0;
     }
     if tui.machines_expanded {
@@ -475,12 +476,21 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
     // Header, then rows, then the machine block pinned to the bottom. The key
     // bar is not here: it takes over the window footer, so that four keys stay
     // visible in the same place they are on every other screen. A terminal too
-    // short to hold everything loses agent rows, never the machine strip — the
+    // short to hold everything loses agent rows before the machine strip — the
     // strip is one line and answers "is my fleet even up", which a list of
     // agents cannot.
     let header_height = 2u16.min(area.height);
     let mut left = area.height.saturating_sub(header_height);
-    let machines_height = machine_lines(tui).min(left);
+    // The strip outranks agent rows when space runs out, but it never takes the
+    // last one: a list with nothing left in it stops being a list, and Home
+    // would be a screen about machines with the agents it exists for cut off.
+    // All or nothing — half a strip is a blank line where a fleet should be.
+    let wanted = machine_lines(tui);
+    let machines_height = if wanted <= left.saturating_sub(1) {
+        wanted
+    } else {
+        0
+    };
     left = left.saturating_sub(machines_height);
     let hint_height = u16::from(tui.home_all_unwired()).min(left);
     let rows_height = left.saturating_sub(hint_height);
@@ -605,13 +615,33 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_strip_stays_silent_until_there_are_two_machines() {
-        // Nothing paired says nothing at all: a strip reading "you are here"
-        // teaches nobody anything and makes the screen look incomplete.
+    fn the_machine_strip_lists_this_machine_with_nothing_paired() {
+        // A fleet of one is still a fleet. Hiding the strip made the screen
+        // say "no machines" about the machine it was being read on.
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
-        assert_eq!(machine_lines(&tui), 0);
-        assert_eq!(home_layout(AREA, &tui).machines.height, 0);
+        let machines = machine_rows(&tui);
+        assert_eq!(machines.len(), 1);
+        assert!(machines[0].this_machine);
+        assert_eq!(machine_lines(&tui), 2);
+        assert_eq!(home_layout(AREA, &tui).machines.height, 2);
+    }
+
+    /// The strip outranks agent rows, but not the last one.
+    #[test]
+    fn a_home_too_short_for_both_keeps_a_row_rather_than_the_whole_strip() {
+        let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+
+        // Two lines of header, three left: the strip fits with a row to spare.
+        let roomy = home_layout(Rect::new(0, 0, 40, 5), &tui);
+        assert_eq!(roomy.machines.height, 2);
+        assert_eq!(roomy.rows.height, 1);
+
+        // One line fewer and the strip would take every row there is, so it
+        // stands down whole — half a strip is a blank line where a fleet goes.
+        let cramped = home_layout(Rect::new(0, 0, 40, 4), &tui);
+        assert_eq!(cramped.machines.height, 0);
+        assert_eq!(cramped.rows.height, 2);
     }
 
     #[test]

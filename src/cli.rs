@@ -735,18 +735,22 @@ async fn wait_for_peers(descriptor: &crate::session_store::SessionDescriptor) ->
 /// date out of process. A machine paired but not in any of them is one you own
 /// that is not answering — off, asleep, or without a node running — and it
 /// keeps its row rather than vanishing. Saying `asleep` is the whole point.
+/// This machine is one of them, so the list is never empty. Printing "no
+/// machines" on the machine being asked was answering a different question than
+/// the one the command asks; the pairing nudge is still worth saying, but as a
+/// line under the fleet rather than instead of it.
 fn print_machines() -> Result<(), Box<dyn Error>> {
     let rows = machine_rows()?;
-    if rows.len() < 2 {
-        println!("No machines paired yet. Run `p2pmux pair` to add one.");
-        return Ok(());
-    }
     println!(
         "{:<12} {:<8} {:<14} RUNNING",
         "NAME", "STATUS", "ACCEPTS WORK"
     );
     for row in &rows {
         println!("{}", crate::tui::machine_line(row));
+    }
+    if rows.len() < 2 {
+        println!();
+        println!("No other machines paired yet. Run `p2pmux pair` to add one.");
     }
     Ok(())
 }
