@@ -54,13 +54,17 @@ const INBOX_SEGMENT_MIN_WIDTH: usize = 7;
 /// Never `inbox 0`. Absence is quieter than a zero and means exactly the same
 /// thing, and a zero on screen is a number the eye has to read before it can
 /// discard it.
+///
+/// Centred in the fixed cell rather than left-aligned: the width is there to
+/// stop the separator twitching, not to pin the word to the left divider, and
+/// a label hugging one wall of its own segment reads as a mistake.
 pub(in crate::tui) fn inbox_segment(needs_you: usize) -> String {
     let text = if needs_you == 0 {
         String::from("inbox")
     } else {
         format!("inbox {needs_you}")
     };
-    format!("{text:<INBOX_SEGMENT_MIN_WIDTH$}")
+    format!("{text:^INBOX_SEGMENT_MIN_WIDTH$}")
 }
 
 /// The whole width the inbox segment and its trailing separator occupy.
@@ -1349,7 +1353,7 @@ mod tests {
         let tab_bar = (0..44).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
         assert!(
-            tab_bar.starts_with("p2pmux │ inbox   │  Tab #1  · Tab #2"),
+            tab_bar.starts_with("p2pmux │  inbox  │  Tab #1  · Tab #2"),
             "{tab_bar:?}"
         );
         assert!(tab_bar.contains("Tab #1"));
@@ -1425,13 +1429,28 @@ mod tests {
     #[test]
     fn the_badge_never_renders_a_zero() {
         // Absence is quieter than a zero and means exactly the same thing.
-        assert_eq!(inbox_segment(0), "inbox  ");
+        assert_eq!(inbox_segment(0), " inbox ");
         assert_eq!(inbox_segment(1), "inbox 1");
         assert_eq!(
             text_width(&inbox_segment(0)),
             text_width(&inbox_segment(9)),
             "a fixed-width segment keeps the separator after it from twitching"
         );
+    }
+
+    /// The fixed width is there to stop the separator twitching, not to pin the
+    /// word to the left divider.
+    #[test]
+    fn the_badge_sits_in_the_middle_of_its_segment() {
+        for needs_you in [0, 1, 9] {
+            let segment = inbox_segment(needs_you);
+            let leading = segment.len() - segment.trim_start().len();
+            let trailing = segment.len() - segment.trim_end().len();
+            assert!(
+                leading.abs_diff(trailing) <= 1,
+                "{segment:?} is not centred in its cell"
+            );
+        }
     }
 
     #[test]
@@ -1451,7 +1470,7 @@ mod tests {
         let tab_bar = (0..52).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
 
         assert!(
-            tab_bar.starts_with("p2pmux │ inbox   │  Tab #1  · Tab #2 ●"),
+            tab_bar.starts_with("p2pmux │  inbox  │  Tab #1  · Tab #2 ●"),
             "the dot belongs to the tab that member is on: {tab_bar:?}"
         );
         let dots = (0..52)
