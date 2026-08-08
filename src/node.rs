@@ -463,13 +463,17 @@ fn run_socket_loop(
         // with a code you handed out is a collaborator, not a machine you own,
         // and must never end up in your fleet.
         //
-        // Sampled on a timer rather than on every drain. `changed` is true on
-        // essentially every frame a pane is producing output, and this loop
-        // turns about a hundred times a second; recomputing member labels and
-        // agent counts at that rate would put string allocation on the path
-        // keystroke echo runs down, to keep a status column fresher than any
-        // human could read it.
-        if changed && peer_scan_due(last_peer_scan, drain_started) {
+        // Sampled on a timer, and on the timer alone. Recomputing member labels
+        // and agent counts on every drain would put string allocation on the
+        // path keystroke echo runs down, a hundred times a second, to keep a
+        // status column fresher than any human could read it.
+        //
+        // It deliberately does *not* also require `drain` to have reported a
+        // change. A machine joining is exactly the event this has to notice,
+        // and it produces no pane output at all — so a session sitting quiet,
+        // which is the normal state of a machine you are not looking at, would
+        // never record the peer that just arrived.
+        if peer_scan_due(last_peer_scan, drain_started) {
             last_peer_scan = Some(drain_started);
             let peers = node.session_peers();
             if peers != last_known_peers {

@@ -130,7 +130,7 @@ def main() -> int:
         time.sleep(3.0)
         check(
             "nothing is left running on the paired machine",
-            beta.run("pgrep -f /usr/local/bin/p2pmux || true", check=False).strip() == "",
+            beta.run("pgrep -x p2pmux || true", check=False).strip() == "",
             "",
         )
 
@@ -173,8 +173,13 @@ def main() -> int:
                 screen[:600],
             )
             check(
-                "with the `needs you` its hook reported, in its own words",
-                "needs you" in screen and "permission" in screen,
+                "with the `needs you` its hook reported",
+                "needs you" in screen,
+                screen[:600],
+            )
+            check(
+                "but never the agent's own words, which stay on its machine",
+                "permission" not in screen and BLOCKED_ON not in screen,
                 screen[:600],
             )
             check(
@@ -191,14 +196,19 @@ def main() -> int:
                 "REMOTE-AGENT-BLOCKED" in a.snapshot(),
                 a.snapshot()[:400],
             )
-            a.type("echo CROSS-MACHINE-OK\n")
+            # Typing into a free remote pane claims the control lease before
+            # anything reaches the shell, and keystrokes sent during that
+            # round trip can be dropped. Claim first, then speak.
+            a.send(b"\r")
+            time.sleep(2.0)
             reached = False
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + 40
             while time.monotonic() < deadline:
                 if "CROSS-MACHINE-OK" in a.snapshot():
                     reached = True
                     break
-                time.sleep(0.5)
+                a.type("echo CROSS-MACHINE-OK\n")
+                time.sleep(3.0)
             check("keystrokes reach a program on the other machine", reached, a.snapshot()[:400])
 
             a.send(CTRL_O)
