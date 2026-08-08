@@ -1,43 +1,14 @@
-//! Key handling while a modal owns the keyboard: the agents overlay, the
-//! rename prompt, the share panel, and the delete-tab confirmation.
+//! Key handling while a modal owns the keyboard: the rename prompt, the share
+//! panel, and the delete-tab confirmation.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     layout::{TabId, normalize_title},
-    tui::{
-        KeyHandling, ModalState, MultiPaneTui, RenamePrompt, RenameTarget, ShareCopy, UiIntent,
-        debug_log::ui_debug_log,
-    },
+    tui::{KeyHandling, ModalState, MultiPaneTui, RenamePrompt, RenameTarget, ShareCopy, UiIntent},
 };
 
 impl MultiPaneTui {
-    pub(in crate::tui) fn handle_agent_overlay_key(&mut self, key: KeyEvent) -> KeyHandling {
-        match key.code {
-            KeyCode::Esc => {
-                self.modal = ModalState::None;
-                self.pending_agent_toggle = None;
-                ui_debug_log("agents_overlay_close", format_args!("reason=esc"));
-                KeyHandling::Consumed(vec![])
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_agent_selection(false);
-                KeyHandling::Consumed(vec![])
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_agent_selection(true);
-                KeyHandling::Consumed(vec![])
-            }
-            KeyCode::Enter => {
-                let Some(pane_id) = self.agent_selected_pane else {
-                    return KeyHandling::Consumed(vec![]);
-                };
-                KeyHandling::Consumed(self.jump_to_agent_pane(pane_id, "enter"))
-            }
-            _ => KeyHandling::Consumed(vec![]),
-        }
-    }
-
     pub(in crate::tui) fn open_rename(&mut self, target: RenameTarget) {
         let value = match target {
             RenameTarget::Pane(pane_id) => self
@@ -162,15 +133,19 @@ mod tests {
     use crate::{
         layout::{Node, Tab},
         tui::{
-            AGENT_TOGGLE_WINDOW, ChordMode, KeyHandling, MouseHandling, MultiPaneTui,
+            ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, MouseHandling, MultiPaneTui,
             PaneMouseProtocol, ShareCopy, UiIntent,
             render::panes::render_multi_pane,
             test_support::{agent_row, layout, split_layout},
         },
     };
 
+    /// Ctrl+A is the legacy way to Home, and it keeps the doubled-press escape
+    /// hatch a decade of screen and tmux users expect: a second press inside
+    /// the window sends a literal Ctrl+A to the pane instead.
     #[test]
-    pub(in crate::tui) fn agents_overlay_opens_immediately_and_double_tap_forwards_ctrl_a() {
+    pub(in crate::tui) fn ctrl_a_opens_home_and_a_doubled_press_forwards_it() {
+        let area = Rect::new(0, 0, 80, 24);
         let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
@@ -181,34 +156,48 @@ mod tests {
         ))
         .unwrap();
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        assert_eq!(
-            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
-            KeyHandling::Consumed(vec![])
-        );
-        assert!(tui.overlay_open());
-        assert_eq!(
-            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
-            KeyHandling::Forward
-        );
-        assert!(!tui.overlay_open());
-        assert_eq!(
-            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
-            KeyHandling::Consumed(vec![])
-        );
-        assert!(tui.overlay_open());
-        tui.pending_agent_toggle = Some(Instant::now() - AGENT_TOGGLE_WINDOW);
-        assert!(!tui.expire_agent_toggle(Instant::now()));
-        assert!(tui.overlay_open());
-        assert_eq!(tui.pending_agent_toggle, None);
-        assert_eq!(
-            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
-            KeyHandling::Consumed(vec![])
-        );
-        assert!(!tui.overlay_open());
+
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
+        assert!(tui.home_open());
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Forward);
+        assert!(!tui.home_open());
+
+        // Outside the window the second press is simply a second press: it
+        // closes Home and reaches no pane.
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
+        assert!(tui.home_open());
+        tui.pending_home_toggle = Some(Instant::now() - HOME_TOGGLE_WINDOW);
+        assert!(!tui.expire_home_toggle(Instant::now()));
+        assert!(tui.home_open());
+        assert_eq!(tui.pending_home_toggle, None);
+        assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
+        assert!(!tui.home_open());
+    }
+
+    /// Ctrl+O has no legacy to honour, so it never forwards: two presses are
+    /// open then close, and nothing reaches the pane either time.
+    #[test]
+    pub(in crate::tui) fn ctrl_o_never_forwards_however_fast_it_is_pressed() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        ))
+        .unwrap();
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        assert_eq!(tui.handle_key(ctrl_o, area), KeyHandling::Consumed(vec![]));
+        assert_eq!(tui.handle_key(ctrl_o, area), KeyHandling::Consumed(vec![]));
+        assert!(!tui.home_open());
     }
 
     #[test]
-    pub(in crate::tui) fn agents_overlay_is_modal_and_enter_jumps_to_another_tab() {
+    pub(in crate::tui) fn home_claims_the_keyboard_and_enter_jumps_to_another_tab() {
+        let area = Rect::new(0, 0, 80, 24);
         let snapshot = layout(
             vec![
                 Tab {
@@ -227,41 +216,21 @@ mod tests {
         let mut tui = MultiPaneTui::new(snapshot).unwrap();
         tui.set_agent_rows(vec![agent_row(2, 2, 1)]);
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24));
+        tui.handle_key(ctrl_a, area);
+
+        // An unclaimed key is swallowed rather than forwarded: there is no pane
+        // in view to forward it to.
         assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-                Rect::new(0, 0, 80, 24)
-            ),
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![])
         );
         assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                Rect::new(0, 0, 80, 24)
-            ),
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
+        assert!(!tui.home_open());
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
-        assert_eq!(tui.pending_agent_toggle, None);
-        assert_eq!(
-            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
-            KeyHandling::Consumed(vec![])
-        );
-        assert!(tui.overlay_open());
-        assert_eq!(
-            tui.handle_key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                Rect::new(0, 0, 80, 24)
-            ),
-            KeyHandling::Consumed(vec![])
-        );
-        assert_eq!(tui.pending_agent_toggle, None);
-        assert_eq!(
-            tui.handle_key(ctrl_a, Rect::new(0, 0, 80, 24)),
-            KeyHandling::Consumed(vec![])
-        );
     }
 
     #[test]
@@ -312,7 +281,7 @@ mod tests {
                 title: String::from("old"),
             }])
         );
-        assert!(!tui.overlay_open());
+        assert!(!tui.modal_open());
     }
 
     #[test]

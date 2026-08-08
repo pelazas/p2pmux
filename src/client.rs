@@ -306,7 +306,7 @@ pub fn run_on(
                         share_ticket = next_ticket;
                         share_code = next_code;
                         if let Some(tui) = tui.as_mut() {
-                            tui.set_agent_overlay_viewport(terminal.size()?.into());
+                            tui.set_home_viewport_for(terminal.size()?.into());
                             // The machine list needs to know which row is the
                             // machine you are sitting at, and only the node can
                             // say which peer this client is.
@@ -660,15 +660,12 @@ pub fn run_on(
                 let area = terminal.size()?.into();
                 if tui.modal_open() {
                     // Blocking dialogs consume mouse input without affecting panes.
-                } else if tui.overlay_open() {
+                } else if tui.home_open() {
                     if matches!(
                         mouse.kind,
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     ) {
-                        tui.scroll_agent_overlay(
-                            area,
-                            matches!(mouse.kind, MouseEventKind::ScrollUp),
-                        );
+                        tui.scroll_home(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
                     } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                         let handling = tui.handle_mouse(mouse, area, PaneMouseProtocol::default());
                         send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
@@ -755,7 +752,7 @@ pub fn run_on(
                 terminal.resize(Rect::new(0, 0, cols, rows))?;
                 viewport = (cols, rows);
                 if !tui.modal_open() {
-                    tui.set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
+                    tui.set_home_viewport_for(Rect::new(0, 0, cols, rows));
                     history.clear();
                     pending_scroll.clear();
                     desired_scroll.clear();
@@ -794,8 +791,8 @@ fn refresh_tui_timers(
     now: Instant,
     last_agent_overlay_animation: &mut Instant,
 ) -> bool {
-    let mut dirty = tui.expire_chord_mode(now) || tui.expire_agent_toggle(now);
-    if tui.agent_overlay_has_working_rows()
+    let mut dirty = tui.expire_chord_mode(now) || tui.expire_home_toggle(now);
+    if tui.home_has_working_rows()
         && now.duration_since(*last_agent_overlay_animation) >= AGENT_OVERLAY_ANIMATION_INTERVAL
     {
         *last_agent_overlay_animation = now;
@@ -837,7 +834,7 @@ fn next_perf_id_if_enabled(next: &mut u64) -> Option<u64> {
 }
 
 fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
-    !tui.overlay_open() && !tui.modal_open() && input_allowed(tui, local_peer_id)
+    !tui.home_open() && !tui.modal_open() && input_allowed(tui, local_peer_id)
 }
 
 #[cfg(test)]
@@ -1291,7 +1288,7 @@ mod tests {
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
         local_ipc::{AgentOverlaySnapshotRow, PaneScreenSnapshot},
         screen::HostScreen,
-        tui::{AGENT_TOGGLE_WINDOW, UiIntent},
+        tui::{HOME_TOGGLE_WINDOW, UiIntent},
     };
 
     use super::*;
@@ -1665,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_client_timer_opens_overlay_and_double_tap_forwards_ctrl_a() {
+    fn attach_client_timers_leave_home_open_and_a_doubled_ctrl_a_forwards() {
         let mut tui = Some(MultiPaneTui::new(layout(&[1])).unwrap());
         let tui = tui.as_mut().unwrap();
         let area = Rect::new(0, 0, 80, 24);
@@ -1673,16 +1670,18 @@ mod tests {
         let mut animation = Instant::now();
 
         assert_eq!(tui.handle_key(ctrl_a, area), KeyHandling::Consumed(vec![]));
-        assert!(tui.overlay_open());
+        assert!(tui.home_open());
+        // A timer tick a second later expires the doubled-press window and
+        // nothing else: Home is a screen, not a transient popup.
         assert!(!refresh_tui_timers(
             tui,
             Instant::now() + Duration::from_secs(1),
             &mut animation,
         ));
-        assert!(tui.overlay_open());
+        assert!(tui.home_open());
         assert_eq!(
             tui.handle_key(
-                crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                crossterm::event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
                 area
             ),
             KeyHandling::Consumed(vec![])
@@ -1711,7 +1710,7 @@ mod tests {
                 area,
             );
             let mut animation = Instant::now();
-            refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
+            refresh_tui_timers(tui, Instant::now() + HOME_TOGGLE_WINDOW, &mut animation);
             assert_eq!(
                 tui.handle_key(
                     crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -1727,7 +1726,7 @@ mod tests {
             area,
         );
         let mut animation = Instant::now();
-        refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
+        refresh_tui_timers(tui, Instant::now() + HOME_TOGGLE_WINDOW, &mut animation);
         assert_eq!(
             tui.handle_key(
                 crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -1738,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn modal_overlay_blocks_paste_and_resize_before_open_sets_scroll_bounds() {
+    fn home_blocks_paste_and_a_resize_before_it_opens_still_sets_scroll_bounds() {
         let mut tui = None;
         apply_rows(
             &mut tui,
@@ -1750,19 +1749,19 @@ mod tests {
             ],
         );
         let tui = tui.as_mut().unwrap();
-        // Short enough that three rows do not fit, so there is something to scroll:
-        // the overlay grows to fit its list whenever the terminal lets it.
+        // Short enough that three rows do not fit, so there is something to
+        // scroll: two lines of header leave two for a list of three.
         let area = Rect::new(0, 0, 24, 6);
-        tui.set_agent_overlay_viewport(area);
+        tui.set_home_viewport_for(area);
         tui.handle_key(
             crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
             area,
         );
         let mut animation = Instant::now();
-        refresh_tui_timers(tui, Instant::now() + AGENT_TOGGLE_WINDOW, &mut animation);
+        refresh_tui_timers(tui, Instant::now() + HOME_TOGGLE_WINDOW, &mut animation);
 
         assert!(!should_forward_paste(tui, b"host"));
-        assert!(tui.scroll_agent_overlay(area, false));
+        assert!(tui.scroll_home(area, false));
     }
 
     #[test]

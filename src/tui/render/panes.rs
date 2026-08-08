@@ -19,11 +19,9 @@ use crate::{
     tui::{
         ChordMode, ModalState, MultiPaneTui, ShareView,
         app::{member_color, member_initial},
-        clock::unix_ms_now,
         geometry::{fixed_grid_viewport, pane_content_rect, visible_leaf_panes},
         member_label,
         render::{
-            agents::render_agents_overlay,
             footer::render_contextual_footer,
             home::render_home,
             modals::{render_delete_tab_confirmation, render_rename_prompt, render_share_modal},
@@ -574,9 +572,6 @@ pub(in crate::tui) fn render_shared_multi_pane(
         } else if !view.ready {
             frame.render_widget(Paragraph::new("waiting for pane snapshot/lease"), content);
         }
-    }
-    if tui.overlay_open() {
-        render_agents_overlay(frame, tui, unix_ms_now());
     }
     if tui.share_open() {
         render_share_modal(frame, &tui.theme, share);

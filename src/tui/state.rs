@@ -196,7 +196,6 @@ pub(in crate::tui) struct Invite {
 pub(in crate::tui) enum ModalState {
     #[default]
     None,
-    Agents,
     Share,
     Rename(RenamePrompt),
     ConfirmDeleteTab {

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     layout::{Axis, LayoutSnapshot, Node, Pane, Tab},
-    tui::{AgentOverlayRow, ModalState, MultiPaneTui, PaneMouseProtocol},
+    tui::{AgentOverlayRow, MultiPaneTui, PaneMouseProtocol},
 };
 
 pub(in crate::tui) fn mouse_protocol(
@@ -122,27 +122,6 @@ pub(in crate::tui) fn home_tui(
             .collect(),
     );
     tui.repair_home_selection();
-    tui
-}
-
-pub(in crate::tui) fn agent_overlay_tui(count: u64) -> MultiPaneTui {
-    let tabs = (1..=count)
-        .map(|pane_id| Tab {
-            tab_id: pane_id,
-            root: Node::Leaf { pane_id },
-            title: None,
-        })
-        .collect();
-    let panes = (1..=count)
-        .map(|pane_id| (pane_id, 2, 8))
-        .collect::<Vec<_>>();
-    let mut tui = MultiPaneTui::new(layout(tabs, &panes)).expect("valid layout");
-    tui.set_agent_rows(
-        (1..=count)
-            .map(|pane_id| agent_row(pane_id, pane_id as usize, 1))
-            .collect(),
-    );
-    tui.modal = ModalState::Agents;
     tui
 }
 

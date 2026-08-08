@@ -109,8 +109,7 @@ fn render_home_in(
                 layout.rows,
             );
         } else {
-            let animation_phase =
-                crate::tui::render::agents::agent_overlay_animation_phase(now_unix_ms);
+            let animation_phase = animation_phase(now_unix_ms);
             let lines = rows
                 .into_iter()
                 .skip(tui.home_scroll_line)
@@ -331,6 +330,21 @@ fn home_state_label(
     }
 }
 
+/// Which spinner frame this instant lands on.
+///
+/// Derived from the clock rather than from a counter the draw loop advances, so
+/// every row spins in step and a frame skipped by a slow repaint is a frame
+/// skipped, not a spinner that falls behind.
+pub(in crate::tui) fn animation_phase(now_unix_ms: u64) -> usize {
+    now_unix_ms.saturating_div(crate::tui::AGENT_OVERLAY_ANIMATION_INTERVAL.as_millis() as u64)
+        as usize
+}
+
+/// The working spinner.
+///
+/// Braille rather than quarter-circles: ten frames instead of four, so the
+/// motion reads as continuous, and every frame occupies exactly one column in
+/// every font that has the block at all.
 fn working_glyph(animation_phase: usize) -> &'static str {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     FRAMES[animation_phase % FRAMES.len()]

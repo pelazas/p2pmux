@@ -9,9 +9,8 @@ use ratatui::layout::Rect;
 use crate::{
     layout::{Axis, NewPanePosition},
     tui::{
-        AGENT_TOGGLE_WINDOW, ChordMode, KeyHandling, ModalState, MultiPaneTui, RenameTarget,
+        ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, ModalState, MultiPaneTui, RenameTarget,
         UiIntent,
-        debug_log::ui_debug_log,
         geometry::{
             direction_distance, grid_for_pane, is_in_direction, rect_center, visible_leaf_panes,
         },
@@ -55,7 +54,7 @@ impl MultiPaneTui {
     pub fn handle_key(&mut self, key: KeyEvent, area: Rect) -> KeyHandling {
         if is_quit(key) {
             self.modal = ModalState::None;
-            self.pending_agent_toggle = None;
+            self.pending_home_toggle = None;
             self.exit_chord_mode();
             return KeyHandling::Quit;
         }
@@ -77,10 +76,8 @@ impl MultiPaneTui {
             if open {
                 self.clear_zoom();
             }
+            self.pending_home_toggle = None;
             return KeyHandling::Consumed(vec![]);
-        }
-        if self.home_open {
-            return self.handle_home_key(key, area);
         }
         // Ctrl+S is claimed before the pane sees it, so a pane never receives XOFF from this
         // binding — the same trade already made for Ctrl+A.
@@ -96,36 +93,34 @@ impl MultiPaneTui {
         if self.share_open() {
             return self.handle_share_key(key);
         }
+        // Ctrl+A is the legacy way in, kept for the muscle memory the old
+        // agents overlay built. It carries the doubled-press escape hatch that
+        // screen and tmux users expect: a second Ctrl+A inside the window
+        // closes Home and sends a literal one to the pane. Ctrl+O -- the
+        // binding this build teaches -- has no such history and no such window.
         if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
-            if self.overlay_open() {
+            if self.home_open {
                 let forward = self
-                    .pending_agent_toggle
-                    .is_some_and(|then| then.elapsed() <= AGENT_TOGGLE_WINDOW);
-                self.modal = ModalState::None;
-                self.pending_agent_toggle = None;
+                    .pending_home_toggle
+                    .is_some_and(|then| then.elapsed() <= HOME_TOGGLE_WINDOW);
+                self.set_home_open(false, if forward { "double_ctrl_a" } else { "ctrl_a" });
+                self.pending_home_toggle = None;
                 return if forward {
-                    ui_debug_log(
-                        "agents_toggle_forward",
-                        format_args!("window_ms={}", AGENT_TOGGLE_WINDOW.as_millis()),
-                    );
                     KeyHandling::Forward
                 } else {
-                    ui_debug_log("agents_overlay_close", format_args!("reason=ctrl_a"));
                     KeyHandling::Consumed(vec![])
                 };
             }
-            self.modal = ModalState::Agents;
-            self.pending_agent_toggle = Some(Instant::now());
-            self.exit_chord_mode();
-            ui_debug_log(
-                "agents_overlay_open",
-                format_args!("window_ms={}", AGENT_TOGGLE_WINDOW.as_millis()),
-            );
+            self.set_home_open(true, "ctrl_a");
+            self.clear_zoom();
+            self.pending_home_toggle = Some(Instant::now());
             return KeyHandling::Consumed(vec![]);
         }
-        if self.overlay_open() {
-            self.set_agent_overlay_viewport(area);
-            return self.handle_agent_overlay_key(key);
+        // Everything below belongs to the panes, so Home claims the rest of the
+        // keyboard before it gets there. Reached after the bindings above so
+        // that the two ways out of Home still work from on it.
+        if self.home_open {
+            return self.handle_home_key(key, area);
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()

@@ -256,14 +256,14 @@ impl MultiPaneTui {
             return handling;
         }
         match mouse.kind {
-            MouseEventKind::Moved if !self.overlay_open() => {
+            MouseEventKind::Moved if !self.home_open() => {
                 self.hover_pane_at(mouse.column, mouse.row, area);
                 MouseHandling::default()
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.overlay_open() {
+                if self.home_open() {
                     return MouseHandling {
-                        intents: self.handle_agent_overlay_click(mouse.column, mouse.row, area),
+                        intents: self.handle_home_click(mouse.column, mouse.row, area),
                         ..MouseHandling::default()
                     };
                 }
@@ -320,7 +320,7 @@ impl MultiPaneTui {
         protocol: PaneMouseProtocol,
     ) -> Option<MouseHandling> {
         // Shift is the standing escape hatch: it always selects, never forwards.
-        if self.overlay_open()
+        if self.home_open()
             || !protocol.reports_mouse()
             || mouse.modifiers.contains(KeyModifiers::SHIFT)
             || self.scrollback_offset(self.focused_pane) != 0

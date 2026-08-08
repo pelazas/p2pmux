@@ -63,11 +63,9 @@ pub struct MultiPaneTui {
     pub(in crate::tui) notified_agent_episodes: BTreeMap<PaneId, u64>,
     pub(in crate::tui) unread_agent_panes: BTreeSet<PaneId>,
     pub(in crate::tui) modal: ModalState,
-    pub(in crate::tui) agent_selected_pane: Option<PaneId>,
-    /// Terminal-line offset into the cards (two card lines plus one spacer each).
-    pub(in crate::tui) agent_overlay_scroll_line: usize,
-    pub(in crate::tui) agent_overlay_viewport_lines: u16,
-    pub(in crate::tui) pending_agent_toggle: Option<Instant>,
+    /// A first Ctrl+A, waiting to see whether a second follows. See
+    /// [`crate::tui::HOME_TOGGLE_WINDOW`].
+    pub(in crate::tui) pending_home_toggle: Option<Instant>,
     /// Whether Home — the inbox — is the screen on display.
     ///
     /// Local to this client and never replicated: see [`crate::tui::home`].
@@ -134,10 +132,7 @@ impl MultiPaneTui {
             notified_agent_episodes: BTreeMap::new(),
             unread_agent_panes: BTreeSet::new(),
             modal: ModalState::None,
-            agent_selected_pane: None,
-            agent_overlay_scroll_line: 0,
-            agent_overlay_viewport_lines: 0,
-            pending_agent_toggle: None,
+            pending_home_toggle: None,
             home_open: false,
             home_selected: None,
             home_scroll_line: 0,
@@ -178,11 +173,7 @@ impl MultiPaneTui {
         self.chord_mode
     }
 
-    pub fn overlay_open(&self) -> bool {
-        matches!(self.modal, ModalState::Agents)
-    }
-
-    /// Whether a blocking dialog is open, excluding the interactive agents overlay.
+    /// Whether a blocking dialog is open.
     pub fn modal_open(&self) -> bool {
         matches!(
             self.modal,

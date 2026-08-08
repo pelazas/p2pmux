@@ -70,7 +70,13 @@ pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
 
-/// How long a first Ctrl+A waits for a second one before the overlay commits.
-pub(crate) const AGENT_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
-/// How often the working glyph in the agents overlay advances.
+/// How long a first Ctrl+A waits for a second one before Home commits.
+///
+/// Ctrl+A is the legacy binding, and screen and tmux users have a decade of
+/// muscle memory that says a doubled Ctrl+A means "send a literal one". Within
+/// this window the second press closes Home and forwards; after it, Home simply
+/// stays open. Ctrl+O -- the binding this build teaches -- has no such history
+/// and no such window.
+pub(crate) const HOME_TOGGLE_WINDOW: Duration = Duration::from_millis(200);
+/// How often the working glyph on an inbox row advances.
 pub(crate) const AGENT_OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);

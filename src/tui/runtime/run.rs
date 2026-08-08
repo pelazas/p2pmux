@@ -114,8 +114,7 @@ impl SharedLayoutRuntime {
             },
         )?;
         clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
-        self.tui
-            .set_agent_overlay_viewport(Rect::new(0, 0, cols, rows));
+        self.tui.set_home_viewport_for(Rect::new(0, 0, cols, rows));
         let mut dirty = true;
         let mut last_draw: Option<Instant> = None;
         let mut pending_escape = PendingEscape::default();
@@ -128,11 +127,11 @@ impl SharedLayoutRuntime {
             if self.tui.expire_chord_mode(Instant::now()) {
                 dirty = true;
             }
-            if self.tui.expire_agent_toggle(Instant::now()) {
+            if self.tui.expire_home_toggle(Instant::now()) {
                 dirty = true;
             }
             let now = Instant::now();
-            if self.tui.agent_overlay_has_working_rows()
+            if self.tui.home_has_working_rows()
                 && now.duration_since(self.last_agent_overlay_animation)
                     >= AGENT_OVERLAY_ANIMATION_INTERVAL
             {
@@ -256,14 +255,14 @@ impl SharedLayoutRuntime {
                 *dirty = true;
             }
             Event::Paste(text) => {
-                if !self.tui.overlay_open() && !self.tui.modal_open() {
+                if !self.tui.home_open() && !self.tui.modal_open() {
                     self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
                 }
                 *dirty = true;
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
-                if !self.tui.overlay_open() && !self.tui.modal_open() {
+                if !self.tui.home_open() && !self.tui.modal_open() {
                     let area = Rect::new(0, 0, *cols, *rows);
                     let protocol = self.focused_pane_mouse_protocol();
                     if protocol.reports_mouse() {
@@ -313,10 +312,10 @@ impl SharedLayoutRuntime {
                 if self.tui.modal_open() {
                     return Ok(false);
                 }
-                if self.tui.overlay_open() {
+                if self.tui.home_open() {
                     *dirty |= self
                         .tui
-                        .scroll_agent_overlay(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
+                        .scroll_home(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
                     return Ok(false);
                 }
                 // A child that reports mouse scrolls its own buffer; local scrollback
@@ -357,8 +356,7 @@ impl SharedLayoutRuntime {
                 *cols = width;
                 *rows = height;
                 self.tui
-                    .set_agent_overlay_viewport(Rect::new(0, 0, width, height));
-                self.tui.ensure_agent_selection_visible();
+                    .set_home_viewport_for(Rect::new(0, 0, width, height));
                 self.reflow_local_panes(Rect::new(0, 0, width, height))?;
                 *dirty = true;
             }

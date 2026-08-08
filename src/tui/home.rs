@@ -64,7 +64,6 @@ impl MultiPaneTui {
             // a share panel still floating over it would be a dialog with no
             // owner.
             self.modal = ModalState::None;
-            self.pending_agent_toggle = None;
             self.exit_chord_mode();
             self.machines_expanded = false;
             self.repair_home_selection();
@@ -134,6 +133,54 @@ impl MultiPaneTui {
     pub(in crate::tui) fn set_home_viewport(&mut self, lines: u16) {
         self.home_viewport_lines = lines;
         self.clamp_home_scroll();
+    }
+
+    /// Tell Home how many rows fit, from the whole terminal rather than from a
+    /// line count the caller had to work out for itself.
+    pub fn set_home_viewport_for(&mut self, area: Rect) {
+        let rows = home_layout(self.geometry(area).content, self).rows.height;
+        self.set_home_viewport(rows);
+    }
+
+    /// Wheel over the inbox. Returns whether anything moved, so a scroll at the
+    /// end of the list never costs a repaint.
+    pub fn scroll_home(&mut self, area: Rect, up: bool) -> bool {
+        self.set_home_viewport_for(area);
+        let previous = self.home_scroll_line;
+        if up {
+            self.home_scroll_line = self.home_scroll_line.saturating_sub(1);
+        } else {
+            self.home_scroll_line = self.home_scroll_line.saturating_add(1);
+        }
+        self.clamp_home_scroll();
+        self.home_scroll_line != previous
+    }
+
+    /// A click on an inbox row selects it and opens it, in one gesture.
+    ///
+    /// One click rather than select-then-Enter: the row already says everything
+    /// there is to know about it, so there is nothing a selected-but-unopened
+    /// row would let the user read.
+    pub(in crate::tui) fn handle_home_click(
+        &mut self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Vec<UiIntent> {
+        let Some(pane_id) = self.home_row_at(column, row, area) else {
+            return Vec::new();
+        };
+        self.home_selected = Some(pane_id);
+        self.enter_pane_from_home(pane_id)
+    }
+
+    pub(in crate::tui) fn home_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
+        let rows = home_layout(self.geometry(area).content, self).rows;
+        if !crate::tui::geometry::rect_contains(rows, column, row) {
+            return None;
+        }
+        let line = usize::from(row.saturating_sub(rows.y)).saturating_add(self.home_scroll_line);
+        self.home_rows().get(line).map(|row| row.pane_id)
     }
 
     pub(in crate::tui) fn home_max_scroll(&self) -> usize {

@@ -128,13 +128,6 @@ const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
-pub(in crate::tui) const AGENT_OVERLAY_HELP: &[FooterSegment] = &[
-    FooterSegment::Text("<"),
-    FooterSegment::Key("↑↓"),
-    FooterSegment::Text("> MOVE   <"),
-    FooterSegment::Key("Enter"),
-    FooterSegment::Text("> FOCUS"),
-];
 /// Enter takes the ticket: it is the only identifier that reaches another machine, so it is
 /// Enter takes the code: it is what a person can actually relay over a call, and it resolves
 /// to the ticket anywhere. The ticket stays one key away for a peer who cannot reach the
