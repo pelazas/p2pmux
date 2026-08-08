@@ -85,20 +85,28 @@ def main() -> int:
         # truncated droplet hostname.
         alpha.cli("config set name alpha")
         beta.cli("config set name beta")
-        alpha.run(f"cat > {alpha.home}/agent.sh <<'SH'\n{HOOKED_AGENT}\nSH")
+        # The agent runs on beta, so the script has to live on beta. Alpha is the
+        # machine that only ever watches it.
+        beta.run(f"cat > {beta.home}/agent.sh <<'SH'\n{HOOKED_AGENT}\nSH")
 
         # --- pairing -------------------------------------------------------
-        offered = beta.cli("pair --no-accept-work", timeout=90)
+        #
+        # Alpha offers, so alpha holds the room. That matters for the last
+        # check: only the coordinator drops a peer from the member list, so if
+        # the machine this scenario switches off were the coordinator, there
+        # would be nobody left to notice it had gone and `asleep` could not
+        # appear for five minutes.
+        offered = alpha.cli("pair --no-accept-work", timeout=90)
         match = PAIR_CODE.search(offered)
         check("`p2pmux pair` prints a pairing code", bool(match), offered.strip()[-200:])
         if not match:
             return 1
         code = match.group(1)
 
-        accepted = alpha.cli(f"pair {code} --accept-work", timeout=120)
+        accepted = beta.cli(f"pair {code} --accept-work", timeout=120)
         check(
             "`p2pmux pair <code>` pairs with the machine that printed it",
-            "paired: beta" in accepted,
+            "paired: alpha" in accepted,
             accepted.strip()[-300:],
         )
 
@@ -114,12 +122,27 @@ def main() -> int:
             listed.strip()[-300:],
         )
 
+        # Everything beta started while pairing goes away, so the next command
+        # has nothing live to attach to. Without this, bare `p2pmux` would be
+        # attaching the session pairing had just left running, and the check
+        # below would prove attaching rather than rejoining.
+        beta.reap()
+        time.sleep(3.0)
+        check(
+            "nothing is left running on the paired machine",
+            beta.run("pgrep -f /usr/local/bin/p2pmux || true", check=False).strip() == "",
+            "",
+        )
+
         with Harness("x-inbox-cross") as harness:
-            # --- bare `p2pmux` on both, with no code typed ------------------
+            # --- bare `p2pmux`, with no code typed and nothing live --------
             b = spawn_remote(harness, beta, "beta", [], cols=COLS, rows=ROWS)
-            b.wait_ready(timeout=45)
-            b.wait_for(r"Agents", timeout=40)
-            check("bare `p2pmux` opens the inbox on the paired machine", True)
+            b.wait_ready(timeout=60)
+            b.wait_for(r"Agents", timeout=60)
+            check(
+                "after pairing, bare `p2pmux` rejoins with no code typed",
+                True,
+            )
 
             # An agent, in a terminal on beta.
             b.send(b"n")
@@ -130,10 +153,7 @@ def main() -> int:
             a = spawn_remote(harness, alpha, "alpha", [], cols=COLS, rows=ROWS)
             a.wait_ready(timeout=45)
             a.wait_for(r"Agents", timeout=40)
-            check(
-                "after pairing, bare `p2pmux` rejoins with no code typed",
-                True,
-            )
+            check("bare `p2pmux` opens the inbox on the machine holding the room", True)
 
             # --- the inbox spans machines ----------------------------------
             deadline = time.monotonic() + 40
@@ -187,7 +207,7 @@ def main() -> int:
 
             # --- a machine that stops answering reads asleep ---------------
             beta.reap()
-            time.sleep(8.0)
+            time.sleep(15.0)
             listed = alpha.cli("machines")
             check(
                 "a paired machine that stopped answering reads asleep",
