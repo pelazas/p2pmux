@@ -214,20 +214,32 @@ impl MultiPaneTui {
         true
     }
 
+    /// Hit-tests the tab bar. `None` means the click landed somewhere else;
+    /// `Some` means the bar answered it, with whatever the node needs to hear.
+    ///
+    /// The two are worth distinguishing because a click the bar consumed must
+    /// not go on to focus a pane or start a selection underneath it.
     pub(in crate::tui) fn switch_tab_at(
         &mut self,
         column: u16,
         row: u16,
         area: Rect,
-    ) -> Option<UiIntent> {
+    ) -> Option<Vec<UiIntent>> {
         let geometry = self.geometry(area);
         // The badge is drawn to look like a tab, so it has to answer a click
         // like one. Anything else makes the one clickable-looking thing on the
         // bar the one thing that does nothing.
+        //
+        // Both directions, the way `Ctrl+O` toggles: a badge that only ever
+        // opens the inbox is a door with no handle on the inside, and the way
+        // back out would be a key the mouse user never learned. `current_tab`
+        // does not move while the inbox is open, so coming back needs no
+        // remembered state — closing Home lands on the tab already in view.
         if rect_contains(self.inbox_rect(geometry.tab_bar), column, row) {
-            self.set_home_open(true, "mouse");
+            let open = !self.home_open();
+            self.set_home_open(open, "mouse");
             self.clear_zoom();
-            return None;
+            return Some(Vec::new());
         }
         let tab_id = geometry
             .tab_labels
@@ -238,7 +250,7 @@ impl MultiPaneTui {
         self.clear_zoom();
         self.select_tab(tab_id)
             .expect("tab came from current snapshot");
-        Some(UiIntent::SwitchTab { tab_id })
+        Some(vec![UiIntent::SwitchTab { tab_id }])
     }
 
     /// Applies the local half of mouse interaction and returns mutations for the node.
@@ -262,6 +274,16 @@ impl MultiPaneTui {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.home_open() {
+                    // The tab bar is still on screen above the inbox, so it
+                    // still answers clicks — the badge to come back out, a tab
+                    // label to land on that tab. Without this the whole bar is
+                    // painted but dead the moment the inbox opens.
+                    if let Some(intents) = self.switch_tab_at(mouse.column, mouse.row, area) {
+                        return MouseHandling {
+                            intents,
+                            ..MouseHandling::default()
+                        };
+                    }
                     return MouseHandling {
                         intents: self.handle_home_click(mouse.column, mouse.row, area),
                         ..MouseHandling::default()
@@ -271,9 +293,9 @@ impl MultiPaneTui {
                 if self.begin_resize_drag(mouse.column, mouse.row, area) {
                     return MouseHandling::default();
                 }
-                if let Some(intent) = self.switch_tab_at(mouse.column, mouse.row, area) {
+                if let Some(intents) = self.switch_tab_at(mouse.column, mouse.row, area) {
                     return MouseHandling {
-                        intents: vec![intent],
+                        intents,
                         ..MouseHandling::default()
                     };
                 }
@@ -817,11 +839,90 @@ mod tests {
         let second_tab = tui.geometry(area).tab_labels[&2];
         assert_eq!(
             tui.switch_tab_at(second_tab.x, 0, area),
-            Some(UiIntent::SwitchTab { tab_id: 2 })
+            Some(vec![UiIntent::SwitchTab { tab_id: 2 }])
         );
         assert_eq!(tui.current_tab(), 2);
         assert_eq!(tui.focused_pane(), 2);
         assert_eq!(tui.chord_mode(), ChordMode::Tab);
         assert_eq!(tui.switch_tab_at(0, 0, area), None);
+    }
+
+    /// The badge opens the inbox and closes it again, so the mouse alone is a
+    /// complete way between the two — no reaching for `Ctrl+O` or `n`.
+    #[test]
+    fn clicking_the_inbox_badge_a_second_time_returns_to_the_tab_you_left() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 40, 8);
+        tui.select_tab(2).expect("second tab exists");
+
+        let badge = tui.inbox_rect(tui.geometry(area).tab_bar);
+        assert_eq!(tui.switch_tab_at(badge.x, badge.y, area), Some(Vec::new()));
+        assert!(tui.home_open(), "the badge opens the inbox");
+
+        assert_eq!(tui.switch_tab_at(badge.x, badge.y, area), Some(Vec::new()));
+        assert!(!tui.home_open(), "and the same click closes it again");
+        assert_eq!(
+            tui.current_tab(),
+            2,
+            "coming back lands on the tab that was in view, not the first one"
+        );
+    }
+
+    /// Clicks on the tab bar reach the bar, not the inbox list underneath it.
+    #[test]
+    fn a_tab_label_clicked_from_inside_the_inbox_leaves_the_inbox_for_that_tab() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+
+                    title: None,
+                },
+            ],
+            &[(1, 2, 2), (2, 2, 2)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 40, 8);
+        tui.set_home_open(true, "test");
+
+        let second_tab = tui.geometry(area).tab_labels[&2];
+        let handling = tui.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: second_tab.x,
+                row: second_tab.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            PaneMouseProtocol::default(),
+        );
+
+        assert_eq!(handling.intents, vec![UiIntent::SwitchTab { tab_id: 2 }]);
+        assert!(!tui.home_open());
+        assert_eq!(tui.current_tab(), 2);
     }
 }
