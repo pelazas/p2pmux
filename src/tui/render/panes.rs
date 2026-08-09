@@ -25,8 +25,8 @@ use crate::{
             footer::render_contextual_footer,
             home::render_home,
             modals::{
-                render_delete_tab_confirmation, render_quit_prompt, render_rename_prompt,
-                render_share_modal,
+                render_add_machine_modal, render_delete_tab_confirmation, render_quit_prompt,
+                render_rename_prompt, render_share_modal,
             },
             vt::{VtScreen, viewed_screen},
         },
@@ -465,7 +465,17 @@ pub(in crate::tui) fn render_shared_multi_pane(
     // drawing panes behind a screen that covers them is wasted work on every
     // frame.
     if tui.home_open() {
-        render_home(frame, tui, crate::tui::clock::unix_ms_now());
+        let now_unix_ms = crate::tui::clock::unix_ms_now();
+        render_home(frame, tui, now_unix_ms);
+        if tui.add_machine_open() {
+            render_add_machine_modal(
+                frame,
+                theme,
+                share,
+                tui.add_machine_joined().as_deref(),
+                crate::tui::render::home::animation_phase(now_unix_ms),
+            );
+        }
         // Home replaces the session chrome but not the question Ctrl+Q asks:
         // `q` opens the same prompt from here, so it has to be drawn here too.
         if tui.quit_open() {

@@ -94,6 +94,9 @@ pub struct MultiPaneTui {
     /// A share-modal copy request. Invite material lives in the node's rendezvous record
     /// rather than in the layout, so the attached client resolves and copies it.
     pub(in crate::tui) pending_share_copy: Option<ShareCopy>,
+    /// Whether the add-machine panel has asked the client to record the
+    /// session's ticket in the pairing file. The TUI owns no filesystem.
+    pub(in crate::tui) pending_pair_offer: bool,
     /// Whether the coordinator is refusing new peers. Mirrored from the node rather than
     /// derived, because only the coordinator knows it and any peer may be drawing it.
     pub(in crate::tui) session_locked: bool,
@@ -146,6 +149,7 @@ impl MultiPaneTui {
             session_locked: false,
             mouse_forwarding: false,
             pending_share_copy: None,
+            pending_pair_offer: false,
         })
     }
 
@@ -182,6 +186,7 @@ impl MultiPaneTui {
                 | ModalState::ConfirmDeleteTab { .. }
                 | ModalState::Share
                 | ModalState::Quit
+                | ModalState::AddMachine(_)
         )
     }
 

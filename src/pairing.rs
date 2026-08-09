@@ -167,6 +167,26 @@ pub fn save(pairing: &Pairing) -> Result<(), PairingError> {
     save_to(&pairing_path()?, pairing)
 }
 
+/// Record the session that machines paired from here will rejoin.
+///
+/// The one write that turns handing out a code into a pairing: without a
+/// ticket, bare `p2pmux` has nothing to rejoin and [`remember_peers`] declines
+/// to record the machines that turn up, so the fleet forgets a machine the
+/// moment it goes to sleep.
+///
+/// It deliberately leaves `accepts_work` alone. That question is asked once,
+/// its answer is default-deny, and a path that never asks it must not answer
+/// it — least of all in the permissive direction.
+pub fn offer(ticket: &str) -> Result<(), PairingError> {
+    let path = pairing_path()?;
+    let mut pairing = load_from(&path)?;
+    if pairing.ticket.as_deref() == Some(ticket) {
+        return Ok(());
+    }
+    pairing.ticket = Some(ticket.to_owned());
+    save_to(&path, &pairing)
+}
+
 /// Record the machines currently in the session, if this machine is paired.
 ///
 /// Called by the node when the member list changes. It is a no-op on a session

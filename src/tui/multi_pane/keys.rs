@@ -80,6 +80,11 @@ impl MultiPaneTui {
         if matches!(self.modal, ModalState::ConfirmDeleteTab { .. }) {
             return self.handle_confirm_delete_tab_key(key);
         }
+        // Above Ctrl+O, so the key that opens the inbox does not walk out from
+        // under a panel that is waiting on another machine to answer.
+        if self.add_machine_open() {
+            return self.handle_add_machine_key(key);
+        }
         // Home, from anywhere — including from inside a live pane, which is the
         // only reason it is claimed this early. `Ctrl+O` is free in shells and
         // transmits in every terminal. `Esc` deliberately is not the way back:

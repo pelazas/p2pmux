@@ -623,8 +623,14 @@ pub fn run_on(
                                 share_code.as_deref(),
                             ));
                         }
+                        if tui.take_pair_offer()
+                            && let Some(ticket) = share_ticket.as_deref()
+                            && let Err(error) = crate::pairing::offer(ticket)
+                        {
+                            share_notice = Some(format!("could not record the pairing: {error}"));
+                        }
                         // The notice belongs to one visit to the modal, not to the session.
-                        if !tui.share_open() {
+                        if !tui.share_open() && !tui.add_machine_open() {
                             share_notice = None;
                         }
                         dirty = true;

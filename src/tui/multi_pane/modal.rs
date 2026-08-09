@@ -6,8 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
     layout::{TabId, normalize_title},
     tui::{
-        KeyHandling, ModalState, MultiPaneTui, QuitAction, RenamePrompt, RenameTarget, ShareCopy,
-        UiIntent,
+        AddMachinePrompt, KeyHandling, ModalState, MultiPaneTui, QuitAction, RenamePrompt,
+        RenameTarget, ShareCopy, UiIntent,
     },
 };
 
@@ -93,6 +93,65 @@ impl MultiPaneTui {
                 self.pending_share_copy = Some(ShareCopy::Ticket);
             }
             KeyCode::Esc if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+            }
+            _ => {}
+        }
+        KeyHandling::Consumed(vec![])
+    }
+
+    /// `a` on the inbox: put up the line the other machine has to run.
+    ///
+    /// The machines already here are remembered so the panel can say which one
+    /// arrived, and the client is asked to record the session's ticket — that
+    /// write is what makes bare `p2pmux` rejoin on both machines afterwards,
+    /// and what lets the node remember the newcomer once it appears.
+    pub(in crate::tui) fn open_add_machine(&mut self) {
+        self.modal = ModalState::AddMachine(AddMachinePrompt {
+            known: crate::tui::home::machine_rows(self)
+                .into_iter()
+                .map(|machine| machine.name)
+                .collect(),
+        });
+        self.pending_pair_offer = true;
+        self.exit_chord_mode();
+    }
+
+    pub fn add_machine_open(&self) -> bool {
+        matches!(self.modal, ModalState::AddMachine(_))
+    }
+
+    /// The machine that has joined since the panel went up, if one has.
+    ///
+    /// Read from the member list rather than from the pairing file: a machine
+    /// that has joined is in the session, and that is the fact the user is
+    /// waiting on. The pairing record catches up a moment later, out of process.
+    pub(in crate::tui) fn add_machine_joined(&self) -> Option<String> {
+        let ModalState::AddMachine(prompt) = &self.modal else {
+            return None;
+        };
+        crate::tui::home::machine_rows(self)
+            .into_iter()
+            .map(|machine| machine.name)
+            .find(|name| !prompt.known.contains(name))
+    }
+
+    /// Takes the request to record the session's ticket in the pairing file.
+    ///
+    /// The TUI never touches the filesystem — the attaching process owns it,
+    /// exactly as it owns the clipboard for [`Self::take_share_copy_request`].
+    pub fn take_pair_offer(&mut self) -> bool {
+        std::mem::take(&mut self.pending_pair_offer)
+    }
+
+    /// `c` copies the line, `Esc` closes. Nothing else: the panel is waiting on
+    /// another machine, and there is no third thing to do while it does.
+    pub(in crate::tui) fn handle_add_machine_key(&mut self, key: KeyEvent) -> KeyHandling {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('c') if key.modifiers.is_empty() => {
+                self.pending_share_copy = Some(ShareCopy::Pair);
+            }
+            KeyCode::Esc | KeyCode::Char('a') if key.modifiers.is_empty() => {
                 self.modal = ModalState::None;
             }
             _ => {}
@@ -595,6 +654,87 @@ mod tests {
 
         let _ = tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
         assert!(!tui.share_open());
+    }
+
+    /// Adding a machine is two halves — the line to run there, and finding out
+    /// whether it worked — and the panel holds both. The second half is the one
+    /// that used to mean going somewhere else.
+    #[test]
+    pub(in crate::tui) fn the_add_machine_panel_shows_the_line_then_reports_the_join() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut tui = crate::tui::test_support::home_tui(&[(
+            "laptop",
+            "claude",
+            crate::protocol::AgentRosterState::Working,
+        )]);
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        tui.set_home_open(true, "test");
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.add_machine_open());
+        assert!(
+            tui.take_pair_offer(),
+            "the session's ticket has to be recorded, or nothing that joins is remembered"
+        );
+        assert!(!tui.take_pair_offer(), "a claimed request is claimed once");
+        assert_eq!(tui.add_machine_joined(), None);
+
+        // `c` copies the pair line rather than the join line: the same code,
+        // but what the machine at the other end does with it is not the same.
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), area);
+        assert_eq!(tui.take_share_copy_request(), Some(ShareCopy::Pair));
+
+        // The machine turns up in the member list, which is the fact the user
+        // is waiting on — the pairing file catches up out of process.
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: b"droplet".to_vec(),
+            endpoint_addr: b"endpoint-droplet".to_vec(),
+            display_name: String::from("droplet"),
+        });
+        assert_eq!(tui.add_machine_joined().as_deref(), Some("droplet"));
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
+        assert!(!tui.add_machine_open());
+    }
+
+    /// The panel is waiting on another machine. A key that walked out from
+    /// under it would leave a dialog owning the keyboard with nothing on
+    /// screen, so it holds every key but the one that ends the session.
+    #[test]
+    pub(in crate::tui) fn the_add_machine_panel_holds_the_keyboard_until_it_is_dismissed() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut tui = crate::tui::test_support::home_tui(&[]);
+        tui.set_home_open(true, "test");
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), area);
+
+        for key in [KeyCode::Char('n'), KeyCode::Char('q'), KeyCode::Down] {
+            assert_eq!(
+                tui.handle_key(KeyEvent::new(key, KeyModifiers::NONE), area),
+                KeyHandling::Consumed(vec![]),
+                "{key:?} must not reach Home while the panel is up"
+            );
+            assert!(tui.add_machine_open());
+        }
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.home_open(), "and never closes the screen underneath it");
+
+        // Ctrl+Q outranks every panel, here as everywhere else.
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                area
+            ),
+            KeyHandling::Quit(QuitAction::Detach)
+        );
     }
 
     #[test]

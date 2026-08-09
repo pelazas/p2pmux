@@ -378,6 +378,13 @@ impl MultiPaneTui {
                     grid_cols,
                 }])
             }
+            KeyCode::Char('a') if key.modifiers.is_empty() => {
+                // Adding a machine used to mean leaving the screen the fleet is
+                // on: `p2pmux pair` in a terminal, then finding out whether it
+                // worked by running something else. Both halves belong here.
+                self.open_add_machine();
+                KeyHandling::Consumed(vec![])
+            }
             // The same question Ctrl+Q asks, asked the same way. Home is the
             // one screen where a bare `q` is free, but it should not be the one
             // screen where leaving skips the prompt.

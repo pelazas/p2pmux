@@ -55,6 +55,8 @@ pub(in crate::tui) const HOME_ROW_NO_HOOKS: &str = "state unknown — no hooks";
 const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
     FooterSegment::Text(" open   "),
+    FooterSegment::Key("a"),
+    FooterSegment::Text(" add machine   "),
     FooterSegment::Key("n"),
     FooterSegment::Text(" new terminal   "),
     FooterSegment::Key("q"),
@@ -74,6 +76,8 @@ const ELAPSED_WIDTH: u16 = 8;
 const RAIL_TEXT_WIDTH: usize = MACHINE_RAIL_WIDTH as usize - 2;
 /// A spacer, the name, and what the machine is doing.
 const RAIL_LINES_PER_MACHINE: usize = 3;
+/// The rule and the key under it, which the fleet never grows into.
+const RAIL_FOOTER_LINES: usize = 2;
 
 pub(in crate::tui) fn render_home(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
     let geometry = tui.geometry(frame.area());
@@ -411,11 +415,14 @@ fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'s
             theme,
         ),
     ];
-    // A spacer and two lines each. A fleet too tall for the rail gives up its
-    // last two lines to a count of what did not fit, because a rail that simply
-    // stopped would be a fleet with machines silently missing from it.
+    // A spacer and two lines each, inside whatever the heading and the key at
+    // the foot leave behind. A fleet too tall for that gives up two more lines
+    // to a count of what did not fit, because a rail that simply stopped would
+    // be a fleet with machines silently missing from it.
     let height = usize::from(height);
-    let body = height.saturating_sub(lines.len());
+    let body = height
+        .saturating_sub(lines.len())
+        .saturating_sub(RAIL_FOOTER_LINES);
     let mut shown = body / RAIL_LINES_PER_MACHINE;
     if shown < machines.len() {
         shown = body.saturating_sub(2) / RAIL_LINES_PER_MACHINE;
@@ -461,6 +468,33 @@ fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'s
             theme,
         ));
     }
+    // The way to add another one, at the foot of the list of the ones you have,
+    // which is where somebody looking at a fleet of one will be looking.
+    while lines.len() + RAIL_FOOTER_LINES < height {
+        lines.push(rail_line(Vec::new(), theme));
+    }
+    lines.push(rail_line(
+        vec![Span::styled(
+            "─".repeat(RAIL_TEXT_WIDTH.saturating_sub(1)),
+            Style::default().fg(theme.agent_overlay_secondary),
+        )],
+        theme,
+    ));
+    lines.push(rail_line(
+        vec![
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(theme.agent_overlay_chrome)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  add a machine",
+                Style::default().fg(theme.agent_overlay_foreground),
+            ),
+        ],
+        theme,
+    ));
     lines
 }
 
@@ -904,6 +938,9 @@ mod tests {
             drawn.contains('│'),
             "the rail hangs off a rule rather than floating: {drawn}"
         );
+        // At the foot of the machines you have, which is where somebody looking
+        // for how to add another one is already looking.
+        assert!(drawn.contains("add a machine"), "{drawn}");
     }
 
     /// A rail with more machines than lines says how many it left out. One that

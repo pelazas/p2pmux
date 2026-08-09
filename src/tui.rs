@@ -57,12 +57,12 @@ pub(crate) use share::share_copy_result;
 pub(crate) use snapshot::{
     LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot, NodeScreenSnapshots,
 };
+pub(in crate::tui) use state::{
+    AddMachinePrompt, Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
+};
 pub use state::{
     AgentOverlayRow, ChordMode, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
     PaneViewState, QuitAction, ShareCopy, ShareView, UiIntent,
-};
-pub(in crate::tui) use state::{
-    Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
 };
 pub(crate) use terminal::clear_before_first_frame;
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
