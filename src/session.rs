@@ -448,10 +448,16 @@ impl LayoutCoordinator {
         {
             return None;
         }
+        // A peer may only report agents in panes it hosts. An agent that is in
+        // no pane — a bot under systemd — is exempt from *that* check and not
+        // from the one that matters: the roster is filed under the peer that
+        // sent it, so a peer can still only ever say what is running on itself.
         if roster.entries.iter().any(|entry| {
-            self.state
-                .pane(entry.pane_id)
-                .is_none_or(|pane| pane.host_peer_id != authenticated_peer_id)
+            entry.pane_id != 0
+                && self
+                    .state
+                    .pane(entry.pane_id)
+                    .is_none_or(|pane| pane.host_peer_id != authenticated_peer_id)
         }) {
             return None;
         }
@@ -1167,9 +1173,14 @@ impl LayoutCoordinator {
                 return false;
             }
             roster.entries.retain(|entry| {
-                self.state
-                    .pane(entry.pane_id)
-                    .is_some_and(|pane| pane.host_peer_id == *host_peer_id)
+                // As on the client: an agent in no pane is a process on that
+                // machine, so it survives every pane and goes when the member
+                // that reported it does — which the check above already does.
+                entry.pane_id == 0
+                    || self
+                        .state
+                        .pane(entry.pane_id)
+                        .is_some_and(|pane| pane.host_peer_id == *host_peer_id)
             });
             true
         });

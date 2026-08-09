@@ -199,7 +199,12 @@ def main() -> int:
         inbox.send("m")
         time.sleep(0.3)
         inbox.key("enter")
-        inbox.wait_for(r"host: mybotvm|mybotvm", timeout=90.0)
+        try:
+            inbox.wait_for(r"host: mybotvm|mybotvm", timeout=90.0)
+        except Exception:
+            print("--- screen when the remote terminal did not arrive ---")
+            print(inbox.snapshot())
+            raise
         step("a pane opened, hosted by the droplet")
         inbox.run_in_shell("hostname")
         screen = inbox.wait_for(r"mybotvm", timeout=60.0)

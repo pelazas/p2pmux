@@ -202,6 +202,12 @@ pub(in crate::tui) struct PendingCreate {
     /// The name of the machine it was asked for on, so a refusal can say which
     /// machine refused. Empty when the pane is being opened here.
     pub(in crate::tui) target_name: String,
+    /// The machine it was asked for on. Empty when that is this one.
+    ///
+    /// Kept because a pane opened elsewhere arrives as a layout commit rather
+    /// than as something this process spawned, and the tab it landed on is
+    /// still the tab the person who asked wants to be looking at.
+    pub(in crate::tui) target_peer: Vec<u8>,
 }
 /// Pure retry state for direct remote-pane subscriptions. Ticks are supplied by the UI drain
 /// loop, which keeps retry behavior deterministic in tests and prevents a failed connect from

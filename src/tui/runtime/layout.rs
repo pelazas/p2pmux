@@ -124,10 +124,14 @@ impl SharedLayoutRuntime {
         let prior_revision = self.tui.snapshot().revision;
         self.agent_rosters.retain(|host, roster| {
             roster.entries.retain(|entry| {
-                snapshot
-                    .panes
-                    .get(&entry.pane_id)
-                    .is_some_and(|pane| pane.host_peer_id == *host)
+                // An agent in no pane outlives every pane: it is a process on
+                // that machine, and it stops being listed when that machine
+                // stops reporting it or leaves.
+                entry.pane_id == 0
+                    || snapshot
+                        .panes
+                        .get(&entry.pane_id)
+                        .is_some_and(|pane| pane.host_peer_id == *host)
             });
             snapshot
                 .members
@@ -175,6 +179,34 @@ impl SharedLayoutRuntime {
                 && let Some(pane) = self.remote.remove(&pane_id)
             {
                 self.spawn_remote_shutdown(pane.pane);
+            }
+        }
+        // A terminal asked for on another machine arrives as a commit rather
+        // than as something this process spawned, so this is where the person
+        // who asked for it gets taken to it. Without this, pressing enter on a
+        // machine created a tab somewhere off screen and looked like nothing
+        // happened at all.
+        if let Some(pending) = self
+            .pending_create
+            .as_ref()
+            .filter(|pending| !pending.hosted_here && !pending.target_peer.is_empty())
+        {
+            let target = pending.target_peer.clone();
+            let arrived = snapshot
+                .panes
+                .values()
+                .filter(|pane| pane.host_peer_id == target && !pane.exited)
+                .map(|pane| pane.pane_id)
+                .find(|pane_id| !self.tui.snapshot().panes.contains_key(pane_id));
+            if let Some(pane_id) = arrived {
+                self.pending_create = None;
+                if let Some(tab) = snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| crate::tui::geometry::contains_leaf(&tab.root, pane_id))
+                {
+                    self.tui.select_created_tab(tab.tab_id);
+                }
             }
         }
         let previously_focused = self.tui.focused_pane();
@@ -570,6 +602,7 @@ impl SharedLayoutRuntime {
             command: command.clone(),
             hosted_here,
             target_name,
+            target_peer: target.clone(),
         });
         self.send_request(LayoutRequest {
             request_id,
@@ -705,6 +738,7 @@ impl SharedLayoutRuntime {
                 command: reservation.command.clone(),
                 hosted_here: true,
                 target_name: String::new(),
+                target_peer: Vec::new(),
             },
         };
         if pending.request_id == 0 || pending.grid_rows == 0 || pending.grid_cols == 0 {
