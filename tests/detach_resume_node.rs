@@ -123,7 +123,14 @@ fn run_detach_resume_round_trip(
     descriptor: &SessionDescriptor,
     child: &mut NodeChild,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous, because what is being waited on is a debug-build node binding
+    // an iroh endpoint on a machine that may be running several other test
+    // binaries at once. Five seconds was enough on a quiet laptop and not on a
+    // loaded CI runner, where this failed with the node still running and its
+    // stderr empty — the shape of a deadline that is too short rather than of
+    // anything being wrong. A node that has actually died still fails
+    // immediately, because that is checked on every pass round the loop.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !socket_path.exists() && Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
             panic!("node exited before creating its socket: {status}");
@@ -223,7 +230,9 @@ fn run_detach_resume_round_trip(
     client::shutdown(descriptor).unwrap();
     drop(reader);
     drop(_stream);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Same reasoning as the startup wait above: a shutdown that is merely slow
+    // must not read as a shutdown that never happened.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
