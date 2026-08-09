@@ -61,7 +61,7 @@ pub(in crate::tui) use state::{
     AddMachinePrompt, Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
 };
 pub use state::{
-    AgentOverlayRow, ChordMode, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
+    AgentOverlayRow, ChordMode, HomeRowId, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
     PaneViewState, QuitAction, ShareCopy, ShareView, UiIntent,
 };
 pub(crate) use terminal::clear_before_first_frame;

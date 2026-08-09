@@ -70,7 +70,7 @@ pub struct MultiPaneTui {
     ///
     /// Local to this client and never replicated: see [`crate::tui::home`].
     pub(in crate::tui) home_open: bool,
-    pub(in crate::tui) home_selected: Option<PaneId>,
+    pub(in crate::tui) home_selected: Option<crate::tui::HomeRowId>,
     /// Which machine the cursor is on, when it is on the fleet rather than on
     /// the agents.
     ///
@@ -85,6 +85,12 @@ pub struct MultiPaneTui {
     /// are about the screen you are still looking at — which machine is asleep,
     /// which one is not yours — and the reader has not gone anywhere.
     pub(in crate::tui) home_notice: Option<String>,
+    /// The area Home was last measured against.
+    ///
+    /// Kept so that a key handler which decides to open a terminal can size it
+    /// without being handed the screen again through three call sites that have
+    /// no other use for it.
+    pub(in crate::tui) last_home_area: Rect,
     /// Which page of the agent list is drawn. Derived from the selection
     /// everywhere except the wheel, which moves both.
     pub(in crate::tui) home_page: usize,
@@ -158,6 +164,7 @@ impl MultiPaneTui {
             home_selected: None,
             home_machine: None,
             home_notice: None,
+            last_home_area: Rect::new(0, 0, 80, 24),
             home_page: 0,
             home_page_size: crate::tui::home::HOME_PAGE_MAX,
             zoomed_pane: None,

@@ -472,10 +472,21 @@ impl SharedLayoutRuntime {
             let now = Instant::now();
             // One scan for the whole session, not one per pane.
             let scan = AgentScan::new(&snapshot);
+            let mut pane_roots = Vec::new();
             for pane in self.local.values_mut() {
                 if !pane.exited {
                     changed |= pane.apply_agent_snapshot(&scan, now);
+                    pane_roots.extend(pane.session_child_pid());
                 }
+            }
+            // The same scan, asked the other question: which agents on this
+            // machine are in none of those trees. That is a bot under systemd,
+            // which is how both assistant agents are meant to run and the one
+            // shape the inbox could not see.
+            let loose = scan.loose_agents(&pane_roots);
+            if loose != self.loose_agents {
+                self.loose_agents = loose;
+                changed = true;
             }
         }
         changed |= self.publish_local_agent_roster();

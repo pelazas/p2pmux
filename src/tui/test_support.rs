@@ -78,6 +78,7 @@ pub(in crate::tui) fn agent_row(
     AgentOverlayRow {
         message: String::new(),
         pane_id,
+        process_pid: 0,
         tab_ordinal,
         pane_ordinal,
         tab_label: format!("Tab #{tab_ordinal}"),

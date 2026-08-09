@@ -129,7 +129,10 @@ pub struct MouseHandling {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentOverlayRow {
+    /// The pane this agent runs in, or `0` for one running outside p2pmux.
     pub pane_id: PaneId,
+    /// The agent's own process, for a row with no pane. `0` otherwise.
+    pub process_pid: u32,
     pub tab_ordinal: usize,
     pub pane_ordinal: usize,
     pub tab_label: String,
@@ -144,6 +147,36 @@ pub struct AgentOverlayRow {
     /// machine — a peer's node strips it before publishing, so a remote row's is
     /// always empty.
     pub message: String,
+}
+
+impl AgentOverlayRow {
+    /// What identifies this row to the cursor.
+    ///
+    /// The inbox used to key its selection on a pane id, which was fine while
+    /// every agent lived in a pane. An agent running under systemd has no pane,
+    /// so identity has to be the pair that is unique either way: which machine,
+    /// and which pane or process on it.
+    pub(in crate::tui) fn row_id(&self) -> HomeRowId {
+        HomeRowId {
+            host: self.host.clone(),
+            pane_id: self.pane_id,
+            process_pid: self.process_pid,
+        }
+    }
+
+    /// Whether this agent is reachable only by starting its own chat command,
+    /// rather than by jumping to a pane p2pmux already owns.
+    pub(in crate::tui) fn outside_p2pmux(&self) -> bool {
+        self.pane_id == 0
+    }
+}
+
+/// The identity of one inbox row. See [`AgentOverlayRow::row_id`].
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HomeRowId {
+    pub host: String,
+    pub pane_id: PaneId,
+    pub process_pid: u32,
 }
 /// A machine this one is paired with.
 ///

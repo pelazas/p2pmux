@@ -179,6 +179,7 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
         NodeMessage::Rosters {
             rosters: vec![AgentOverlaySnapshotRow {
                 pane_id: 1,
+                process_pid: 0,
                 kind: "agent".into(),
                 cwd: "/tmp".into(),
                 state: 1,

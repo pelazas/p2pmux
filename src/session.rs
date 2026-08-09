@@ -4907,6 +4907,7 @@ mod control_queue_tests {
                 generation,
                 entries: vec![AgentRosterEntry {
                     pane_id: 1,
+                    process_pid: 0,
                     agent_kind: String::from("codex"),
                     cwd: String::from("/repo"),
                     state: AgentRosterState::Working as i32,

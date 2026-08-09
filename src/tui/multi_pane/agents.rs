@@ -16,6 +16,12 @@ use crate::{
 impl MultiPaneTui {
     pub fn set_agent_rows(&mut self, mut rows: Vec<AgentOverlayRow>) -> bool {
         rows.retain_mut(|row| {
+            // An agent running outside p2pmux has no pane to be located in, and
+            // dropping it here is exactly how a bot under systemd stayed
+            // invisible. Its labels came from whoever built the row.
+            if row.outside_p2pmux() {
+                return true;
+            }
             let Some((tab_ordinal, pane_ordinal)) = self.pane_location(row.pane_id) else {
                 return false;
             };
@@ -36,7 +42,14 @@ impl MultiPaneTui {
                 .unwrap_or_else(|| format!("Pane #{pane_ordinal}"));
             true
         });
-        rows.sort_by_key(|row| (row.tab_ordinal, row.pane_ordinal, row.pane_id));
+        rows.sort_by_key(|row| {
+            (
+                row.tab_ordinal,
+                row.pane_ordinal,
+                row.pane_id,
+                row.process_pid,
+            )
+        });
         if self.agent_rows == rows {
             return false;
         }

@@ -228,6 +228,10 @@ pub enum NodeMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentOverlaySnapshotRow {
     pub pane_id: u64,
+    /// The agent's own process, for a row with no pane. See
+    /// [`crate::tui::AgentOverlayRow::row_id`].
+    #[serde(default)]
+    pub process_pid: u32,
     pub kind: String,
     pub cwd: String,
     pub state: i32,
@@ -247,6 +251,7 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
     fn from(row: &crate::tui::AgentOverlayRow) -> Self {
         Self {
             pane_id: row.pane_id,
+            process_pid: row.process_pid,
             kind: row.kind.clone(),
             cwd: row.cwd.clone(),
             state: row.state as i32,

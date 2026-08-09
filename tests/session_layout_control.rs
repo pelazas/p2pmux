@@ -227,6 +227,7 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
             generation: 1,
             entries: vec![AgentRosterEntry {
                 pane_id: reservation.pane_id,
+                process_pid: 0,
                 agent_kind: String::from("codex"),
                 cwd: String::from("/repo"),
                 state: AgentRosterState::Working as i32,

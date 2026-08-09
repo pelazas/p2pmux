@@ -271,6 +271,11 @@ impl SharedLocalPane {
         })
     }
 
+    /// The pty's own child, which roots this pane's process tree.
+    pub(in crate::tui) fn session_child_pid(&self) -> Option<u32> {
+        self.host.process_id()
+    }
+
     pub(in crate::tui) fn apply_agent_snapshot(
         &mut self,
         scan: &AgentScan<'_>,
@@ -295,6 +300,7 @@ impl SharedLocalPane {
         let listed = self.agent_tracker.listed_agent()?;
         Some(AgentRosterEntry {
             pane_id: self.pane_id,
+            process_pid: 0,
             agent_kind: listed.agent.kind.wire_value().into(),
             cwd: listed.agent.cwd,
             state: roster_state(listed.state) as i32,

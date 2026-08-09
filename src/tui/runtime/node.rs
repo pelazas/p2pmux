@@ -135,17 +135,6 @@ impl SharedLayoutRuntime {
     /// This is what makes `p2pmux machines` able to answer "is that machine
     /// awake" without attaching to the session. Only the node knows, and only
     /// the node is always running.
-    /// What another machine of yours is waiting to be allowed to start here.
-    ///
-    /// The node holds the request; the attached client is what can ask a human
-    /// about it. `None` when nothing is held, which also retracts a question
-    /// that has since been answered or expired.
-    pub(crate) fn pending_remote_work(&self) -> Option<Vec<String>> {
-        self.pending_remote
-            .as_ref()
-            .map(|(_, pending)| pending.command.clone())
-    }
-
     pub(crate) fn session_peers(&self) -> Vec<crate::session_store::SessionPeer> {
         let local = self.local_peer_id();
         let members = &self.tui.snapshot().members;
@@ -179,6 +168,17 @@ impl SharedLayoutRuntime {
                 }
             })
             .collect()
+    }
+
+    /// What another machine of yours is waiting to be allowed to start here.
+    ///
+    /// The node holds the request; the attached client is what can ask a human
+    /// about it. `None` when nothing is held, which also retracts a question
+    /// that has since been answered or expired.
+    pub(crate) fn pending_remote_work(&self) -> Option<Vec<String>> {
+        self.pending_remote
+            .as_ref()
+            .map(|(_, pending)| pending.command.clone())
     }
 
     pub(crate) fn node_local_scrollback(&self, pane_id: PaneId) -> Option<LocalScrollbackWindow> {
@@ -306,12 +306,32 @@ impl SharedLayoutRuntime {
 
     pub(in crate::tui) fn publish_local_agent_roster(&mut self) -> bool {
         let now = Instant::now();
-        let entries = self
+        let mut entries = self
             .local
             .values()
             .filter(|pane| !pane.exited)
             .filter_map(crate::tui::SharedLocalPane::agent_roster_entry)
             .collect::<Vec<_>>();
+        // The agents nobody started in a pane go out on the same roster, keyed
+        // by their own process because they have no pane to be keyed by. State
+        // is `Unknown` and stays that way: these agents have no p2pmux hooks,
+        // and the row says "running, and I cannot tell you more" rather than
+        // inventing an answer from how quiet the process is.
+        entries.extend(
+            self.loose_agents
+                .iter()
+                .map(|agent| crate::protocol::AgentRosterEntry {
+                    pane_id: 0,
+                    process_pid: agent.pid,
+                    agent_kind: String::from(agent.kind.wire_value()),
+                    cwd: truncate_bytes(
+                        sanitize_single_line(&agent.cwd),
+                        crate::protocol::MAX_AGENT_CWD_BYTES,
+                    ),
+                    state: AgentRosterState::Unknown as i32,
+                    working_since_unix_ms: 0,
+                }),
+        );
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
             return false;
         }
@@ -395,64 +415,101 @@ impl SharedLayoutRuntime {
                 })
                 .collect::<BTreeMap<_, _>>();
         self.agent_rosters
-            .values()
-            .flat_map(|roster| {
-                roster.entries.iter().filter_map(|entry| {
-                    let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
-                    if pane.exited {
-                        return None;
-                    }
-                    let view = self.tui.pane_view(entry.pane_id)?;
-                    let &(tab_ordinal, pane_ordinal) = pane_locations.get(&entry.pane_id)?;
-                    let tab = self
-                        .tui
-                        .snapshot()
-                        .tabs
-                        .iter()
-                        .find(|tab| contains_leaf(&tab.root, entry.pane_id))?;
-                    let host = sanitize_single_line(&member_label(
-                        &pane.host_peer_id,
-                        &self.tui.snapshot().members,
-                    ));
-                    let controller = view
-                        .controller_peer_id
-                        .as_deref()
-                        .filter(|id| !id.is_empty())
-                        .map(|id| {
-                            sanitize_single_line(&member_label(id, &self.tui.snapshot().members))
-                        })
-                        .unwrap_or_else(|| String::from("free"));
-                    Some(AgentOverlayRow {
-                        pane_id: entry.pane_id,
-                        tab_ordinal,
-                        pane_ordinal,
-                        tab_label: tab
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| format!("Tab #{tab_ordinal}")),
-                        pane_label: pane
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| format!("Pane #{pane_ordinal}")),
-                        kind: sanitize_single_line(&entry.agent_kind),
-                        cwd: sanitize_single_line(&entry.cwd),
-                        state: AgentRosterState::from_wire(entry.state),
-                        working_since_unix_ms: entry.working_since_unix_ms,
-                        host,
-                        controller,
-                        // Read from the pane rather than the roster entry, and
-                        // so only ever present for a pane this node hosts: the
-                        // roster is the peer-facing shape and has no field for
-                        // it. A member's agent reports its message to its own
-                        // node, where it stays.
-                        message: self
-                            .local
-                            .get(&entry.pane_id)
-                            .and_then(crate::tui::SharedLocalPane::listed_agent)
-                            .map(|listed| listed.message)
-                            .unwrap_or_default(),
+            .iter()
+            .flat_map(|(host_peer_id, roster)| {
+                let loose = roster
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.pane_id == 0)
+                    .map(|entry| {
+                        // An agent nobody started in a pane. There is no tab,
+                        // no pane and nobody holding it, and the row says so
+                        // with dashes rather than inventing a location.
+                        AgentOverlayRow {
+                            pane_id: 0,
+                            process_pid: entry.process_pid,
+                            tab_ordinal: 0,
+                            pane_ordinal: 0,
+                            tab_label: String::from("—"),
+                            pane_label: String::from("not in p2pmux"),
+                            kind: sanitize_single_line(&entry.agent_kind),
+                            cwd: sanitize_single_line(&entry.cwd),
+                            state: AgentRosterState::from_wire(entry.state),
+                            working_since_unix_ms: entry.working_since_unix_ms,
+                            host: sanitize_single_line(&member_label(
+                                host_peer_id,
+                                &self.tui.snapshot().members,
+                            )),
+                            controller: String::from("—"),
+                            message: String::new(),
+                        }
                     })
-                })
+                    .collect::<Vec<_>>();
+                roster
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let pane = self.tui.snapshot().panes.get(&entry.pane_id)?;
+                        if pane.exited {
+                            return None;
+                        }
+                        let view = self.tui.pane_view(entry.pane_id)?;
+                        let &(tab_ordinal, pane_ordinal) = pane_locations.get(&entry.pane_id)?;
+                        let tab = self
+                            .tui
+                            .snapshot()
+                            .tabs
+                            .iter()
+                            .find(|tab| contains_leaf(&tab.root, entry.pane_id))?;
+                        let host = sanitize_single_line(&member_label(
+                            &pane.host_peer_id,
+                            &self.tui.snapshot().members,
+                        ));
+                        let controller = view
+                            .controller_peer_id
+                            .as_deref()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| {
+                                sanitize_single_line(&member_label(
+                                    id,
+                                    &self.tui.snapshot().members,
+                                ))
+                            })
+                            .unwrap_or_else(|| String::from("free"));
+                        Some(AgentOverlayRow {
+                            pane_id: entry.pane_id,
+                            process_pid: 0,
+                            tab_ordinal,
+                            pane_ordinal,
+                            tab_label: tab
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| format!("Tab #{tab_ordinal}")),
+                            pane_label: pane
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| format!("Pane #{pane_ordinal}")),
+                            kind: sanitize_single_line(&entry.agent_kind),
+                            cwd: sanitize_single_line(&entry.cwd),
+                            state: AgentRosterState::from_wire(entry.state),
+                            working_since_unix_ms: entry.working_since_unix_ms,
+                            host,
+                            controller,
+                            // Read from the pane rather than the roster entry, and
+                            // so only ever present for a pane this node hosts: the
+                            // roster is the peer-facing shape and has no field for
+                            // it. A member's agent reports its message to its own
+                            // node, where it stays.
+                            message: self
+                                .local
+                                .get(&entry.pane_id)
+                                .and_then(crate::tui::SharedLocalPane::listed_agent)
+                                .map(|listed| listed.message)
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .chain(loose)
+                    .collect::<Vec<_>>()
             })
             .collect()
     }

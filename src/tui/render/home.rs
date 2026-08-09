@@ -185,7 +185,7 @@ fn render_home_in(
                     format_home_card(
                         row,
                         card,
-                        tui.home_selected == Some(row.pane_id),
+                        tui.home_selected.as_ref() == Some(&row.row_id()),
                         layout.rows.width,
                         now_unix_ms,
                         animation_phase,
@@ -394,8 +394,17 @@ pub(in crate::tui) fn format_home_card(
 }
 
 /// `~/work/p2pmux · tab 2 · pane 1` — where the agent is, and where Enter goes.
+///
+/// An agent p2pmux did not start has no tab and no pane to name, and Enter
+/// there does something different: it opens a terminal on that agent's machine
+/// and runs its chat command. The line says which of the two it is looking at,
+/// because the rest of the card cannot be told apart.
 fn home_location(row: &AgentOverlayRow, cwd_already_shown: bool) -> String {
-    let where_it_runs = format!("tab {} · pane {}", row.tab_ordinal, row.pane_ordinal);
+    let where_it_runs = if row.outside_p2pmux() {
+        String::from("running outside p2pmux · enter opens a chat")
+    } else {
+        format!("tab {} · pane {}", row.tab_ordinal, row.pane_ordinal)
+    };
     if cwd_already_shown || row.cwd.is_empty() {
         return where_it_runs;
     }

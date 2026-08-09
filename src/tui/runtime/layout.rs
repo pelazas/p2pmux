@@ -779,6 +779,17 @@ impl SharedLayoutRuntime {
             }
             Some(CoordinatorResponse::Reservation(_)) | None => {}
         }
+        // A pane started to run something specific says so in its title, and
+        // this machine is the only peer allowed to name it — the layout lets a
+        // pane's host rename it and nobody else. That title is what makes
+        // pressing Enter on the same agent twice find the pane instead of
+        // opening a second one.
+        if !pending.command.is_empty() {
+            self.handle_intent(UiIntent::RenamePane {
+                pane_id: reservation.pane_id,
+                title: crate::tui::home::chat_pane_title(&pending.command),
+            })?;
+        }
         Ok(())
     }
 

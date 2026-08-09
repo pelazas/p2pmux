@@ -427,6 +427,7 @@ fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
         generation: 1,
         entries: vec![AgentRosterEntry {
             pane_id: 1,
+            process_pid: 0,
             agent_kind: String::from("codex"),
             cwd: String::from("/forged"),
             state: AgentRosterState::Working as i32,
@@ -443,6 +444,7 @@ fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
                 generation: 1,
                 entries: vec![AgentRosterEntry {
                     pane_id: 1,
+                    process_pid: 0,
                     agent_kind: String::from("codex"),
                     cwd: String::from("/repo"),
                     state: AgentRosterState::Working as i32,

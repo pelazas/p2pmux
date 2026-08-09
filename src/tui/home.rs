@@ -21,8 +21,20 @@ use ratatui::layout::Rect;
 use crate::{
     layout::PaneId,
     protocol::AgentRosterState,
-    tui::{AgentOverlayRow, ModalState, MultiPaneTui, UiIntent, debug_log::ui_debug_log},
+    tui::{
+        AgentOverlayRow, HomeRowId, ModalState, MultiPaneTui, UiIntent, debug_log::ui_debug_log,
+    },
 };
+
+/// The title a chat pane carries, so that pressing Enter twice finds it.
+///
+/// The pane's own machine sets it, because that machine is the pane's host and
+/// the only peer the layout lets rename it. Everybody else reads it, which is
+/// what makes "is there already a chat open with that bot" answerable without
+/// asking every peer what its panes are running.
+pub(in crate::tui) fn chat_pane_title(command: &[String]) -> String {
+    format!("chat: {}", command.join(" "))
+}
 
 /// Where a state sorts in the inbox. Higher comes first.
 ///
@@ -131,13 +143,14 @@ impl MultiPaneTui {
         let rows = self
             .home_rows()
             .into_iter()
-            .map(|row| row.pane_id)
+            .map(AgentOverlayRow::row_id)
             .collect::<Vec<_>>();
         if self
             .home_selected
-            .is_none_or(|pane_id| !rows.contains(&pane_id))
+            .as_ref()
+            .is_none_or(|selected| !rows.contains(selected))
         {
-            self.home_selected = rows.first().copied();
+            self.home_selected = rows.first().cloned();
         }
         self.clamp_home_page();
         self.ensure_home_selection_visible();
@@ -151,6 +164,7 @@ impl MultiPaneTui {
     /// Tell Home how many agents fit on a page, from the whole terminal rather
     /// than from a count the caller had to work out for itself.
     pub fn set_home_viewport_for(&mut self, area: Rect) {
+        self.last_home_area = area;
         let rows = home_layout(self.geometry(area).content, self).rows.height;
         self.set_home_viewport(home_page_size(rows));
     }
@@ -176,7 +190,7 @@ impl MultiPaneTui {
             self.home_selected = self
                 .home_rows()
                 .get(self.home_page.saturating_mul(self.home_page_size.max(1)))
-                .map(|row| row.pane_id);
+                .map(|row| row.row_id());
             return true;
         }
         false
@@ -200,7 +214,7 @@ impl MultiPaneTui {
         self.home_selected = self
             .home_rows()
             .get(self.home_page_start())
-            .map(|row| row.pane_id);
+            .map(|row| row.row_id());
         true
     }
 
@@ -232,14 +246,19 @@ impl MultiPaneTui {
         row: u16,
         area: Rect,
     ) -> Vec<UiIntent> {
-        let Some(pane_id) = self.home_row_at(column, row, area) else {
+        let Some(clicked) = self.home_row_at(column, row, area) else {
             return Vec::new();
         };
-        self.home_selected = Some(pane_id);
-        self.enter_pane_from_home(pane_id)
+        self.home_selected = Some(clicked);
+        self.open_home_selection()
     }
 
-    pub(in crate::tui) fn home_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
+    pub(in crate::tui) fn home_row_at(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<HomeRowId> {
         let layout = home_layout(self.geometry(area).content, self);
         if !crate::tui::geometry::rect_contains(layout.rows, column, row) {
             return None;
@@ -250,7 +269,7 @@ impl MultiPaneTui {
         // is the one the pointer looks like it is on.
         self.home_rows()
             .get(self.home_page_start().saturating_add(line / card))
-            .map(|row| row.pane_id)
+            .map(|row| row.row_id())
     }
 
     pub(in crate::tui) fn clamp_home_page(&mut self) {
@@ -264,10 +283,10 @@ impl MultiPaneTui {
     /// stayed put while the cursor walked off it would be a screen showing
     /// agents nobody chose.
     pub(in crate::tui) fn ensure_home_selection_visible(&mut self) {
-        let Some(index) = self.home_selected.and_then(|pane_id| {
+        let Some(index) = self.home_selected.as_ref().and_then(|selected| {
             self.home_rows()
                 .iter()
-                .position(|row| row.pane_id == pane_id)
+                .position(|row| row.row_id() == *selected)
         }) else {
             return;
         };
@@ -279,7 +298,7 @@ impl MultiPaneTui {
         let rows = self
             .home_rows()
             .into_iter()
-            .map(|row| row.pane_id)
+            .map(AgentOverlayRow::row_id)
             .collect::<Vec<_>>();
         if rows.is_empty() {
             self.home_selected = None;
@@ -287,14 +306,15 @@ impl MultiPaneTui {
         }
         let current = self
             .home_selected
-            .and_then(|pane_id| rows.iter().position(|id| *id == pane_id))
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|id| id == selected))
             .unwrap_or(0);
         let next = if forward {
             (current + 1) % rows.len()
         } else {
             (current + rows.len() - 1) % rows.len()
         };
-        self.home_selected = Some(rows[next]);
+        self.home_selected = Some(rows[next].clone());
         self.ensure_home_selection_visible();
     }
 
@@ -384,11 +404,110 @@ impl MultiPaneTui {
     /// of the tab appeared a beat later unasked — which reads as a glitch, not
     /// as a choice. `Ctrl+P` then `z` is still there for anyone who wants the
     /// pane alone on screen, now as something the user asks for.
+    /// An agent running outside p2pmux has no pane to land in, so Enter opens
+    /// one: a terminal on that agent's own machine, running that agent's chat
+    /// command. See [`Self::open_chat_with_selected_agent`].
     pub(in crate::tui) fn open_home_selection(&mut self) -> Vec<UiIntent> {
-        let Some(pane_id) = self.home_selected else {
+        let Some(selected) = self.home_selected.clone() else {
             return Vec::new();
         };
-        self.enter_pane_from_home(pane_id)
+        if selected.pane_id == 0 {
+            return self.open_chat_with_selected_agent(&selected);
+        }
+        self.enter_pane_from_home(selected.pane_id)
+    }
+
+    /// Enter on an agent p2pmux did not start.
+    ///
+    /// Three things have to be true before a pane is asked for, and each has
+    /// its own sentence when it is not:
+    ///
+    /// - p2pmux has to know how to talk to that agent at all. Some have no
+    ///   client to run, and the row says so rather than doing nothing.
+    /// - the machine has to be one of yours and in the session, which is
+    ///   [`Self::open_terminal_on_selected_machine`]'s question too.
+    /// - the user has to be told **which** of the three things this is about to
+    ///   do. Opening a brand-new conversation while implying you joined the
+    ///   running one is the single outcome worth going out of the way to avoid,
+    ///   so the notice is written before the request goes out and names the
+    ///   difference in words.
+    ///
+    /// Pressing Enter twice does not leave two chat panes: a pane already
+    /// running that agent's chat command on that machine is focused instead.
+    fn open_chat_with_selected_agent(&mut self, selected: &HomeRowId) -> Vec<UiIntent> {
+        let Some(row) = self
+            .agent_rows
+            .iter()
+            .find(|row| row.row_id() == *selected)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let Some(kind) = crate::agent_detect::AgentKind::from_wire(&row.kind) else {
+            self.home_notice = Some(format!(
+                "p2pmux does not know how to open a chat with {}",
+                row.kind
+            ));
+            return Vec::new();
+        };
+        let chat = kind.chat();
+        if chat.access == crate::agent_detect::ChatAccess::None {
+            self.home_notice = Some(format!(
+                "{}: {}",
+                kind.display_label(),
+                chat.access.describe()
+            ));
+            return Vec::new();
+        }
+        let command = chat
+            .command
+            .iter()
+            .map(|part| String::from(*part))
+            .collect::<Vec<_>>();
+        // Already open: focus it rather than starting a second one. Matched on
+        // the machine and the command, which is what "a chat with that bot"
+        // means when the pane has no other identity.
+        if let Some(existing) = self.chat_pane_for(&row.host, &command) {
+            return self.enter_pane_from_home(existing);
+        }
+        let Some(index) = machine_rows(self)
+            .iter()
+            .position(|machine| machine.name == row.host)
+        else {
+            self.home_notice = Some(format!("{} is not in this session", row.host));
+            return Vec::new();
+        };
+        self.home_machine = Some(index);
+        let intents = self.open_terminal_on_selected_machine(self.last_home_area, command);
+        self.home_machine = None;
+        if !intents.is_empty() {
+            // Said before it happens, and it names which of the three this is.
+            self.home_notice = Some(format!(
+                "{} on {}: {}",
+                kind.display_label(),
+                row.host,
+                chat.access.describe()
+            ));
+        }
+        intents
+    }
+
+    /// A pane on `host` already running `command`, if there is one.
+    ///
+    /// Titles are what a pane carries across machines, so that is what this
+    /// matches on — the alternative would be asking every peer what its panes
+    /// are running, which is a question the layout deliberately does not carry.
+    fn chat_pane_for(&self, host: &str, command: &[String]) -> Option<PaneId> {
+        let title = chat_pane_title(command);
+        self.snapshot
+            .panes
+            .values()
+            .find(|pane| {
+                pane.title.as_deref() == Some(title.as_str())
+                    && !pane.exited
+                    && crate::tui::member_label(&pane.host_peer_id, &self.snapshot.members) == host
+            })
+            .map(|pane| pane.pane_id)
     }
 
     pub(in crate::tui) fn enter_pane_from_home(&mut self, pane_id: PaneId) -> Vec<UiIntent> {
@@ -884,8 +1003,8 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, home_card, home_layout,
-        home_page_size, machine_rows,
+        HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, chat_pane_title, home_card,
+        home_layout, home_page_size, machine_rows,
     };
     use crate::{
         layout::{Axis, Node, Tab},
@@ -895,6 +1014,14 @@ mod tests {
             test_support::{agent_row, home_tui, layout},
         },
     };
+
+    /// The pane the cursor is on, for the tests that predate rows without one.
+    fn selected_pane(tui: &MultiPaneTui) -> Option<crate::layout::PaneId> {
+        tui.home_selected
+            .as_ref()
+            .map(|selected| selected.pane_id)
+            .filter(|pane_id| *pane_id != 0)
+    }
 
     const AREA: Rect = Rect {
         x: 0,
@@ -1093,13 +1220,13 @@ mod tests {
         ]);
         tui.set_home_open(true, "test");
         // Sorted, the blocked desktop row is first, so the cursor starts there.
-        assert_eq!(tui.home_selected, Some(2));
+        assert_eq!(selected_pane(&tui), Some(2));
 
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA),
             KeyHandling::Consumed(vec![])
         );
-        assert_eq!(tui.home_selected, Some(1));
+        assert_eq!(selected_pane(&tui), Some(1));
 
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA),
@@ -1286,11 +1413,12 @@ mod tests {
         assert_eq!(tui.home_page_count(), 2);
         assert_eq!(tui.home_page(), 0);
 
-        let first = tui.home_selected.expect("a cursor on arrival");
+        let first = selected_pane(&tui);
+        assert!(first.is_some(), "a cursor on arrival");
         tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
         assert_eq!(tui.home_page(), 1);
         assert_eq!(
-            tui.home_selected,
+            selected_pane(&tui),
             tui.home_rows().get(page_size).map(|row| row.pane_id),
             "the cursor lands on the first agent of the page it arrives at"
         );
@@ -1298,7 +1426,7 @@ mod tests {
         // Two pages, so `l` wraps back rather than stopping at the end.
         tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
         assert_eq!(tui.home_page(), 0);
-        assert_eq!(tui.home_selected, Some(first));
+        assert_eq!(selected_pane(&tui), first);
 
         tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), AREA);
         assert_eq!(tui.home_page(), 1);
@@ -1315,7 +1443,7 @@ mod tests {
         }
         assert_eq!(tui.home_page(), 1);
         assert_eq!(
-            tui.home_selected,
+            selected_pane(&tui),
             tui.home_rows().get(page_size).map(|row| row.pane_id)
         );
 
@@ -1347,7 +1475,7 @@ mod tests {
         let rows = tui
             .home_rows()
             .into_iter()
-            .map(|row| row.pane_id)
+            .map(crate::tui::AgentOverlayRow::row_id)
             .collect::<Vec<_>>();
         let list = home_layout(tui.geometry(AREA).content, &tui).rows;
         assert_eq!(home_card(list.height), HomeCard::Full);
@@ -1355,13 +1483,13 @@ mod tests {
         for line in 0..HomeCard::Full.lines() as u16 {
             assert_eq!(
                 tui.home_row_at(2, list.y + line, AREA),
-                Some(rows[0]),
+                Some(rows[0].clone()),
                 "line {line} of the first card belongs to it"
             );
         }
         assert_eq!(
             tui.home_row_at(2, list.y + HomeCard::Full.lines() as u16, AREA),
-            Some(rows[1])
+            Some(rows[1].clone())
         );
         // The rail is not the list, and a click on it opens nothing.
         assert_eq!(tui.home_row_at(AREA.width - 2, list.y, AREA), None);
@@ -1414,7 +1542,7 @@ mod tests {
         ]);
         tui.set_home_open(true, "test");
         tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
-        let moved = tui.home_selected.expect("a row is selected");
+        let moved = selected_pane(&tui).expect("a row is selected");
         tui.set_home_open(false, "test");
 
         // A blocked agent appears while the user is elsewhere -- and it is not
@@ -1428,9 +1556,9 @@ mod tests {
         tui.set_agent_rows(rows);
         tui.set_home_open(true, "test");
 
-        assert_ne!(tui.home_selected, Some(moved));
+        assert_ne!(selected_pane(&tui), Some(moved));
         assert_eq!(
-            tui.home_selected,
+            selected_pane(&tui),
             tui.home_rows().first().map(|row| row.pane_id),
             "Enter on arrival has to open the row the sort order put on top"
         );
@@ -1444,21 +1572,149 @@ mod tests {
         ]);
         tui.set_home_open(true, "test");
         tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
-        let selected = tui.home_selected.expect("a row is selected");
+        let selected = selected_pane(&tui).expect("a row is selected");
 
         let mut rows = tui.agent_rows.clone();
         rows[0].state = AgentRosterState::Pending;
         tui.set_agent_rows(rows);
         tui.repair_home_selection();
         assert_eq!(
-            tui.home_selected,
+            selected_pane(&tui),
             Some(selected),
             "re-sorting the list must not move the cursor to another agent"
         );
 
         tui.set_agent_rows(Vec::new());
         tui.repair_home_selection();
-        assert_eq!(tui.home_selected, None);
+        assert_eq!(selected_pane(&tui), None);
+    }
+
+    /// An inbox with a droplet in it and a Hermes running on that droplet, which
+    /// is the situation both agent issues are about.
+    fn tui_with_a_bot_on_a_droplet(kind: &str) -> MultiPaneTui {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: vec![0xca, 0xfe],
+            endpoint_addr: vec![2],
+            display_name: String::from("droplet"),
+            kind: crate::layout::MemberKind::Machine,
+        });
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("droplet"),
+            peer_id: Some(String::from("cafe")),
+            accepts_work: Some(true),
+        }];
+        let mut rows = tui.agent_rows.clone();
+        rows.push(crate::tui::AgentOverlayRow {
+            // No pane: this is a daemon, which is how both assistant agents
+            // are meant to run.
+            pane_id: 0,
+            process_pid: 985,
+            host: String::from("droplet"),
+            kind: String::from(kind),
+            state: AgentRosterState::Unknown,
+            ..crate::tui::test_support::agent_row(0, 0, 0)
+        });
+        tui.set_agent_rows(rows);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        tui
+    }
+
+    fn select_the_bot(tui: &mut MultiPaneTui) {
+        let selected = tui
+            .home_rows()
+            .iter()
+            .find(|row| row.pane_id == 0)
+            .map(|row| row.row_id())
+            .expect("the bot is in the inbox");
+        tui.home_selected = Some(selected);
+    }
+
+    /// The product promise of both agent issues: a bot running under systemd on
+    /// another machine, reachable with one keypress.
+    #[test]
+    fn enter_on_a_bot_outside_p2pmux_opens_a_chat_on_its_own_machine() {
+        let mut tui = tui_with_a_bot_on_a_droplet("hermes");
+        select_the_bot(&mut tui);
+
+        let intents = tui.open_home_selection();
+
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [UiIntent::CreateTabOn { peer_id, command, name, .. }]
+                    if peer_id == &vec![0xca, 0xfe]
+                        && command == &[String::from("hermes"), String::from("chat")]
+                        && name == "droplet"
+            ),
+            "{intents:?}"
+        );
+    }
+
+    /// The one genuinely bad outcome this feature could have.
+    #[test]
+    fn a_new_conversation_is_never_presented_as_joining_the_running_one() {
+        let mut tui = tui_with_a_bot_on_a_droplet("hermes");
+        select_the_bot(&mut tui);
+
+        tui.open_home_selection();
+
+        let notice = tui.home_notice.clone().expect("a notice");
+        assert!(
+            notice.contains("not the one already running"),
+            "Hermes cannot join its gateway's conversation, and the UI has to say so: {notice}"
+        );
+
+        // OpenClaw can, and says the true thing about itself instead.
+        let mut tui = tui_with_a_bot_on_a_droplet("openclaw");
+        select_the_bot(&mut tui);
+        tui.open_home_selection();
+        let notice = tui.home_notice.clone().expect("a notice");
+        assert!(
+            notice.contains("joining the conversation already running"),
+            "{notice}"
+        );
+    }
+
+    /// Pressing Enter twice must not leave two chat panes against one bot.
+    #[test]
+    fn a_second_enter_finds_the_chat_pane_the_first_one_opened() {
+        let mut tui = tui_with_a_bot_on_a_droplet("hermes");
+        // The pane the first Enter would have produced, as it comes back on the
+        // next layout commit: hosted by the droplet, titled after the command.
+        tui.snapshot.panes.insert(
+            9,
+            crate::layout::Pane {
+                pane_id: 9,
+                host_peer_id: vec![0xca, 0xfe],
+                locked: false,
+                exited: false,
+                grid_rows: 2,
+                grid_cols: 8,
+                title: Some(chat_pane_title(&[
+                    String::from("hermes"),
+                    String::from("chat"),
+                ])),
+            },
+        );
+        tui.snapshot.tabs.push(crate::layout::Tab {
+            tab_id: 9,
+            root: crate::layout::Node::Leaf { pane_id: 9 },
+            title: None,
+        });
+        select_the_bot(&mut tui);
+
+        let intents = tui.open_home_selection();
+
+        assert_eq!(
+            intents,
+            vec![UiIntent::FocusPane { pane_id: 9 }],
+            "the second press goes to the chat that is already open"
+        );
+        assert_eq!(tui.current_tab(), 9);
     }
 
     /// A fleet you can only read is a fleet you cannot open a terminal on.

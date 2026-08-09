@@ -77,6 +77,12 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     pub(in crate::tui) agent_roster_generation: u64,
     pub(in crate::tui) last_local_agent_entries: Vec<AgentRosterEntry>,
+    /// Agents running on this machine outside every pane — a bot under systemd,
+    /// something left in a stray tmux.
+    ///
+    /// Refreshed by the same process scan the panes use, because it is the same
+    /// scan: the only difference is which processes it is asked about.
+    pub(in crate::tui) loose_agents: Vec<crate::agent_detect::LooseAgent>,
     pub(in crate::tui) next_agent_roster_heartbeat: Instant,
     pub(in crate::tui) last_agent_overlay_animation: Instant,
     pub(in crate::tui) presence_generation: u64,
@@ -238,6 +244,7 @@ impl SharedLayoutRuntime {
             agent_rosters: BTreeMap::new(),
             agent_roster_generation: 0,
             last_local_agent_entries: Vec::new(),
+            loose_agents: Vec::new(),
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
             presence_generation: 0,

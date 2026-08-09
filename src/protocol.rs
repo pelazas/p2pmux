@@ -785,6 +785,14 @@ pub struct AgentRosterEntry {
     /// timestamp in milliseconds when the current working interval started.
     #[prost(uint64, tag = "5")]
     pub working_since_unix_ms: u64,
+    /// The agent's own process, for an agent that is not in a pane.
+    ///
+    /// `pane_id` is `0` for those, because there is no pane — a bot under
+    /// systemd, or something started in a stray tmux. This is what identifies
+    /// the row instead, and what makes two daemons on one machine two rows.
+    /// Zero for every pane-hosted agent, which is identified by its pane.
+    #[prost(uint32, tag = "6")]
+    pub process_pid: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
@@ -1210,10 +1218,16 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
             actual: roster.entries.len(),
         });
     }
-    let mut pane_ids = HashSet::new();
+    let mut identities = HashSet::new();
     for entry in &roster.entries {
-        validate_nonzero("agent_roster.entry.pane_id", entry.pane_id)?;
-        if !pane_ids.insert(entry.pane_id) {
+        // One of the two, never both and never neither: a pane-hosted agent is
+        // identified by its pane, and an agent running outside p2pmux by its
+        // own process. An entry with both would be two claims about what it is,
+        // and an entry with neither could not be told from any other.
+        if (entry.pane_id == 0) == (entry.process_pid == 0) {
+            return Err(ProtocolError::InvalidLayout("agent_roster.entry.pane_id"));
+        }
+        if !identities.insert((entry.pane_id, entry.process_pid)) {
             return Err(ProtocolError::InvalidLayout("agent_roster.entry.pane_id"));
         }
         validate_field_size(

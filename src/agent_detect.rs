@@ -1,7 +1,7 @@
 //! Pure helpers for detecting supported coding agents in a hosted PTY tree.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -353,6 +353,18 @@ pub struct DetectedAgent {
     pub cwd: String,
 }
 
+/// An agent running on this machine but not in any p2pmux pane.
+///
+/// A bot under systemd, or something started in a stray tmux. Detectable, and —
+/// until the capability table existed — not reachable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LooseAgent {
+    pub kind: AgentKind,
+    /// Identity for a row that has no pane to be identified by.
+    pub pid: u32,
+    pub cwd: String,
+}
+
 #[derive(Clone, Debug)]
 struct Candidate<'a> {
     process: &'a ProcessSnapshot,
@@ -444,6 +456,47 @@ impl<'a> AgentScan<'a> {
                 kind: candidate.kind,
                 cwd: candidate.process.cwd.clone().unwrap_or_default(),
             })
+    }
+
+    /// Agents on this machine that are not inside any of these panes.
+    ///
+    /// The inbox was built on the assumption that an agent is something you
+    /// started in a p2pmux pane, so an assistant running under systemd — which
+    /// is how both Hermes and OpenClaw are meant to run — was invisible to it.
+    /// This is the other half: every agent the scan found whose process is not
+    /// descended from a pane, deduplicated by kind so one daemon's worker
+    /// processes do not each get a row.
+    ///
+    /// The shallowest process wins within a kind, which is the daemon itself
+    /// rather than whatever it forked.
+    pub fn loose_agents(&self, pane_roots: &[u32]) -> Vec<LooseAgent> {
+        let mut found: BTreeMap<AgentKind, &ProcessSnapshot> = BTreeMap::new();
+        for &(process, kind) in &self.agents {
+            if pane_roots
+                .iter()
+                .any(|&root| self.descendant_depth(root, process.pid).is_some())
+            {
+                continue;
+            }
+            // A daemon's own children are the same agent, so the one nearest
+            // the top of the tree is the one worth a row. `parents` holds every
+            // pid that is somebody's parent, so a process whose own parent is
+            // also an agent of this kind is a child of it.
+            match found.get(&kind) {
+                Some(existing) if self.descendant_depth(existing.pid, process.pid).is_some() => {}
+                _ => {
+                    found.insert(kind, process);
+                }
+            }
+        }
+        found
+            .into_iter()
+            .map(|(kind, process)| LooseAgent {
+                kind,
+                pid: process.pid,
+                cwd: process.cwd.clone().unwrap_or_default(),
+            })
+            .collect()
     }
 
     fn descendant_depth(&self, root_pid: u32, pid: u32) -> Option<usize> {

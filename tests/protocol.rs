@@ -450,6 +450,7 @@ fn agent_roster(entries: Vec<AgentRosterEntry>) -> AgentRoster {
 fn agent_entry(pane_id: u64) -> AgentRosterEntry {
     AgentRosterEntry {
         pane_id,
+        process_pid: 0,
         agent_kind: String::from("codex"),
         cwd: String::from("/repo"),
         state: AgentRosterState::Working as i32,

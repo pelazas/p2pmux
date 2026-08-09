@@ -1060,6 +1060,7 @@ fn apply_rosters(
             .into_iter()
             .map(|row| AgentOverlayRow {
                 pane_id: row.pane_id,
+                process_pid: row.process_pid,
                 tab_ordinal: 0,
                 pane_ordinal: 0,
                 tab_label: String::new(),
@@ -1424,6 +1425,7 @@ mod tests {
         AgentOverlaySnapshotRow {
             message: String::new(),
             pane_id,
+            process_pid: 0,
             kind: String::from("codex"),
             cwd: String::from("/repo"),
             state,
