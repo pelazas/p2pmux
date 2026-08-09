@@ -178,6 +178,28 @@ impl MultiPaneTui {
         false
     }
 
+    /// `h` and `l`, and the page keys: a whole page at a time, cursor and all.
+    ///
+    /// The cursor lands on the first agent of the page it arrives at, which is
+    /// the most urgent one there — the same rule that decides what the cursor
+    /// sits on when the inbox opens.
+    pub(in crate::tui) fn turn_home_page(&mut self, forward: bool) -> bool {
+        let pages = self.home_page_count();
+        if pages < 2 {
+            return false;
+        }
+        self.home_page = if forward {
+            (self.home_page + 1) % pages
+        } else {
+            (self.home_page + pages - 1) % pages
+        };
+        self.home_selected = self
+            .home_rows()
+            .get(self.home_page_start())
+            .map(|row| row.pane_id);
+        true
+    }
+
     /// How many pages the list has. Never zero: an empty inbox is one page.
     pub(in crate::tui) fn home_page_count(&self) -> usize {
         self.agent_rows
@@ -383,6 +405,17 @@ impl MultiPaneTui {
             }
             KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
                 self.move_home_selection(true);
+                KeyHandling::Consumed(vec![])
+            }
+            // Pages step sideways, so the sideways keys move them. Not `←` and
+            // `→`: `→` already steps off Home onto the tabs, and the second way
+            // in should not become the way to page a list.
+            KeyCode::Char('l') | KeyCode::PageDown if key.modifiers.is_empty() => {
+                self.turn_home_page(true);
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Char('h') | KeyCode::PageUp if key.modifiers.is_empty() => {
+                self.turn_home_page(false);
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
@@ -694,7 +727,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
 
-    use super::{MACHINE_RAIL_WIDTH, MachinePanel, home_layout, machine_rows};
+    use super::{
+        HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, home_card, home_layout,
+        home_page_size, machine_rows,
+    };
     use crate::{
         protocol::AgentRosterState,
         tui::{KeyHandling, MultiPaneTui, UiIntent, test_support::home_tui},
@@ -982,6 +1018,110 @@ mod tests {
         let before = home_layout(AREA, &tui);
         tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
         assert_eq!(home_layout(AREA, &tui), before);
+    }
+
+    /// Eight is the ceiling however tall the terminal is, and one is the floor
+    /// however short: a page with nothing on it is not a page.
+    #[test]
+    fn a_page_holds_what_fits_and_never_more_than_eight() {
+        assert_eq!(home_card(200), HomeCard::Full);
+        assert_eq!(home_page_size(200), HOME_PAGE_MAX);
+        // Twenty lines of `Full` cards is five agents, not eight.
+        assert_eq!(home_page_size(20), 5);
+        // Short enough for rows, where a line each is all an agent gets.
+        assert_eq!(home_page_size(8), 8);
+        assert_eq!(home_page_size(3), 3);
+        assert_eq!(home_page_size(0), 1);
+    }
+
+    /// An inbox with `count` agents on it, opened and measured against [`AREA`],
+    /// alongside the page size that terminal works out to.
+    fn paged_tui(count: usize) -> (MultiPaneTui, usize) {
+        let rows = (0..count)
+            .map(|index| {
+                (
+                    if index % 2 == 0 { "laptop" } else { "droplet" },
+                    "claude",
+                    AgentRosterState::Working,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut tui = home_tui(&rows);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let page_size = tui.home_page_size;
+        (tui, page_size)
+    }
+
+    /// A list longer than a page is paged, not scrolled, and `h`/`l` move a
+    /// whole page with the cursor rather than leaving it behind.
+    #[test]
+    fn h_and_l_turn_the_page_and_take_the_cursor_with_them() {
+        let (mut tui, page_size) = paged_tui(8);
+        assert_eq!(tui.home_page_count(), 2);
+        assert_eq!(tui.home_page(), 0);
+
+        let first = tui.home_selected.expect("a cursor on arrival");
+        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 1);
+        assert_eq!(
+            tui.home_selected,
+            tui.home_rows().get(page_size).map(|row| row.pane_id),
+            "the cursor lands on the first agent of the page it arrives at"
+        );
+
+        // Two pages, so `l` wraps back rather than stopping at the end.
+        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 0);
+        assert_eq!(tui.home_selected, Some(first));
+
+        tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 1);
+    }
+
+    /// The page follows the cursor. Walking off the bottom of one page has to
+    /// bring the next one into view, or `j` stops at the end of page one.
+    #[test]
+    fn walking_the_cursor_off_a_page_brings_the_next_one_into_view() {
+        let (mut tui, page_size) = paged_tui(8);
+
+        for _ in 0..page_size {
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
+        }
+        assert_eq!(tui.home_page(), 1);
+        assert_eq!(
+            tui.home_selected,
+            tui.home_rows().get(page_size).map(|row| row.pane_id)
+        );
+
+        // And back up over the same edge.
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 0);
+    }
+
+    /// A page must not survive the agents that were on it going away.
+    #[test]
+    fn a_page_that_empties_falls_back_to_one_that_has_something_on_it() {
+        let (mut tui, page_size) = paged_tui(8);
+        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 1);
+
+        let rows = tui.agent_rows[..page_size].to_vec();
+        tui.set_agent_rows(rows);
+        tui.repair_home_selection();
+        assert_eq!(tui.home_page_count(), 1);
+        assert_eq!(tui.home_page(), 0);
+    }
+
+    /// One page means no paging: the keys do nothing rather than redrawing the
+    /// same agents under a page number that never changes.
+    #[test]
+    fn a_list_that_fits_on_one_page_has_no_pages_to_turn() {
+        let (mut tui, _) = paged_tui(3);
+
+        assert_eq!(tui.home_page_count(), 1);
+        assert!(!tui.turn_home_page(true));
+        assert_eq!(tui.home_page(), 0);
     }
 
     #[test]

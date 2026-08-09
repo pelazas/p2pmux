@@ -63,6 +63,20 @@ const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
+/// The same bar with the paging keys, shown only while there is a second page
+/// for them to reach — by the same rule that took `m` off the bar.
+const HOME_KEYS_PAGED: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" open   "),
+    FooterSegment::Key("h l"),
+    FooterSegment::Text(" page   "),
+    FooterSegment::Key("a"),
+    FooterSegment::Text(" add machine   "),
+    FooterSegment::Key("n"),
+    FooterSegment::Text(" new terminal   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
 
 /// Column widths. The machine and agent columns are fixed so the eye can read
 /// down them; everything the row has left over goes to what the agent is doing,
@@ -177,7 +191,7 @@ fn render_home_in(
     }
 
     if keys.width > 0 && keys.height > 0 {
-        render_home_keys(frame.buffer_mut(), theme, keys);
+        render_home_keys(frame.buffer_mut(), theme, keys, tui.home_page_count() > 1);
     }
 }
 
@@ -820,7 +834,7 @@ pub fn machine_line(machine: &MachineRow) -> String {
     )
 }
 
-fn render_home_keys(buffer: &mut Buffer, theme: &UiTheme, keys: Rect) {
+fn render_home_keys(buffer: &mut Buffer, theme: &UiTheme, keys: Rect, paged: bool) {
     if keys.height == 0 {
         return;
     }
@@ -837,7 +851,7 @@ fn render_home_keys(buffer: &mut Buffer, theme: &UiTheme, keys: Rect) {
         keys.x.saturating_add(1),
         keys.y,
         keys.right(),
-        HOME_KEYS,
+        if paged { HOME_KEYS_PAGED } else { HOME_KEYS },
     );
 }
 
