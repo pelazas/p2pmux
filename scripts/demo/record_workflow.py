@@ -580,11 +580,15 @@ def perform(cards: dict[str, Machine], code: str, recorder: Recorder, narrator: 
     answered = 0
     while time.monotonic() < deadline:
         screen = laptop.snapshot()
+        blocked = "Permission required" in screen
         # 2.5 is the median it was asked about, and a number it can only print
-        # by having run the file on the droplet.
-        if "2.5" in screen:
+        # by having run the file on the droplet. Not while a dialog is up: an
+        # agent that writes `assert median([1,2,3,4]) == 2.5` puts the number on
+        # screen in the command it is still asking permission to run, and
+        # stopping there ends the video on the question rather than the answer.
+        if "2.5" in screen and not blocked:
             break
-        if "Permission required" in screen:
+        if blocked:
             # A lease that went idle while the agent thought means the first
             # keystroke buys the pane back rather than answering the dialog.
             if "control: laptop" not in screen:
