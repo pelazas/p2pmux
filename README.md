@@ -88,10 +88,24 @@ not an agent orchestration platform.
   OpenCode agent running on every machine in the session, sorted by which one is blocking you.
   Press Enter on a row and you are typing in that terminal; `Ctrl+O` brings you back. `needs you`
   comes only from the agent's own hooks, never from guessing at output timing: run
-  `p2pmux setup claude` once, and `p2pmux doctor` to check. An agent with no hooks says
+  `p2pmux setup` once, and `p2pmux doctor` to check. An agent with no hooks says
   *state unknown — no hooks* on its own row rather than being guessed about.
 - `p2pmux pair` associates two machines you own, once and permanently. After that, bare `p2pmux`
   rejoins on either with no code typed, and `p2pmux machines` says which of them are awake.
+
+<p align="center">
+  <a href="docs/assets/workflow.mp4">
+    <img src="docs/assets/workflow.png" width="820"
+         alt="a laptop and two droplets in one session; an opencode agent running on each droplet, both listed in the laptop's inbox as needing a human">
+  </a>
+</p>
+
+<p align="center">
+  <em><a href="docs/assets/workflow.mp4">Ninety seconds, three machines</a>: a MacBook and two
+  DigitalOcean droplets share one session, an <code>opencode</code> agent is started from the
+  laptop on each droplet, and the inbox says which of them is blocking a human. Recorded live by
+  <a href="scripts/demo/record_workflow.py"><code>scripts/demo/record_workflow.py</code></a>.</em>
+</p>
 
 ## Status
 

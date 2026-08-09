@@ -41,9 +41,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
-from wcwidth import wcwidth  # noqa: E402
+
+# The camera — cell capture, glyph rendering, ffmpeg — is shared with
+# record_workflow.py. What stays here is this GIF's own layout and its story.
+from termcard import (  # noqa: E402
+    CARD_BG,
+    CELL_H,
+    CELL_W,
+    CHROME_BG,
+    CHROME_TEXT,
+    PAGE_BG,
+    draw_terminal,
+    encode_gif,
+    grab,
+    load_fonts,
+)
 
 from driver import Harness  # noqa: E402
 
@@ -68,38 +83,10 @@ RELEASE_DIR = REPO_ROOT / "target" / "release"
 COLS, ROWS = 96, 14
 FPS = 12
 
-# ------------------------------------------------------------------ appearance
-
-# Menlo at 15px is exactly 9x18 per cell with no rounding, and carries the ✓/✗/●/◆
-# glyphs the agents overlay draws.
-FONT_PATH = Path("/System/Library/Fonts/Menlo.ttc")
-FONT_SIZE = 15
-CELL_W, CELL_H = 9, 18
-BASELINE_PAD = 0
-
-PAGE_BG = "#07080b"
-CARD_BG = "#0d1016"
-CHROME_BG = "#171b24"
-CHROME_TEXT = "#7d879c"
-LABEL_TEXT = "#c3cbd9"
-
+# This GIF's own frame: two stacked cards, and the padding around them.
 PAD = 18
 GAP = 16
 CHROME_H = 30
-
-# xterm's first eight, warmed up slightly for a dark card.
-ANSI = {
-    "black": "#20242e",
-    "red": "#ff6b63",
-    "green": "#4ed58c",
-    "brown": "#e4c05c",
-    "blue": "#5aa9ff",
-    "magenta": "#c78dff",
-    "cyan": "#4fd6d6",
-    "white": "#d5dbe6",
-}
-DEFAULT_FG = "#cbd3e1"
-DEFAULT_BG = CARD_BG
 
 
 @dataclass(frozen=True)
@@ -135,73 +122,7 @@ MEMBERS = {
 }
 
 
-def color(value: str, fallback: str) -> str:
-    if value == "default":
-        return fallback
-    if value in ANSI:
-        return ANSI[value]
-    return f"#{value}"
-
-
-def load_fonts() -> tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]:
-    return (
-        ImageFont.truetype(str(FONT_PATH), FONT_SIZE, index=0),
-        ImageFont.truetype(str(FONT_PATH), FONT_SIZE, index=1),
-    )
-
-
-# Box drawing straight from the font leaves hairline seams between cells, and this UI
-# is almost entirely borders. Draw the line glyphs geometrically instead, as
-# (up, down, left, right) stroke weights: 0 none, 1 light, 2 heavy.
-BOX = {
-    "─": (0, 0, 1, 1), "━": (0, 0, 2, 2), "│": (1, 1, 0, 0), "┃": (2, 2, 0, 0),
-    "┌": (0, 1, 0, 1), "┏": (0, 2, 0, 2), "┐": (0, 1, 1, 0), "┓": (0, 2, 2, 0),
-    "└": (1, 0, 0, 1), "┗": (2, 0, 0, 2), "┘": (1, 0, 1, 0), "┛": (2, 0, 2, 0),
-    "├": (1, 1, 0, 1), "┣": (2, 2, 0, 2), "┤": (1, 1, 1, 0), "┫": (2, 2, 2, 0),
-    "┬": (0, 1, 1, 1), "┳": (0, 2, 2, 2), "┴": (1, 0, 1, 1), "┻": (2, 0, 2, 2),
-    "┼": (1, 1, 1, 1), "╋": (2, 2, 2, 2),
-    "╭": (0, 1, 0, 1), "╮": (0, 1, 1, 0), "╰": (1, 0, 0, 1), "╯": (1, 0, 1, 0),
-    "╴": (0, 0, 1, 0), "╵": (1, 0, 0, 0), "╶": (0, 0, 0, 1), "╷": (0, 1, 0, 0),
-}
-
-
-def draw_box(draw: ImageDraw.ImageDraw, char: str, left: int, top: int, fill: str) -> None:
-    up, down, west, east = BOX[char]
-    mid_x, mid_y = left + CELL_W // 2, top + CELL_H // 2
-    right, bottom = left + CELL_W, top + CELL_H
-    for weight, box in (
-        (up, [mid_x, top, mid_x, mid_y]),
-        (down, [mid_x, mid_y, mid_x, bottom]),
-        (west, [left, mid_y, mid_x, mid_y]),
-        (east, [mid_x, mid_y, right, mid_y]),
-    ):
-        if weight:
-            draw.line(box, fill=fill, width=weight)
-
-
 # --------------------------------------------------------------------- capture
-
-
-def grab(peer) -> dict:
-    """One frame of a peer: every cell's glyph and attributes, plus the cursor."""
-    with peer._lock:
-        screen = peer._screen
-        rows = []
-        for y in range(screen.lines):
-            source = screen.buffer[y]
-            cells: list[tuple | None] = []
-            x = 0
-            while x < screen.columns:
-                char = source[x]
-                data = char.data or " "
-                cells.append((data, char.fg, char.bg, char.bold, char.reverse))
-                width = 2 if wcwidth(data[0]) == 2 else 1
-                if width == 2:
-                    cells.append(None)
-                x += width
-            rows.append(cells[: screen.columns])
-        cursor = (screen.cursor.x, screen.cursor.y, screen.cursor.hidden)
-    return {"rows": rows, "cursor": cursor}
 
 
 class Recorder(threading.Thread):
@@ -236,46 +157,6 @@ def card_size() -> tuple[int, int]:
 def canvas_size() -> tuple[int, int]:
     body_w, body_h = card_size()
     return body_w + PAD * 2, (body_h + CHROME_H) * 2 + GAP + PAD * 2
-
-
-def draw_terminal(
-    draw: ImageDraw.ImageDraw,
-    frame: dict,
-    origin: tuple[int, int],
-    fonts: tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont],
-) -> None:
-    regular, bold = fonts
-    ox, oy = origin
-    cursor_x, cursor_y, cursor_hidden = frame["cursor"]
-    for y, row in enumerate(frame["rows"]):
-        top = oy + y * CELL_H
-        for x, cell in enumerate(row):
-            if cell is None:
-                continue
-            data, fg_name, bg_name, is_bold, reverse = cell
-            left = ox + x * CELL_W
-            fg = color(fg_name, DEFAULT_FG)
-            bg = color(bg_name, DEFAULT_BG)
-            if reverse:
-                fg, bg = bg, fg
-            span = CELL_W * (2 if wcwidth(data[0]) == 2 else 1)
-            if bg != DEFAULT_BG:
-                draw.rectangle([left, top, left + span - 1, top + CELL_H - 1], fill=bg)
-            if data in BOX:
-                draw_box(draw, data, left, top, fg)
-            elif data != " ":
-                draw.text(
-                    (left, top + BASELINE_PAD),
-                    data,
-                    font=bold if is_bold else regular,
-                    fill=fg,
-                )
-    if not cursor_hidden and cursor_y < ROWS and cursor_x < COLS:
-        left, top = ox + cursor_x * CELL_W, oy + cursor_y * CELL_H
-        draw.rectangle([left, top, left + CELL_W - 1, top + CELL_H - 1], fill="#e8eefc")
-        cell = frame["rows"][cursor_y][cursor_x]
-        if cell and cell[0] != " ":
-            draw.text((left, top + BASELINE_PAD), cell[0], font=regular, fill=CARD_BG)
 
 
 def draw_chrome(
@@ -514,25 +395,6 @@ def perform(host, guest, code: str) -> None:
     pause(1.8)
 
 
-def encode(frames_dir: Path, output: Path) -> None:
-    filters = (
-        "[0:v]split[a][b];"
-        "[a]palettegen=max_colors=160:stats_mode=diff[p];"
-        "[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle"
-    )
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-framerate", str(FPS),
-            "-i", str(frames_dir / "f%05d.png"),
-            "-filter_complex", filters,
-            "-loop", "0",
-            str(output),
-        ],
-        check=True,
-    )
-
-
 def render_gif(frames: list[dict], output: Path, frames_dir: Path) -> None:
     fonts = load_fonts()
     if frames_dir.exists():
@@ -540,7 +402,7 @@ def render_gif(frames: list[dict], output: Path, frames_dir: Path) -> None:
     frames_dir.mkdir(parents=True)
     for index, frame in enumerate(frames):
         render_frame(frame, fonts, MEMBERS).save(frames_dir / f"f{index:05d}.png")
-    encode(frames_dir, output)
+    encode_gif(frames_dir, output, FPS)
     seconds = len(frames) / FPS
     size_mb = output.stat().st_size / 1_000_000
     print(f"{output}  ({len(frames)} frames, {seconds:.1f}s, {size_mb:.2f} MB)")
