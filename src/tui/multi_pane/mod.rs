@@ -73,8 +73,6 @@ pub struct MultiPaneTui {
     pub(in crate::tui) home_selected: Option<PaneId>,
     pub(in crate::tui) home_scroll_line: usize,
     pub(in crate::tui) home_viewport_lines: u16,
-    /// Whether `m` has expanded the machine strip into the full list.
-    pub(in crate::tui) machines_expanded: bool,
     /// The pane Home handed the user into, drawn alone in the content area.
     ///
     /// A local view choice, so it never reaches the layout: the pane keeps the
@@ -140,7 +138,6 @@ impl MultiPaneTui {
             home_selected: None,
             home_scroll_line: 0,
             home_viewport_lines: 0,
-            machines_expanded: false,
             zoomed_pane: None,
             paired_machines: Vec::new(),
             local_peer_id: None,

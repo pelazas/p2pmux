@@ -65,7 +65,6 @@ impl MultiPaneTui {
             // owner.
             self.modal = ModalState::None;
             self.exit_chord_mode();
-            self.machines_expanded = false;
             // Arriving puts the cursor back on the top row, which is the one
             // that most wants a human. That is the whole reason for the sort
             // order, and a cursor left where a previous visit happened to end
@@ -319,10 +318,6 @@ impl MultiPaneTui {
         true
     }
 
-    pub(in crate::tui) fn toggle_machines_expanded(&mut self) {
-        self.machines_expanded = !self.machines_expanded;
-    }
-
     /// Which peer this client is, so the machine list can mark the row for the
     /// machine the user is sitting at. Only the node knows it.
     pub fn set_local_peer_id(&mut self, peer_id: Vec<u8>) {
@@ -383,10 +378,6 @@ impl MultiPaneTui {
                     grid_cols,
                 }])
             }
-            KeyCode::Char('m') if key.modifiers.is_empty() => {
-                self.toggle_machines_expanded();
-                KeyHandling::Consumed(vec![])
-            }
             // The same question Ctrl+Q asks, asked the same way. Home is the
             // one screen where a bare `q` is free, but it should not be the one
             // screen where leaving skips the prompt.
@@ -422,10 +413,42 @@ pub(in crate::tui) struct HomeLayout {
     pub(in crate::tui) rows: Rect,
     /// The `p2pmux setup` nudge. Zero-height unless every row is unreported.
     pub(in crate::tui) hint: Rect,
-    /// The one-line machine strip, or the expanded list under `m`.
-    /// Zero-height only before the member list has arrived.
+    /// Where the machines go. Zero-height only before the member list has
+    /// arrived, and shaped by [`HomeLayout::machine_panel`].
     pub(in crate::tui) machines: Rect,
+    pub(in crate::tui) machine_panel: MachinePanel,
 }
+
+/// How the fleet is drawn, which is a question of how much room there is.
+///
+/// The screen's spare space is horizontal as much as vertical — the column that
+/// says what an agent is doing is rarely more than half used — so the widest
+/// tier spends that width on machines rather than leaving it blank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum MachinePanel {
+    /// A column down the right-hand side, with a line each for what a machine
+    /// is and what it is running.
+    Rail,
+    /// The same facts as a table under the agents, when the terminal is too
+    /// narrow to give a column away.
+    Table,
+    /// Names and ticks on one line, when there is not even room for a table.
+    /// It still answers "is my fleet up", which is what earns it the space.
+    Strip,
+    /// Nothing known yet. The member list has not arrived.
+    Empty,
+}
+
+/// How wide the rail is, including the rule it hangs off.
+pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 26;
+/// The narrowest terminal that gets a rail.
+///
+/// Below this the agents would be paying for the fleet: a card whose sentence
+/// column is under 40 columns truncates what the agent said, which is the one
+/// thing on the screen worth reading in full.
+const MACHINE_RAIL_MIN_WIDTH: u16 = 88;
+/// The shortest terminal that gets a rail: a heading, a blank, and one machine.
+const MACHINE_RAIL_MIN_HEIGHT: u16 = 6;
 
 /// Every machine this client knows about, session members first.
 ///
@@ -486,59 +509,96 @@ pub struct MachineRow {
     pub this_machine: bool,
 }
 
-/// How many lines the machine block wants.
-///
-/// One machine still gets a strip. Hiding it until a second machine appeared
-/// made a fleet of one look like a fleet of none — the screen said "no
-/// machines" about the machine it was being read on. A strip with one name in
-/// it says the fleet is up and has room for more, which is the truth.
-pub(in crate::tui) fn machine_lines(tui: &MultiPaneTui) -> u16 {
-    let machines = machine_rows(tui).len();
-    if machines == 0 {
-        return 0;
-    }
-    if tui.machines_expanded {
-        // A blank spacer, a heading, and one line each.
-        u16::try_from(machines)
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-    } else {
-        2
-    }
+/// How many lines the table under the agents wants: a blank spacer, a heading,
+/// and one line per machine.
+fn machine_table_lines(machines: usize) -> u16 {
+    u16::try_from(machines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
 }
 
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
-    // Header, then rows, then the machine block pinned to the bottom. The key
-    // bar is not here: it takes over the window footer, so that four keys stay
-    // visible in the same place they are on every other screen. A terminal too
-    // short to hold everything loses agent rows before the machine strip — the
-    // strip is one line and answers "is my fleet even up", which a list of
-    // agents cannot.
-    let header_height = 2u16.min(area.height);
-    let mut left = area.height.saturating_sub(header_height);
-    // The strip outranks agent rows when space runs out, but it never takes the
-    // last one: a list with nothing left in it stops being a list, and Home
-    // would be a screen about machines with the agents it exists for cut off.
-    // All or nothing — half a strip is a blank line where a fleet should be.
-    let wanted = machine_lines(tui);
-    let machines_height = if wanted <= left.saturating_sub(1) {
-        wanted
+    // Header, then rows, then the machines — down the right on a terminal with
+    // width to spare, and pinned to the bottom otherwise. The key bar is not
+    // here: it takes over the window footer, so that four keys stay visible in
+    // the same place they are on every other screen.
+    let machines = machine_rows(tui).len();
+    if machines == 0 {
+        let (header, rows, hint) = stacked(area, tui, 0);
+        return HomeLayout {
+            header,
+            rows,
+            hint,
+            machines: Rect::new(area.x, hint.bottom(), area.width, 0),
+            machine_panel: MachinePanel::Empty,
+        };
+    }
+    if area.width >= MACHINE_RAIL_MIN_WIDTH && area.height >= MACHINE_RAIL_MIN_HEIGHT {
+        // The rail is full height rather than sized to the fleet: it is a column
+        // of the screen, and a short one would leave a ragged hole beside the
+        // agents. A fleet too tall for it says so on its last line.
+        let rail = Rect::new(
+            area.right().saturating_sub(MACHINE_RAIL_WIDTH),
+            area.y,
+            MACHINE_RAIL_WIDTH,
+            area.height,
+        );
+        let (header, rows, hint) = stacked(
+            Rect::new(
+                area.x,
+                area.y,
+                area.width.saturating_sub(MACHINE_RAIL_WIDTH),
+                area.height,
+            ),
+            tui,
+            0,
+        );
+        return HomeLayout {
+            header,
+            rows,
+            hint,
+            machines: rail,
+            machine_panel: MachinePanel::Rail,
+        };
+    }
+    // Under the agents, then. The machines outrank agent rows when space runs
+    // out, but never take the last one: a list with nothing left in it stops
+    // being a list, and Home would be a screen about machines with the agents
+    // it exists for cut off. All or nothing — half a block is a blank line
+    // where a fleet should be.
+    let left = area.height.saturating_sub(2u16.min(area.height));
+    let table = machine_table_lines(machines);
+    let (panel, height) = if table <= left.saturating_sub(1) {
+        (MachinePanel::Table, table)
+    } else if left.saturating_sub(1) >= 2 {
+        (MachinePanel::Strip, 2)
     } else {
-        0
+        (MachinePanel::Empty, 0)
     };
-    left = left.saturating_sub(machines_height);
+    let (header, rows, hint) = stacked(area, tui, height);
+    HomeLayout {
+        header,
+        rows,
+        hint,
+        machines: Rect::new(area.x, hint.bottom(), area.width, height),
+        machine_panel: panel,
+    }
+}
+
+/// The header, the agent rows and the hint, stacked into whatever width and
+/// height are left once the machines have taken their share.
+fn stacked(area: Rect, tui: &MultiPaneTui, machines_height: u16) -> (Rect, Rect, Rect) {
+    let header_height = 2u16.min(area.height);
+    let left = area
+        .height
+        .saturating_sub(header_height)
+        .saturating_sub(machines_height);
     let hint_height = u16::from(tui.home_all_unwired()).min(left);
     let rows_height = left.saturating_sub(hint_height);
     let header = Rect::new(area.x, area.y, area.width, header_height);
     let rows = Rect::new(area.x, header.bottom(), area.width, rows_height);
     let hint = Rect::new(area.x, rows.bottom(), area.width, hint_height);
-    let machines = Rect::new(area.x, hint.bottom(), area.width, machines_height);
-    HomeLayout {
-        header,
-        rows,
-        hint,
-        machines,
-    }
+    (header, rows, hint)
 }
 
 #[cfg(test)]
@@ -546,7 +606,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
 
-    use super::{home_layout, machine_lines, machine_rows};
+    use super::{MACHINE_RAIL_WIDTH, MachinePanel, home_layout, machine_rows};
     use crate::{
         protocol::AgentRosterState,
         tui::{KeyHandling, MultiPaneTui, UiIntent, test_support::home_tui},
@@ -650,33 +710,76 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_strip_lists_this_machine_with_nothing_paired() {
-        // A fleet of one is still a fleet. Hiding the strip made the screen
+    fn the_machine_list_holds_this_machine_with_nothing_paired() {
+        // A fleet of one is still a fleet. Hiding the list made the screen
         // say "no machines" about the machine it was being read on.
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
         let machines = machine_rows(&tui);
         assert_eq!(machines.len(), 1);
         assert!(machines[0].this_machine);
-        assert_eq!(machine_lines(&tui), 2);
-        assert_eq!(home_layout(AREA, &tui).machines.height, 2);
+
+        let layout = home_layout(AREA, &tui);
+        assert_eq!(layout.machine_panel, MachinePanel::Rail);
+        assert_eq!(layout.machines.height, AREA.height);
     }
 
-    /// The strip outranks agent rows, but not the last one.
+    /// The rail is a column of the screen, so what it costs is width, and the
+    /// agents keep every line they had.
     #[test]
-    fn a_home_too_short_for_both_keeps_a_row_rather_than_the_whole_strip() {
+    fn the_rail_takes_width_from_the_agents_and_never_a_row() {
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
-        // Two lines of header, three left: the strip fits with a row to spare.
-        let roomy = home_layout(Rect::new(0, 0, 40, 5), &tui);
-        assert_eq!(roomy.machines.height, 2);
-        assert_eq!(roomy.rows.height, 1);
+        let layout = home_layout(AREA, &tui);
+        assert_eq!(layout.rows.width, AREA.width - MACHINE_RAIL_WIDTH);
+        assert_eq!(layout.machines.x, AREA.width - MACHINE_RAIL_WIDTH);
+        assert_eq!(
+            layout.rows.height,
+            AREA.height - 2,
+            "the header is the only thing above the agents"
+        );
+    }
+
+    /// Narrow terminals get the same facts under the agents instead, and the
+    /// machines outrank agent rows there — but never take the last one.
+    #[test]
+    fn a_terminal_too_narrow_for_a_rail_puts_the_machines_underneath() {
+        let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+
+        // A spacer, a heading and one machine, with rows to spare.
+        let roomy = home_layout(Rect::new(0, 0, 40, 10), &tui);
+        assert_eq!(roomy.machine_panel, MachinePanel::Table);
+        assert_eq!(roomy.machines.height, 3);
+        assert_eq!(roomy.rows.height, 5);
+
+        // No room for the table: the strip still answers "is my fleet up".
+        let tight = home_layout(Rect::new(0, 0, 40, 5), &tui);
+        assert_eq!(tight.machine_panel, MachinePanel::Strip);
+        assert_eq!(tight.machines.height, 2);
+        assert_eq!(tight.rows.height, 1);
 
         // One line fewer and the strip would take every row there is, so it
         // stands down whole — half a strip is a blank line where a fleet goes.
         let cramped = home_layout(Rect::new(0, 0, 40, 4), &tui);
+        assert_eq!(cramped.machine_panel, MachinePanel::Empty);
         assert_eq!(cramped.machines.height, 0);
         assert_eq!(cramped.rows.height, 2);
+    }
+
+    /// A terminal too short for a rail falls back rather than drawing a
+    /// two-line column beside a two-line list.
+    #[test]
+    fn a_wide_but_short_terminal_falls_back_from_the_rail() {
+        let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+
+        assert_eq!(
+            home_layout(Rect::new(0, 0, 120, 5), &tui).machine_panel,
+            MachinePanel::Strip
+        );
+        assert_eq!(
+            home_layout(Rect::new(0, 0, 120, 6), &tui).machine_panel,
+            MachinePanel::Rail
+        );
     }
 
     #[test]
@@ -695,7 +798,6 @@ mod tests {
             .expect("the paired machine is listed");
         assert!(!oldbox.reachable);
         assert_eq!(oldbox.accepts_work, Some(true));
-        assert_eq!(machine_lines(&tui), 2);
     }
 
     #[test]
@@ -777,19 +879,21 @@ mod tests {
         );
     }
 
+    /// `m` used to expand the strip into the table. The rail is the table, so
+    /// there is nothing left for the key to do and it no longer claims one.
     #[test]
-    fn m_expands_the_machines_list_in_place() {
+    fn every_machine_is_listed_without_a_key_to_expand_them() {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
-        assert_eq!(machine_lines(&tui), 2);
 
+        assert_eq!(machine_rows(&tui).len(), 2);
+        let before = home_layout(AREA, &tui);
         tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
-        assert!(tui.machines_expanded);
-        assert_eq!(machine_lines(&tui), 4, "a spacer, a heading, and two rows");
+        assert_eq!(home_layout(AREA, &tui), before);
     }
 
     #[test]

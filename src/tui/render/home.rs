@@ -21,7 +21,9 @@ use crate::{
     protocol::AgentRosterState,
     tui::{
         AgentOverlayRow, MultiPaneTui,
-        home::{HomeLayout, MachineRow, home_layout, machine_rows},
+        home::{
+            HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_layout, machine_rows,
+        },
         render::footer::{FooterSegment, render_footer_segments},
         text::{sanitize_single_line, text_width, truncate_leading, truncate_trailing},
     },
@@ -47,13 +49,14 @@ pub(in crate::tui) const HOME_EMPTY_NO_HOOKS: &str =
 /// long as it is true.
 pub(in crate::tui) const HOME_ROW_NO_HOOKS: &str = "state unknown — no hooks";
 
+/// `m machines` is gone from here: it expanded the strip into a table, and the
+/// rail is that table, permanently. A key that changes nothing is worse on a
+/// key bar than a key that is missing from one.
 const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
     FooterSegment::Text(" open   "),
     FooterSegment::Key("n"),
     FooterSegment::Text(" new terminal   "),
-    FooterSegment::Key("m"),
-    FooterSegment::Text(" machines   "),
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
@@ -67,6 +70,10 @@ const STATE_WIDTH: u16 = 12;
 /// Wide enough for `9h59m59s`, which is every clock anyone watches. A longer
 /// one pushes into the description column rather than losing a digit.
 const ELAPSED_WIDTH: u16 = 8;
+/// What a rail line has left for words once the rule and its space are drawn.
+const RAIL_TEXT_WIDTH: usize = MACHINE_RAIL_WIDTH as usize - 2;
+/// A spacer, the name, and what the machine is doing.
+const RAIL_LINES_PER_MACHINE: usize = 3;
 
 pub(in crate::tui) fn render_home(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
     let geometry = tui.geometry(frame.area());
@@ -144,7 +151,13 @@ fn render_home_in(
     }
 
     if layout.machines.height > 0 {
-        frame.render_widget(Paragraph::new(machine_block(tui, theme)), layout.machines);
+        let lines = match layout.machine_panel {
+            MachinePanel::Rail => machine_rail(tui, theme, layout.machines.height),
+            MachinePanel::Table => machine_table(tui, theme),
+            MachinePanel::Strip => machine_strip(tui, theme),
+            MachinePanel::Empty => Vec::new(),
+        };
+        frame.render_widget(Paragraph::new(lines), layout.machines);
     }
 
     if keys.width > 0 && keys.height > 0 {
@@ -378,36 +391,119 @@ fn home_kind_label(kind: &str) -> &'static str {
     }
 }
 
-/// The machine strip: fleet health in one line, without a second screen.
-pub(in crate::tui) fn machine_block(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
+/// The fleet down the right-hand side: every machine, two lines each.
+///
+/// A column rather than a footer because the space it spends was never being
+/// used — the sentence an agent gets is rarely half the width of the screen —
+/// and because a fleet you can see the whole time is the difference between
+/// machines being part of the product and being a command you remember to run.
+fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'static>> {
     let machines = machine_rows(tui);
-    // Empty only before the member list has arrived — the machine this is
-    // running on is a machine, and once it is known it is always in the strip.
-    if machines.is_empty() {
-        return Vec::new();
+    let mut lines = vec![
+        rail_line(Vec::new(), theme),
+        rail_line(
+            vec![Span::styled(
+                format!("MACHINES · {}", machines.len()),
+                Style::default()
+                    .fg(theme.agent_overlay_muted)
+                    .add_modifier(Modifier::BOLD),
+            )],
+            theme,
+        ),
+    ];
+    // A spacer and two lines each. A fleet too tall for the rail gives up its
+    // last two lines to a count of what did not fit, because a rail that simply
+    // stopped would be a fleet with machines silently missing from it.
+    let height = usize::from(height);
+    let body = height.saturating_sub(lines.len());
+    let mut shown = body / RAIL_LINES_PER_MACHINE;
+    if shown < machines.len() {
+        shown = body.saturating_sub(2) / RAIL_LINES_PER_MACHINE;
     }
-    if !tui.machines_expanded {
-        let mut spans = vec![Span::raw(" ")];
-        for machine in &machines {
-            spans.push(Span::styled(
-                sanitize_single_line(&machine.name),
-                Style::default().fg(theme.agent_overlay_foreground),
-            ));
-            spans.push(Span::styled(
-                if machine.reachable {
-                    " ✓   ".to_owned()
-                } else {
-                    " asleep   ".to_owned()
-                },
-                Style::default().fg(if machine.reachable {
-                    theme.agent_overlay_muted
-                } else {
-                    theme.agent_overlay_secondary
-                }),
-            ));
-        }
-        return vec![Line::raw(""), Line::from(spans)];
+    for machine in machines.iter().take(shown) {
+        lines.push(rail_line(Vec::new(), theme));
+        lines.push(rail_line(
+            vec![
+                Span::styled(
+                    if machine.reachable { "● " } else { "○ " },
+                    Style::default().fg(if machine.reachable {
+                        theme.agent_overlay_chrome
+                    } else {
+                        theme.agent_overlay_secondary
+                    }),
+                ),
+                Span::styled(
+                    truncate_trailing(&sanitize_single_line(&machine.name), RAIL_TEXT_WIDTH - 2),
+                    Style::default().fg(theme.agent_overlay_foreground),
+                ),
+            ],
+            theme,
+        ));
+        lines.push(rail_line(
+            vec![Span::styled(
+                format!(
+                    "  {}",
+                    truncate_trailing(&machine_detail(machine), RAIL_TEXT_WIDTH - 2)
+                ),
+                Style::default().fg(theme.agent_overlay_muted),
+            )],
+            theme,
+        ));
     }
+    if shown < machines.len() {
+        let rest = machines.len() - shown;
+        lines.push(rail_line(Vec::new(), theme));
+        lines.push(rail_line(
+            vec![Span::styled(
+                format!("+{rest} more"),
+                Style::default().fg(theme.agent_overlay_secondary),
+            )],
+            theme,
+        ));
+    }
+    lines
+}
+
+/// What a machine is, under its name: whether it is this one, whether it is
+/// answering, and what it is running.
+///
+/// `accepts work` appears only when that machine actually said so. The answer
+/// is given during its own pairing and has no way back here, so printing
+/// anything for a machine that never said would be inventing consent.
+fn machine_detail(machine: &MachineRow) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if machine.this_machine {
+        parts.push(String::from("this machine"));
+    } else if !machine.reachable {
+        parts.push(String::from("asleep"));
+    }
+    if machine.accepts_work == Some(true) {
+        parts.push(String::from("accepts work"));
+    }
+    match machine.agents {
+        0 => {}
+        1 => parts.push(String::from("1 agent")),
+        count => parts.push(format!("{count} agents")),
+    }
+    if parts.is_empty() {
+        parts.push(String::from("ready"));
+    }
+    parts.join(" · ")
+}
+
+/// One rail line, hung off the rule that separates it from the agents.
+fn rail_line(mut spans: Vec<Span<'static>>, theme: &UiTheme) -> Line<'static> {
+    let mut line = vec![Span::styled(
+        "│ ",
+        Style::default().fg(theme.agent_overlay_secondary),
+    )];
+    line.append(&mut spans);
+    Line::from(line)
+}
+
+/// The same facts as a table under the agents, for a terminal too narrow to
+/// give a column away.
+fn machine_table(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::raw(""),
         Line::styled(
@@ -420,13 +516,37 @@ pub(in crate::tui) fn machine_block(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    for machine in &machines {
+    for machine in &machine_rows(tui) {
         lines.push(Line::styled(
             format!(" {}", machine_line(machine)),
             Style::default().fg(theme.agent_overlay_foreground),
         ));
     }
     lines
+}
+
+/// Fleet health in one line, for a terminal with room for nothing else.
+fn machine_strip(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
+    let mut spans = vec![Span::raw(" ")];
+    for machine in &machine_rows(tui) {
+        spans.push(Span::styled(
+            sanitize_single_line(&machine.name),
+            Style::default().fg(theme.agent_overlay_foreground),
+        ));
+        spans.push(Span::styled(
+            if machine.reachable {
+                " ✓   ".to_owned()
+            } else {
+                " asleep   ".to_owned()
+            },
+            Style::default().fg(if machine.reachable {
+                theme.agent_overlay_muted
+            } else {
+                theme.agent_overlay_secondary
+            }),
+        ));
+    }
+    vec![Line::raw(""), Line::from(spans)]
 }
 
 /// One machine, formatted identically on Home and in `p2pmux machines`, so the
@@ -509,13 +629,13 @@ mod tests {
 
     use super::{
         ELAPSED_WIDTH, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
-        format_home_row, header_line, home_elapsed, machine_line,
+        format_home_row, header_line, home_elapsed, machine_detail, machine_line,
     };
     use crate::{
         agent_detect::{AgentKind, AgentState, DetectedAgent, PaneAgentTracker},
         config::UiTheme,
         protocol::AgentRosterState,
-        tui::{home::MachineRow, test_support::agent_row},
+        tui::{MultiPaneTui, home::MachineRow, test_support::agent_row},
     };
 
     fn rendered(state: AgentRosterState, message: &str) -> String {
@@ -525,6 +645,24 @@ mod tests {
         row.kind = String::from("claude");
         row.message = message.to_owned();
         format_home_row(&row, false, 100, 0, 0, &UiTheme::default()).to_string()
+    }
+
+    /// Home drawn into a terminal of the given size, one string per screen row.
+    pub(in crate::tui) fn screen(tui: &MultiPaneTui, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| super::render_home(frame, tui, 0))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     /// The rule, checked at the boundary where it is consumed rather than only
@@ -684,5 +822,109 @@ mod tests {
         };
 
         assert!(machine_line(&asleep).contains("asleep"));
+    }
+
+    /// The line under a machine's name says what it is and what it is running.
+    /// A machine that is up and idle still says something — a blank line under
+    /// a name reads as a machine the screen knows nothing about.
+    #[test]
+    fn the_line_under_a_machine_names_what_it_is_and_what_it_runs() {
+        let base = MachineRow {
+            name: String::from("droplet"),
+            reachable: true,
+            accepts_work: None,
+            agents: 0,
+            this_machine: false,
+        };
+
+        assert_eq!(machine_detail(&base), "ready");
+        assert_eq!(
+            machine_detail(&MachineRow {
+                agents: 1,
+                ..base.clone()
+            }),
+            "1 agent"
+        );
+        assert_eq!(
+            machine_detail(&MachineRow {
+                this_machine: true,
+                agents: 3,
+                ..base.clone()
+            }),
+            "this machine · 3 agents"
+        );
+        assert_eq!(
+            machine_detail(&MachineRow {
+                reachable: false,
+                ..base.clone()
+            }),
+            "asleep"
+        );
+        // Never said is never printed: the answer is given during that
+        // machine's own pairing and has no way back here, so anything else
+        // would be inventing consent nobody gave.
+        assert_eq!(
+            machine_detail(&MachineRow {
+                accepts_work: None,
+                agents: 2,
+                ..base.clone()
+            }),
+            "2 agents"
+        );
+        assert_eq!(
+            machine_detail(&MachineRow {
+                accepts_work: Some(true),
+                agents: 2,
+                ..base
+            }),
+            "accepts work · 2 agents"
+        );
+    }
+
+    /// The fleet stays on screen the whole time the inbox is up, in width the
+    /// agents were never using.
+    #[test]
+    fn the_rail_draws_every_machine_beside_the_agents() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("oldbox"),
+            accepts_work: None,
+        }];
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(drawn.contains("MACHINES · 2"), "{drawn}");
+        assert!(drawn.contains("● laptop"), "{drawn}");
+        assert!(drawn.contains("this machine · 1 agent"), "{drawn}");
+        assert!(drawn.contains("○ oldbox"), "{drawn}");
+        assert!(drawn.contains("asleep"), "{drawn}");
+        assert!(
+            drawn.contains('│'),
+            "the rail hangs off a rule rather than floating: {drawn}"
+        );
+    }
+
+    /// A rail with more machines than lines says how many it left out. One that
+    /// simply stopped would be a fleet with machines silently missing from it.
+    #[test]
+    fn a_rail_too_short_for_the_fleet_counts_what_it_cut() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.paired_machines = (1..=6)
+            .map(|index| crate::tui::PairedMachine {
+                name: format!("box{index}"),
+                accepts_work: None,
+            })
+            .collect();
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 14).join("\n");
+        assert!(drawn.contains("MACHINES · 7"), "{drawn}");
+        assert!(
+            drawn.contains(" more"),
+            "the machines that did not fit are counted, not dropped: {drawn}"
+        );
     }
 }
