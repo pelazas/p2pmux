@@ -74,7 +74,7 @@ impl MultiPaneTui {
             // where the user put it, and a row changing state under it must
             // never drag it somewhere else.
             self.home_selected = None;
-            self.home_scroll_line = 0;
+            self.home_page = 0;
             self.repair_home_selection();
         }
         ui_debug_log(
@@ -135,34 +135,64 @@ impl MultiPaneTui {
         {
             self.home_selected = rows.first().copied();
         }
-        self.clamp_home_scroll();
+        self.clamp_home_page();
         self.ensure_home_selection_visible();
     }
 
-    pub(in crate::tui) fn set_home_viewport(&mut self, lines: u16) {
-        self.home_viewport_lines = lines;
-        self.clamp_home_scroll();
+    pub(in crate::tui) fn set_home_viewport(&mut self, page_size: usize) {
+        self.home_page_size = page_size.max(1);
+        self.clamp_home_page();
     }
 
-    /// Tell Home how many rows fit, from the whole terminal rather than from a
-    /// line count the caller had to work out for itself.
+    /// Tell Home how many agents fit on a page, from the whole terminal rather
+    /// than from a count the caller had to work out for itself.
     pub fn set_home_viewport_for(&mut self, area: Rect) {
         let rows = home_layout(self.geometry(area).content, self).rows.height;
-        self.set_home_viewport(rows);
+        self.set_home_viewport(home_page_size(rows));
     }
 
     /// Wheel over the inbox. Returns whether anything moved, so a scroll at the
     /// end of the list never costs a repaint.
+    ///
+    /// A page at a time rather than an agent at a time: the list is paged, and
+    /// a wheel that slid one card off the top would leave a page nobody chose,
+    /// with the first agent half in view.
     pub fn scroll_home(&mut self, area: Rect, up: bool) -> bool {
         self.set_home_viewport_for(area);
-        let previous = self.home_scroll_line;
+        let previous = self.home_page;
         if up {
-            self.home_scroll_line = self.home_scroll_line.saturating_sub(1);
+            self.home_page = self.home_page.saturating_sub(1);
         } else {
-            self.home_scroll_line = self.home_scroll_line.saturating_add(1);
+            self.home_page = self.home_page.saturating_add(1);
         }
-        self.clamp_home_scroll();
-        self.home_scroll_line != previous
+        self.clamp_home_page();
+        if self.home_page != previous {
+            // The cursor follows the page. Leaving it behind on a page that is
+            // no longer drawn means Enter opens an agent that is not on screen.
+            self.home_selected = self
+                .home_rows()
+                .get(self.home_page.saturating_mul(self.home_page_size.max(1)))
+                .map(|row| row.pane_id);
+            return true;
+        }
+        false
+    }
+
+    /// How many pages the list has. Never zero: an empty inbox is one page.
+    pub(in crate::tui) fn home_page_count(&self) -> usize {
+        self.agent_rows
+            .len()
+            .div_ceil(self.home_page_size.max(1))
+            .max(1)
+    }
+
+    pub(in crate::tui) fn home_page(&self) -> usize {
+        self.home_page
+    }
+
+    /// The index of the first agent on the page being drawn.
+    pub(in crate::tui) fn home_page_start(&self) -> usize {
+        self.home_page.saturating_mul(self.home_page_size.max(1))
     }
 
     /// A click on an inbox row selects it and opens it, in one gesture.
@@ -184,32 +214,30 @@ impl MultiPaneTui {
     }
 
     pub(in crate::tui) fn home_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
-        let rows = home_layout(self.geometry(area).content, self).rows;
-        if !crate::tui::geometry::rect_contains(rows, column, row) {
+        let layout = home_layout(self.geometry(area).content, self);
+        if !crate::tui::geometry::rect_contains(layout.rows, column, row) {
             return None;
         }
-        let line = usize::from(row.saturating_sub(rows.y)).saturating_add(self.home_scroll_line);
-        self.home_rows().get(line).map(|row| row.pane_id)
+        let line = usize::from(row.saturating_sub(layout.rows.y));
+        let card = home_card(layout.rows.height).lines();
+        // A click on a card's blank spacer belongs to the card above it, which
+        // is the one the pointer looks like it is on.
+        self.home_rows()
+            .get(self.home_page_start().saturating_add(line / card))
+            .map(|row| row.pane_id)
     }
 
-    pub(in crate::tui) fn home_max_scroll(&self) -> usize {
-        self.agent_rows
-            .len()
-            .saturating_sub(usize::from(self.home_viewport_lines.max(1)))
+    pub(in crate::tui) fn clamp_home_page(&mut self) {
+        self.home_page = self.home_page.min(self.home_page_count().saturating_sub(1));
     }
 
-    pub(in crate::tui) fn clamp_home_scroll(&mut self) {
-        if self.home_viewport_lines == 0 {
-            self.home_scroll_line = 0;
-            return;
-        }
-        self.home_scroll_line = self.home_scroll_line.min(self.home_max_scroll());
-    }
-
+    /// Puts the page the cursor is on on screen.
+    ///
+    /// The selection is what the page follows, never the other way round: the
+    /// sort order decides which agent most wants a human, and a page that
+    /// stayed put while the cursor walked off it would be a screen showing
+    /// agents nobody chose.
     pub(in crate::tui) fn ensure_home_selection_visible(&mut self) {
-        if self.home_viewport_lines == 0 {
-            return;
-        }
         let Some(index) = self.home_selected.and_then(|pane_id| {
             self.home_rows()
                 .iter()
@@ -217,13 +245,8 @@ impl MultiPaneTui {
         }) else {
             return;
         };
-        let viewport = usize::from(self.home_viewport_lines.max(1));
-        if index < self.home_scroll_line {
-            self.home_scroll_line = index;
-        } else if index >= self.home_scroll_line.saturating_add(viewport) {
-            self.home_scroll_line = index.saturating_add(1).saturating_sub(viewport);
-        }
-        self.clamp_home_scroll();
+        self.home_page = index / self.home_page_size.max(1);
+        self.clamp_home_page();
     }
 
     pub(in crate::tui) fn move_home_selection(&mut self, forward: bool) {
@@ -352,7 +375,7 @@ impl MultiPaneTui {
         area: Rect,
     ) -> crate::tui::KeyHandling {
         use crate::tui::KeyHandling;
-        self.set_home_viewport(home_layout(self.geometry(area).content, self).rows.height);
+        self.set_home_viewport_for(area);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
                 self.move_home_selection(false);
@@ -446,8 +469,66 @@ pub(in crate::tui) enum MachinePanel {
     Empty,
 }
 
+/// How much of the screen one agent gets.
+///
+/// A line each was the right answer when the screen was a list of processes.
+/// It is the wrong one for a fleet: nobody runs thirty agents, so the list
+/// occupied a fifth of a terminal and left the rest blank, and a row that had
+/// to fit in one line could show what an agent said *or* which repository it
+/// said it in, never both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum HomeCard {
+    /// Who and where, what it said, and where Enter will land you.
+    Full,
+    /// Who and where, and what it said. The location line is the first thing
+    /// worth dropping: it is the only one you can get by pressing Enter.
+    Compact,
+    /// One line, as it was. What a terminal too short for anything else gets.
+    Row,
+}
+
+impl HomeCard {
+    /// Lines on screen per agent, including the blank that separates two cards.
+    pub(in crate::tui) fn lines(self) -> usize {
+        match self {
+            Self::Full => 4,
+            Self::Compact => 3,
+            Self::Row => 1,
+        }
+    }
+}
+
+/// The richest card the agent list has room for.
+///
+/// Chosen from the height alone, never from how many agents there are: a screen
+/// that changed shape when a fifth agent appeared would be a screen you have to
+/// re-read every time the fleet moves.
+pub(in crate::tui) fn home_card(rows_height: u16) -> HomeCard {
+    // Three cards' worth, so a tier is only taken when it can show a list
+    // rather than a single agent and a gap.
+    if rows_height >= 12 {
+        HomeCard::Full
+    } else if rows_height >= 9 {
+        HomeCard::Compact
+    } else {
+        HomeCard::Row
+    }
+}
+
+/// The most agents one page shows.
+///
+/// Not a space limit — a tall terminal fits more. It is the number of things a
+/// screen can be glanced at rather than read, and the inbox is sorted so that
+/// what is on page one is what most wants a human.
+pub(in crate::tui) const HOME_PAGE_MAX: usize = 8;
+
+/// How many agents fit on a page of a list this tall.
+pub(in crate::tui) fn home_page_size(rows_height: u16) -> usize {
+    (usize::from(rows_height) / home_card(rows_height).lines()).clamp(1, HOME_PAGE_MAX)
+}
+
 /// How wide the rail is, including the rule it hangs off.
-pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 26;
+pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 28;
 /// The narrowest terminal that gets a rail.
 ///
 /// Below this the agents would be paying for the fleet: a card whose sentence

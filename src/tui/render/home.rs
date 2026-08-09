@@ -22,7 +22,8 @@ use crate::{
     tui::{
         AgentOverlayRow, MultiPaneTui,
         home::{
-            HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_layout, machine_rows,
+            HomeCard, HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_card,
+            home_layout, machine_rows,
         },
         render::footer::{FooterSegment, render_footer_segments},
         text::{sanitize_single_line, text_width, truncate_leading, truncate_trailing},
@@ -78,6 +79,9 @@ const RAIL_TEXT_WIDTH: usize = MACHINE_RAIL_WIDTH as usize - 2;
 const RAIL_LINES_PER_MACHINE: usize = 3;
 /// The rule and the key under it, which the fleet never grows into.
 const RAIL_FOOTER_LINES: usize = 2;
+/// Where a card's second and third lines start: under the dot, not under the
+/// marker, so the block of text hangs off the state glyph that introduces it.
+const CARD_INDENT: u16 = 3;
 
 pub(in crate::tui) fn render_home(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
     let geometry = tui.geometry(frame.area());
@@ -102,7 +106,13 @@ fn render_home_in(
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw(""),
-                header_line(tui.home_needs_you_count(), theme),
+                header_line(
+                    tui.home_needs_you_count(),
+                    tui.home_page(),
+                    tui.home_page_count(),
+                    layout.header.width,
+                    theme,
+                ),
             ]),
             layout.header,
         );
@@ -123,13 +133,15 @@ fn render_home_in(
             );
         } else {
             let animation_phase = animation_phase(now_unix_ms);
+            let card = home_card(layout.rows.height);
             let lines = rows
                 .into_iter()
-                .skip(tui.home_scroll_line)
-                .take(usize::from(layout.rows.height))
-                .map(|row| {
-                    format_home_row(
+                .skip(tui.home_page_start())
+                .take(usize::from(layout.rows.height) / card.lines())
+                .flat_map(|row| {
+                    format_home_card(
                         row,
+                        card,
                         tui.home_selected == Some(row.pane_id),
                         layout.rows.width,
                         now_unix_ms,
@@ -171,7 +183,18 @@ fn render_home_in(
 
 /// `Agents · 2 need you` — the whole value of the screen in one number, and the
 /// exact sentence a notification will one day carry.
-pub(in crate::tui) fn header_line(needs_you: usize, theme: &UiTheme) -> Line<'static> {
+///
+/// The page marker sits at the other end, and only when there is more than one
+/// page. It never has to be read to know whether something is waiting: the
+/// count beside the title covers the whole list, not the page on screen, and
+/// the sort order puts what most wants a human on page one.
+pub(in crate::tui) fn header_line(
+    needs_you: usize,
+    page: usize,
+    pages: usize,
+    width: u16,
+    theme: &UiTheme,
+) -> Line<'static> {
     let mut spans = vec![Span::styled(
         " Agents",
         Style::default()
@@ -193,16 +216,199 @@ pub(in crate::tui) fn header_line(needs_you: usize, theme: &UiTheme) -> Line<'st
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if pages > 1 {
+        let marker = format!("page {} of {pages} ", page.saturating_add(1), pages = pages);
+        let used = spans.iter().fold(0_u16, |total, span| {
+            total.saturating_add(text_width(&span.content))
+        });
+        let gap = width
+            .saturating_sub(used)
+            .saturating_sub(text_width(&marker));
+        if gap > 0 {
+            spans.push(Span::raw(" ".repeat(usize::from(gap))));
+            spans.push(Span::styled(
+                marker,
+                Style::default().fg(theme.agent_overlay_muted),
+            ));
+        }
+    }
     Line::from(spans)
+}
+
+/// One agent, as many lines as the terminal has room for.
+///
+/// The `Full` card is the one worth reading:
+///
+/// ```text
+/// › ● droplet    claude                     needs you        2m14s
+///     permission: write to /etc/hosts
+///     ~/work/p2pmux · tab 2 · pane 1
+/// ```
+///
+/// The second line is what the agent said, at whatever length it said it, and
+/// the third is the two facts a one-line row had to choose between showing —
+/// which repository it is in, and where Enter is about to put you. It is never
+/// a model-written summary: a richer sentence that can lie about what an agent
+/// did defeats the entire point of not reading the terminal yourself.
+pub(in crate::tui) fn format_home_card(
+    row: &AgentOverlayRow,
+    card: HomeCard,
+    selected: bool,
+    width: u16,
+    now_unix_ms: u64,
+    animation_phase: usize,
+    theme: &UiTheme,
+) -> Vec<Line<'static>> {
+    if card == HomeCard::Row {
+        return vec![format_home_row(
+            row,
+            selected,
+            width,
+            now_unix_ms,
+            animation_phase,
+            theme,
+        )];
+    }
+    let background = if selected {
+        Style::default().bg(theme.agent_overlay_selected_background)
+    } else {
+        Style::default()
+    };
+    let (said, said_style) = home_description(row, theme);
+    let mut lines = vec![
+        card_headline(row, selected, width, now_unix_ms, animation_phase, theme),
+        card_line(&said, said_style, width, background),
+    ];
+    if card == HomeCard::Full {
+        // The cwd only when the line above did not already have to be it: the
+        // fallback for an agent that has said nothing is its directory, and
+        // printing that twice would waste the line the card exists for.
+        let location = home_location(row, said == short_cwd(&row.cwd));
+        lines.push(card_line(
+            &location,
+            Style::default().fg(theme.agent_overlay_secondary),
+            width,
+            background,
+        ));
+    }
+    // The blank between two cards, tinted with the selection so the band reads
+    // as one agent rather than as three lines that happen to be adjacent.
+    lines.push(card_line("", Style::default(), width, background));
+    lines
+}
+
+/// `~/work/p2pmux · tab 2 · pane 1` — where the agent is, and where Enter goes.
+fn home_location(row: &AgentOverlayRow, cwd_already_shown: bool) -> String {
+    let where_it_runs = format!("tab {} · pane {}", row.tab_ordinal, row.pane_ordinal);
+    if cwd_already_shown || row.cwd.is_empty() {
+        return where_it_runs;
+    }
+    format!("{} · {where_it_runs}", short_cwd(&row.cwd))
+}
+
+/// A card's second or third line: indented under the dot, and padded so the
+/// selection band covers the whole width.
+fn card_line(text: &str, style: Style, width: u16, background: Style) -> Line<'static> {
+    let room = usize::from(width.saturating_sub(CARD_INDENT));
+    let text = truncate_trailing(&sanitize_single_line(text), room);
+    Line::from(vec![
+        Span::styled(" ".repeat(usize::from(CARD_INDENT)), background),
+        Span::styled(format!("{text:<room$}"), style.patch(background)),
+    ])
+    .style(background)
+}
+
+/// The first line of a card: who, where, what state, and for how long.
+fn card_headline(
+    row: &AgentOverlayRow,
+    selected: bool,
+    width: u16,
+    now_unix_ms: u64,
+    animation_phase: usize,
+    theme: &UiTheme,
+) -> Line<'static> {
+    let (dot, state_word) = home_state_label(row.state, animation_phase);
+    let state_color = home_state_color(row.state, theme);
+    let background = if selected {
+        Style::default().bg(theme.agent_overlay_selected_background)
+    } else {
+        Style::default()
+    };
+    let mut state_style = Style::default().fg(state_color);
+    if row.state.needs_you() {
+        state_style = state_style.add_modifier(Modifier::BOLD);
+    }
+
+    let mut spans = vec![
+        Span::styled(
+            if selected { "›" } else { " " },
+            Style::default()
+                .fg(theme.agent_overlay_chrome)
+                .patch(background),
+        ),
+        Span::styled(dot, Style::default().fg(state_color).patch(background)),
+        Span::styled(" ", background),
+        Span::styled(
+            pad(&sanitize_single_line(&row.host), MACHINE_WIDTH),
+            Style::default()
+                .fg(theme.agent_overlay_foreground)
+                .patch(background),
+        ),
+        Span::styled(" ", background),
+        Span::styled(
+            pad(home_kind_label(&row.kind), AGENT_WIDTH),
+            Style::default()
+                .fg(theme.agent_overlay_foreground)
+                .add_modifier(Modifier::BOLD)
+                .patch(background),
+        ),
+    ];
+    // State and elapsed are pushed to the right-hand edge, where they line up
+    // down the page and leave the middle to the name. Both drop off a terminal
+    // too narrow to hold them rather than pushing the name off the front.
+    let used = text_width("  ")
+        .saturating_add(text_width(dot))
+        .saturating_add(MACHINE_WIDTH)
+        .saturating_add(AGENT_WIDTH)
+        .saturating_add(1);
+    let tail = STATE_WIDTH.saturating_add(ELAPSED_WIDTH).saturating_add(1);
+    if width > used.saturating_add(tail) {
+        spans.push(Span::styled(
+            " ".repeat(usize::from(width.saturating_sub(used).saturating_sub(tail))),
+            background,
+        ));
+        spans.push(Span::styled(
+            pad(state_word, STATE_WIDTH),
+            state_style.patch(background),
+        ));
+        spans.push(Span::styled(
+            format!(
+                "{:>width$}",
+                home_elapsed(row, now_unix_ms),
+                width = usize::from(ELAPSED_WIDTH)
+            ),
+            Style::default()
+                .fg(theme.agent_overlay_muted)
+                .patch(background),
+        ));
+    }
+    let drawn = spans.iter().fold(0_u16, |total, span| {
+        total.saturating_add(text_width(&span.content))
+    });
+    spans.push(Span::styled(
+        " ".repeat(usize::from(width.saturating_sub(drawn))),
+        background,
+    ));
+    Line::from(spans).style(background)
 }
 
 /// One agent, one line:
 /// `‹dot› ‹machine› ‹agent› ‹state› ‹what it is doing› ‹elapsed›`.
 ///
-/// Machine is a column rather than a panel because you care about a machine
-/// almost exclusively through an agent that happens to be on it. Elapsed is
-/// right-aligned and last because it is the first thing worth cutting when the
-/// terminal is narrow.
+/// What a terminal too short for a card falls back to. Machine is a column
+/// rather than a panel because you care about a machine almost exclusively
+/// through an agent that happens to be on it. Elapsed is right-aligned and last
+/// because it is the first thing worth cutting when the terminal is narrow.
 pub(in crate::tui) fn format_home_row(
     row: &AgentOverlayRow,
     selected: bool,
@@ -663,13 +869,17 @@ mod tests {
 
     use super::{
         ELAPSED_WIDTH, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
-        format_home_row, header_line, home_elapsed, machine_detail, machine_line,
+        format_home_row, header_line, home_card, home_elapsed, machine_detail, machine_line,
     };
     use crate::{
         agent_detect::{AgentKind, AgentState, DetectedAgent, PaneAgentTracker},
         config::UiTheme,
         protocol::AgentRosterState,
-        tui::{MultiPaneTui, home::MachineRow, test_support::agent_row},
+        tui::{
+            MultiPaneTui,
+            home::{HomeCard, MachineRow},
+            test_support::agent_row,
+        },
     };
 
     fn rendered(state: AgentRosterState, message: &str) -> String {
@@ -795,15 +1005,28 @@ mod tests {
     #[test]
     fn the_header_says_the_count_in_words_a_notification_could_reuse() {
         let theme = UiTheme::default();
-        assert_eq!(header_line(0, &theme).to_string().trim(), "Agents");
-        assert_eq!(
-            header_line(1, &theme).to_string().trim(),
-            "Agents · 1 needs you"
+        let header = |needs_you| header_line(needs_you, 0, 1, 80, &theme).to_string();
+
+        assert_eq!(header(0).trim(), "Agents");
+        assert_eq!(header(1).trim(), "Agents · 1 needs you");
+        assert_eq!(header(2).trim(), "Agents · 2 need you");
+    }
+
+    /// The page marker appears only when there is a second page, and never
+    /// where it could be read as part of the count: the count is of the whole
+    /// list, so a page you cannot see can never be hiding something urgent.
+    #[test]
+    fn the_header_marks_the_page_only_when_there_is_more_than_one() {
+        let theme = UiTheme::default();
+
+        assert!(
+            !header_line(2, 0, 1, 80, &theme)
+                .to_string()
+                .contains("page")
         );
-        assert_eq!(
-            header_line(2, &theme).to_string().trim(),
-            "Agents · 2 need you"
-        );
+        let paged = header_line(2, 1, 3, 80, &theme).to_string();
+        assert!(paged.starts_with(" Agents · 2 need you"), "{paged:?}");
+        assert!(paged.trim_end().ends_with("page 2 of 3"), "{paged:?}");
     }
 
     #[test]
@@ -913,6 +1136,55 @@ mod tests {
             }),
             "accepts work · 2 agents"
         );
+    }
+
+    /// The card shows what a one-line row had to choose between: what the agent
+    /// said, *and* which repository it said it in.
+    #[test]
+    fn a_card_shows_the_words_and_the_place_a_row_could_only_pick_between() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("droplet", "claude", AgentRosterState::Pending)]);
+        tui.agent_rows[0].message = String::from("permission: write to /etc/hosts");
+        tui.agent_rows[0].cwd = String::from("/Users/sam/work/p2pmux");
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(drawn.contains("permission: write to /etc/hosts"), "{drawn}");
+        assert!(drawn.contains("work/p2pmux · tab 1 · pane 1"), "{drawn}");
+        assert!(drawn.contains("needs you"), "{drawn}");
+    }
+
+    /// An agent that has said nothing falls back to its directory, and the card
+    /// must not then print the directory twice.
+    #[test]
+    fn a_card_with_nothing_said_does_not_print_the_directory_twice() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("droplet", "claude", AgentRosterState::Working)]);
+        tui.agent_rows[0].cwd = String::from("/Users/sam/work/p2pmux");
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert_eq!(
+            drawn.matches("work/p2pmux").count(),
+            1,
+            "the fallback line already is the directory: {drawn}"
+        );
+        assert!(drawn.contains("tab 1 · pane 1"), "{drawn}");
+    }
+
+    /// A terminal too short for cards keeps the one-line rows rather than
+    /// showing one agent and a gap.
+    #[test]
+    fn a_short_terminal_falls_back_to_one_line_a_row() {
+        let tui = crate::tui::test_support::home_tui(&[
+            ("droplet", "claude", AgentRosterState::Pending),
+            ("laptop", "codex", AgentRosterState::Working),
+        ]);
+
+        assert_eq!(home_card(20), HomeCard::Full);
+        assert_eq!(home_card(11), HomeCard::Compact);
+        assert_eq!(home_card(8), HomeCard::Row);
+        let _ = tui;
     }
 
     /// The fleet stays on screen the whole time the inbox is up, in width the

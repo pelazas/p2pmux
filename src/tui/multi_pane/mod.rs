@@ -71,8 +71,11 @@ pub struct MultiPaneTui {
     /// Local to this client and never replicated: see [`crate::tui::home`].
     pub(in crate::tui) home_open: bool,
     pub(in crate::tui) home_selected: Option<PaneId>,
-    pub(in crate::tui) home_scroll_line: usize,
-    pub(in crate::tui) home_viewport_lines: u16,
+    /// Which page of the agent list is drawn. Derived from the selection
+    /// everywhere except the wheel, which moves both.
+    pub(in crate::tui) home_page: usize,
+    /// How many agents that page holds, from the last layout that was measured.
+    pub(in crate::tui) home_page_size: usize,
     /// The pane Home handed the user into, drawn alone in the content area.
     ///
     /// A local view choice, so it never reaches the layout: the pane keeps the
@@ -139,8 +142,8 @@ impl MultiPaneTui {
             pending_home_toggle: None,
             home_open: false,
             home_selected: None,
-            home_scroll_line: 0,
-            home_viewport_lines: 0,
+            home_page: 0,
+            home_page_size: crate::tui::home::HOME_PAGE_MAX,
             zoomed_pane: None,
             paired_machines: Vec::new(),
             local_peer_id: None,
