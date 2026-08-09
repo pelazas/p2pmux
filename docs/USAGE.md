@@ -309,11 +309,16 @@ Each row is a status dot, the machine the agent is on, the agent, its state, wha
 was doing, and how long it has been in that state. Rows sort blocked → done → running → idle: a
 row that needs you never appears below one that does not, and that is the point of the screen.
 
+Opening a row puts you on the tab that agent lives on, focused on its pane, with the rest of that
+tab drawn around it. The focused pane's border says which one you landed in, so there is nothing
+to hunt for, and the panes it shares the tab with stay where you left them. Use `Ctrl+P` then `z`
+if you want the agent alone on screen.
+
 | Key | Does |
 |-----|------|
 | `Ctrl+O` | The inbox, from anywhere including inside a live terminal |
 | `Ctrl+A` | The same, kept for the muscle memory the old agents overlay built |
-| `Enter` | Open the selected agent's terminal, full screen |
+| `Enter` | Go to the selected agent's tab and focus its pane |
 | `n` | New terminal on this machine |
 | `m` | Expand the machine list |
 | `↑` `↓` | Move the selection |
