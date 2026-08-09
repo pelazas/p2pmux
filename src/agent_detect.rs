@@ -44,6 +44,14 @@ pub enum AgentKind {
     Cursor,
     Pi,
     OpenCode,
+    /// A personal-assistant daemon, not a coding agent started in a pane.
+    ///
+    /// Both of these run under a runtime — Hermes under `python`, OpenClaw
+    /// under `node` — so neither is ever the basename in `ps`, and neither is
+    /// a child of the pane you are looking at. What identifies them is the
+    /// module or program path in their command line.
+    Hermes,
+    OpenClaw,
 }
 
 impl AgentKind {
@@ -75,6 +83,25 @@ impl AgentKind {
                 .any(|argument| argument.contains("/opencode") || argument.ends_with("opencode"))
         {
             Some(Self::OpenCode)
+        } else if matches_launcher(exe_basename, name, cmdline, "hermes")
+            // The shape the gateway actually has on a machine running one:
+            // `.../venv/bin/python -m hermes_cli.main gateway run`. Matched as
+            // the argument *after* `-m`, not as a word anywhere in the command
+            // line — `grep -rn hermes_cli .` mentions the module and is not
+            // running it, and on a developer's machine that difference is the
+            // whole difference.
+            || cmdline
+                .windows(2)
+                .any(|pair| pair[0] == "-m" && is_module_path(&pair[1], "hermes_cli"))
+        {
+            Some(Self::Hermes)
+        } else if matches_launcher(exe_basename, name, cmdline, "openclaw")
+            || matches_launcher(exe_basename, name, cmdline, "clawd")
+            || cmdline.iter().any(|argument| {
+                is_program_path(argument, "openclaw") || is_program_path(argument, "clawd")
+            })
+        {
+            Some(Self::OpenClaw)
         } else {
             None
         }
@@ -88,6 +115,8 @@ impl AgentKind {
             Self::Cursor => "cursor",
             Self::Pi => "pi",
             Self::OpenCode => "opencode",
+            Self::Hermes => "hermes",
+            Self::OpenClaw => "openclaw",
         }
     }
 
@@ -101,6 +130,8 @@ impl AgentKind {
             "cursor" => Some(Self::Cursor),
             "pi" => Some(Self::Pi),
             "opencode" => Some(Self::OpenCode),
+            "hermes" => Some(Self::Hermes),
+            "openclaw" => Some(Self::OpenClaw),
             _ => None,
         }
     }
@@ -118,6 +149,97 @@ impl AgentKind {
             Self::Cursor => "Cursor Agent",
             Self::Pi => "Pi",
             Self::OpenCode => "OpenCode",
+            Self::Hermes => "Hermes",
+            Self::OpenClaw => "OpenClaw",
+        }
+    }
+
+    /// What running this agent's chat command actually gets you, and what it is.
+    ///
+    /// One exhaustive match, so adding an agent cannot forget to answer the
+    /// question — and the answer is checked against the real CLI rather than
+    /// assumed, because the difference between joining a conversation and
+    /// starting a new one is the difference between the feature working and the
+    /// feature lying.
+    pub const fn chat(self) -> AgentChat {
+        match self {
+            // A daemon plus a client: `openclaw chat` sends the turn through
+            // the running gateway, and `--local` is the flag that opts out of
+            // it. A real attach.
+            Self::OpenClaw => AgentChat {
+                access: ChatAccess::Attach,
+                command: &["openclaw", "chat"],
+            },
+            // Not an attach, despite looking like one. Hermes is also a daemon
+            // plus a client, but `hermes chat` runs the agent in the calling
+            // process and there is no flag that joins the conversation the
+            // gateway is having now. `--continue` resumes a *stored* session,
+            // which is a different promise. Same agent, same memories, new
+            // conversation — and the UI says so.
+            Self::Hermes => AgentChat {
+                access: ChatAccess::NewSession,
+                command: &["hermes", "chat"],
+            },
+            // The coding agents. Starting the binary starts a conversation; it
+            // cannot join one already running in someone else's terminal.
+            Self::Claude => AgentChat {
+                access: ChatAccess::NewSession,
+                command: &["claude"],
+            },
+            Self::Codex => AgentChat {
+                access: ChatAccess::NewSession,
+                command: &["codex"],
+            },
+            Self::Cursor => AgentChat {
+                access: ChatAccess::NewSession,
+                command: &["cursor-agent"],
+            },
+            Self::Pi => AgentChat {
+                access: ChatAccess::NewSession,
+                command: &["pi"],
+            },
+            Self::OpenCode => AgentChat {
+                access: ChatAccess::NewSession,
+                command: &["opencode"],
+            },
+        }
+    }
+}
+
+/// How to reach an agent from the inbox, and what reaching it means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentChat {
+    pub access: ChatAccess,
+    /// The argv to run in a terminal on the agent's own machine. Never a shell
+    /// string: it is handed to the machine that hosts the pane, which decides
+    /// whether it may run it, and that decision has to be about the same words
+    /// that end up being executed.
+    pub command: &'static [&'static str],
+}
+
+/// What running an agent's chat command gets you.
+///
+/// The distinction exists because getting it wrong is the one genuinely bad
+/// outcome: opening a brand-new conversation while implying you joined the
+/// running one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatAccess {
+    /// A real client that joins the conversation already in progress.
+    Attach,
+    /// Starting the binary begins a *fresh* conversation with the same agent.
+    /// It cannot join the running one.
+    NewSession,
+    /// Visible in the inbox, no way in.
+    None,
+}
+
+impl ChatAccess {
+    /// What the UI says it is about to do, before it does it.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Attach => "joining the conversation already running",
+            Self::NewSession => "starting a new conversation — not the one already running",
+            Self::None => "no way to open a chat with this agent",
         }
     }
 }
@@ -126,6 +248,30 @@ fn matches_launcher(exe_basename: &str, name: &str, cmdline: &[String], launcher
     exe_basename == launcher
         || name == launcher
         || cmdline.first().is_some_and(|argv0| argv0 == launcher)
+}
+
+/// Whether an argument is a Python module path rooted at `module`.
+///
+/// `hermes_cli.main`, not `--config=hermes_cli` and not a file called
+/// `notes-about-hermes_cli.md`. The whole argument has to be the module or a
+/// submodule of it, because a substring search over a command line finds every
+/// process that merely mentions one.
+fn is_module_path(argument: &str, module: &str) -> bool {
+    argument == module
+        || argument
+            .strip_prefix(module)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether an argument is a path to, or the bare name of, the program `name`.
+///
+/// The same rule one level up: `/usr/lib/node_modules/openclaw/dist/index.js`
+/// and `openclaw` count; `openclaw.md` does not, and neither does a word that
+/// merely contains the name.
+fn is_program_path(argument: &str, name: &str) -> bool {
+    argument
+        .split('/')
+        .any(|component| component == name || component.strip_prefix(name) == Some(".js"))
 }
 
 /// One process from a sampler snapshot.
@@ -720,6 +866,128 @@ mod tests {
         assert_eq!(AgentKind::Claude.display_label(), "Claude Code");
         assert_eq!(AgentKind::Cursor.wire_value(), "cursor");
         assert_eq!(AgentKind::OpenCode.wire_value(), "opencode");
+    }
+
+    /// The two assistant daemons, matched on the shape they really have.
+    ///
+    /// Neither is ever the basename in `ps` — Hermes runs under `python` and
+    /// OpenClaw under `node` — and neither is a child of the pane you are
+    /// looking at, so nothing about the old "the launcher is the pane's own
+    /// child" assumption applies.
+    #[test]
+    fn the_assistant_daemons_are_matched_by_what_ps_actually_shows() {
+        // Copied from `ps` on the droplet running one:
+        // /home/pelazas/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run --replace
+        let hermes_gateway = vec![
+            String::from("/home/pelazas/.hermes/hermes-agent/venv/bin/python"),
+            String::from("-m"),
+            String::from("hermes_cli.main"),
+            String::from("gateway"),
+            String::from("run"),
+            String::from("--replace"),
+        ];
+        assert_eq!(
+            AgentKind::from_process("python", "python", &hermes_gateway),
+            Some(AgentKind::Hermes)
+        );
+        assert_eq!(
+            AgentKind::from_process("python3.11", "python3.11", &hermes_gateway),
+            Some(AgentKind::Hermes),
+            "the runtime's version in the basename must not decide anything"
+        );
+        assert_eq!(
+            AgentKind::from_process("hermes", "hermes", &[]),
+            Some(AgentKind::Hermes),
+            "and the client, which is what a chat pane runs"
+        );
+
+        // OpenClaw ships `openclaw-gateway.service` as a systemd user unit and
+        // runs under node.
+        let openclaw_gateway = vec![
+            String::from("node"),
+            String::from("/usr/lib/node_modules/openclaw/dist/index.js"),
+            String::from("gateway"),
+        ];
+        assert_eq!(
+            AgentKind::from_process("node", "node", &openclaw_gateway),
+            Some(AgentKind::OpenClaw)
+        );
+        assert_eq!(
+            AgentKind::from_process("openclaw", "node", &[]),
+            Some(AgentKind::OpenClaw)
+        );
+        assert_eq!(
+            AgentKind::from_process("clawd", "clawd", &[]),
+            Some(AgentKind::OpenClaw),
+            "the name it shipped under before the rename"
+        );
+    }
+
+    /// A substring search over a command line finds every process that merely
+    /// mentions an agent, which on a developer's machine is a lot of them.
+    #[test]
+    fn talking_about_an_agent_is_not_running_one() {
+        let editing = vec![String::from("vim"), String::from("openclaw.md")];
+        assert_eq!(AgentKind::from_process("vim", "vim", &editing), None);
+
+        let searching = vec![
+            String::from("grep"),
+            String::from("-rn"),
+            String::from("hermes_cli"),
+            String::from("."),
+        ];
+        assert_eq!(AgentKind::from_process("grep", "grep", &searching), None);
+
+        // Hermes' own migration helper, which is about OpenClaw and is not it.
+        let migrating = vec![
+            String::from("hermes"),
+            String::from("claw"),
+            String::from("migrate"),
+        ];
+        assert_eq!(
+            AgentKind::from_process("hermes", "hermes", &migrating),
+            Some(AgentKind::Hermes),
+            "it is Hermes, and specifically not OpenClaw"
+        );
+
+        let reading_a_note = vec![String::from("less"), String::from("notes-hermes_cli.txt")];
+        assert_eq!(
+            AgentKind::from_process("less", "less", &reading_a_note),
+            None
+        );
+    }
+
+    /// The wire values and the labels have to move together with the enum, and
+    /// an unknown value still has to be refused rather than coerced.
+    #[test]
+    fn the_new_agents_round_trip_and_unknown_values_are_still_refused() {
+        for kind in [AgentKind::Hermes, AgentKind::OpenClaw] {
+            assert_eq!(AgentKind::from_wire(kind.wire_value()), Some(kind));
+            assert!(!kind.display_label().is_empty());
+            assert!(!kind.chat().command.is_empty());
+        }
+        assert_eq!(AgentKind::Hermes.display_label(), "Hermes");
+        assert_eq!(AgentKind::OpenClaw.display_label(), "OpenClaw");
+        assert_eq!(AgentKind::from_wire("hermes-agent"), None);
+    }
+
+    /// The finding this issue asked for, pinned so it cannot be quietly
+    /// "corrected" back to the guess it started as.
+    #[test]
+    fn openclaw_attaches_and_hermes_starts_a_new_conversation() {
+        assert_eq!(AgentKind::OpenClaw.chat().access, ChatAccess::Attach);
+        assert_eq!(AgentKind::OpenClaw.chat().command, &["openclaw", "chat"]);
+
+        assert_eq!(AgentKind::Hermes.chat().access, ChatAccess::NewSession);
+        assert_eq!(AgentKind::Hermes.chat().command, &["hermes", "chat"]);
+        assert!(
+            AgentKind::Hermes
+                .chat()
+                .access
+                .describe()
+                .contains("not the one already running"),
+            "the one genuinely bad outcome is implying otherwise"
+        );
     }
 
     #[test]
