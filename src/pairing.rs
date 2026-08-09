@@ -221,7 +221,7 @@ pub fn remember_peers(names: &[String]) -> Result<(), PairingError> {
 
 /// Best-effort read for the paths where a failure must not stop the UI.
 ///
-/// The inbox draws a machine strip from this. A pairing file that cannot be
+/// The inbox draws its machines rail from this. A pairing file that cannot be
 /// read is worth a missing strip, never a client that refuses to start.
 pub fn load_or_empty() -> Pairing {
     load().unwrap_or_default()

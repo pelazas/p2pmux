@@ -1,4 +1,4 @@
-//! Drawing Home: the header count, one line per agent, the machine strip, and
+//! Drawing Home: the header count, a card per agent, the machines rail, and
 //! the key bar.
 //!
 //! What is deliberately *not* here is as load-bearing as what is: no output

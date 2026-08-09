@@ -615,7 +615,7 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
     rows
 }
 
-/// One line of the machine strip, and one row of `p2pmux machines`.
+/// One machine on the inbox, and one row of `p2pmux machines`.
 ///
 /// Public because the CLI builds these too: the `m` key on Home and the command
 /// print the same rows through the same formatter, so the two can never drift
