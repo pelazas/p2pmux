@@ -550,6 +550,13 @@ impl MultiPaneTui {
     ) -> bool {
         let old_tab = self.current_tab;
         let old_pane = self.focused_pane;
+        if old_pane != pane_id {
+            // A press was forwarded to the pane that held focus, and the child
+            // there is waiting for its release. Focus moving out from under the
+            // gesture -- a peer's layout change, a pane created elsewhere --
+            // ends it: the release belongs to that child, not to the next one.
+            self.mouse_forwarding = false;
+        }
         self.current_tab = tab_id;
         self.focused_pane = pane_id;
         let unread_cleared = self.unread_agent_panes.remove(&pane_id);

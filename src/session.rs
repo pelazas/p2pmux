@@ -15,7 +15,9 @@ use std::{
 
 use iroh::{
     EndpointAddr, EndpointId,
-    endpoint::{ConnectingError, Connection, Incoming, SendStream},
+    endpoint::{
+        ConnectingError, Connection, ConnectionError, Incoming, SendStream, VarInt, WriteError,
+    },
 };
 use prost::Message as _;
 use tokio::{
@@ -3422,11 +3424,37 @@ fn expected_service_error(error: &SessionError) -> bool {
     )
 }
 
+/// Whether a serve loop ended because the subscriber hung up, rather than
+/// because something went wrong.
+///
+/// A guest that detaches closes its connection, and which call notices depends
+/// on what the host was doing at that instant. Reading the guest's next frame
+/// fails, which is the common case -- but a host in the middle of pushing a
+/// screen sees the close on the stream it was opening or writing instead. Same
+/// event, three shapes; only the first was recognised, so a clean detach could
+/// surface to the operator as a pane-connection error and redden a test that
+/// asserts a served subscription ended cleanly.
+///
+/// Every close this protocol sends carries code 0, so a peer that closed with
+/// any other code is saying something and is still worth reporting.
 fn is_normal_peer_disconnect(result: &Result<(), SessionError>) -> bool {
-    matches!(
-        result,
-        Err(SessionError::Transport(TransportError::StreamRead(_)))
-    )
+    match result {
+        Err(SessionError::Transport(TransportError::StreamRead(_))) => true,
+        Err(SessionError::Transport(TransportError::Stream(error))) => is_graceful_close(error),
+        Err(SessionError::Transport(TransportError::Write(WriteError::ConnectionLost(error)))) => {
+            is_graceful_close(error)
+        }
+        _ => false,
+    }
+}
+
+fn is_graceful_close(error: &ConnectionError) -> bool {
+    match error {
+        // Our own shutdown, racing a subscription that was still being served.
+        ConnectionError::LocallyClosed => true,
+        ConnectionError::ApplicationClosed(close) => close.error_code == VarInt::from_u32(0),
+        _ => false,
+    }
 }
 
 fn layout_queue_error<T>(error: mpsc::error::TrySendError<T>) -> LayoutControlQueueError {
@@ -4593,6 +4621,44 @@ mod control_queue_tests {
     use super::*;
     use crate::protocol::{AgentRosterEntry, AgentRosterState};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn a_subscriber_hanging_up_mid_serve_is_not_a_service_error() {
+        use iroh::endpoint::ApplicationClose;
+
+        let hung_up = || {
+            ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: VarInt::from_u32(0),
+                reason: Default::default(),
+            })
+        };
+        let transport = |error| Err(SessionError::Transport(error));
+
+        // Noticed while reading the guest's next frame, while opening the stream
+        // for the next screen, or while writing one: one detach, three shapes.
+        assert!(is_normal_peer_disconnect(&transport(
+            TransportError::Stream(hung_up())
+        )));
+        assert!(is_normal_peer_disconnect(&transport(
+            TransportError::Write(WriteError::ConnectionLost(hung_up()))
+        )));
+        assert!(is_normal_peer_disconnect(&transport(
+            TransportError::Stream(ConnectionError::LocallyClosed)
+        )));
+
+        // A peer that closed with a code is saying something, and a connection
+        // that timed out did not hang up at all.
+        assert!(!is_normal_peer_disconnect(&transport(
+            TransportError::Stream(ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: VarInt::from_u32(7),
+                reason: Default::default(),
+            }))
+        )));
+        assert!(!is_normal_peer_disconnect(&transport(
+            TransportError::Stream(ConnectionError::TimedOut)
+        )));
+        assert!(!is_normal_peer_disconnect(&Ok(())));
+    }
 
     struct FailingWriter;
 
