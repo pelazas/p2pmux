@@ -1689,6 +1689,24 @@ mod tests {
     }
 
     #[test]
+    fn an_echoed_focus_lets_the_pane_created_next_take_focus() {
+        let mut tui = None;
+        // The click landed on the pane the node had already focused, so the echo
+        // that releases this hold is one the node only sends because it answers
+        // every focus request rather than only the ones that moved it.
+        let mut pending_focus = Some((1, 2));
+        apply_focus_snapshot(&mut tui, layout(&[1, 2]), 1, 2, &mut pending_focus);
+        assert_eq!(pending_focus, None);
+
+        let mut created = layout(&[1, 2, 3]);
+        created.revision = 2;
+        apply_focus_snapshot(&mut tui, created, 1, 3, &mut pending_focus);
+
+        let tui = tui.unwrap();
+        assert_eq!((tui.current_tab(), tui.focused_pane()), (1, 3));
+    }
+
+    #[test]
     fn snapshot_focus_replaces_pending_focus_when_layout_removes_it() {
         let mut tui = None;
         let mut pending_focus = Some((1, 2));
