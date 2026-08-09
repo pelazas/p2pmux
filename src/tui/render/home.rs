@@ -23,7 +23,7 @@ use crate::{
         AgentOverlayRow, MultiPaneTui,
         home::{
             HomeCard, HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_card,
-            home_layout, machine_rows,
+            home_layout, home_page_size, machine_rows,
         },
         render::footer::{FooterSegment, render_footer_segments},
         text::{sanitize_single_line, text_width, truncate_leading, truncate_trailing},
@@ -162,7 +162,11 @@ fn render_home_in(
             let lines = rows
                 .into_iter()
                 .skip(tui.home_page_start())
-                .take(usize::from(layout.rows.height) / card.lines())
+                // A page, not everything the height happens to fit: past eight
+                // agents the two stop being the same number, and drawing more
+                // than a page holds puts agents on screen that `h` and `l` then
+                // step over, under a marker claiming a page they are not on.
+                .take(home_page_size(layout.rows.height))
                 .flat_map(|row| {
                     format_home_card(
                         row,
@@ -942,10 +946,36 @@ mod tests {
         protocol::AgentRosterState,
         tui::{
             MultiPaneTui,
-            home::{HomeCard, MachineRow},
+            home::{HOME_PAGE_MAX, HomeCard, MachineRow},
             test_support::agent_row,
         },
     };
+
+    /// A page has to be what the screen *draws*, not only what `h` and `l` step
+    /// by. A tall terminal has room for more agents than a page holds, and
+    /// filling it drew agents that paging then stepped straight over, under a
+    /// marker naming a page they were not on.
+    #[test]
+    fn a_tall_terminal_draws_one_page_rather_than_everything_that_fits() {
+        use ratatui::layout::Rect;
+
+        let agents = (0..9)
+            .map(|_| ("laptop", "claude", AgentRosterState::Working))
+            .collect::<Vec<_>>();
+        let mut tui = crate::tui::test_support::home_tui(&agents);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(Rect::new(0, 0, 120, 60));
+
+        assert_eq!(tui.home_page_count(), 2, "nine agents is more than a page");
+        let drawn = screen(&tui, 120, 60)
+            .iter()
+            .filter(|line| line.contains("claude"))
+            .count();
+        assert_eq!(
+            drawn, HOME_PAGE_MAX,
+            "a page holds eight however tall the terminal is"
+        );
+    }
 
     fn rendered(state: AgentRosterState, message: &str) -> String {
         let mut row = agent_row(1, 1, 1);
