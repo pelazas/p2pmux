@@ -589,6 +589,13 @@ pub fn run_on(
         let Some(tui) = tui.as_mut() else {
             continue;
         };
+        // Zoom lives entirely in this client -- it never becomes a layout
+        // request -- but it decides how much screen the pane is drawn in, and
+        // the node is what sizes the PTYs it hosts. Compared around the whole
+        // event rather than hooked into `toggle_zoom`, because the zoom also
+        // stands itself down: opening Home, moving focus, switching tab and
+        // clicking another pane all clear it.
+        let zoom_before = tui.zoomed_pane();
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 // A forwarded key can still have ended chord mode on its way past, and the
@@ -783,6 +790,22 @@ pub fn run_on(
                 dirty = true;
             }
             _ => {}
+        }
+        if tui.zoomed_pane() != zoom_before {
+            let (cols, rows) = node_viewport;
+            write_message(
+                &mut stream,
+                &ClientMessage::Zoom {
+                    pane_id: tui.zoomed_pane(),
+                    cols,
+                    rows,
+                },
+            )?;
+            // The panes are about to be reflowed under it, so history taken
+            // against the old grid describes rows that no longer exist.
+            history.clear();
+            pending_scroll.clear();
+            desired_scroll.clear();
         }
     }
     if !node_ended && !detach_sent {
