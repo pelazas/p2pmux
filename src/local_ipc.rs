@@ -37,6 +37,18 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    /// The attached client zoomed a pane, or gave the zoom back.
+    ///
+    /// Zoom is a local view choice — it never reaches the shared layout — but it
+    /// decides how much screen the pane is being drawn in, and the node is the
+    /// one that sizes the PTYs it hosts. So it travels like a resize rather than
+    /// like an intent: the client's terminal size rides along, because the node
+    /// is detached and has no terminal of its own to measure.
+    Zoom {
+        pane_id: Option<u64>,
+        cols: u16,
+        rows: u16,
+    },
     ResyncScreen {
         pane_id: u64,
     },

@@ -183,6 +183,26 @@ impl SharedLayoutRuntime {
         self.reflow_local_panes(Rect::new(0, 0, cols, rows))
     }
 
+    /// Take the client's zoom and resize the panes this node hosts to match.
+    ///
+    /// A zoomed pane is alone on the screen, so it is entitled to the whole
+    /// content area — and the PTY behind it has to be told, or it keeps drawing
+    /// into the corner of a box that grew around it. Unzooming runs the same
+    /// path in reverse: the geometry goes back to the split and every pane in it
+    /// is resized back.
+    pub fn node_zoom(
+        &mut self,
+        pane_id: Option<PaneId>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        self.tui.set_zoomed_pane(pane_id);
+        if cols == 0 || rows == 0 {
+            return Ok(());
+        }
+        self.reflow_local_panes(Rect::new(0, 0, cols, rows))
+    }
+
     pub fn node_focus(&mut self, tab_id: TabId, pane_id: PaneId) -> Result<(), Box<dyn Error>> {
         let previous = self.tui.focused_pane();
         self.tui
