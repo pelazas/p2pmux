@@ -134,6 +134,19 @@ pub struct AgentOverlayRow {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PairedMachine {
     pub name: String,
+    /// The machine's peer identity, hex-encoded, as seen when it was paired.
+    ///
+    /// This is what ownership is actually decided on. A name is chosen by the
+    /// machine that carries it and two machines can pick the same one; a peer
+    /// id is the transport's own authenticated identity, so a stranger cannot
+    /// present someone else's and a rename cannot cost a machine its place in
+    /// the fleet.
+    ///
+    /// `None` for records written before this field existed. Those fall back to
+    /// matching on the name — no worse than what they had — and are upgraded in
+    /// place the first time the machine is seen in a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
     /// Whether that machine accepts work from this one — or `None` when it has
     /// never said.
     ///

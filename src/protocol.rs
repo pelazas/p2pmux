@@ -178,6 +178,29 @@ pub mod envelope {
     }
 }
 
+/// What is at the other end of a member: a machine, a person, or no answer.
+///
+/// Self-declared, and deliberately so. It answers "is there a human here",
+/// which nobody but that peer can know and nobody can usefully lie about — a
+/// person cannot become your machine by saying so, because ownership is decided
+/// against your own pairing record and this marker can only ever narrow that
+/// set.
+///
+/// The three-way split is what makes that narrowing safe. `Unspecified` is `0`,
+/// so a peer built before this field existed, or one whose p2pmux started
+/// before this box was paired, says nothing rather than being made to say
+/// "person" — and a machine in your fleet that says nothing is still yours,
+/// exactly as it was before this field existed. Only an explicit `Person`
+/// takes ownership away, and only an explicit `Machine` lets a peer be adopted
+/// into a fleet during pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MemberKind {
+    Unspecified = 0,
+    Machine = 1,
+    Person = 2,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Join {
     #[prost(bytes = "vec", tag = "1")]
@@ -188,6 +211,8 @@ pub struct Join {
     pub endpoint_addr: Vec<u8>,
     #[prost(string, tag = "4")]
     pub display_name: String,
+    #[prost(enumeration = "MemberKind", tag = "5")]
+    pub member_kind: i32,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -301,6 +326,11 @@ pub struct MemberDescriptor {
     pub endpoint_addr: Vec<u8>,
     #[prost(string, tag = "3")]
     pub display_name: String,
+    /// Carried onward from the member's own [`Join`], never invented by the
+    /// coordinator. A coordinator that dropped it would cost a machine of yours
+    /// its marker, which is the harmless direction; it cannot mint one.
+    #[prost(enumeration = "MemberKind", tag = "4")]
+    pub member_kind: i32,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

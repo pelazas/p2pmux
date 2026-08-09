@@ -25,6 +25,7 @@ pub(in crate::tui) fn layout(tabs: Vec<Tab>, panes: &[(u64, u16, u16)]) -> Layou
             peer_id: b"host".to_vec(),
             endpoint_addr: b"endpoint".to_vec(),
             display_name: String::new(),
+            kind: Default::default(),
         }],
         tabs,
         panes: panes
@@ -148,6 +149,7 @@ pub(in crate::tui) fn two_tab_presence_tui() -> MultiPaneTui {
         peer_id: b"tis".to_vec(),
         endpoint_addr: b"endpoint-tis".to_vec(),
         display_name: "tis".into(),
+        kind: Default::default(),
     });
     MultiPaneTui::new(snapshot).expect("valid layout")
 }
@@ -170,16 +172,19 @@ pub(in crate::tui) fn named_members() -> Vec<crate::layout::Member> {
             peer_id: b"host".to_vec(),
             endpoint_addr: b"endpoint".to_vec(),
             display_name: "pelazas".into(),
+            kind: Default::default(),
         },
         crate::layout::Member {
             peer_id: b"tis".to_vec(),
             endpoint_addr: b"endpoint-tis".to_vec(),
             display_name: "tis".into(),
+            kind: Default::default(),
         },
         crate::layout::Member {
             peer_id: b"ana".to_vec(),
             endpoint_addr: b"endpoint-ana".to_vec(),
             display_name: "ana".into(),
+            kind: Default::default(),
         },
     ]
 }
@@ -190,6 +195,7 @@ pub(in crate::tui) fn presence_members(count: usize) -> Vec<crate::layout::Membe
             peer_id: vec![index as u8; 4],
             endpoint_addr: vec![index as u8],
             display_name: format!("member{index}"),
+            kind: Default::default(),
         })
         .collect()
 }

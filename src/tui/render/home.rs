@@ -707,8 +707,8 @@ fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'s
         lines.push(rail_line(
             vec![
                 Span::styled(
-                    if machine.reachable { "● " } else { "○ " },
-                    Style::default().fg(if machine.reachable {
+                    machine_glyph(machine),
+                    Style::default().fg(if machine.owned && machine.reachable {
                         theme.agent_overlay_chrome
                     } else {
                         theme.agent_overlay_secondary
@@ -783,6 +783,10 @@ fn machine_detail(machine: &MachineRow) -> String {
     let mut parts: Vec<String> = Vec::new();
     if machine.this_machine {
         parts.push(String::from("this machine"));
+    } else if !machine.owned {
+        // Said before anything else about them, because it is the fact that
+        // decides what the rest of the screen may offer to do here.
+        parts.push(String::from(GUEST_DETAIL));
     } else if !machine.reachable {
         parts.push(String::from("asleep"));
     }
@@ -798,6 +802,23 @@ fn machine_detail(machine: &MachineRow) -> String {
         parts.push(String::from("ready"));
     }
     parts.join(" · ")
+}
+
+/// What a machine row says about itself when it is not one of yours.
+pub(in crate::tui) const GUEST_DETAIL: &str = "joined this session";
+
+/// The bullet in front of a machine's name.
+///
+/// A filled dot is compute you own and it is answering; a hollow one is yours
+/// and asleep. A diamond is neither: someone collaborating from their own
+/// laptop, which is not a machine that can be asleep *to you* and not one this
+/// screen will ever offer to start work on.
+fn machine_glyph(machine: &MachineRow) -> &'static str {
+    match (machine.owned, machine.reachable) {
+        (false, _) => "◇ ",
+        (true, true) => "● ",
+        (true, false) => "○ ",
+    }
 }
 
 /// One rail line, hung off the rule that separates it from the agents.
@@ -825,11 +846,30 @@ fn machine_table(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    for machine in &machine_rows(tui) {
+    let rows = machine_rows(tui);
+    let (fleet, guests): (Vec<_>, Vec<_>) = rows.iter().partition(|row| row.owned);
+    for machine in fleet {
         lines.push(Line::styled(
             format!(" {}", machine_line(machine)),
             Style::default().fg(theme.agent_overlay_foreground),
         ));
+    }
+    // Their own heading rather than more rows in the fleet table. The table is
+    // read as "the machines I have"; a person collaborating on this session is
+    // not one, and the difference has to survive being glanced at.
+    if !guests.is_empty() {
+        lines.push(Line::styled(
+            String::from(" IN THIS SESSION, NOT YOURS"),
+            Style::default()
+                .fg(theme.agent_overlay_muted)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for machine in guests {
+            lines.push(Line::styled(
+                format!(" {}", machine_line(machine)),
+                Style::default().fg(theme.agent_overlay_secondary),
+            ));
+        }
     }
     lines
 }
@@ -937,7 +977,7 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        ELAPSED_WIDTH, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
+        ELAPSED_WIDTH, GUEST_DETAIL, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
         format_home_row, header_line, home_card, home_elapsed, machine_detail, machine_line,
     };
     use crate::{
@@ -1170,6 +1210,7 @@ mod tests {
     fn an_unanswered_accepts_work_column_reads_as_a_dash_not_a_refusal() {
         let here = MachineRow {
             name: String::from("laptop"),
+            owned: true,
             reachable: true,
             accepts_work: None,
             agents: 2,
@@ -1197,6 +1238,7 @@ mod tests {
     fn an_unreachable_machine_reads_asleep() {
         let asleep = MachineRow {
             name: String::from("oldbox"),
+            owned: true,
             reachable: false,
             accepts_work: Some(true),
             agents: 0,
@@ -1213,6 +1255,7 @@ mod tests {
     fn the_line_under_a_machine_names_what_it_is_and_what_it_runs() {
         let base = MachineRow {
             name: String::from("droplet"),
+            owned: true,
             reachable: true,
             accepts_work: None,
             agents: 0,
@@ -1321,6 +1364,7 @@ mod tests {
         tui.snapshot.members[0].display_name = String::from("laptop");
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("oldbox"),
+            peer_id: None,
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
@@ -1340,6 +1384,73 @@ mod tests {
         assert!(drawn.contains("add a machine"), "{drawn}");
     }
 
+    /// The line this whole issue is about, drawn rather than merely computed.
+    ///
+    /// A stranger who joined with a ticket and a droplet paired six months ago
+    /// used to render identically. They must not: everything the screen goes on
+    /// to offer — start a terminal there, keep it in every session — is only a
+    /// safe thing to offer about compute you own.
+    #[test]
+    fn a_person_who_joined_does_not_render_as_one_of_your_machines() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: vec![0xca, 0xfe, 0xca, 0xfe],
+            endpoint_addr: vec![2],
+            display_name: String::from("sam"),
+            // Says it is a machine, and is still not one of yours: the claim is
+            // not in the pairing record, and only the record can put it there.
+            kind: crate::layout::MemberKind::Machine,
+        });
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("droplet"),
+            peer_id: None,
+            accepts_work: None,
+        }];
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(
+            drawn.contains("◇ sam"),
+            "a guest gets its own mark: {drawn}"
+        );
+        assert!(
+            drawn.contains(GUEST_DETAIL),
+            "and its own words, said before anything else about it: {drawn}"
+        );
+        assert!(
+            drawn.contains("● laptop") && drawn.contains("○ droplet"),
+            "while your machines keep the marks that mean awake and asleep: {drawn}"
+        );
+    }
+
+    /// The narrow tier makes the same distinction with a heading, because a
+    /// table read as "the machines I have" must not quietly contain someone
+    /// else's laptop.
+    #[test]
+    fn the_table_puts_people_under_their_own_heading() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: vec![0xca, 0xfe, 0xca, 0xfe],
+            endpoint_addr: vec![2],
+            display_name: String::from("sam"),
+            kind: crate::layout::MemberKind::Person,
+        });
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 70, 20).join("\n");
+        assert!(drawn.contains("IN THIS SESSION, NOT YOURS"), "{drawn}");
+        let fleet_heading = drawn.find("NAME").expect("the fleet heading");
+        let guest_heading = drawn.find("IN THIS SESSION").expect("the guest heading");
+        assert!(
+            fleet_heading < guest_heading,
+            "your machines come first: {drawn}"
+        );
+    }
+
     /// A rail with more machines than lines says how many it left out. One that
     /// simply stopped would be a fleet with machines silently missing from it.
     #[test]
@@ -1349,6 +1460,7 @@ mod tests {
         tui.paired_machines = (1..=6)
             .map(|index| crate::tui::PairedMachine {
                 name: format!("box{index}"),
+                peer_id: None,
                 accepts_work: None,
             })
             .collect();

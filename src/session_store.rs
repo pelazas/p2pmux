@@ -162,6 +162,14 @@ pub struct SessionPeer {
     /// Whether this row is the machine holding the record.
     #[serde(default)]
     pub this_machine: bool,
+    /// Hex-encoded peer id. Written so that out-of-process readers — `p2pmux
+    /// machines`, and `p2pmux pair` deciding which arrival to record — can ask
+    /// the fleet record about a member without attaching to the session.
+    #[serde(default)]
+    pub peer_id: String,
+    /// What that member said it is, carried through from the member list.
+    #[serde(default)]
+    pub kind: crate::layout::MemberKind,
 }
 
 impl SessionDescriptor {

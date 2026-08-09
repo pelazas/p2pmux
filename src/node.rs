@@ -135,6 +135,21 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     // Before the first pane spawns: every PTY this node opens inherits the
     // socket path from here, and pane 1 is created a few lines below.
     crate::pty_host::set_agent_socket_path(descriptor.socket_path.clone());
+    // Before anything joins or hosts, because this is what the member list will
+    // carry. A box that has been through `p2pmux pair` belongs to a fleet and
+    // says so; one that has not says nothing. It is not a claim about *whose*
+    // fleet — every peer answers that against its own pairing record — so a
+    // machine of someone else's saying it here wins them nothing.
+    crate::session::set_local_member_kind(if crate::pairing::load_or_empty().can_rejoin() {
+        crate::layout::MemberKind::Machine
+    } else {
+        // Not `Person`: this box may well be paired a moment from now, by the
+        // `p2pmux pair` that is about to print a code against the session this
+        // node is starting. Claiming to be a person would be a claim that
+        // outlives the moment it was true, and would cost this machine its
+        // place in its own fleet.
+        crate::layout::MemberKind::Unspecified
+    });
     let (mut node, published_code) = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
@@ -485,12 +500,16 @@ fn run_socket_loop(
                 if let Err(error) = store.write(descriptor) {
                     eprintln!("p2pmux node: failed to record the session's machines: {error}");
                 }
-                let names = peers
+                let seen = peers
                     .iter()
                     .filter(|peer| !peer.this_machine)
-                    .map(|peer| peer.name.clone())
+                    .map(|peer| crate::pairing::SeenMachine {
+                        name: peer.name.clone(),
+                        peer_id: peer.peer_id.clone(),
+                        kind: peer.kind,
+                    })
                     .collect::<Vec<_>>();
-                if let Err(error) = crate::pairing::remember_peers(&names) {
+                if let Err(error) = crate::pairing::pin_peers(&seen) {
                     eprintln!("p2pmux node: failed to record paired machines: {error}");
                 }
             }

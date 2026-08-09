@@ -58,6 +58,43 @@ pub enum NewPanePosition {
     Second,
 }
 
+/// What is at the other end of a member: a machine, a person, or no answer.
+///
+/// The layout's copy of [`crate::protocol::MemberKind`], kept here so this
+/// model stays free of the wire types the way [`Axis`] is. `Unspecified` is the
+/// default for the same reason it is `0` on the wire: a member list written
+/// before this field existed said nothing, and reading silence as an answer
+/// would put words in an older peer's mouth.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberKind {
+    #[default]
+    Unspecified,
+    Machine,
+    Person,
+}
+
+impl MemberKind {
+    /// Whether this member may be recognized as one of your machines.
+    ///
+    /// Silence counts. A machine that was in your fleet before this field
+    /// existed, or whose p2pmux started before the box was paired, is still
+    /// your machine — the marker exists to let a peer disclaim being one, not
+    /// to make every peer prove it.
+    pub const fn could_be_machine(self) -> bool {
+        !matches!(self, Self::Person)
+    }
+
+    /// Whether this member said, in as many words, that it is a machine.
+    ///
+    /// The stricter of the two questions, and the one asked before *writing* to
+    /// the fleet record. Joining a fleet is a change; being recognized in one
+    /// is not.
+    pub const fn declared_machine(self) -> bool {
+        matches!(self, Self::Machine)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Node {
@@ -77,6 +114,11 @@ pub struct Member {
     pub peer_id: Vec<u8>,
     pub endpoint_addr: Vec<u8>,
     pub display_name: String,
+    /// What this member said it is. Never what the coordinator decided it is:
+    /// the claim is carried, and every client answers "is that one of mine"
+    /// against its own pairing record.
+    #[serde(default)]
+    pub kind: MemberKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +260,24 @@ impl SessionState {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, LayoutError> {
+        Self::new_with_identity(
+            initial_host,
+            endpoint_addr,
+            display_name,
+            MemberKind::default(),
+            grid_rows,
+            grid_cols,
+        )
+    }
+
+    pub fn new_with_identity(
+        initial_host: Vec<u8>,
+        endpoint_addr: Vec<u8>,
+        display_name: String,
+        kind: MemberKind,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<Self, LayoutError> {
         validate_grid(grid_rows, grid_cols)?;
         validate_peer_id(&initial_host)?;
         validate_endpoint_addr(&endpoint_addr)?;
@@ -239,6 +299,7 @@ impl SessionState {
                 peer_id: initial_host,
                 endpoint_addr,
                 display_name,
+                kind,
             }],
             tabs: vec![Tab {
                 tab_id: 1,
@@ -400,6 +461,23 @@ impl SessionState {
         endpoint_addr: Vec<u8>,
         display_name: String,
     ) -> Result<Option<InvalidatedReservation>, LayoutError> {
+        self.add_member_with_identity(
+            base_revision,
+            peer_id,
+            endpoint_addr,
+            display_name,
+            MemberKind::default(),
+        )
+    }
+
+    pub fn add_member_with_identity(
+        &mut self,
+        base_revision: u64,
+        peer_id: Vec<u8>,
+        endpoint_addr: Vec<u8>,
+        display_name: String,
+        kind: MemberKind,
+    ) -> Result<Option<InvalidatedReservation>, LayoutError> {
         self.check_mutation(base_revision)?;
         validate_peer_id(&peer_id)?;
         validate_endpoint_addr(&endpoint_addr)?;
@@ -414,6 +492,7 @@ impl SessionState {
             peer_id,
             endpoint_addr,
             display_name,
+            kind,
         });
         self.advance_revision();
         Ok(self.invalidate_reservation())

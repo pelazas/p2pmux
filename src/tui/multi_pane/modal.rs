@@ -693,6 +693,7 @@ mod tests {
             peer_id: b"droplet".to_vec(),
             endpoint_addr: b"endpoint-droplet".to_vec(),
             display_name: String::from("droplet"),
+            kind: Default::default(),
         });
         assert_eq!(tui.add_machine_joined().as_deref(), Some("droplet"));
 

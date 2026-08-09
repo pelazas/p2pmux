@@ -6,10 +6,11 @@ use p2pmux::protocol::{
     MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES,
     MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_LEDGER_PAYLOAD_BYTES, MAX_PANE_ID_BYTES,
     MAX_PEER_ID_BYTES, MAX_PRESENCE_ENTRIES, MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES,
-    MarkPaneExited, MemberDescriptor, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor,
-    PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster,
-    ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor,
-    TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
+    MarkPaneExited, MemberDescriptor, MemberKind, NewPanePosition, PROTOCOL_VERSION,
+    PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, Presence,
+    PresenceRoster, ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot,
+    SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame,
+    envelope,
 };
 use prost::Message;
 
@@ -232,6 +233,7 @@ fn envelope_exposes_each_v1_body() {
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
+            member_kind: Default::default(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -361,6 +363,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
+            member_kind: Default::default(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -766,6 +769,7 @@ fn layout_state(root: LayoutNode) -> LayoutState {
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
+            member_kind: Default::default(),
         }],
         panes: vec![PaneDescriptor {
             pane_id: 1,
@@ -952,6 +956,7 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                 peer_id: format!("peer-{index}").into_bytes(),
                 endpoint_addr: b"endpoint".to_vec(),
                 display_name: String::new(),
+                member_kind: Default::default(),
             })
             .collect(),
         ..state.clone()
@@ -1110,6 +1115,7 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: Vec::new(),
         display_name: String::new(),
+        member_kind: Default::default(),
     }));
     let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
@@ -1567,6 +1573,7 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
             peer_id: b"peer-a".to_vec(),
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
+            member_kind: Default::default(),
         }],
         panes: vec![PaneDescriptor {
             pane_id: 11,
@@ -1628,6 +1635,7 @@ fn join_wire_shape_encodes_a_present_endpoint_address() {
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: b"endpoint-a".to_vec(),
         display_name: String::new(),
+        member_kind: Default::default(),
     };
 
     assert_eq!(
@@ -1682,6 +1690,7 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: vec![0; MAX_ENDPOINT_ADDR_BYTES + 1],
         display_name: String::new(),
+        member_kind: Default::default(),
     }));
 
     for invalid in [
@@ -1841,6 +1850,7 @@ fn decoder_rejects_missing_fields_and_invalid_sequences() {
         peer_id: b"peer-a".to_vec(),
         endpoint_addr: Vec::new(),
         display_name: String::new(),
+        member_kind: Default::default(),
     }));
     let mut empty_id_frame = Vec::new();
     empty_id
@@ -1974,6 +1984,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 peer_id: b"peer-a".to_vec(),
                 endpoint_addr: Vec::new(),
                 display_name: String::new(),
+                member_kind: Default::default(),
             })),
         ),
         (
@@ -1983,6 +1994,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 peer_id: vec![0; MAX_PEER_ID_BYTES + 1],
                 endpoint_addr: Vec::new(),
                 display_name: String::new(),
+                member_kind: Default::default(),
             })),
         ),
         (
@@ -2027,6 +2039,44 @@ fn encode_frame_rejects_invalid_envelopes() {
     for (name, envelope) in cases {
         assert!(encode_frame(&envelope).is_err(), "{name} must be rejected");
     }
+}
+
+#[test]
+fn a_member_kind_survives_the_wire_and_an_unknown_one_reads_as_silence() {
+    // The marker that separates a machine you own from a person who joined has
+    // to cross the network, because the member list is the only thing that
+    // does. What it must never do is turn a peer that said nothing — an older
+    // build, or one whose node started before its box was paired — into a peer
+    // that claimed to be a person, because that claim takes ownership away.
+    let joined = Join {
+        session_id: b"session-a".to_vec(),
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: b"endpoint-a".to_vec(),
+        display_name: String::from("droplet"),
+        member_kind: MemberKind::Machine as i32,
+    };
+    let decoded = Join::decode(joined.encode_to_vec().as_slice()).expect("join decodes");
+    assert_eq!(decoded.member_kind, MemberKind::Machine as i32);
+
+    let member = MemberDescriptor {
+        peer_id: b"peer-a".to_vec(),
+        endpoint_addr: b"endpoint-a".to_vec(),
+        display_name: String::from("droplet"),
+        member_kind: MemberKind::Person as i32,
+    };
+    let decoded =
+        MemberDescriptor::decode(member.encode_to_vec().as_slice()).expect("member decodes");
+    assert_eq!(decoded.member_kind, MemberKind::Person as i32);
+
+    assert_eq!(
+        MemberKind::Unspecified as i32,
+        0,
+        "a field absent from an older peer's message decodes as zero, and zero must mean silence"
+    );
+    assert!(
+        MemberKind::try_from(9_999).is_err(),
+        "a kind this build does not know is not coerced into one it does"
+    );
 }
 
 fn encode_varint(mut value: u64) -> Vec<u8> {

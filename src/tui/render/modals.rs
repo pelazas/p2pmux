@@ -608,6 +608,7 @@ mod tests {
             peer_id: b"droplet".to_vec(),
             endpoint_addr: b"endpoint-droplet".to_vec(),
             display_name: String::from("droplet"),
+            kind: Default::default(),
         });
 
         let rendered = add_machine_screen(&tui);

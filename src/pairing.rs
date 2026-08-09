@@ -10,8 +10,15 @@
 //!   session, which is what makes bare `p2pmux` work on either of them with no
 //!   code typed. The short-code-to-ticket mechanism already exists, so pairing
 //!   is mostly persistence plus auto-join on start.
-//! - **The names of the machines paired with this one**, so the inbox can say
-//!   `asleep` about a machine that is switched off rather than forgetting it.
+//! - **The machines paired with this one**, by authenticated peer id and by the
+//!   name they go under, so the inbox can say `asleep` about a machine that is
+//!   switched off rather than forgetting it.
+//!
+//!   This file is what decides ownership, and it is the only thing that does. A
+//!   member of a session says on the wire whether a person or a machine is at
+//!   the other end, but that claim can only ever *narrow* what this file says:
+//!   being one of your machines means being written in here, by a `p2pmux pair`
+//!   you ran. Nothing a peer sends can add a row.
 //! - **Whether this machine accepts work.** Off by default, asked once during
 //!   pairing rather than as a separate configuration step. Nothing acts on it
 //!   yet: it is the consent primitive that will later make starting a terminal
@@ -38,9 +45,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::tui::PairedMachine;
+use crate::{layout::MemberKind, tui::PairedMachine};
 
 static PAIRING_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// How long after `p2pmux pair` an arriving machine is taken to be the invited
+/// one. Long enough to walk to another room and type a command, short enough
+/// that a code left on screen overnight does not adopt whoever turns up.
+const PAIRING_WINDOW_SECONDS: u64 = 10 * 60;
 
 const PAIRING_HEADER: &str = "# p2pmux pairing\n#\n# Machines you have paired with this one, and the session they share.\n# Written by `p2pmux pair`. Delete a [[machine]] block to unpair it.\n\n";
 
@@ -82,6 +94,18 @@ pub struct Pairing {
     /// it. Recorded during pairing and, for now, only recorded.
     #[serde(default)]
     pub accepts_work: bool,
+    /// Unix seconds until which an arriving machine is the one being paired.
+    ///
+    /// `p2pmux pair` prints a code and returns, so the machine that offered it
+    /// is not watching when the other one turns up — the node is. Something has
+    /// to tell the node that the next arrival was invited, and this is it: a
+    /// window the user opened deliberately, that closes on the first machine
+    /// admitted through it and expires on its own if nobody comes.
+    ///
+    /// Without it the node had no way to tell an invited machine from a guest,
+    /// and resolved that by treating every peer as fleet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_until: Option<u64>,
     #[serde(default, rename = "machine")]
     pub machines: Vec<PairedMachine>,
 }
@@ -92,22 +116,43 @@ impl Pairing {
         self.ticket.is_some()
     }
 
-    /// Record a machine, or update the one already under that name.
+    /// Record a machine, or update the one already there.
     ///
     /// Pairing twice with the same machine is a re-pair, not a second machine:
     /// a user who re-runs `p2pmux pair` after moving house should end up with
-    /// one desktop, not two.
-    pub fn remember(&mut self, name: &str, accepts_work: Option<bool>) {
+    /// one desktop, not two. Identity is the peer id where there is one, so a
+    /// machine that was renamed is still the same machine, and two machines
+    /// that chose the same name are still two.
+    pub fn remember(&mut self, name: &str, peer_id: Option<String>, accepts_work: Option<bool>) {
         let name = name.trim();
         if name.is_empty() {
             return;
         }
-        match self
-            .machines
-            .iter_mut()
-            .find(|machine| machine.name == name)
-        {
-            Some(machine) => {
+        let existing = match peer_id.as_deref() {
+            Some(peer_id) => self
+                .machines
+                .iter_mut()
+                .position(|machine| machine.peer_id.as_deref() == Some(peer_id))
+                // A machine paired before peer ids were recorded is that same
+                // machine turning up with its identity for the first time, not
+                // a new one. Adopt the row rather than growing a duplicate.
+                .or_else(|| {
+                    self.machines
+                        .iter()
+                        .position(|machine| machine.peer_id.is_none() && machine.name == name)
+                }),
+            None => self
+                .machines
+                .iter()
+                .position(|machine| machine.name == name),
+        };
+        match existing {
+            Some(index) => {
+                let machine = &mut self.machines[index];
+                machine.name = name.to_owned();
+                if peer_id.is_some() {
+                    machine.peer_id = peer_id;
+                }
                 // Only ever upgraded from "never said" to an answer. A machine
                 // that told us once must not be silently un-told by a later
                 // sighting that carried nothing.
@@ -117,6 +162,7 @@ impl Pairing {
             }
             None => self.machines.push(PairedMachine {
                 name: name.to_owned(),
+                peer_id,
                 accepts_work,
             }),
         }
@@ -124,11 +170,62 @@ impl Pairing {
             .sort_by(|left, right| left.name.cmp(&right.name));
     }
 
+    /// Whether a member of a session is one of the machines in this fleet.
+    ///
+    /// The whole ownership decision, in one place, and it is answered locally:
+    /// nothing a peer sends can make this return `true`, because the peer id is
+    /// the transport's own authenticated identity and the fleet list is a file
+    /// only this machine writes.
+    ///
+    /// The member's own claim can only ever take ownership away. A peer that
+    /// says it has a person at it is taken at its word — the claim costs it
+    /// access rather than winning it — while a peer that says it is a machine
+    /// still has to be in this file to count. A peer that says nothing is
+    /// judged on this file alone, which is all there was before it could speak.
+    pub fn owns(&self, peer_id: &str, name: &str, kind: MemberKind) -> bool {
+        owns_machine(&self.machines, peer_id, name, kind)
+    }
+
+    /// Whether a machine arriving now was invited by a recent `p2pmux pair`.
+    pub fn pairing_window_open(&self, now: u64) -> bool {
+        self.pending_until.is_some_and(|until| now < until)
+    }
+
+    /// Open the window an arriving machine may join the fleet through.
+    pub fn open_pairing_window(&mut self, now: u64) {
+        self.pending_until = Some(now.saturating_add(PAIRING_WINDOW_SECONDS));
+    }
+
     pub fn forget(&mut self, name: &str) -> bool {
         let before = self.machines.len();
         self.machines.retain(|machine| machine.name != name);
         before != self.machines.len()
     }
+}
+
+/// Whether a session member is one of the machines in a fleet.
+///
+/// Free-standing because the client holds the fleet as a plain list rather than
+/// as a [`Pairing`] — it is handed the machines and never the ticket — and the
+/// one question this file exists to answer must not have two implementations.
+pub fn owns_machine(fleet: &[PairedMachine], peer_id: &str, name: &str, kind: MemberKind) -> bool {
+    kind.could_be_machine()
+        && fleet.iter().any(|machine| match &machine.peer_id {
+            Some(known) => known == peer_id,
+            // A record from before peer ids: matching on the name is what it
+            // has always done, and it upgrades to the line above the first time
+            // [`pin_peers`] sees this machine in a session.
+            None => machine.name == name,
+        })
+}
+
+/// The stable text form of a peer id, used everywhere the fleet record and the
+/// session store have to talk about the same machine.
+pub fn peer_id_hex(peer_id: &[u8]) -> String {
+    peer_id
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 pub fn pairing_path() -> Result<PathBuf, PairingError> {
@@ -187,19 +284,26 @@ pub fn offer(ticket: &str) -> Result<(), PairingError> {
     save_to(&path, &pairing)
 }
 
-/// Record the machines currently in the session, if this machine is paired.
+/// Attach identities and current names to machines already in the fleet.
 ///
-/// Called by the node when the member list changes. It is a no-op on a session
-/// pairing knows nothing about, and that guard is the whole security of it: a
-/// guest who joined with a code you handed out is a collaborator, not a machine
-/// you own, and must never end up in your fleet or inherit an `accepts work`
-/// answer you gave about your own desktop.
+/// Called by the node when the member list changes. It **never adds a machine**,
+/// and that is the point. It used to: any peer of a session, once this machine
+/// was paired at all, was written in as fleet — so a guest who joined with a
+/// code you handed out became one of your machines, inherited whatever the
+/// fleet is allowed to do, and stayed after they left. The guard that was
+/// supposed to prevent it only asked whether *this* machine was paired, which
+/// is true in exactly the situation the guest turns up in.
 ///
-/// Machines are only ever added. A paired machine that is switched off stops
-/// being a member and must keep its row — saying `asleep` is the entire reason
-/// the record exists. Unpairing is `p2pmux unpair`, an explicit act.
-pub fn remember_peers(names: &[String]) -> Result<(), PairingError> {
-    if names.is_empty() {
+/// Machines enter the fleet through `p2pmux pair` and no other way. What this
+/// does is keep the records honest once they are in it: pin the peer id of a
+/// machine paired before ids were recorded, and follow a machine that was
+/// renamed.
+///
+/// Machines are never removed either. A paired machine that is switched off
+/// stops being a member and must keep its row — saying `asleep` is the entire
+/// reason the record exists. Unpairing is `p2pmux unpair`, an explicit act.
+pub fn pin_peers(seen: &[SeenMachine]) -> Result<(), PairingError> {
+    if seen.is_empty() {
         return Ok(());
     }
     let path = pairing_path()?;
@@ -207,16 +311,58 @@ pub fn remember_peers(names: &[String]) -> Result<(), PairingError> {
     if !pairing.can_rejoin() {
         return Ok(());
     }
-    let before = pairing.machines.clone();
-    for name in names {
-        if !pairing.machines.iter().any(|machine| &machine.name == name) {
-            pairing.remember(name, None);
-        }
-    }
-    if pairing.machines == before {
+    let before = pairing.clone();
+    pin_into(&mut pairing, seen, now_unix());
+    if pairing == before {
         return Ok(());
     }
     save_to(&path, &pairing)
+}
+
+/// What a session's member list does to a fleet record. The pure half of
+/// [`pin_peers`], so the rules can be tested without a filesystem.
+fn pin_into(pairing: &mut Pairing, seen: &[SeenMachine], now: u64) {
+    for machine in seen {
+        // Writing to the fleet asks the strict question. Silence is enough to
+        // be *recognized* as a machine you own; it is not enough to be written
+        // in as one, and neither is a peer that says a person is driving it.
+        if !machine.kind.declared_machine() {
+            continue;
+        }
+        if pairing.owns(&machine.peer_id, &machine.name, machine.kind) {
+            pairing.remember(&machine.name, Some(machine.peer_id.clone()), None);
+            continue;
+        }
+        // Not in the fleet. The only way in is through a window `p2pmux pair`
+        // opened, and it admits one machine and then closes: a second arrival
+        // has to be invited by a second `p2pmux pair`.
+        if pairing.pairing_window_open(now) {
+            pairing.pending_until = None;
+            pairing.remember(&machine.name, Some(machine.peer_id.clone()), None);
+        }
+    }
+}
+
+/// Seconds since the epoch, or `0` on a clock that will not answer.
+///
+/// Zero closes the pairing window rather than opening it, which is the right
+/// way for this to fail: a machine that cannot tell the time should not be
+/// admitting members to a fleet on the strength of a deadline.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// One member of a live session, as the fleet record cares about it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeenMachine {
+    pub name: String,
+    /// Hex-encoded peer id, which the transport authenticated.
+    pub peer_id: String,
+    /// What that peer said it is. See [`Pairing::owns`].
+    pub kind: MemberKind,
 }
 
 /// Best-effort read for the paths where a failure must not stop the UI.
@@ -247,7 +393,10 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), PairingError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pairing, load_from, save_to};
+    use super::{
+        MemberKind, PAIRING_WINDOW_SECONDS, Pairing, SeenMachine, load_from, now_unix, pin_into,
+        save_to,
+    };
     use crate::tui::PairedMachine;
 
     fn temporary_path(name: &str) -> std::path::PathBuf {
@@ -283,10 +432,11 @@ mod tests {
         let mut pairing = Pairing {
             ticket: Some(String::from("p2pmux-ticket")),
             accepts_work: true,
+            pending_until: None,
             machines: Vec::new(),
         };
-        pairing.remember("desktop", Some(false));
-        pairing.remember("droplet", Some(true));
+        pairing.remember("desktop", Some(String::from("aa")), Some(false));
+        pairing.remember("droplet", Some(String::from("bb")), Some(true));
 
         save_to(&path, &pairing).expect("save");
         assert_eq!(load_from(&path).expect("load"), pairing);
@@ -296,19 +446,185 @@ mod tests {
     #[test]
     fn pairing_twice_with_a_machine_updates_it_rather_than_duplicating_it() {
         let mut pairing = Pairing::default();
-        pairing.remember("desktop", None);
-        pairing.remember("desktop", Some(true));
+        pairing.remember("desktop", None, None);
+        pairing.remember("desktop", None, Some(true));
 
         assert_eq!(
             pairing.machines,
             vec![PairedMachine {
                 name: String::from("desktop"),
+                peer_id: None,
                 accepts_work: Some(true),
             }],
             "a later sighting upgrades an unanswered machine and never downgrades one"
         );
         assert!(pairing.forget("desktop"));
         assert!(!pairing.forget("desktop"));
+    }
+
+    #[test]
+    fn a_machine_paired_before_peer_ids_is_adopted_rather_than_duplicated() {
+        // The upgrade path. A record written by an older build has only a name;
+        // the first sighting of that machine in a session attaches its identity
+        // to the row that is already there.
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", None, Some(true));
+        pairing.remember("droplet", Some(String::from("beef")), None);
+
+        assert_eq!(
+            pairing.machines,
+            vec![PairedMachine {
+                name: String::from("droplet"),
+                peer_id: Some(String::from("beef")),
+                accepts_work: Some(true),
+            }],
+            "the identity lands on the existing row, and the answer it already gave survives"
+        );
+    }
+
+    #[test]
+    fn a_renamed_machine_is_still_the_same_machine() {
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("beef")), None);
+        pairing.remember("fra1", Some(String::from("beef")), None);
+
+        assert_eq!(
+            pairing.machines.len(),
+            1,
+            "identity is the peer id, not the name"
+        );
+        assert_eq!(pairing.machines[0].name, "fra1");
+    }
+
+    #[test]
+    fn a_stranger_cannot_pass_for_a_machine_you_own() {
+        // The whole ownership question. Being in a session with someone, and
+        // even declaring yourself a machine, is not being one of their machines.
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("beef")), None);
+
+        assert!(pairing.owns("beef", "droplet", MemberKind::Machine));
+        assert!(
+            !pairing.owns("cafe", "droplet", MemberKind::Machine),
+            "a peer that took the same name is still not the machine that was paired"
+        );
+        assert!(
+            !pairing.owns("cafe", "laptop", MemberKind::Machine),
+            "declaring yourself a machine wins nothing without being in the file"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_says_a_person_is_driving_is_never_one_of_your_machines() {
+        // Self-declaration narrows and never widens. A machine in the fleet
+        // that reports a human at it stops being offered as compute, which is
+        // the only direction this claim is allowed to move anything.
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("beef")), None);
+
+        assert!(!pairing.owns("beef", "droplet", MemberKind::Person));
+    }
+
+    #[test]
+    fn a_machine_that_says_nothing_is_still_yours() {
+        // An older build, or a node that started before this box was paired.
+        // Silence must read as it always did — the fleet record alone — or an
+        // upgrade would quietly empty someone's fleet.
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("beef")), None);
+
+        assert!(pairing.owns("beef", "droplet", MemberKind::Unspecified));
+    }
+
+    #[test]
+    fn a_guest_of_a_session_never_joins_the_fleet() {
+        // The hole this issue was really about. Every peer of a session used to
+        // be written in as one of your machines the moment this machine was
+        // paired at all, so a collaborator you handed a code to became fleet
+        // and stayed there after they left.
+        let path = temporary_path("guest");
+        std::fs::write(&path, "ticket = \"t\"\n").expect("write");
+        let seen = vec![SeenMachine {
+            name: String::from("their-laptop"),
+            peer_id: String::from("cafe"),
+            kind: MemberKind::Machine,
+        }];
+
+        let mut pairing = load_from(&path).expect("load");
+        assert!(!pairing.pairing_window_open(now_unix()));
+        pin_into(&mut pairing, &seen, now_unix());
+
+        assert!(
+            pairing.machines.is_empty(),
+            "a peer of a session is not a machine you own"
+        );
+    }
+
+    #[test]
+    fn the_window_opened_by_pairing_admits_one_machine_and_closes() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("t")),
+            ..Pairing::default()
+        };
+        pairing.open_pairing_window(1_000);
+        let seen = vec![
+            SeenMachine {
+                name: String::from("droplet"),
+                peer_id: String::from("beef"),
+                kind: MemberKind::Machine,
+            },
+            SeenMachine {
+                name: String::from("their-laptop"),
+                peer_id: String::from("cafe"),
+                kind: MemberKind::Machine,
+            },
+        ];
+
+        pin_into(&mut pairing, &seen, 1_001);
+
+        assert_eq!(
+            pairing.machines.len(),
+            1,
+            "one `p2pmux pair` invites one machine"
+        );
+        assert_eq!(pairing.machines[0].name, "droplet");
+        assert!(!pairing.pairing_window_open(1_001), "and then it is shut");
+    }
+
+    #[test]
+    fn an_expired_window_admits_nobody() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("t")),
+            ..Pairing::default()
+        };
+        pairing.open_pairing_window(1_000);
+        let seen = vec![SeenMachine {
+            name: String::from("droplet"),
+            peer_id: String::from("beef"),
+            kind: MemberKind::Machine,
+        }];
+
+        pin_into(&mut pairing, &seen, 1_000 + PAIRING_WINDOW_SECONDS + 1);
+
+        assert!(pairing.machines.is_empty());
+    }
+
+    #[test]
+    fn a_machine_already_in_the_fleet_has_its_identity_pinned_without_a_window() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("t")),
+            ..Pairing::default()
+        };
+        pairing.remember("droplet", None, Some(true));
+        let seen = vec![SeenMachine {
+            name: String::from("droplet"),
+            peer_id: String::from("beef"),
+            kind: MemberKind::Machine,
+        }];
+
+        pin_into(&mut pairing, &seen, 9_999);
+
+        assert_eq!(pairing.machines[0].peer_id.as_deref(), Some("beef"));
     }
 
     #[test]

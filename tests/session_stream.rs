@@ -861,6 +861,7 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
                     peer_id: guest_id.clone(),
                     endpoint_addr: guest_endpoint_addr,
                     display_name: String::new(),
+                    member_kind: Default::default(),
                 })),
             },
         )
@@ -948,6 +949,7 @@ async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_wind
                     peer_id: guest_id,
                     endpoint_addr: guest_endpoint_addr,
                     display_name: String::new(),
+                    member_kind: Default::default(),
                 })),
             },
         )

@@ -596,6 +596,10 @@ const MACHINE_RAIL_MIN_HEIGHT: u16 = 6;
 /// A member is in the session and therefore reachable. A paired machine that is
 /// not a member is one you own that is not answering — asleep, off, or without
 /// a node running — and saying so is the whole reason the strip exists.
+///
+/// Members that are *not* yours come back too, marked as such. They are people
+/// collaborating on this session, and dropping them would be as wrong as the
+/// old behaviour of drawing them as fleet.
 pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
     let mut rows = tui
         .snapshot
@@ -607,6 +611,7 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
             // machines that chose the same name get disambiguated there, and
             // matching on the raw name would credit one's agents to the other.
             let name = crate::tui::member_label(&member.peer_id, &tui.snapshot.members);
+            let this_machine = tui.local_peer_id.as_deref() == Some(member.peer_id.as_slice());
             MachineRow {
                 accepts_work: tui
                     .paired_machines
@@ -614,7 +619,16 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
                     .find(|paired| paired.name == name)
                     .and_then(|paired| paired.accepts_work),
                 agents: tui.agent_rows.iter().filter(|row| row.host == name).count(),
-                this_machine: tui.local_peer_id.as_deref() == Some(member.peer_id.as_slice()),
+                // The machine you are sitting at is yours without consulting a
+                // record: it is the one this fleet is kept on.
+                owned: this_machine
+                    || crate::pairing::owns_machine(
+                        &tui.paired_machines,
+                        &crate::pairing::peer_id_hex(&member.peer_id),
+                        &name,
+                        member.kind,
+                    ),
+                this_machine,
                 reachable: true,
                 name,
             }
@@ -630,8 +644,12 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
             accepts_work: paired.accepts_work,
             agents: 0,
             this_machine: false,
+            owned: true,
         });
     }
+    // Yours first, then the people. Within each group the order is the one the
+    // caller built: session members before machines that are not answering.
+    rows.sort_by_key(|row| !row.owned);
     rows
 }
 
@@ -648,14 +666,25 @@ pub struct MachineRow {
     pub accepts_work: Option<bool>,
     pub agents: usize,
     pub this_machine: bool,
+    /// Whether this is compute you own rather than someone who joined.
+    ///
+    /// The two used to share one list and one rendering, so a stranger who
+    /// joined with a ticket and a droplet paired six months ago looked
+    /// identical. Everything that offers to *do* something to a machine — start
+    /// a terminal on it, keep it in every session — is only a safe thing to
+    /// offer about the first kind, so the line has to exist before any of it.
+    pub owned: bool,
 }
 
 /// How many lines the table under the agents wants: a blank spacer, a heading,
-/// and one line per machine.
-fn machine_table_lines(machines: usize) -> u16 {
-    u16::try_from(machines)
+/// one line per machine, and a second heading when there are people in the
+/// session as well as machines you own.
+fn machine_table_lines(rows: &[MachineRow]) -> u16 {
+    let guests = u16::from(rows.iter().any(|row| !row.owned));
+    u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2)
+        .saturating_add(guests)
 }
 
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
@@ -663,7 +692,8 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
     // width to spare, and pinned to the bottom otherwise. The key bar is not
     // here: it takes over the window footer, so that four keys stay visible in
     // the same place they are on every other screen.
-    let machines = machine_rows(tui).len();
+    let rows_for_machines = machine_rows(tui);
+    let machines = rows_for_machines.len();
     if machines == 0 {
         let (header, rows, hint) = stacked(area, tui, 0);
         return HomeLayout {
@@ -708,7 +738,7 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
     // it exists for cut off. All or nothing — half a block is a blank line
     // where a fleet should be.
     let left = area.height.saturating_sub(2u16.min(area.height));
-    let table = machine_table_lines(machines);
+    let table = machine_table_lines(&rows_for_machines);
     let (panel, height) = if table <= left.saturating_sub(1) {
         (MachinePanel::Table, table)
     } else if left.saturating_sub(1) >= 2 {
@@ -935,6 +965,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("oldbox"),
+            peer_id: None,
             accepts_work: Some(true),
         }];
 
@@ -1097,6 +1128,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
+            peer_id: None,
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");

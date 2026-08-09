@@ -1379,6 +1379,7 @@ mod tests {
                 peer_id: b"host".to_vec(),
                 endpoint_addr: b"endpoint".to_vec(),
                 display_name: String::from("Host"),
+                kind: Default::default(),
             }],
             tabs: vec![Tab {
                 tab_id: 1,

@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -27,7 +27,7 @@ use tokio::{
 
 use crate::{
     layout::{
-        Axis, LayoutError, LayoutSnapshot, MAX_MEMBERS, Member,
+        Axis, LayoutError, LayoutSnapshot, MAX_MEMBERS, Member, MemberKind as LayoutMemberKind,
         NewPanePosition as LayoutNewPanePosition, Node, Pane, SessionState, Tab,
     },
     lease::LeaseState,
@@ -36,11 +36,12 @@ use crate::{
         AgentRoster, ControlLease, CoordinatorChangeRecord, CreatePane, CreateTab, DeletePane,
         DeleteTab, Delta, Envelope, Input, Join, LayoutCommit, LayoutNode, LayoutReject,
         LayoutRejectReason, LayoutRequest, LayoutSplit, LayoutState, LedgerEntryKind,
-        MarkPaneExited, MemberDescriptor, MembershipEvent, MembershipRecord,
-        NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
-        PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ReleaseControl,
-        RenamePane, RenameTab, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis,
-        TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, envelope,
+        MarkPaneExited, MemberDescriptor, MemberKind as WireMemberKind, MembershipEvent,
+        MembershipRecord, NewPanePosition as ProtocolNewPanePosition, PROTOCOL_VERSION,
+        PaneDescriptor, PaneFailed, PaneReady, PaneReservation, PaneSubscribe, Presence,
+        PresenceRoster, ReleaseControl, RenamePane, RenameTab, SessionSnapshot, SetPaneLock,
+        SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids, Welcome,
+        envelope,
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
@@ -281,10 +282,11 @@ impl LayoutCoordinator {
     ) -> Result<Self, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&coordinator_peer_id, endpoint_addr)?;
         Ok(Self {
-            state: SessionState::new_with_display_name(
+            state: SessionState::new_with_identity(
                 coordinator_peer_id.clone(),
                 endpoint_addr,
                 display_name,
+                local_member_kind(),
                 grid_rows,
                 grid_cols,
             )?,
@@ -542,6 +544,21 @@ impl LayoutCoordinator {
         endpoint_addr: EndpointAddr,
         display_name: String,
     ) -> Result<MembershipChange, CoordinatorError> {
+        self.admit_with_identity(
+            peer_id,
+            endpoint_addr,
+            display_name,
+            LayoutMemberKind::default(),
+        )
+    }
+
+    pub fn admit_with_identity(
+        &mut self,
+        peer_id: Vec<u8>,
+        endpoint_addr: EndpointAddr,
+        display_name: String,
+        kind: LayoutMemberKind,
+    ) -> Result<MembershipChange, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
         if let Some(existing) = self
             .state
@@ -564,11 +581,12 @@ impl LayoutCoordinator {
             )?;
             return self.membership_change(peer_id, MembershipEvent::EndpointChanged, invalidated);
         }
-        let invalidated = self.state.add_member_with_display_name(
+        let invalidated = self.state.add_member_with_identity(
             self.state.revision(),
             peer_id.clone(),
             endpoint_addr,
             display_name,
+            kind,
         )?;
         self.membership_change(peer_id, MembershipEvent::Joined, invalidated)
     }
@@ -1219,6 +1237,57 @@ fn protocol_pane_position(position: Option<i32>) -> Result<LayoutNewPanePosition
     }
 }
 
+/// What this process says it is when it joins or hosts a session.
+///
+/// Process-global because that is the shape of the fact: a p2pmux is either
+/// running on a box that belongs to a fleet or it is not, and the answer cannot
+/// differ between two sessions the same process is in. Threading it through
+/// every `_with_display_name` variant would have bought nothing and doubled an
+/// already wide API.
+///
+/// Default `Person`, so a caller that never sets it — every test, and any path
+/// that has not read the pairing record — claims nothing.
+static LOCAL_MEMBER_KIND: AtomicI32 = AtomicI32::new(WireMemberKind::Person as i32);
+
+/// Declare what this process is. Called once at startup, before joining.
+///
+/// Note what this does *not* claim: not "I am one of your machines", only "I am
+/// a machine that belongs to some fleet". Whose fleet is a question every peer
+/// answers for itself against its own pairing record, and no message can
+/// answer it for them.
+pub fn set_local_member_kind(kind: LayoutMemberKind) {
+    LOCAL_MEMBER_KIND.store(wire_member_kind(kind) as i32, Ordering::Relaxed);
+}
+
+pub fn local_member_kind() -> LayoutMemberKind {
+    model_member_kind(LOCAL_MEMBER_KIND.load(Ordering::Relaxed))
+}
+
+/// The wire value for a member kind.
+pub(crate) fn wire_member_kind(kind: LayoutMemberKind) -> WireMemberKind {
+    match kind {
+        LayoutMemberKind::Unspecified => WireMemberKind::Unspecified,
+        LayoutMemberKind::Person => WireMemberKind::Person,
+        LayoutMemberKind::Machine => WireMemberKind::Machine,
+    }
+}
+
+/// The model value for a wire member kind, treating anything unrecognized as no
+/// answer at all.
+///
+/// Deliberately not an error the way an unknown split axis is. A value this
+/// build does not know can only have come from a peer that knows more kinds
+/// than it does, and refusing the whole member list over it would turn a future
+/// release into an incompatibility. Reading it as "said nothing" leaves that
+/// member exactly where an older peer would have left it.
+fn model_member_kind(kind: i32) -> LayoutMemberKind {
+    match WireMemberKind::try_from(kind) {
+        Ok(WireMemberKind::Machine) => LayoutMemberKind::Machine,
+        Ok(WireMemberKind::Person) => LayoutMemberKind::Person,
+        Ok(WireMemberKind::Unspecified) | Err(_) => LayoutMemberKind::Unspecified,
+    }
+}
+
 fn protocol_reservation(reservation: crate::layout::PaneReservation) -> PaneReservation {
     PaneReservation {
         reservation_id: reservation.reservation_id,
@@ -1237,6 +1306,7 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
                 peer_id: member.peer_id,
                 endpoint_addr: member.endpoint_addr,
                 display_name: member.display_name,
+                member_kind: wire_member_kind(member.kind) as i32,
             })
             .collect(),
         panes: snapshot
@@ -1276,6 +1346,7 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
             peer_id: member.peer_id.clone(),
             endpoint_addr: member.endpoint_addr.clone(),
             display_name: member.display_name.clone(),
+            kind: model_member_kind(member.member_kind),
         })
         .collect();
     let panes = state
@@ -1919,6 +1990,10 @@ pub struct JoinReceipt {
     pub coordinator_peer_id: Vec<u8>,
     pub endpoint_addr: EndpointAddr,
     pub display_name: String,
+    /// What the joiner said it is. Passed straight through to the member list
+    /// so that every client can ask its own pairing record whether that claim
+    /// belongs to a machine it owns.
+    pub member_kind: LayoutMemberKind,
     pub session_name: String,
     /// How many takeovers this session has been through, so a joiner knows which
     /// coordinator's signatures to expect without having to read the history it missed.
@@ -2226,6 +2301,7 @@ impl HostSession {
             coordinator_peer_id: coordinator.as_bytes().to_vec(),
             endpoint_addr,
             display_name: join.display_name,
+            member_kind: model_member_kind(join.member_kind),
             session_name: self.session_name.clone(),
             coordinator_epoch: self.coordinator_epoch,
         };
@@ -3149,10 +3225,11 @@ impl SharedLayoutHost {
                     .coordinator
                     .lock()
                     .map_err(|_| SessionError::PeerTask)?;
-                let membership = coordinator_guard.admit_with_display_name(
+                let membership = coordinator_guard.admit_with_identity(
                     receipt.admitted_peer_id.clone(),
                     receipt.endpoint_addr.clone(),
                     receipt.display_name.clone(),
+                    receipt.member_kind,
                 )?;
 
                 let state = membership
@@ -4470,6 +4547,7 @@ async fn join_handshake_with_display_name(
                     endpoint_addr: serde_json::to_vec(&transport.endpoint_addr())
                         .expect("endpoint address should serialize"),
                     display_name,
+                    member_kind: wire_member_kind(local_member_kind()) as i32,
                 })),
             },
         )
@@ -4496,6 +4574,9 @@ async fn join_handshake_with_display_name(
         coordinator_peer_id: welcome.coordinator_peer_id,
         endpoint_addr: ticket.endpoint_addr().clone(),
         display_name: String::new(),
+        // This receipt describes the coordinator we just joined, not us. What
+        // it is gets read off the member list it sends back, not guessed here.
+        member_kind: LayoutMemberKind::default(),
         session_name: welcome.session_name,
         coordinator_epoch: welcome.coordinator_epoch,
     })

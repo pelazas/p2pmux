@@ -811,6 +811,7 @@ mod tests {
             peer_id: b"guest".to_vec(),
             endpoint_addr: b"guest-endpoint".to_vec(),
             display_name: String::from("Guest"),
+            kind: Default::default(),
         });
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
@@ -855,6 +856,7 @@ mod tests {
             peer_id: b"host".to_vec(),
             endpoint_addr: b"endpoint".to_vec(),
             display_name: String::from("Host"),
+            kind: Default::default(),
         }];
         assert_eq!(
             pane_title(

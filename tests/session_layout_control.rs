@@ -495,6 +495,7 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
                 peer_id: raw_id.clone(),
                 endpoint_addr: serde_json::to_vec(&raw.endpoint_addr()).expect("endpoint"),
                 display_name: String::new(),
+                member_kind: Default::default(),
             })),
         },
     )
@@ -941,6 +942,7 @@ async fn closing_after_welcome_rolls_back_admission_before_control_setup() {
                 peer_id: raw_id,
                 endpoint_addr: serde_json::to_vec(&raw.endpoint_addr()).expect("endpoint"),
                 display_name: String::new(),
+                member_kind: Default::default(),
             })),
         },
     )

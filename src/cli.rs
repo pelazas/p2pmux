@@ -626,6 +626,12 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket.clone());
     pairing.accepts_work = accepts_work;
+    // This command returns as soon as it has printed a code, so the node is
+    // what will be watching when the other machine arrives. The window is how
+    // it knows that arrival was invited: without one, every peer of the session
+    // looks the same as the machine you meant to pair with, which is how a
+    // guest used to end up in the fleet.
+    pairing.open_pairing_window(crate::pairing::now_unix());
     crate::pairing::save(&pairing)?;
 
     let mut stdout = io::stdout().lock();
@@ -680,7 +686,11 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
-        pairing.remember(peer, None);
+        // Recorded by peer id, which the transport authenticated, rather than
+        // by the name the machine chose for itself. A machine renamed later is
+        // still this machine; two machines that pick the same name are still
+        // two.
+        pairing.remember(&peer.name, Some(peer.peer_id.clone()), None);
     }
     crate::pairing::save(&pairing)?;
 
@@ -696,7 +706,7 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
         writeln!(stdout, "Run `p2pmux machines` once it is awake.")?;
     } else {
         for peer in peers {
-            writeln!(stdout, "paired: {peer}")?;
+            writeln!(stdout, "paired: {}", peer.name)?;
         }
     }
     writeln!(stdout, "\nFrom now on, bare `p2pmux` rejoins with no code.")?;
@@ -733,13 +743,28 @@ async fn wait_for_invite(
 ///
 /// Bounded and best-effort: the pairing is already recorded, so an empty answer
 /// costs a name in the printout and nothing else.
-async fn wait_for_peers(descriptor: &crate::session_store::SessionDescriptor) -> Vec<String> {
+async fn wait_for_peers(
+    descriptor: &crate::session_store::SessionDescriptor,
+) -> Vec<crate::session_store::SessionPeer> {
     const PEER_TIMEOUT: Duration = Duration::from_secs(15);
     let deadline = Instant::now() + PEER_TIMEOUT;
     while Instant::now() < deadline {
-        let peers = crate::pairing::load_or_empty().machines;
+        // Read from the live session rather than from the fleet record. The
+        // fleet record is what this is about to write, and a machine only
+        // reaches it by being paired — so waiting for it to fill up would be
+        // waiting for something this function is supposed to cause.
+        let peers = crate::session_store::SessionStore::for_current_user()
+            .and_then(|store| store.list_live())
+            .map(|live| {
+                live.into_iter()
+                    .filter(|session| session.id == descriptor.id)
+                    .flat_map(|session| session.peers.into_iter())
+                    .filter(|peer| !peer.this_machine && peer.kind.declared_machine())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         if !peers.is_empty() {
-            return peers.into_iter().map(|machine| machine.name).collect();
+            return peers;
         }
         // A node that died takes the pairing's chance of learning a name with
         // it, so stop waiting for an answer that is not coming.
@@ -766,14 +791,26 @@ async fn wait_for_peers(descriptor: &crate::session_store::SessionDescriptor) ->
 /// line under the fleet rather than instead of it.
 fn print_machines() -> Result<(), Box<dyn Error>> {
     let rows = machine_rows()?;
+    let (fleet, guests): (Vec<_>, Vec<_>) = rows.iter().partition(|row| row.owned);
     println!(
         "{:<12} {:<8} {:<14} RUNNING",
         "NAME", "STATUS", "ACCEPTS WORK"
     );
-    for row in &rows {
+    for row in &fleet {
         println!("{}", crate::tui::machine_line(row));
     }
-    if rows.len() < 2 {
+    // Under their own heading, never in the fleet table. Someone collaborating
+    // on this session from their own laptop is not compute you own, and a list
+    // that prints them together is the list that would go on to offer to start
+    // a terminal on a stranger's machine.
+    if !guests.is_empty() {
+        println!();
+        println!("IN THIS SESSION, NOT YOURS");
+        for row in &guests {
+            println!("{}", crate::tui::machine_line(row));
+        }
+    }
+    if fleet.len() < 2 {
         println!();
         println!("No other machines paired yet. Run `p2pmux pair` to add one.");
     }
@@ -809,6 +846,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
         // this machine, about this machine.
         accepts_work: Some(pairing.accepts_work),
         this_machine: true,
+        owned: true,
     }];
     for peer in live
         .iter()
@@ -824,6 +862,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
             accepts_work: accepts_work(&peer.name),
             agents: peer.agents,
             this_machine: false,
+            owned: pairing.owns(&peer.peer_id, &peer.name, peer.kind),
         });
     }
     for machine in &pairing.machines {
@@ -836,8 +875,10 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
             accepts_work: machine.accepts_work,
             agents: 0,
             this_machine: false,
+            owned: true,
         });
     }
+    rows.sort_by_key(|row| !row.owned);
     Ok(rows)
 }
 
