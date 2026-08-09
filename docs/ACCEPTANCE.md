@@ -170,3 +170,53 @@ invited into a session it was not paired into.
   refusing to join.
 - No feature is reported complete on the strength of a unit test alone where a
   real-hardware check is listed above.
+
+---
+
+# What was demonstrated
+
+Every criterion above is met. The parts that could only be checked with a
+second machine were checked with one: `scripts/e2e/scenario_r_fleet.py` pairs
+this Mac with a droplet running a real Hermes gateway, over the real network,
+with the droplet's p2pmux in a sandbox HOME so nothing touches a pairing record
+or session anybody uses.
+
+    == ownership (#71)          the droplet is fleet, not a guest
+    == fleet follows you (#73)  it joined a session it was never paired into,
+                                with no code typed there
+    == detection (#76)          the Hermes gateway reached this Mac's inbox
+    == remote terminal (#72)    a pane hosted by the droplet; `hostname` in it
+                                prints mybotvm, not this Mac
+    == chat (#75)               the Hermes row says enter starts a new
+                                conversation, and never that it joins one
+
+Separately, on the droplet's real systemd: the unit was installed, the daemon
+killed at PID 443008, and systemd brought it back at 443085 with
+`NRestarts=1` — #73's restart-on-crash criterion. The unit was then removed.
+
+## What the second machine found that the test suite could not
+
+Six bugs, every one of them invisible to a green `cargo test`. They are the
+argument for writing the hardware checks into the criteria rather than
+treating them as a nice-to-have.
+
+1. **Invitations were coalesced away.** They went out on the latest-wins state
+   channel, where the next layout snapshot silently replaced them — and
+   snapshots arrive constantly.
+2. **The machine that offers the pairing code never entered the other
+   machine's fleet.** It cannot declare itself a machine, because its node
+   started before the pairing file had a ticket, and the joining side was
+   filtering on that declaration. Pairing looked complete from one side and
+   left the other's fleet empty.
+3. **A node's peer id is not a machine's identity.** Ownership pinned to it
+   held only inside the session pairing happened in, so the machine that
+   followed you into a new one arrived as a stranger. This is #71's own open
+   question, answered by hardware.
+4. **A roster carrying an agent in no pane was dropped whole**, by a rule that
+   was right and was the only rule: entries must name panes the sender hosts.
+5. **Opening a terminal on another machine looked like nothing happened.** The
+   tab was created, on the right machine, with the right shell — and the person
+   who asked stayed where they were.
+6. **The agent column named Hermes and OpenClaw "agent"**, because it kept its
+   own list of kinds. #76 warned that four places move together. There were
+   five.
