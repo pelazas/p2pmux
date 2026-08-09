@@ -64,7 +64,9 @@ const HOME_KEYS: &[FooterSegment] = &[
 const MACHINE_WIDTH: u16 = 10;
 const AGENT_WIDTH: u16 = 9;
 const STATE_WIDTH: u16 = 12;
-const ELAPSED_WIDTH: u16 = 5;
+/// Wide enough for `9h59m59s`, which is every clock anyone watches. A longer
+/// one pushes into the description column rather than losing a digit.
+const ELAPSED_WIDTH: u16 = 8;
 
 pub(in crate::tui) fn render_home(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
     let geometry = tui.geometry(frame.area());
@@ -294,17 +296,22 @@ fn home_description(row: &AgentOverlayRow, theme: &UiTheme) -> (String, Style) {
 
 /// Elapsed for every state that has a clock running. A row with no episode
 /// behind it shows nothing rather than a zero.
+///
+/// The seconds never drop off. A minute-only clock stops moving for a whole
+/// minute at a time, and a row you are waiting on that looks frozen is worse
+/// than two extra characters in the narrowest column.
 fn home_elapsed(row: &AgentOverlayRow, now_unix_ms: u64) -> String {
     if row.working_since_unix_ms == 0 {
         return String::new();
     }
-    let seconds = now_unix_ms
+    let elapsed = now_unix_ms
         .saturating_sub(row.working_since_unix_ms)
         .saturating_div(1_000);
-    if seconds >= 3_600 {
-        format!("{}h{}m", seconds / 3_600, (seconds % 3_600) / 60)
-    } else if seconds >= 60 {
-        format!("{}m", seconds / 60)
+    let (hours, minutes, seconds) = (elapsed / 3_600, (elapsed % 3_600) / 60, elapsed % 60);
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
     } else {
         format!("{seconds}s")
     }
@@ -501,8 +508,8 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS, format_home_row, header_line,
-        machine_line,
+        ELAPSED_WIDTH, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
+        format_home_row, header_line, home_elapsed, machine_line,
     };
     use crate::{
         agent_detect::{AgentKind, AgentState, DetectedAgent, PaneAgentTracker},
@@ -584,6 +591,33 @@ mod tests {
         // point of not reading the terminal yourself.
         let line = rendered(AgentRosterState::Working, "");
         assert!(line.contains("repository/path"), "{line:?}");
+    }
+
+    /// The seconds stay on past the first minute. A clock that only moves once
+    /// a minute is indistinguishable from a clock that has stopped, which is
+    /// the one thing the column exists to rule out.
+    #[test]
+    fn the_elapsed_column_keeps_its_seconds_at_every_length() {
+        let mut row = agent_row(1, 1, 1);
+        row.working_since_unix_ms = 1_000_000;
+        let at = |seconds: u64| home_elapsed(&row, 1_000_000 + seconds * 1_000);
+
+        assert_eq!(at(0), "0s");
+        assert_eq!(at(45), "45s");
+        assert_eq!(at(65), "1m05s");
+        assert_eq!(at(3_599), "59m59s");
+        assert_eq!(at(3_600), "1h00m00s");
+        assert_eq!(at(35_999), "9h59m59s");
+
+        assert!(
+            at(35_999).len() <= usize::from(ELAPSED_WIDTH),
+            "the column has to hold the longest clock anyone watches"
+        );
+        row.working_since_unix_ms = 0;
+        assert!(
+            home_elapsed(&row, 1_000_000).is_empty(),
+            "a row with no episode behind it shows nothing rather than a zero"
+        );
     }
 
     #[test]
