@@ -49,8 +49,8 @@ session after upgrading when attach protocol changes are present.
 
 Everyone in a session runs the same wire protocol. It is pinned per release and never negotiated
 down, so a peer on a different one fails its join — reported as an unsupported protocol version —
-rather than entering a session it only half understands. v0.1.4 moved that pin, so a v0.1.3 peer
-cannot join a v0.1.4 session or the reverse: upgrade together.
+rather than entering a session it only half understands. v0.1.4 moved that pin and v0.1.5 leaves it
+where it is, so v0.1.4 and v0.1.5 share sessions freely and a v0.1.3 peer can join neither.
 
 To dogfood the shared layout on one machine:
 

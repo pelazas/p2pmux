@@ -109,10 +109,13 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.4 runs sessions between machines on different networks and different
-continents. macOS and Linux, both architectures. A coordinator that dies no longer ends the
-session — a survivor takes the role over, with a new join code — but a pane whose host is gone
-stays in the layout as a placeholder rather than being reaped on a timer.
+**Early, but real.** v0.1.5 runs sessions between machines on different networks and different
+continents. macOS and Linux, both architectures. Bare `p2pmux` opens the inbox, two machines pair
+once and rejoin without a code, and two agents report their own state through hooks — Claude Code
+and OpenCode. A coordinator that dies no longer ends the session — a survivor takes the role over,
+with a new join code — but a pane whose host is gone stays in the layout as a placeholder rather
+than being reaped on a timer. Codex, Cursor and Pi are detected but have no hooks yet, so their
+rows say so rather than guessing.
 
 ## Install
 
