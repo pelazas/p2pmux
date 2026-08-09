@@ -447,6 +447,28 @@ mod tests {
     }
 
     #[test]
+    fn focus_moving_mid_gesture_ends_the_forwarding_instead_of_releasing_elsewhere() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let protocol = reporting_child();
+
+        tui.handle_mouse(
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+            protocol,
+        );
+        // The node moved focus while the button was still down.
+        tui.set_focus(1, 2).expect("the split has a second pane");
+        let up = tui.handle_mouse(
+            left_mouse(MouseEventKind::Up(MouseButton::Left), 4, 3),
+            area,
+            protocol,
+        );
+
+        assert_eq!(up.forward_bytes, None);
+    }
+
+    #[test]
     fn a_forwarded_press_keeps_the_drag_and_release_away_from_selection() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
         let area = Rect::new(0, 0, 80, 24);

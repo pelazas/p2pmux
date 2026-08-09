@@ -174,6 +174,9 @@ fn run_detach_resume_round_trip(
         &mut stream,
         &ClientMessage::Input {
             bytes: b"printf p2pmux-detach-roundtrip\\r".to_vec(),
+            // Addressed to the pane the client is looking at, the way the real
+            // client sends it, rather than left for the node to guess.
+            pane_id: Some(1),
             perf_id: None,
         },
     );

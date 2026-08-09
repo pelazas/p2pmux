@@ -36,10 +36,21 @@ impl SharedLayoutRuntime {
         self.drain()
     }
 
-    pub fn node_input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
-        let pane_id = self.tui.focused_pane();
+    /// Deliver a client's bytes to the pane it addressed them to, and report
+    /// which pane that turned out to be.
+    ///
+    /// `pane_id` is `None` for a client too old to name one; that one still gets
+    /// this node's focus, which is what every client used to get. The pane comes
+    /// back so the caller can prioritise that pane's next screen without asking
+    /// focus a second question and getting a different answer.
+    pub fn node_input(
+        &mut self,
+        pane_id: Option<PaneId>,
+        bytes: Vec<u8>,
+    ) -> Result<Option<PaneId>, Box<dyn Error>> {
+        let pane_id = pane_id.unwrap_or_else(|| self.tui.focused_pane());
         if !self.input_allowed(pane_id) {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(pane) = self.local.get_mut(&pane_id) {
             pane.input(bytes.clone())?;
@@ -48,7 +59,7 @@ impl SharedLayoutRuntime {
             pane.input(bytes);
         }
         self.tui.reset_scrollback(pane_id);
-        Ok(())
+        Ok(Some(pane_id))
     }
 
     pub fn release_all_local_control(&mut self) -> Result<(), Box<dyn Error>> {

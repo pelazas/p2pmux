@@ -27,6 +27,19 @@ pub enum ClientMessage {
     },
     Input {
         bytes: Vec<u8>,
+        /// The pane the client encoded these bytes for.
+        ///
+        /// Input is only meaningful next to the pane it was aimed at: a key is
+        /// encoded against that pane's keyboard mode and a mouse report against
+        /// its xterm mouse mode, and a report the addressed child asked for is
+        /// line noise typed into any other one. Routing by the node's own focus
+        /// instead loses exactly that during the round trip that follows a new
+        /// pane, when the two ends briefly disagree about where focus is.
+        ///
+        /// Omitted by clients older than this field; those still route to
+        /// whatever the node has focused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         perf_id: Option<u64>,
     },
