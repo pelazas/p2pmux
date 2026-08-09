@@ -292,10 +292,21 @@ impl MultiPaneTui {
     ///
     /// Cleared whenever the pane stops existing or focus moves elsewhere, so a
     /// stale zoom can never hide the rest of a tab.
-    pub(in crate::tui) fn zoomed_pane(&self) -> Option<PaneId> {
+    pub fn zoomed_pane(&self) -> Option<PaneId> {
         self.zoomed_pane
             .filter(|pane_id| *pane_id == self.focused_pane)
             .filter(|pane_id| self.snapshot.panes.contains_key(pane_id))
+    }
+
+    /// Mirror a zoom that happened on the attached client.
+    ///
+    /// The node keeps its own [`MultiPaneTui`] only to decide how big the panes
+    /// it hosts should be, and a zoom changes that answer: the zoomed pane gets
+    /// the whole content area, so its PTY has to grow to match. Without this the
+    /// node reflows against a layout the user is no longer looking at, and the
+    /// zoomed pane draws its old small grid in the corner of a full-screen box.
+    pub fn set_zoomed_pane(&mut self, pane_id: Option<PaneId>) {
+        self.zoomed_pane = pane_id;
     }
 
     pub(in crate::tui) fn clear_zoom(&mut self) {

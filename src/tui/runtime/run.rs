@@ -47,6 +47,7 @@ impl SharedLayoutRuntime {
         area: Rect,
     ) -> Result<bool, Box<dyn Error>> {
         let previously_focused = self.tui.focused_pane();
+        let zoom_before = self.tui.zoomed_pane();
         let quit = match self.tui.handle_key(key, area) {
             // Nothing behind this process to leave running, so both answers
             // mean the same thing here. The prompt that distinguishes them is
@@ -75,6 +76,11 @@ impl SharedLayoutRuntime {
                 Ok(false)
             }
         }?;
+        // A zoomed pane is alone on the screen and gets all of it, so the PTY
+        // behind it has to grow to match -- and shrink back when the zoom ends.
+        if self.tui.zoomed_pane() != zoom_before {
+            self.reflow_local_panes(area)?;
+        }
         self.release_blurred_pane(previously_focused)?;
         Ok(quit)
     }
@@ -289,6 +295,7 @@ impl SharedLayoutRuntime {
                 }
                 let area = Rect::new(0, 0, *cols, *rows);
                 let previously_focused = self.tui.focused_pane();
+                let zoom_before = self.tui.zoomed_pane();
                 let protocol = self.focused_pane_mouse_protocol();
                 let handling = self.tui.handle_mouse(mouse, area, protocol);
                 if let Some(bytes) = handling.forward_bytes {
@@ -302,6 +309,11 @@ impl SharedLayoutRuntime {
                 }
                 if handling.copy_selection_requested {
                     self.copy_selection_to_clipboard();
+                }
+                // Clicking a sibling stands the zoom down, which gives the
+                // panes their split rects back.
+                if self.tui.zoomed_pane() != zoom_before {
+                    self.reflow_local_panes(area)?;
                 }
                 self.release_blurred_pane(previously_focused)?;
                 *dirty = true;

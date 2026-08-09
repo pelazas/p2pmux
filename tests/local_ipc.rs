@@ -42,6 +42,35 @@ fn agent_status_is_tagged_and_tolerates_a_producer_that_omits_cwd() {
     );
 }
 
+/// Zoom never becomes a layout request, so this message is the only way the
+/// node learns that the pane it hosts is now alone on a full screen and its PTY
+/// has to grow to match. `None` is the way back out.
+#[test]
+fn zoom_carries_the_pane_and_the_size_to_reflow_against() {
+    let zoomed = ClientMessage::Zoom {
+        pane_id: Some(3),
+        cols: 200,
+        rows: 50,
+    };
+    let value = serde_json::to_value(&zoomed).unwrap();
+    assert_eq!(value["type"], "zoom");
+    assert_eq!(value["pane_id"], 3);
+    assert_eq!(
+        serde_json::from_value::<ClientMessage>(value).unwrap(),
+        zoomed
+    );
+
+    let unzoomed = ClientMessage::Zoom {
+        pane_id: None,
+        cols: 200,
+        rows: 50,
+    };
+    assert_eq!(
+        serde_json::from_value::<ClientMessage>(serde_json::to_value(&unzoomed).unwrap()).unwrap(),
+        unzoomed
+    );
+}
+
 #[test]
 fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
     let message = NodeMessage::Snapshot {

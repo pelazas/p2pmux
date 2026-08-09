@@ -569,7 +569,13 @@ pub(in crate::tui) fn render_shared_multi_pane(
         // interior before drawing it so letterbox margins cannot retain cells from an older pane.
         frame.render_widget(Clear, content);
         if let Some(screen) = screens.get(&pane_id) {
-            let viewport = fixed_grid_viewport(content, pane.grid_rows, pane.grid_cols);
+            // The grid the screen actually has, not the one the layout records:
+            // a reflow resizes the PTY here and now, while the descriptor only
+            // catches up once the coordinator has accepted the new grid. Trusting
+            // the descriptor letterboxes a pane that has already grown -- which is
+            // most visible on a zoom, where the pane doubles in size in one frame.
+            let (grid_rows, grid_cols) = screen.size();
+            let viewport = fixed_grid_viewport(content, grid_rows, grid_cols);
             let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
             frame.render_widget(
                 VtScreen::new(screen.as_ref()).with_selection(
@@ -940,6 +946,48 @@ mod tests {
         assert!(zoomed.contains(" zoom "), "{zoomed}");
     }
 
+    /// A zoom is only a zoom if the terminal inside the pane grew with the box.
+    ///
+    /// The PTY is resized by the node the moment the zoom lands, but the pane
+    /// descriptor only carries the new grid once the coordinator has accepted
+    /// it. Drawing against the descriptor in the meantime leaves a full-screen
+    /// box with a split-sized terminal in the corner of it — the bug this
+    /// asserts against.
+    #[test]
+    fn a_zoomed_pane_draws_the_grid_its_pty_actually_has() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 60, 12);
+        tui.toggle_zoom();
+        let rect = tui.geometry(area).panes[&tui.focused_pane()];
+        let (rows, columns) = crate::tui::geometry::grid_for_pane(rect);
+        // The descriptor still says 4x10: the layout has not caught up yet.
+        assert_eq!(
+            (
+                tui.snapshot().panes[&1].grid_rows,
+                tui.snapshot().panes[&1].grid_cols
+            ),
+            (4, 10)
+        );
+
+        let mut parser = vt100::Parser::new(rows, columns, 0);
+        parser.process(
+            "X".repeat(usize::from(rows) * usize::from(columns))
+                .as_bytes(),
+        );
+        let screen = parser.screen().clone();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::from([(1u64, &screen)])))
+            .expect("draw");
+
+        let drawn = rendered(terminal.backend().buffer(), 60, 12);
+        let last_content_row = drawn.lines().nth(usize::from(rows)).expect("content row");
+        assert!(
+            last_content_row.starts_with(&format!("│{}│", "X".repeat(usize::from(columns)))),
+            "the zoomed pane should fill its box, got: {last_content_row}"
+        );
+    }
+
     fn rendered(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> String {
         (0..height)
             .map(|row| {
@@ -1217,10 +1265,14 @@ mod tests {
         terminal.backend_mut().assert_cursor_position((3, 2));
     }
 
+    /// Clipped means "outside the pane it is drawn in", not "outside the grid
+    /// the layout last recorded" — the screen's own size is what the viewport
+    /// follows, so a descriptor lagging behind a reflow no longer hides a cursor
+    /// that is plainly on screen. A cursor past the pane's own border still is.
     #[test]
     fn focused_pane_never_draws_a_hidden_or_clipped_vt_cursor() {
-        for sequence in [b"\x1b[?25l".as_slice(), b"abcd".as_slice()] {
-            let mut parser = vt100::Parser::new(1, 5, 0);
+        for sequence in [b"\x1b[?25l".as_slice(), b"abcdefgh".as_slice()] {
+            let mut parser = vt100::Parser::new(1, 9, 0);
             parser.process(sequence);
             let mut tui = MultiPaneTui::new(layout(
                 vec![Tab {
@@ -1229,7 +1281,7 @@ mod tests {
 
                     title: None,
                 }],
-                &[(1, 1, 3)],
+                &[(1, 1, 9)],
             ))
             .expect("valid layout");
             tui.set_pane_view(
