@@ -641,7 +641,10 @@ pub fn run_on(
                             if let Some(perf_id) = perf_id {
                                 crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
                             }
-                            write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
+                            write_message(
+                                &mut stream,
+                                &pane_input(tui.focused_pane(), bytes, perf_id),
+                            )?;
                             history.remove(&tui.focused_pane());
                             pending_scroll.remove(&tui.focused_pane());
                             desired_scroll.remove(&tui.focused_pane());
@@ -659,10 +662,7 @@ pub fn run_on(
                     }
                     write_message(
                         &mut stream,
-                        &ClientMessage::Input {
-                            bytes: text.into_bytes(),
-                            perf_id,
-                        },
+                        &pane_input(tui.focused_pane(), text.into_bytes(), perf_id),
                     )?;
                     history.remove(&tui.focused_pane());
                     pending_scroll.remove(&tui.focused_pane());
@@ -698,7 +698,10 @@ pub fn run_on(
                         .and_then(|handling| handling.forward_bytes);
                     if let Some(bytes) = forwarded {
                         let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
-                        write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
+                        write_message(
+                            &mut stream,
+                            &pane_input(tui.focused_pane(), bytes, perf_id),
+                        )?;
                     } else {
                         let pane_id =
                             tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
@@ -743,6 +746,9 @@ pub fn run_on(
                         }
                     }
                 } else {
+                    // Read before the click, which is allowed to move focus: the
+                    // report was encoded against the pane that had focus then.
+                    let addressed = tui.focused_pane();
                     let handling = tui.handle_mouse(
                         mouse,
                         area,
@@ -754,7 +760,7 @@ pub fn run_on(
                     }
                     if let Some(bytes) = handling.forward_bytes {
                         let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
-                        write_message(&mut stream, &ClientMessage::Input { bytes, perf_id })?;
+                        write_message(&mut stream, &pane_input(addressed, bytes, perf_id))?;
                     }
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
@@ -818,6 +824,20 @@ fn refresh_tui_timers(
         dirty = true;
     }
     dirty
+}
+
+/// Bytes addressed to the pane they were encoded for.
+///
+/// Every byte this client sends was shaped by one pane's state -- its keyboard
+/// mode, its xterm mouse mode -- so it names that pane rather than letting the
+/// node re-decide from its own focus, which lags this one by a round trip after
+/// every pane the session creates.
+fn pane_input(pane_id: u64, bytes: Vec<u8>, perf_id: Option<u64>) -> ClientMessage {
+    ClientMessage::Input {
+        bytes,
+        pane_id: Some(pane_id),
+        perf_id,
+    }
 }
 
 /// The mouse reporting the focused pane's child has turned on, if any.

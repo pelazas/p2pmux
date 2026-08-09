@@ -500,13 +500,17 @@ fn run_socket_loop(
         let mut full_snapshot = false;
         if !shutdown && let Some(client) = client.as_mut() {
             match read_message(&mut client.reader) {
-                Ok(Some(ClientMessage::Input { bytes, perf_id })) => {
-                    let focused_pane = node.local_focus().1;
-                    node.input(bytes)
+                Ok(Some(ClientMessage::Input {
+                    bytes,
+                    pane_id,
+                    perf_id,
+                })) => {
+                    let target = node
+                        .input(pane_id, bytes)
                         .map_err(|error| io::Error::other(error.to_string()))?;
-                    client
-                        .publish
-                        .arm_target_urgency(focused_pane, Instant::now());
+                    if let Some(target) = target {
+                        client.publish.arm_target_urgency(target, Instant::now());
+                    }
                     client.publish.perf_id = perf_id;
                     if let Some(perf_id) = perf_id {
                         crate::perf::log(&format!("P2PMUX_PERF id={perf_id} node_input"));
@@ -1444,8 +1448,14 @@ impl SharedLayoutNode {
         self.runtime.drain_node()
     }
 
-    pub fn input(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
-        self.runtime.node_input(bytes)
+    /// Deliver a client's bytes to the pane it named, or to this node's focus
+    /// when the client named none. Returns the pane they reached, if any.
+    pub fn input(
+        &mut self,
+        pane_id: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<Option<u64>, Box<dyn Error>> {
+        self.runtime.node_input(pane_id, bytes)
     }
     pub fn local_peer_id(&self) -> Vec<u8> {
         self.runtime.local_peer_id()
@@ -1631,6 +1641,7 @@ mod tests {
         let (mut writer, stream) = UnixStream::pair().unwrap();
         let mut frames = serde_json::to_vec(&ClientMessage::Input {
             bytes: b"first".to_vec(),
+            pane_id: Some(1),
             perf_id: None,
         })
         .unwrap();
@@ -1976,7 +1987,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_focus_reads_runtime_state_without_drain() {
+    async fn focus_reads_runtime_state_and_input_lands_on_the_pane_the_client_named() {
         let host = SharedLayoutHost::new(HostSession::create().await.unwrap(), 2, 8).unwrap();
         let panes = host.pane_server();
         let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
@@ -2032,6 +2043,18 @@ mod tests {
         node.focus(1, 2).unwrap();
 
         assert_eq!(node.local_focus(), (1, 2));
+
+        // Input goes where the client aimed it, not where this node happens to
+        // be looking -- the two disagree for one round trip after every new
+        // pane, and that is exactly when a mouse report encoded for one pane
+        // would otherwise be typed into another.
+        assert_eq!(
+            node.input(Some(1), b"\x1b[<35;1;1M".to_vec()).unwrap(),
+            Some(1)
+        );
+        // A client too old to name a pane still gets the node's focus.
+        assert_eq!(node.input(None, b"x".to_vec()).unwrap(), Some(2));
+
         tokio::task::block_in_place(|| node.shutdown());
     }
 

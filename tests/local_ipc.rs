@@ -43,6 +43,35 @@ fn agent_status_is_tagged_and_tolerates_a_producer_that_omits_cwd() {
 }
 
 #[test]
+fn input_names_the_pane_it_was_encoded_for_and_tolerates_a_client_that_cannot() {
+    let message = ClientMessage::Input {
+        bytes: b"\x1b[<35;12;5M".to_vec(),
+        pane_id: Some(7),
+        perf_id: None,
+    };
+    let value = serde_json::to_value(&message).unwrap();
+    assert_eq!(value["type"], "input");
+    assert_eq!(value["pane_id"], 7);
+    assert_eq!(
+        serde_json::from_value::<ClientMessage>(value).unwrap(),
+        message
+    );
+
+    // A client from before the field routes the way every client used to: to
+    // whatever the node has focused.
+    let unaddressed: ClientMessage =
+        serde_json::from_str(r#"{"type":"input","bytes":[120]}"#).expect("pane_id is optional");
+    assert_eq!(
+        unaddressed,
+        ClientMessage::Input {
+            bytes: b"x".to_vec(),
+            pane_id: None,
+            perf_id: None,
+        }
+    );
+}
+
+#[test]
 fn protocol_messages_are_tagged_and_attachment_is_generation_safe() {
     let message = NodeMessage::Snapshot {
         room_name: "lisbon".into(),
