@@ -43,14 +43,19 @@ finder descriptor is the only durable session data, under `~/Library/Application
 on macOS and `$XDG_STATE_HOME/p2pmux/` — `~/.local/state/p2pmux/` unless you set it — on Linux.
 The Unix socket is under `$XDG_RUNTIME_DIR/p2pmux/` where Linux provides one, and `/tmp/p2pmux-$UID/`
 otherwise, which is also where macOS keeps it. Screens, PTYs, tickets, layout state, and focus are
-never restored from disk. The node survives terminal closure but is managed by neither launchd nor
-systemd. Local IPC is intentionally versioned as an implementation detail, so restart an existing
+never restored from disk. The node survives terminal closure. It is not managed by launchd or systemd
+itself — the *fleet agent* is, and only if you asked for it: `p2pmux daemon install` writes a
+launchd agent on macOS or a systemd user unit on Linux, so a paired machine rejoins its home
+session at boot and can be invited into sessions you start later. `p2pmux pair` offers to install
+it, and remembers a no. Local IPC is intentionally versioned as an implementation detail, so restart an existing
 session after upgrading when attach protocol changes are present.
 
 Everyone in a session runs the same wire protocol. It is pinned per release and never negotiated
 down, so a peer on a different one fails its join — reported as an unsupported protocol version —
-rather than entering a session it only half understands. v0.1.4 moved that pin and v0.1.5 leaves it
-where it is, so v0.1.4 and v0.1.5 share sessions freely and a v0.1.3 peer can join neither.
+rather than entering a session it only half understands. v0.1.6 moved that pin: it added a message
+older peers cannot decode, so a v0.1.5 peer is refused at the door rather than dropping its control
+stream the first time one arrives. v0.1.4 and v0.1.5 still share sessions with each other, and
+neither can join a v0.1.6 one.
 
 To dogfood the shared layout on one machine:
 

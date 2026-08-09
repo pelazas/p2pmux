@@ -21,5 +21,5 @@ fn exposes_the_scaffold_module_boundaries() {
     let _: Option<Election> = None;
     // Bumped by the coordinator epoch, which every welcome and every ledger entry now
     // carries: a peer on 9 cannot tell which coordinator sealed what it is being sent.
-    assert_eq!(PROTOCOL_VERSION, 10);
+    assert_eq!(PROTOCOL_VERSION, 11);
 }

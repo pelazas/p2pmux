@@ -109,13 +109,28 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.5 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.6 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. Bare `p2pmux` opens the inbox, two machines pair
 once and rejoin without a code, and two agents report their own state through hooks — Claude Code
 and OpenCode. A coordinator that dies no longer ends the session — a survivor takes the role over,
 with a new join code — but a pane whose host is gone stays in the layout as a placeholder rather
 than being reaped on a timer. Codex, Cursor and Pi are detected but have no hooks yet, so their
 rows say so rather than guessing.
+
+v0.1.6 is about the other machines. The inbox tells a machine you own from a person who joined,
+and only ever offers to start work on the first kind. You can open a terminal on one of your
+machines from the fleet list, subject to an allowlist that machine's owner writes on the machine
+itself — commands matched in full, default closed, and no blocklist, because a blocklist on an
+interactive shell is a guardrail against accidents and not a boundary. Your machines follow you
+into sessions they were never paired into, kept there by a fleet agent under launchd or systemd.
+Agents running *outside* p2pmux — a bot under systemd, something in a stray tmux — appear in the
+inbox too, and pressing enter opens their own chat client on their own machine. Hermes and
+OpenClaw are detected; the row says which of the two things enter does, because `openclaw chat`
+joins the conversation its gateway is having and `hermes chat` starts a new one.
+
+**Upgrading from v0.1.5 is not optional if you share sessions.** The wire protocol moved, so a
+v0.1.5 peer cannot join a v0.1.6 session at all — it is refused with an unsupported-protocol
+error rather than half-joining.
 
 ## Install
 
