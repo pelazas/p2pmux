@@ -288,7 +288,7 @@ impl MultiPaneTui {
         vec![UiIntent::FocusPane { pane_id }]
     }
 
-    /// The pane drawn alone, when Home handed the user into one.
+    /// The pane drawn alone, when the user asked for one with `Ctrl+P` `z`.
     ///
     /// Cleared whenever the pane stops existing or focus moves elsewhere, so a
     /// stale zoom can never hide the rest of a tab.
@@ -304,11 +304,11 @@ impl MultiPaneTui {
 
     /// Give the focused pane the whole content area, or give it back.
     ///
-    /// The same local view state Home already uses to hand you into an agent,
-    /// reachable on purpose rather than only as a side effect of arriving from
-    /// the inbox. Nothing about the layout changes: the pane keeps the grid the
-    /// session gave it and simply stops sharing the screen with its siblings,
-    /// so no other member sees anything happen.
+    /// The only way into a zoom now that the inbox stopped arriving in one, so
+    /// a pane is alone on screen because the user asked for that and not as a
+    /// side effect of how they got there. Nothing about the layout changes: the
+    /// pane keeps the grid the session gave it and simply stops sharing the
+    /// screen with its siblings, so no other member sees anything happen.
     ///
     /// A tab with one pane is already zoomed, so the key does nothing there
     /// rather than lighting a badge that describes no change.
@@ -775,23 +775,37 @@ mod tests {
         );
     }
 
-    /// A zoom the user asked for on one tab must not follow them into the tab
-    /// the inbox hands them next.
+    /// A zoom the user asked for earlier must not still be up on the pane the
+    /// inbox hands them next.
+    ///
+    /// The leftover has to be on *that* pane to say anything: `zoomed_pane()`
+    /// reports a zoom only while it is also the focused pane, so a zoom parked
+    /// on some other pane reads as `None` whether or not anything cleared it.
+    ///
+    /// Set here directly because every real door into Home — `Ctrl+O`,
+    /// `Ctrl+A`, stepping left off the first tab, the inbox badge — clears the
+    /// zoom on the way in. The guarantee is pinned on the path that lands the
+    /// user rather than on four callers each remembering.
     #[test]
     fn enter_stands_down_a_zoom_left_over_from_an_earlier_visit() {
         let mut tui = home_tui(&[
             ("laptop", "claude", AgentRosterState::Working),
             ("desktop", "claude", AgentRosterState::Pending),
         ]);
-        tui.select_pane(1, 1, "test");
-        tui.zoomed_pane = Some(1);
-        assert_eq!(tui.zoomed_pane(), Some(1));
+        // The pending agent sorts to the top row, so it is the one Enter opens.
+        tui.select_pane(2, 2, "test");
+        tui.zoomed_pane = Some(2);
+        assert_eq!(tui.zoomed_pane(), Some(2));
 
         tui.set_home_open(true, "test");
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA);
 
-        assert_eq!(tui.focused_pane(), 2);
-        assert_eq!(tui.zoomed_pane(), None);
+        assert_eq!(tui.focused_pane(), 2, "the row the inbox opened");
+        assert_eq!(
+            tui.zoomed_pane(),
+            None,
+            "the leftover zoom is stood down, not carried into the tab"
+        );
     }
 
     #[test]

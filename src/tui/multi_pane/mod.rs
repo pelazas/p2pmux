@@ -373,10 +373,10 @@ impl MultiPaneTui {
                 .saturating_sub(tab_bar.height + tab_bar_gap + footer_height),
         );
         let mut panes = BTreeMap::new();
-        // A pane opened from Home gets the whole content area to itself. This is
-        // a local view choice and never reaches the layout, so the pane keeps
-        // the fixed grid the shared layout gave it and simply stops sharing the
-        // screen with its siblings.
+        // A zoomed pane gets the whole content area to itself. This is a local
+        // view choice and never reaches the layout, so the pane keeps the fixed
+        // grid the shared layout gave it and simply stops sharing the screen
+        // with its siblings.
         if let Some(pane_id) = self.zoomed_pane() {
             panes.insert(pane_id, content);
         } else if let Some(tab) = self.current_tab_layout() {
