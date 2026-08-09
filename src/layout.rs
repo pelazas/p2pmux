@@ -119,6 +119,45 @@ pub struct Member {
     /// against its own pairing record.
     #[serde(default)]
     pub kind: MemberKind,
+    /// The machine behind this member, when it proved which one it is.
+    ///
+    /// Empty when it offered no proof or offered one that did not check out —
+    /// so this is verified or absent, never merely claimed. A node's peer id
+    /// belongs to one process; this is what survives the process, and it is
+    /// what a fleet record is keyed on.
+    #[serde(default)]
+    pub machine_id: Vec<u8>,
+    /// The signature `machine_id` was accepted on, carried so that every member
+    /// can check it for itself rather than taking the coordinator's word.
+    #[serde(default)]
+    pub machine_proof: Vec<u8>,
+}
+
+/// Everything a member says about itself when it joins.
+///
+/// Bundled rather than passed as four more arguments, because they travel
+/// together everywhere and because the interesting invariant is about the pair
+/// at the end: a machine id is kept only with a proof that checks out.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemberIdentity {
+    pub display_name: String,
+    pub kind: MemberKind,
+    pub machine_id: Vec<u8>,
+    pub machine_proof: Vec<u8>,
+}
+
+impl MemberIdentity {
+    /// Drop a machine id whose proof does not check out against `peer_id`.
+    ///
+    /// Called wherever a member list is built, so that everything downstream
+    /// can read a machine id as verified or absent and never ask again.
+    pub fn verified_for(mut self, peer_id: &[u8]) -> Self {
+        if !crate::machine_id::verify(&self.machine_id, peer_id, &self.machine_proof) {
+            self.machine_id.clear();
+            self.machine_proof.clear();
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,8 +340,10 @@ impl SessionState {
         Self::new_with_identity(
             initial_host,
             endpoint_addr,
-            display_name,
-            MemberKind::default(),
+            MemberIdentity {
+                display_name,
+                ..MemberIdentity::default()
+            },
             grid_rows,
             grid_cols,
         )
@@ -311,11 +352,17 @@ impl SessionState {
     pub fn new_with_identity(
         initial_host: Vec<u8>,
         endpoint_addr: Vec<u8>,
-        display_name: String,
-        kind: MemberKind,
+        identity: MemberIdentity,
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<Self, LayoutError> {
+        let identity = identity.verified_for(&initial_host);
+        let MemberIdentity {
+            display_name,
+            kind,
+            machine_id,
+            machine_proof,
+        } = identity;
         validate_grid(grid_rows, grid_cols)?;
         validate_peer_id(&initial_host)?;
         validate_endpoint_addr(&endpoint_addr)?;
@@ -338,6 +385,8 @@ impl SessionState {
                 endpoint_addr,
                 display_name,
                 kind,
+                machine_id,
+                machine_proof,
             }],
             tabs: vec![Tab {
                 tab_id: 1,
@@ -503,8 +552,10 @@ impl SessionState {
             base_revision,
             peer_id,
             endpoint_addr,
-            display_name,
-            MemberKind::default(),
+            MemberIdentity {
+                display_name,
+                ..MemberIdentity::default()
+            },
         )
     }
 
@@ -513,9 +564,14 @@ impl SessionState {
         base_revision: u64,
         peer_id: Vec<u8>,
         endpoint_addr: Vec<u8>,
-        display_name: String,
-        kind: MemberKind,
+        identity: MemberIdentity,
     ) -> Result<Option<InvalidatedReservation>, LayoutError> {
+        let MemberIdentity {
+            display_name,
+            kind,
+            machine_id,
+            machine_proof,
+        } = identity.verified_for(&peer_id);
         self.check_mutation(base_revision)?;
         validate_peer_id(&peer_id)?;
         validate_endpoint_addr(&endpoint_addr)?;
@@ -531,6 +587,8 @@ impl SessionState {
             endpoint_addr,
             display_name,
             kind,
+            machine_id,
+            machine_proof,
         });
         self.advance_revision();
         Ok(self.invalidate_reservation())

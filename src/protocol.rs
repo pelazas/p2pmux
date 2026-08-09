@@ -245,6 +245,16 @@ pub struct Join {
     pub display_name: String,
     #[prost(enumeration = "MemberKind", tag = "5")]
     pub member_kind: i32,
+    /// This machine's own identity, which outlives the process behind
+    /// `peer_id`. See [`crate::machine_id`].
+    #[prost(bytes = "vec", tag = "6")]
+    pub machine_id: Vec<u8>,
+    /// A signature over `peer_id` by the key `machine_id` names. A member list
+    /// keeps the machine id only where this checks out, so everything
+    /// downstream reads a machine id as verified or absent and never has to
+    /// ask again.
+    #[prost(bytes = "vec", tag = "7")]
+    pub machine_proof: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -363,6 +373,12 @@ pub struct MemberDescriptor {
     /// its marker, which is the harmless direction; it cannot mint one.
     #[prost(enumeration = "MemberKind", tag = "4")]
     pub member_kind: i32,
+    /// As on [`Join`], and carried onward the same way. A coordinator cannot
+    /// forge one: every reader checks the proof against the peer id itself.
+    #[prost(bytes = "vec", tag = "5")]
+    pub machine_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub machine_proof: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

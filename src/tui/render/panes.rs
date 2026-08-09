@@ -820,6 +820,8 @@ mod tests {
             endpoint_addr: b"guest-endpoint".to_vec(),
             display_name: String::from("Guest"),
             kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         });
 
         assert_eq!(visible_leaf_panes(&snapshot.tabs[0].root), vec![8, 3]);
@@ -865,6 +867,8 @@ mod tests {
             endpoint_addr: b"endpoint".to_vec(),
             display_name: String::from("Host"),
             kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         }];
         assert_eq!(
             pane_title(

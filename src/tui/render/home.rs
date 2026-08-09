@@ -1422,7 +1422,7 @@ mod tests {
         tui.snapshot.members[0].display_name = String::from("laptop");
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("oldbox"),
-            peer_id: None,
+            machine_id: None,
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
@@ -1460,10 +1460,12 @@ mod tests {
             // Says it is a machine, and is still not one of yours: the claim is
             // not in the pairing record, and only the record can put it there.
             kind: crate::layout::MemberKind::Machine,
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         });
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            peer_id: None,
+            machine_id: None,
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
@@ -1496,6 +1498,8 @@ mod tests {
             endpoint_addr: vec![2],
             display_name: String::from("sam"),
             kind: crate::layout::MemberKind::Person,
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         });
         tui.set_home_open(true, "test");
 
@@ -1518,7 +1522,7 @@ mod tests {
         tui.paired_machines = (1..=6)
             .map(|index| crate::tui::PairedMachine {
                 name: format!("box{index}"),
-                peer_id: None,
+                machine_id: None,
                 accepts_work: None,
             })
             .collect();

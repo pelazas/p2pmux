@@ -773,11 +773,16 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
-        // Recorded by peer id, which the transport authenticated, rather than
-        // by the name the machine chose for itself. A machine renamed later is
-        // still this machine; two machines that pick the same name are still
-        // two.
-        pairing.remember(&peer.name, Some(peer.peer_id.clone()), None);
+        // Recorded by machine id, which that machine proved, rather than by
+        // the name it chose for itself. A machine renamed later is still this
+        // machine; two machines that pick the same name are still two; and the
+        // same machine in a different session, with a different node behind it,
+        // is still the one you paired.
+        pairing.remember(
+            &peer.name,
+            (!peer.machine_id.is_empty()).then(|| peer.machine_id.clone()),
+            None,
+        );
     }
     crate::pairing::save(&pairing)?;
 
@@ -991,7 +996,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
             accepts_work: accepts_work(&peer.name),
             agents: peer.agents,
             this_machine: false,
-            owned: pairing.owns(&peer.peer_id, &peer.name, peer.kind),
+            owned: pairing.owns(&peer.machine_id, &peer.name, peer.kind),
         });
     }
     for machine in &pairing.machines {

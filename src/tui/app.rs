@@ -608,18 +608,24 @@ mod tests {
                 endpoint_addr: vec![1],
                 display_name: "sam".into(),
                 kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             },
             crate::layout::Member {
                 peer_id: vec![0x11, 0x22, 0x33, 0x44],
                 endpoint_addr: vec![2],
                 display_name: "sam".into(),
                 kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             },
             crate::layout::Member {
                 peer_id: vec![0x55, 0x66, 0x77, 0x88],
                 endpoint_addr: vec![3],
                 display_name: "pat".into(),
                 kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             },
         ];
 

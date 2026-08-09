@@ -548,7 +548,7 @@ fn run_socket_loop(
                     .filter(|peer| !peer.this_machine)
                     .map(|peer| crate::pairing::SeenMachine {
                         name: peer.name.clone(),
-                        peer_id: peer.peer_id.clone(),
+                        machine_id: peer.machine_id.clone(),
                         kind: peer.kind,
                     })
                     .collect::<Vec<_>>();

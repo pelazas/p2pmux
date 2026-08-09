@@ -862,6 +862,8 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
                     endpoint_addr: guest_endpoint_addr,
                     display_name: String::new(),
                     member_kind: Default::default(),
+                    machine_proof: Default::default(),
+                    machine_id: Default::default(),
                 })),
             },
         )
@@ -950,6 +952,8 @@ async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_wind
                     endpoint_addr: guest_endpoint_addr,
                     display_name: String::new(),
                     member_kind: Default::default(),
+                    machine_proof: Default::default(),
+                    machine_id: Default::default(),
                 })),
             },
         )

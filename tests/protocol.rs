@@ -234,6 +234,8 @@ fn envelope_exposes_each_v1_body() {
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
             member_kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -364,6 +366,8 @@ fn sample_envelopes() -> Vec<Envelope> {
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
             member_kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -771,6 +775,8 @@ fn layout_state(root: LayoutNode) -> LayoutState {
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
             member_kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         }],
         panes: vec![PaneDescriptor {
             pane_id: 1,
@@ -969,6 +975,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
                 endpoint_addr: b"endpoint".to_vec(),
                 display_name: String::new(),
                 member_kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             })
             .collect(),
         ..state.clone()
@@ -1136,6 +1144,8 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         endpoint_addr: Vec::new(),
         display_name: String::new(),
         member_kind: Default::default(),
+        machine_proof: Default::default(),
+        machine_id: Default::default(),
     }));
     let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
@@ -1623,6 +1633,8 @@ fn layout_state_wire_shape_includes_all_nested_fields() {
             endpoint_addr: b"endpoint-a".to_vec(),
             display_name: String::new(),
             member_kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         }],
         panes: vec![PaneDescriptor {
             pane_id: 11,
@@ -1685,6 +1697,8 @@ fn join_wire_shape_encodes_a_present_endpoint_address() {
         endpoint_addr: b"endpoint-a".to_vec(),
         display_name: String::new(),
         member_kind: Default::default(),
+        machine_proof: Default::default(),
+        machine_id: Default::default(),
     };
 
     assert_eq!(
@@ -1740,6 +1754,8 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         endpoint_addr: vec![0; MAX_ENDPOINT_ADDR_BYTES + 1],
         display_name: String::new(),
         member_kind: Default::default(),
+        machine_proof: Default::default(),
+        machine_id: Default::default(),
     }));
 
     for invalid in [
@@ -1900,6 +1916,8 @@ fn decoder_rejects_missing_fields_and_invalid_sequences() {
         endpoint_addr: Vec::new(),
         display_name: String::new(),
         member_kind: Default::default(),
+        machine_proof: Default::default(),
+        machine_id: Default::default(),
     }));
     let mut empty_id_frame = Vec::new();
     empty_id
@@ -2034,6 +2052,8 @@ fn encode_frame_rejects_invalid_envelopes() {
                 endpoint_addr: Vec::new(),
                 display_name: String::new(),
                 member_kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             })),
         ),
         (
@@ -2044,6 +2064,8 @@ fn encode_frame_rejects_invalid_envelopes() {
                 endpoint_addr: Vec::new(),
                 display_name: String::new(),
                 member_kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             })),
         ),
         (
@@ -2103,6 +2125,8 @@ fn a_member_kind_survives_the_wire_and_an_unknown_one_reads_as_silence() {
         endpoint_addr: b"endpoint-a".to_vec(),
         display_name: String::from("droplet"),
         member_kind: MemberKind::Machine as i32,
+        machine_proof: Default::default(),
+        machine_id: Default::default(),
     };
     let decoded = Join::decode(joined.encode_to_vec().as_slice()).expect("join decodes");
     assert_eq!(decoded.member_kind, MemberKind::Machine as i32);
@@ -2112,6 +2136,8 @@ fn a_member_kind_survives_the_wire_and_an_unknown_one_reads_as_silence() {
         endpoint_addr: b"endpoint-a".to_vec(),
         display_name: String::from("droplet"),
         member_kind: MemberKind::Person as i32,
+        machine_proof: Default::default(),
+        machine_id: Default::default(),
     };
     let decoded =
         MemberDescriptor::decode(member.encode_to_vec().as_slice()).expect("member decodes");

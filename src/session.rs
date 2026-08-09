@@ -285,8 +285,7 @@ impl LayoutCoordinator {
             state: SessionState::new_with_identity(
                 coordinator_peer_id.clone(),
                 endpoint_addr,
-                display_name,
-                local_member_kind(),
+                local_identity(display_name, &coordinator_peer_id),
                 grid_rows,
                 grid_cols,
             )?,
@@ -547,8 +546,10 @@ impl LayoutCoordinator {
         self.admit_with_identity(
             peer_id,
             endpoint_addr,
-            display_name,
-            LayoutMemberKind::default(),
+            crate::layout::MemberIdentity {
+                display_name,
+                ..Default::default()
+            },
         )
     }
 
@@ -556,8 +557,7 @@ impl LayoutCoordinator {
         &mut self,
         peer_id: Vec<u8>,
         endpoint_addr: EndpointAddr,
-        display_name: String,
-        kind: LayoutMemberKind,
+        identity: crate::layout::MemberIdentity,
     ) -> Result<MembershipChange, CoordinatorError> {
         let endpoint_addr = serialized_endpoint(&peer_id, endpoint_addr)?;
         if let Some(existing) = self
@@ -585,8 +585,7 @@ impl LayoutCoordinator {
             self.state.revision(),
             peer_id.clone(),
             endpoint_addr,
-            display_name,
-            kind,
+            identity,
         )?;
         self.membership_change(peer_id, MembershipEvent::Joined, invalidated)
     }
@@ -1286,6 +1285,20 @@ pub fn local_member_kind() -> LayoutMemberKind {
     model_member_kind(LOCAL_MEMBER_KIND.load(Ordering::Relaxed))
 }
 
+/// What this process says about itself when it hosts a session.
+///
+/// The coordinator is a member too, and a member list that named every machine
+/// but the one holding it would leave the fleet unable to recognize the
+/// machine it is talking to.
+fn local_identity(display_name: String, peer_id: &[u8]) -> crate::layout::MemberIdentity {
+    crate::layout::MemberIdentity {
+        display_name,
+        kind: local_member_kind(),
+        machine_id: crate::machine_id::machine_id(),
+        machine_proof: crate::machine_id::prove(peer_id),
+    }
+}
+
 /// The wire value for a member kind.
 pub(crate) fn wire_member_kind(kind: LayoutMemberKind) -> WireMemberKind {
     match kind {
@@ -1346,6 +1359,8 @@ fn protocol_layout_state(snapshot: LayoutSnapshot) -> LayoutState {
                 endpoint_addr: member.endpoint_addr,
                 display_name: member.display_name,
                 member_kind: wire_member_kind(member.kind) as i32,
+                machine_id: member.machine_id,
+                machine_proof: member.machine_proof,
             })
             .collect(),
         panes: snapshot
@@ -1381,11 +1396,26 @@ pub fn layout_snapshot_from_state(state: &LayoutState) -> Result<LayoutSnapshot,
     let members = state
         .members
         .iter()
-        .map(|member| Member {
-            peer_id: member.peer_id.clone(),
-            endpoint_addr: member.endpoint_addr.clone(),
-            display_name: member.display_name.clone(),
-            kind: model_member_kind(member.member_kind),
+        .map(|member| {
+            // Verified here, on the machine that is about to act on it, rather
+            // than taken from the coordinator on trust. A coordinator can drop
+            // a machine id — which costs that member its marker and grants
+            // nothing — but it cannot mint one.
+            let identity = crate::layout::MemberIdentity {
+                display_name: member.display_name.clone(),
+                kind: model_member_kind(member.member_kind),
+                machine_id: member.machine_id.clone(),
+                machine_proof: member.machine_proof.clone(),
+            }
+            .verified_for(&member.peer_id);
+            Member {
+                peer_id: member.peer_id.clone(),
+                endpoint_addr: member.endpoint_addr.clone(),
+                display_name: identity.display_name,
+                kind: identity.kind,
+                machine_id: identity.machine_id,
+                machine_proof: identity.machine_proof,
+            }
         })
         .collect();
     let panes = state
@@ -2039,10 +2069,10 @@ pub struct JoinReceipt {
     pub coordinator_peer_id: Vec<u8>,
     pub endpoint_addr: EndpointAddr,
     pub display_name: String,
-    /// What the joiner said it is. Passed straight through to the member list
-    /// so that every client can ask its own pairing record whether that claim
-    /// belongs to a machine it owns.
-    pub member_kind: LayoutMemberKind,
+    /// What the joiner said about itself, passed straight through to the member
+    /// list so that every client can ask its own pairing record whether that
+    /// claim belongs to a machine it owns.
+    pub identity: crate::layout::MemberIdentity,
     pub session_name: String,
     /// How many takeovers this session has been through, so a joiner knows which
     /// coordinator's signatures to expect without having to read the history it missed.
@@ -2349,8 +2379,13 @@ impl HostSession {
             admitted_peer_id: remote_id.as_bytes().to_vec(),
             coordinator_peer_id: coordinator.as_bytes().to_vec(),
             endpoint_addr,
-            display_name: join.display_name,
-            member_kind: model_member_kind(join.member_kind),
+            display_name: join.display_name.clone(),
+            identity: crate::layout::MemberIdentity {
+                display_name: join.display_name,
+                kind: model_member_kind(join.member_kind),
+                machine_id: join.machine_id,
+                machine_proof: join.machine_proof,
+            },
             session_name: self.session_name.clone(),
             coordinator_epoch: self.coordinator_epoch,
         };
@@ -3385,8 +3420,7 @@ impl SharedLayoutHost {
                 let membership = coordinator_guard.admit_with_identity(
                     receipt.admitted_peer_id.clone(),
                     receipt.endpoint_addr.clone(),
-                    receipt.display_name.clone(),
-                    receipt.member_kind,
+                    receipt.identity.clone(),
                 )?;
 
                 let state = membership
@@ -4791,6 +4825,8 @@ async fn join_handshake_with_display_name(
                         .expect("endpoint address should serialize"),
                     display_name,
                     member_kind: wire_member_kind(local_member_kind()) as i32,
+                    machine_id: crate::machine_id::machine_id(),
+                    machine_proof: crate::machine_id::prove(client_id.as_bytes()),
                 })),
             },
         )
@@ -4819,7 +4855,7 @@ async fn join_handshake_with_display_name(
         display_name: String::new(),
         // This receipt describes the coordinator we just joined, not us. What
         // it is gets read off the member list it sends back, not guessed here.
-        member_kind: LayoutMemberKind::default(),
+        identity: crate::layout::MemberIdentity::default(),
         session_name: welcome.session_name,
         coordinator_epoch: welcome.coordinator_epoch,
     })

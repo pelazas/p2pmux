@@ -73,19 +73,24 @@ impl SharedLayoutRuntime {
     /// machine in one member list.
     pub(in crate::tui) fn consider_fleet_invite(&mut self, from_peer_id: &[u8], ticket: &str) {
         let name = crate::tui::member_label(from_peer_id, &self.tui.snapshot().members);
-        let kind = self
+        let member = self
             .tui
             .snapshot()
             .members
             .iter()
             .find(|member| member.peer_id == from_peer_id)
+            .cloned();
+        let kind = member
+            .as_ref()
             .map(|member| member.kind)
             .unwrap_or_default();
-        let owned = crate::pairing::load_or_empty().owns(
-            &crate::pairing::peer_id_hex(from_peer_id),
-            &name,
-            kind,
-        );
+        // The machine, not the node: the peer that sent this is one process on
+        // it, and the fleet record is about the box.
+        let machine = member
+            .as_ref()
+            .map(|member| crate::machine_id::to_hex(&member.machine_id))
+            .unwrap_or_default();
+        let owned = crate::pairing::load_or_empty().owns(&machine, &name, kind);
         crate::tui::debug_log::ui_debug_log(
             "fleet_invite_considered",
             format_args!("from={name} owned={owned} kind={kind:?}"),

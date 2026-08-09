@@ -48,6 +48,8 @@ async fn rejected_raw_join_endpoint(host: &HostSession, endpoint_addr: Vec<u8>) 
                     endpoint_addr,
                     display_name: String::new(),
                     member_kind: Default::default(),
+                    machine_proof: Default::default(),
+                    machine_id: Default::default(),
                 })),
             },
         )

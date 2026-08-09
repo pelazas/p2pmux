@@ -844,7 +844,7 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
                 owned: this_machine
                     || crate::pairing::owns_machine(
                         &tui.paired_machines,
-                        &crate::pairing::peer_id_hex(&member.peer_id),
+                        &crate::machine_id::to_hex(&member.machine_id),
                         &name,
                         member.kind,
                     ),
@@ -1198,7 +1198,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("oldbox"),
-            peer_id: None,
+            machine_id: None,
             accepts_work: Some(true),
         }];
 
@@ -1361,7 +1361,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            peer_id: None,
+            machine_id: None,
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
@@ -1600,10 +1600,15 @@ mod tests {
             endpoint_addr: vec![2],
             display_name: String::from("droplet"),
             kind: crate::layout::MemberKind::Machine,
+            machine_proof: Default::default(),
+            // The identity the fixture paired below. A `Member` is only ever
+            // built after its proof has been checked, so a literal one carries
+            // the verified id directly.
+            machine_id: vec![0xca, 0xfe],
         });
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            peer_id: Some(String::from("cafe")),
+            machine_id: Some(String::from("cafe")),
             accepts_work: Some(true),
         }];
         let mut rows = tui.agent_rows.clone();
@@ -1723,7 +1728,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            peer_id: None,
+            machine_id: None,
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
@@ -1751,7 +1756,7 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            peer_id: None,
+            machine_id: None,
             accepts_work: None,
         }];
         tui.snapshot.members.push(crate::layout::Member {
@@ -1759,6 +1764,8 @@ mod tests {
             endpoint_addr: vec![2],
             display_name: String::from("sam"),
             kind: crate::layout::MemberKind::Machine,
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         });
         tui.set_home_open(true, "test");
 
@@ -1802,7 +1809,7 @@ mod tests {
         tui.local_peer_id = Some(b"host".to_vec());
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
-            peer_id: Some(String::from("cafe")),
+            machine_id: Some(String::from("cafe")),
             accepts_work: Some(true),
         }];
         tui.snapshot.members.push(crate::layout::Member {
@@ -1810,6 +1817,11 @@ mod tests {
             endpoint_addr: vec![2],
             display_name: String::from("droplet"),
             kind: crate::layout::MemberKind::Machine,
+            machine_proof: Default::default(),
+            // The identity the fixture paired below. A `Member` is only ever
+            // built after its proof has been checked, so a literal one carries
+            // the verified id directly.
+            machine_id: vec![0xca, 0xfe],
         });
         tui.set_home_open(true, "test");
 

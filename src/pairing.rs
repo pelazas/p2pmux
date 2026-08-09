@@ -218,23 +218,23 @@ impl Pairing {
     /// one desktop, not two. Identity is the peer id where there is one, so a
     /// machine that was renamed is still the same machine, and two machines
     /// that chose the same name are still two.
-    pub fn remember(&mut self, name: &str, peer_id: Option<String>, accepts_work: Option<bool>) {
+    pub fn remember(&mut self, name: &str, machine_id: Option<String>, accepts_work: Option<bool>) {
         let name = name.trim();
         if name.is_empty() {
             return;
         }
-        let existing = match peer_id.as_deref() {
-            Some(peer_id) => self
+        let existing = match machine_id.as_deref() {
+            Some(machine_id) => self
                 .machines
                 .iter_mut()
-                .position(|machine| machine.peer_id.as_deref() == Some(peer_id))
-                // A machine paired before peer ids were recorded is that same
+                .position(|machine| machine.machine_id.as_deref() == Some(machine_id))
+                // A machine paired before identities were recorded is that same
                 // machine turning up with its identity for the first time, not
                 // a new one. Adopt the row rather than growing a duplicate.
                 .or_else(|| {
                     self.machines
                         .iter()
-                        .position(|machine| machine.peer_id.is_none() && machine.name == name)
+                        .position(|machine| machine.machine_id.is_none() && machine.name == name)
                 }),
             None => self
                 .machines
@@ -245,8 +245,8 @@ impl Pairing {
             Some(index) => {
                 let machine = &mut self.machines[index];
                 machine.name = name.to_owned();
-                if peer_id.is_some() {
-                    machine.peer_id = peer_id;
+                if machine_id.is_some() {
+                    machine.machine_id = machine_id;
                 }
                 // Only ever upgraded from "never said" to an answer. A machine
                 // that told us once must not be silently un-told by a later
@@ -257,7 +257,7 @@ impl Pairing {
             }
             None => self.machines.push(PairedMachine {
                 name: name.to_owned(),
-                peer_id,
+                machine_id,
                 accepts_work,
             }),
         }
@@ -277,8 +277,8 @@ impl Pairing {
     /// access rather than winning it — while a peer that says it is a machine
     /// still has to be in this file to count. A peer that says nothing is
     /// judged on this file alone, which is all there was before it could speak.
-    pub fn owns(&self, peer_id: &str, name: &str, kind: MemberKind) -> bool {
-        owns_machine(&self.machines, peer_id, name, kind)
+    pub fn owns(&self, machine_id: &str, name: &str, kind: MemberKind) -> bool {
+        owns_machine(&self.machines, machine_id, name, kind)
     }
 
     /// Whether a machine arriving now was invited by a recent `p2pmux pair`.
@@ -305,22 +305,13 @@ impl Pairing {
 /// one question this file exists to answer must not have two implementations.
 pub fn owns_machine(fleet: &[PairedMachine], peer_id: &str, name: &str, kind: MemberKind) -> bool {
     kind.could_be_machine()
-        && fleet.iter().any(|machine| match &machine.peer_id {
+        && fleet.iter().any(|machine| match &machine.machine_id {
             Some(known) => known == peer_id,
             // A record from before peer ids: matching on the name is what it
             // has always done, and it upgrades to the line above the first time
             // [`pin_peers`] sees this machine in a session.
             None => machine.name == name,
         })
-}
-
-/// The stable text form of a peer id, used everywhere the fleet record and the
-/// session store have to talk about the same machine.
-pub fn peer_id_hex(peer_id: &[u8]) -> String {
-    peer_id
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
 }
 
 pub fn pairing_path() -> Result<PathBuf, PairingError> {
@@ -424,8 +415,8 @@ fn pin_into(pairing: &mut Pairing, seen: &[SeenMachine], now: u64) {
         if !machine.kind.declared_machine() {
             continue;
         }
-        if pairing.owns(&machine.peer_id, &machine.name, machine.kind) {
-            pairing.remember(&machine.name, Some(machine.peer_id.clone()), None);
+        if pairing.owns(&machine.machine_id, &machine.name, machine.kind) {
+            pairing.remember(&machine.name, machine.identity(), None);
             continue;
         }
         // Not in the fleet. The only way in is through a window `p2pmux pair`
@@ -433,7 +424,7 @@ fn pin_into(pairing: &mut Pairing, seen: &[SeenMachine], now: u64) {
         // has to be invited by a second `p2pmux pair`.
         if pairing.pairing_window_open(now) {
             pairing.pending_until = None;
-            pairing.remember(&machine.name, Some(machine.peer_id.clone()), None);
+            pairing.remember(&machine.name, machine.identity(), None);
         }
     }
 }
@@ -454,10 +445,21 @@ pub fn now_unix() -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeenMachine {
     pub name: String,
-    /// Hex-encoded peer id, which the transport authenticated.
-    pub peer_id: String,
+    /// Hex-encoded machine id, already verified against the peer id the
+    /// transport authenticated. Empty when that member proved nothing.
+    pub machine_id: String,
     /// What that peer said it is. See [`Pairing::owns`].
     pub kind: MemberKind,
+}
+
+impl SeenMachine {
+    /// The identity to record, or `None` when this member proved none.
+    ///
+    /// Recording an empty one would write a row that matches nothing and
+    /// blocks the real identity from ever being pinned to it.
+    pub fn identity(&self) -> Option<String> {
+        (!self.machine_id.is_empty()).then(|| self.machine_id.clone())
+    }
 }
 
 /// Best-effort read for the paths where a failure must not stop the UI.
@@ -550,7 +552,7 @@ mod tests {
             pairing.machines,
             vec![PairedMachine {
                 name: String::from("desktop"),
-                peer_id: None,
+                machine_id: None,
                 accepts_work: Some(true),
             }],
             "a later sighting upgrades an unanswered machine and never downgrades one"
@@ -572,7 +574,7 @@ mod tests {
             pairing.machines,
             vec![PairedMachine {
                 name: String::from("droplet"),
-                peer_id: Some(String::from("beef")),
+                machine_id: Some(String::from("beef")),
                 accepts_work: Some(true),
             }],
             "the identity lands on the existing row, and the answer it already gave survives"
@@ -623,6 +625,37 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_that_proved_nothing_is_never_matched_against_one_that_did() {
+        // The failure this could have had: an empty machine id compared equal
+        // to every record that has none, so a member which proved nothing would
+        // be recognized as whichever machine happened to be listed.
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("beef")), None);
+
+        assert!(
+            !pairing.owns("", "droplet", MemberKind::Machine),
+            "proving nothing must not match a record that names an identity"
+        );
+    }
+
+    /// The reason this is a machine id and not the node's peer id: a node's key
+    /// is generated per process, so the same machine in a second session is a
+    /// different peer. Ownership has to survive that, and only an identity that
+    /// outlives the process does.
+    #[test]
+    fn the_same_machine_in_another_session_is_still_yours() {
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("beef")), None);
+
+        // Same machine, new node, new peer id — and the record still knows it.
+        assert!(pairing.owns("beef", "droplet", MemberKind::Machine));
+        assert!(
+            pairing.owns("beef", "droplet-renamed", MemberKind::Machine),
+            "and a machine that was renamed is still the machine you paired"
+        );
+    }
+
+    #[test]
     fn a_machine_that_says_nothing_is_still_yours() {
         // An older build, or a node that started before this box was paired.
         // Silence must read as it always did — the fleet record alone — or an
@@ -643,7 +676,7 @@ mod tests {
         std::fs::write(&path, "ticket = \"t\"\n").expect("write");
         let seen = vec![SeenMachine {
             name: String::from("their-laptop"),
-            peer_id: String::from("cafe"),
+            machine_id: String::from("cafe"),
             kind: MemberKind::Machine,
         }];
 
@@ -667,12 +700,12 @@ mod tests {
         let seen = vec![
             SeenMachine {
                 name: String::from("droplet"),
-                peer_id: String::from("beef"),
+                machine_id: String::from("beef"),
                 kind: MemberKind::Machine,
             },
             SeenMachine {
                 name: String::from("their-laptop"),
-                peer_id: String::from("cafe"),
+                machine_id: String::from("cafe"),
                 kind: MemberKind::Machine,
             },
         ];
@@ -697,7 +730,7 @@ mod tests {
         pairing.open_pairing_window(1_000);
         let seen = vec![SeenMachine {
             name: String::from("droplet"),
-            peer_id: String::from("beef"),
+            machine_id: String::from("beef"),
             kind: MemberKind::Machine,
         }];
 
@@ -715,13 +748,13 @@ mod tests {
         pairing.remember("droplet", None, Some(true));
         let seen = vec![SeenMachine {
             name: String::from("droplet"),
-            peer_id: String::from("beef"),
+            machine_id: String::from("beef"),
             kind: MemberKind::Machine,
         }];
 
         pin_into(&mut pairing, &seen, 9_999);
 
-        assert_eq!(pairing.machines[0].peer_id.as_deref(), Some("beef"));
+        assert_eq!(pairing.machines[0].machine_id.as_deref(), Some("beef"));
     }
 
     #[test]

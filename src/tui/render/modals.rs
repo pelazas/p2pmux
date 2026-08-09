@@ -670,6 +670,8 @@ mod tests {
             endpoint_addr: b"endpoint-droplet".to_vec(),
             display_name: String::from("droplet"),
             kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         });
 
         let rendered = add_machine_screen(&tui);

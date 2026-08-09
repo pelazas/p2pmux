@@ -162,7 +162,7 @@ impl SharedLayoutRuntime {
                 crate::session_store::SessionPeer {
                     agents: agents_by_host.get(&name).copied().unwrap_or_default(),
                     this_machine: member.peer_id == local,
-                    peer_id: crate::pairing::peer_id_hex(&member.peer_id),
+                    machine_id: crate::machine_id::to_hex(&member.machine_id),
                     kind: member.kind,
                     name,
                 }

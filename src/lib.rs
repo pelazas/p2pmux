@@ -14,6 +14,7 @@ pub mod layout;
 pub mod lease;
 pub mod ledger;
 pub mod local_ipc;
+pub mod machine_id;
 pub mod node;
 pub mod pairing;
 mod perf;

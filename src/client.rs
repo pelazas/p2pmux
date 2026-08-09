@@ -1395,6 +1395,8 @@ mod tests {
                 endpoint_addr: b"endpoint".to_vec(),
                 display_name: String::from("Host"),
                 kind: Default::default(),
+                machine_proof: Default::default(),
+                machine_id: Default::default(),
             }],
             tabs: vec![Tab {
                 tab_id: 1,

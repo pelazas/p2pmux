@@ -748,6 +748,8 @@ mod tests {
             endpoint_addr: b"endpoint-droplet".to_vec(),
             display_name: String::from("droplet"),
             kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
         });
         assert_eq!(tui.add_machine_joined().as_deref(), Some("droplet"));
 
