@@ -152,7 +152,7 @@ def main() -> int:
         before = remote.cli("ls", timeout=60.0)
         # Under a PTY, because `create` opens the real UI and measures the
         # terminal it is going to draw into. A pipe has no size to ask for.
-        harness.create_room("followme")
+        followme, _ = harness.create_room("followme")
         step("created a session on this Mac the droplet was never paired into")
         deadline = time.monotonic() + 120
         after = before
@@ -167,6 +167,43 @@ def main() -> int:
             "the droplet did not follow this Mac into the new session"
         )
         step("the droplet joined it on its own, with no code typed there")
+
+        # That peer has done its job, and a session with a client on it is one
+        # bare `p2pmux` refuses to attach to.
+        followme.close()
+        time.sleep(1.0)
+
+        section("the inbox, on the machine you are sitting at")
+        # KNOWN GAP, and the reason this scenario exists: a node's peer id is
+        # generated per process, so the droplet's identity in *this* session is
+        # not the one the fleet record pinned when it was paired. It therefore
+        # draws as a guest here even though `p2pmux machines` calls it fleet.
+        # Ownership needs a machine identity that outlives one node; until it
+        # has one, the checks below fail.
+        # Bare `p2pmux` rejoins the paired session and opens the inbox, which
+        # is the screen all three remaining checks are about.
+        inbox = harness.spawn("inbox", [])
+        inbox.wait_for(r"MACHINES", timeout=60.0)
+        screen = inbox.wait_for(r"mybotvm", timeout=60.0)
+        step("the droplet is on the inbox's machine list")
+
+        section("a bot nobody started in p2pmux (#76)")
+        screen = inbox.wait_for(r"(?i)hermes", timeout=90.0)
+        step("the Hermes gateway on the droplet reached this Mac's inbox")
+        assert "hermes" in screen.lower(), screen
+
+        section("a terminal on the droplet (#72)")
+        # `m` walks the fleet; this Mac is first, the droplet second.
+        inbox.send("m")
+        time.sleep(0.3)
+        inbox.send("m")
+        time.sleep(0.3)
+        inbox.key("enter")
+        inbox.wait_for(r"host: mybotvm|mybotvm", timeout=90.0)
+        step("a pane opened, hosted by the droplet")
+        inbox.run_in_shell("hostname")
+        screen = inbox.wait_for(r"mybotvm", timeout=60.0)
+        step("`hostname` in it prints the droplet's name, not this Mac's")
 
     print("\nscenario R: every check passed")
     return 0
