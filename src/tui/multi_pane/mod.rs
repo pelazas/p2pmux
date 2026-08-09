@@ -71,10 +71,11 @@ pub struct MultiPaneTui {
     /// Local to this client and never replicated: see [`crate::tui::home`].
     pub(in crate::tui) home_open: bool,
     pub(in crate::tui) home_selected: Option<PaneId>,
-    pub(in crate::tui) home_scroll_line: usize,
-    pub(in crate::tui) home_viewport_lines: u16,
-    /// Whether `m` has expanded the machine strip into the full list.
-    pub(in crate::tui) machines_expanded: bool,
+    /// Which page of the agent list is drawn. Derived from the selection
+    /// everywhere except the wheel, which moves both.
+    pub(in crate::tui) home_page: usize,
+    /// How many agents that page holds, from the last layout that was measured.
+    pub(in crate::tui) home_page_size: usize,
     /// The pane Home handed the user into, drawn alone in the content area.
     ///
     /// A local view choice, so it never reaches the layout: the pane keeps the
@@ -96,6 +97,9 @@ pub struct MultiPaneTui {
     /// A share-modal copy request. Invite material lives in the node's rendezvous record
     /// rather than in the layout, so the attached client resolves and copies it.
     pub(in crate::tui) pending_share_copy: Option<ShareCopy>,
+    /// Whether the add-machine panel has asked the client to record the
+    /// session's ticket in the pairing file. The TUI owns no filesystem.
+    pub(in crate::tui) pending_pair_offer: bool,
     /// Whether the coordinator is refusing new peers. Mirrored from the node rather than
     /// derived, because only the coordinator knows it and any peer may be drawing it.
     pub(in crate::tui) session_locked: bool,
@@ -138,9 +142,8 @@ impl MultiPaneTui {
             pending_home_toggle: None,
             home_open: false,
             home_selected: None,
-            home_scroll_line: 0,
-            home_viewport_lines: 0,
-            machines_expanded: false,
+            home_page: 0,
+            home_page_size: crate::tui::home::HOME_PAGE_MAX,
             zoomed_pane: None,
             paired_machines: Vec::new(),
             local_peer_id: None,
@@ -149,6 +152,7 @@ impl MultiPaneTui {
             session_locked: false,
             mouse_forwarding: false,
             pending_share_copy: None,
+            pending_pair_offer: false,
         })
     }
 
@@ -185,6 +189,7 @@ impl MultiPaneTui {
                 | ModalState::ConfirmDeleteTab { .. }
                 | ModalState::Share
                 | ModalState::Quit
+                | ModalState::AddMachine(_)
         )
     }
 

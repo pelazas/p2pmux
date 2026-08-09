@@ -163,11 +163,15 @@ pub(in crate::tui) struct RenamePrompt {
     pub(in crate::tui) value: String,
     pub(in crate::tui) error: Option<String>,
 }
-/// Which piece of invite material the share modal asked the client to copy.
+/// Which piece of invite material a panel asked the client to copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShareCopy {
     Ticket,
     Code,
+    /// The same invite, as the `p2pmux pair` line the add-machine panel shows.
+    /// Pairing and joining resolve the same code; what differs is what the
+    /// machine at the other end does with it afterwards.
+    Pair,
 }
 /// The host-only invite material the share modal renders.
 ///
@@ -204,6 +208,22 @@ pub(in crate::tui) enum ModalState {
     },
     /// Ctrl+Q, asking which of the two leavings was meant.
     Quit,
+    /// `a` on the inbox: the line to run on the machine being added.
+    AddMachine(AddMachinePrompt),
+}
+/// The add-machine panel, and what it needs to notice the machine arriving.
+///
+/// Adding a machine used to mean leaving the UI: `p2pmux pair` on one machine,
+/// carry the code to the other, and find out whether it worked by running
+/// something else. The panel keeps both halves on the screen the fleet is
+/// already on, and stays up to report the join rather than leaving the user to
+/// go and check.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::tui) struct AddMachinePrompt {
+    /// The machines that were already here when the panel went up. Anything
+    /// that appears afterwards is the one being added, which is the whole
+    /// difference between instructions and a report.
+    pub(in crate::tui) known: Vec<String>,
 }
 /// The two ways out, which one keystroke used to conflate.
 ///

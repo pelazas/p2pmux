@@ -180,6 +180,15 @@ pub(in crate::tui) const SHARE_HELP_GUEST: &[FooterSegment] = &[
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> CLOSE"),
 ];
+/// The add-machine panel offers one invite and one thing to do with it, so
+/// there is no second key to name.
+pub(in crate::tui) const ADD_MACHINE_HELP: &[FooterSegment] = &[
+    FooterSegment::Text("<"),
+    FooterSegment::Key("c"),
+    FooterSegment::Text("> COPY   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> CLOSE"),
+];
 /// The help segments for a chord mode, narrowed to the widest tier `width` can hold.
 ///
 /// Pane mode has tiers because its bar is the longest one here and adding a key

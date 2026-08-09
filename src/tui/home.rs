@@ -65,7 +65,6 @@ impl MultiPaneTui {
             // owner.
             self.modal = ModalState::None;
             self.exit_chord_mode();
-            self.machines_expanded = false;
             // Arriving puts the cursor back on the top row, which is the one
             // that most wants a human. That is the whole reason for the sort
             // order, and a cursor left where a previous visit happened to end
@@ -75,7 +74,7 @@ impl MultiPaneTui {
             // where the user put it, and a row changing state under it must
             // never drag it somewhere else.
             self.home_selected = None;
-            self.home_scroll_line = 0;
+            self.home_page = 0;
             self.repair_home_selection();
         }
         ui_debug_log(
@@ -136,34 +135,86 @@ impl MultiPaneTui {
         {
             self.home_selected = rows.first().copied();
         }
-        self.clamp_home_scroll();
+        self.clamp_home_page();
         self.ensure_home_selection_visible();
     }
 
-    pub(in crate::tui) fn set_home_viewport(&mut self, lines: u16) {
-        self.home_viewport_lines = lines;
-        self.clamp_home_scroll();
+    pub(in crate::tui) fn set_home_viewport(&mut self, page_size: usize) {
+        self.home_page_size = page_size.max(1);
+        self.clamp_home_page();
     }
 
-    /// Tell Home how many rows fit, from the whole terminal rather than from a
-    /// line count the caller had to work out for itself.
+    /// Tell Home how many agents fit on a page, from the whole terminal rather
+    /// than from a count the caller had to work out for itself.
     pub fn set_home_viewport_for(&mut self, area: Rect) {
         let rows = home_layout(self.geometry(area).content, self).rows.height;
-        self.set_home_viewport(rows);
+        self.set_home_viewport(home_page_size(rows));
     }
 
     /// Wheel over the inbox. Returns whether anything moved, so a scroll at the
     /// end of the list never costs a repaint.
+    ///
+    /// A page at a time rather than an agent at a time: the list is paged, and
+    /// a wheel that slid one card off the top would leave a page nobody chose,
+    /// with the first agent half in view.
     pub fn scroll_home(&mut self, area: Rect, up: bool) -> bool {
         self.set_home_viewport_for(area);
-        let previous = self.home_scroll_line;
+        let previous = self.home_page;
         if up {
-            self.home_scroll_line = self.home_scroll_line.saturating_sub(1);
+            self.home_page = self.home_page.saturating_sub(1);
         } else {
-            self.home_scroll_line = self.home_scroll_line.saturating_add(1);
+            self.home_page = self.home_page.saturating_add(1);
         }
-        self.clamp_home_scroll();
-        self.home_scroll_line != previous
+        self.clamp_home_page();
+        if self.home_page != previous {
+            // The cursor follows the page. Leaving it behind on a page that is
+            // no longer drawn means Enter opens an agent that is not on screen.
+            self.home_selected = self
+                .home_rows()
+                .get(self.home_page.saturating_mul(self.home_page_size.max(1)))
+                .map(|row| row.pane_id);
+            return true;
+        }
+        false
+    }
+
+    /// `h` and `l`, and the page keys: a whole page at a time, cursor and all.
+    ///
+    /// The cursor lands on the first agent of the page it arrives at, which is
+    /// the most urgent one there — the same rule that decides what the cursor
+    /// sits on when the inbox opens.
+    pub(in crate::tui) fn turn_home_page(&mut self, forward: bool) -> bool {
+        let pages = self.home_page_count();
+        if pages < 2 {
+            return false;
+        }
+        self.home_page = if forward {
+            (self.home_page + 1) % pages
+        } else {
+            (self.home_page + pages - 1) % pages
+        };
+        self.home_selected = self
+            .home_rows()
+            .get(self.home_page_start())
+            .map(|row| row.pane_id);
+        true
+    }
+
+    /// How many pages the list has. Never zero: an empty inbox is one page.
+    pub(in crate::tui) fn home_page_count(&self) -> usize {
+        self.agent_rows
+            .len()
+            .div_ceil(self.home_page_size.max(1))
+            .max(1)
+    }
+
+    pub(in crate::tui) fn home_page(&self) -> usize {
+        self.home_page
+    }
+
+    /// The index of the first agent on the page being drawn.
+    pub(in crate::tui) fn home_page_start(&self) -> usize {
+        self.home_page.saturating_mul(self.home_page_size.max(1))
     }
 
     /// A click on an inbox row selects it and opens it, in one gesture.
@@ -185,32 +236,30 @@ impl MultiPaneTui {
     }
 
     pub(in crate::tui) fn home_row_at(&self, column: u16, row: u16, area: Rect) -> Option<PaneId> {
-        let rows = home_layout(self.geometry(area).content, self).rows;
-        if !crate::tui::geometry::rect_contains(rows, column, row) {
+        let layout = home_layout(self.geometry(area).content, self);
+        if !crate::tui::geometry::rect_contains(layout.rows, column, row) {
             return None;
         }
-        let line = usize::from(row.saturating_sub(rows.y)).saturating_add(self.home_scroll_line);
-        self.home_rows().get(line).map(|row| row.pane_id)
+        let line = usize::from(row.saturating_sub(layout.rows.y));
+        let card = home_card(layout.rows.height).lines();
+        // A click on a card's blank spacer belongs to the card above it, which
+        // is the one the pointer looks like it is on.
+        self.home_rows()
+            .get(self.home_page_start().saturating_add(line / card))
+            .map(|row| row.pane_id)
     }
 
-    pub(in crate::tui) fn home_max_scroll(&self) -> usize {
-        self.agent_rows
-            .len()
-            .saturating_sub(usize::from(self.home_viewport_lines.max(1)))
+    pub(in crate::tui) fn clamp_home_page(&mut self) {
+        self.home_page = self.home_page.min(self.home_page_count().saturating_sub(1));
     }
 
-    pub(in crate::tui) fn clamp_home_scroll(&mut self) {
-        if self.home_viewport_lines == 0 {
-            self.home_scroll_line = 0;
-            return;
-        }
-        self.home_scroll_line = self.home_scroll_line.min(self.home_max_scroll());
-    }
-
+    /// Puts the page the cursor is on on screen.
+    ///
+    /// The selection is what the page follows, never the other way round: the
+    /// sort order decides which agent most wants a human, and a page that
+    /// stayed put while the cursor walked off it would be a screen showing
+    /// agents nobody chose.
     pub(in crate::tui) fn ensure_home_selection_visible(&mut self) {
-        if self.home_viewport_lines == 0 {
-            return;
-        }
         let Some(index) = self.home_selected.and_then(|pane_id| {
             self.home_rows()
                 .iter()
@@ -218,13 +267,8 @@ impl MultiPaneTui {
         }) else {
             return;
         };
-        let viewport = usize::from(self.home_viewport_lines.max(1));
-        if index < self.home_scroll_line {
-            self.home_scroll_line = index;
-        } else if index >= self.home_scroll_line.saturating_add(viewport) {
-            self.home_scroll_line = index.saturating_add(1).saturating_sub(viewport);
-        }
-        self.clamp_home_scroll();
+        self.home_page = index / self.home_page_size.max(1);
+        self.clamp_home_page();
     }
 
     pub(in crate::tui) fn move_home_selection(&mut self, forward: bool) {
@@ -339,10 +383,6 @@ impl MultiPaneTui {
         true
     }
 
-    pub(in crate::tui) fn toggle_machines_expanded(&mut self) {
-        self.machines_expanded = !self.machines_expanded;
-    }
-
     /// Which peer this client is, so the machine list can mark the row for the
     /// machine the user is sitting at. Only the node knows it.
     pub fn set_local_peer_id(&mut self, peer_id: Vec<u8>) {
@@ -377,7 +417,7 @@ impl MultiPaneTui {
         area: Rect,
     ) -> crate::tui::KeyHandling {
         use crate::tui::KeyHandling;
-        self.set_home_viewport(home_layout(self.geometry(area).content, self).rows.height);
+        self.set_home_viewport_for(area);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
                 self.move_home_selection(false);
@@ -385,6 +425,17 @@ impl MultiPaneTui {
             }
             KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
                 self.move_home_selection(true);
+                KeyHandling::Consumed(vec![])
+            }
+            // Pages step sideways, so the sideways keys move them. Not `←` and
+            // `→`: `→` already steps off Home onto the tabs, and the second way
+            // in should not become the way to page a list.
+            KeyCode::Char('l') | KeyCode::PageDown if key.modifiers.is_empty() => {
+                self.turn_home_page(true);
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Char('h') | KeyCode::PageUp if key.modifiers.is_empty() => {
+                self.turn_home_page(false);
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
@@ -403,8 +454,11 @@ impl MultiPaneTui {
                     grid_cols,
                 }])
             }
-            KeyCode::Char('m') if key.modifiers.is_empty() => {
-                self.toggle_machines_expanded();
+            KeyCode::Char('a') if key.modifiers.is_empty() => {
+                // Adding a machine used to mean leaving the screen the fleet is
+                // on: `p2pmux pair` in a terminal, then finding out whether it
+                // worked by running something else. Both halves belong here.
+                self.open_add_machine();
                 KeyHandling::Consumed(vec![])
             }
             // The same question Ctrl+Q asks, asked the same way. Home is the
@@ -442,10 +496,100 @@ pub(in crate::tui) struct HomeLayout {
     pub(in crate::tui) rows: Rect,
     /// The `p2pmux setup` nudge. Zero-height unless every row is unreported.
     pub(in crate::tui) hint: Rect,
-    /// The one-line machine strip, or the expanded list under `m`.
-    /// Zero-height only before the member list has arrived.
+    /// Where the machines go. Zero-height only before the member list has
+    /// arrived, and shaped by [`HomeLayout::machine_panel`].
     pub(in crate::tui) machines: Rect,
+    pub(in crate::tui) machine_panel: MachinePanel,
 }
+
+/// How the fleet is drawn, which is a question of how much room there is.
+///
+/// The screen's spare space is horizontal as much as vertical — the column that
+/// says what an agent is doing is rarely more than half used — so the widest
+/// tier spends that width on machines rather than leaving it blank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum MachinePanel {
+    /// A column down the right-hand side, with a line each for what a machine
+    /// is and what it is running.
+    Rail,
+    /// The same facts as a table under the agents, when the terminal is too
+    /// narrow to give a column away.
+    Table,
+    /// Names and ticks on one line, when there is not even room for a table.
+    /// It still answers "is my fleet up", which is what earns it the space.
+    Strip,
+    /// Nothing known yet. The member list has not arrived.
+    Empty,
+}
+
+/// How much of the screen one agent gets.
+///
+/// A line each was the right answer when the screen was a list of processes.
+/// It is the wrong one for a fleet: nobody runs thirty agents, so the list
+/// occupied a fifth of a terminal and left the rest blank, and a row that had
+/// to fit in one line could show what an agent said *or* which repository it
+/// said it in, never both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum HomeCard {
+    /// Who and where, what it said, and where Enter will land you.
+    Full,
+    /// Who and where, and what it said. The location line is the first thing
+    /// worth dropping: it is the only one you can get by pressing Enter.
+    Compact,
+    /// One line, as it was. What a terminal too short for anything else gets.
+    Row,
+}
+
+impl HomeCard {
+    /// Lines on screen per agent, including the blank that separates two cards.
+    pub(in crate::tui) fn lines(self) -> usize {
+        match self {
+            Self::Full => 4,
+            Self::Compact => 3,
+            Self::Row => 1,
+        }
+    }
+}
+
+/// The richest card the agent list has room for.
+///
+/// Chosen from the height alone, never from how many agents there are: a screen
+/// that changed shape when a fifth agent appeared would be a screen you have to
+/// re-read every time the fleet moves.
+pub(in crate::tui) fn home_card(rows_height: u16) -> HomeCard {
+    // Three cards' worth, so a tier is only taken when it can show a list
+    // rather than a single agent and a gap.
+    if rows_height >= 12 {
+        HomeCard::Full
+    } else if rows_height >= 9 {
+        HomeCard::Compact
+    } else {
+        HomeCard::Row
+    }
+}
+
+/// The most agents one page shows.
+///
+/// Not a space limit — a tall terminal fits more. It is the number of things a
+/// screen can be glanced at rather than read, and the inbox is sorted so that
+/// what is on page one is what most wants a human.
+pub(in crate::tui) const HOME_PAGE_MAX: usize = 8;
+
+/// How many agents fit on a page of a list this tall.
+pub(in crate::tui) fn home_page_size(rows_height: u16) -> usize {
+    (usize::from(rows_height) / home_card(rows_height).lines()).clamp(1, HOME_PAGE_MAX)
+}
+
+/// How wide the rail is, including the rule it hangs off.
+pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 28;
+/// The narrowest terminal that gets a rail.
+///
+/// Below this the agents would be paying for the fleet: a card whose sentence
+/// column is under 40 columns truncates what the agent said, which is the one
+/// thing on the screen worth reading in full.
+const MACHINE_RAIL_MIN_WIDTH: u16 = 88;
+/// The shortest terminal that gets a rail: a heading, a blank, and one machine.
+const MACHINE_RAIL_MIN_HEIGHT: u16 = 6;
 
 /// Every machine this client knows about, session members first.
 ///
@@ -491,7 +635,7 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
     rows
 }
 
-/// One line of the machine strip, and one row of `p2pmux machines`.
+/// One machine on the inbox, and one row of `p2pmux machines`.
 ///
 /// Public because the CLI builds these too: the `m` key on Home and the command
 /// print the same rows through the same formatter, so the two can never drift
@@ -506,59 +650,96 @@ pub struct MachineRow {
     pub this_machine: bool,
 }
 
-/// How many lines the machine block wants.
-///
-/// One machine still gets a strip. Hiding it until a second machine appeared
-/// made a fleet of one look like a fleet of none — the screen said "no
-/// machines" about the machine it was being read on. A strip with one name in
-/// it says the fleet is up and has room for more, which is the truth.
-pub(in crate::tui) fn machine_lines(tui: &MultiPaneTui) -> u16 {
-    let machines = machine_rows(tui).len();
-    if machines == 0 {
-        return 0;
-    }
-    if tui.machines_expanded {
-        // A blank spacer, a heading, and one line each.
-        u16::try_from(machines)
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-    } else {
-        2
-    }
+/// How many lines the table under the agents wants: a blank spacer, a heading,
+/// and one line per machine.
+fn machine_table_lines(machines: usize) -> u16 {
+    u16::try_from(machines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
 }
 
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
-    // Header, then rows, then the machine block pinned to the bottom. The key
-    // bar is not here: it takes over the window footer, so that four keys stay
-    // visible in the same place they are on every other screen. A terminal too
-    // short to hold everything loses agent rows before the machine strip — the
-    // strip is one line and answers "is my fleet even up", which a list of
-    // agents cannot.
-    let header_height = 2u16.min(area.height);
-    let mut left = area.height.saturating_sub(header_height);
-    // The strip outranks agent rows when space runs out, but it never takes the
-    // last one: a list with nothing left in it stops being a list, and Home
-    // would be a screen about machines with the agents it exists for cut off.
-    // All or nothing — half a strip is a blank line where a fleet should be.
-    let wanted = machine_lines(tui);
-    let machines_height = if wanted <= left.saturating_sub(1) {
-        wanted
+    // Header, then rows, then the machines — down the right on a terminal with
+    // width to spare, and pinned to the bottom otherwise. The key bar is not
+    // here: it takes over the window footer, so that four keys stay visible in
+    // the same place they are on every other screen.
+    let machines = machine_rows(tui).len();
+    if machines == 0 {
+        let (header, rows, hint) = stacked(area, tui, 0);
+        return HomeLayout {
+            header,
+            rows,
+            hint,
+            machines: Rect::new(area.x, hint.bottom(), area.width, 0),
+            machine_panel: MachinePanel::Empty,
+        };
+    }
+    if area.width >= MACHINE_RAIL_MIN_WIDTH && area.height >= MACHINE_RAIL_MIN_HEIGHT {
+        // The rail is full height rather than sized to the fleet: it is a column
+        // of the screen, and a short one would leave a ragged hole beside the
+        // agents. A fleet too tall for it says so on its last line.
+        let rail = Rect::new(
+            area.right().saturating_sub(MACHINE_RAIL_WIDTH),
+            area.y,
+            MACHINE_RAIL_WIDTH,
+            area.height,
+        );
+        let (header, rows, hint) = stacked(
+            Rect::new(
+                area.x,
+                area.y,
+                area.width.saturating_sub(MACHINE_RAIL_WIDTH),
+                area.height,
+            ),
+            tui,
+            0,
+        );
+        return HomeLayout {
+            header,
+            rows,
+            hint,
+            machines: rail,
+            machine_panel: MachinePanel::Rail,
+        };
+    }
+    // Under the agents, then. The machines outrank agent rows when space runs
+    // out, but never take the last one: a list with nothing left in it stops
+    // being a list, and Home would be a screen about machines with the agents
+    // it exists for cut off. All or nothing — half a block is a blank line
+    // where a fleet should be.
+    let left = area.height.saturating_sub(2u16.min(area.height));
+    let table = machine_table_lines(machines);
+    let (panel, height) = if table <= left.saturating_sub(1) {
+        (MachinePanel::Table, table)
+    } else if left.saturating_sub(1) >= 2 {
+        (MachinePanel::Strip, 2)
     } else {
-        0
+        (MachinePanel::Empty, 0)
     };
-    left = left.saturating_sub(machines_height);
+    let (header, rows, hint) = stacked(area, tui, height);
+    HomeLayout {
+        header,
+        rows,
+        hint,
+        machines: Rect::new(area.x, hint.bottom(), area.width, height),
+        machine_panel: panel,
+    }
+}
+
+/// The header, the agent rows and the hint, stacked into whatever width and
+/// height are left once the machines have taken their share.
+fn stacked(area: Rect, tui: &MultiPaneTui, machines_height: u16) -> (Rect, Rect, Rect) {
+    let header_height = 2u16.min(area.height);
+    let left = area
+        .height
+        .saturating_sub(header_height)
+        .saturating_sub(machines_height);
     let hint_height = u16::from(tui.home_all_unwired()).min(left);
     let rows_height = left.saturating_sub(hint_height);
     let header = Rect::new(area.x, area.y, area.width, header_height);
     let rows = Rect::new(area.x, header.bottom(), area.width, rows_height);
     let hint = Rect::new(area.x, rows.bottom(), area.width, hint_height);
-    let machines = Rect::new(area.x, hint.bottom(), area.width, machines_height);
-    HomeLayout {
-        header,
-        rows,
-        hint,
-        machines,
-    }
+    (header, rows, hint)
 }
 
 #[cfg(test)]
@@ -566,7 +747,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
 
-    use super::{home_layout, machine_lines, machine_rows};
+    use super::{
+        HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, home_card, home_layout,
+        home_page_size, machine_rows,
+    };
     use crate::{
         layout::{Axis, Node, Tab},
         protocol::AgentRosterState,
@@ -674,33 +858,76 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_strip_lists_this_machine_with_nothing_paired() {
-        // A fleet of one is still a fleet. Hiding the strip made the screen
+    fn the_machine_list_holds_this_machine_with_nothing_paired() {
+        // A fleet of one is still a fleet. Hiding the list made the screen
         // say "no machines" about the machine it was being read on.
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
         let machines = machine_rows(&tui);
         assert_eq!(machines.len(), 1);
         assert!(machines[0].this_machine);
-        assert_eq!(machine_lines(&tui), 2);
-        assert_eq!(home_layout(AREA, &tui).machines.height, 2);
+
+        let layout = home_layout(AREA, &tui);
+        assert_eq!(layout.machine_panel, MachinePanel::Rail);
+        assert_eq!(layout.machines.height, AREA.height);
     }
 
-    /// The strip outranks agent rows, but not the last one.
+    /// The rail is a column of the screen, so what it costs is width, and the
+    /// agents keep every line they had.
     #[test]
-    fn a_home_too_short_for_both_keeps_a_row_rather_than_the_whole_strip() {
+    fn the_rail_takes_width_from_the_agents_and_never_a_row() {
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
-        // Two lines of header, three left: the strip fits with a row to spare.
-        let roomy = home_layout(Rect::new(0, 0, 40, 5), &tui);
-        assert_eq!(roomy.machines.height, 2);
-        assert_eq!(roomy.rows.height, 1);
+        let layout = home_layout(AREA, &tui);
+        assert_eq!(layout.rows.width, AREA.width - MACHINE_RAIL_WIDTH);
+        assert_eq!(layout.machines.x, AREA.width - MACHINE_RAIL_WIDTH);
+        assert_eq!(
+            layout.rows.height,
+            AREA.height - 2,
+            "the header is the only thing above the agents"
+        );
+    }
+
+    /// Narrow terminals get the same facts under the agents instead, and the
+    /// machines outrank agent rows there — but never take the last one.
+    #[test]
+    fn a_terminal_too_narrow_for_a_rail_puts_the_machines_underneath() {
+        let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+
+        // A spacer, a heading and one machine, with rows to spare.
+        let roomy = home_layout(Rect::new(0, 0, 40, 10), &tui);
+        assert_eq!(roomy.machine_panel, MachinePanel::Table);
+        assert_eq!(roomy.machines.height, 3);
+        assert_eq!(roomy.rows.height, 5);
+
+        // No room for the table: the strip still answers "is my fleet up".
+        let tight = home_layout(Rect::new(0, 0, 40, 5), &tui);
+        assert_eq!(tight.machine_panel, MachinePanel::Strip);
+        assert_eq!(tight.machines.height, 2);
+        assert_eq!(tight.rows.height, 1);
 
         // One line fewer and the strip would take every row there is, so it
         // stands down whole — half a strip is a blank line where a fleet goes.
         let cramped = home_layout(Rect::new(0, 0, 40, 4), &tui);
+        assert_eq!(cramped.machine_panel, MachinePanel::Empty);
         assert_eq!(cramped.machines.height, 0);
         assert_eq!(cramped.rows.height, 2);
+    }
+
+    /// A terminal too short for a rail falls back rather than drawing a
+    /// two-line column beside a two-line list.
+    #[test]
+    fn a_wide_but_short_terminal_falls_back_from_the_rail() {
+        let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+
+        assert_eq!(
+            home_layout(Rect::new(0, 0, 120, 5), &tui).machine_panel,
+            MachinePanel::Strip
+        );
+        assert_eq!(
+            home_layout(Rect::new(0, 0, 120, 6), &tui).machine_panel,
+            MachinePanel::Rail
+        );
     }
 
     #[test]
@@ -719,7 +946,6 @@ mod tests {
             .expect("the paired machine is listed");
         assert!(!oldbox.reachable);
         assert_eq!(oldbox.accepts_work, Some(true));
-        assert_eq!(machine_lines(&tui), 2);
     }
 
     #[test]
@@ -864,19 +1090,154 @@ mod tests {
         );
     }
 
+    /// `m` used to expand the strip into the table. The rail is the table, so
+    /// there is nothing left for the key to do and it no longer claims one.
     #[test]
-    fn m_expands_the_machines_list_in_place() {
+    fn every_machine_is_listed_without_a_key_to_expand_them() {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.paired_machines = vec![crate::tui::PairedMachine {
             name: String::from("droplet"),
             accepts_work: None,
         }];
         tui.set_home_open(true, "test");
-        assert_eq!(machine_lines(&tui), 2);
 
+        assert_eq!(machine_rows(&tui).len(), 2);
+        let before = home_layout(AREA, &tui);
         tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
-        assert!(tui.machines_expanded);
-        assert_eq!(machine_lines(&tui), 4, "a spacer, a heading, and two rows");
+        assert_eq!(home_layout(AREA, &tui), before);
+    }
+
+    /// Eight is the ceiling however tall the terminal is, and one is the floor
+    /// however short: a page with nothing on it is not a page.
+    #[test]
+    fn a_page_holds_what_fits_and_never_more_than_eight() {
+        assert_eq!(home_card(200), HomeCard::Full);
+        assert_eq!(home_page_size(200), HOME_PAGE_MAX);
+        // Twenty lines of `Full` cards is five agents, not eight.
+        assert_eq!(home_page_size(20), 5);
+        // Short enough for rows, where a line each is all an agent gets.
+        assert_eq!(home_page_size(8), 8);
+        assert_eq!(home_page_size(3), 3);
+        assert_eq!(home_page_size(0), 1);
+    }
+
+    /// An inbox with `count` agents on it, opened and measured against [`AREA`],
+    /// alongside the page size that terminal works out to.
+    fn paged_tui(count: usize) -> (MultiPaneTui, usize) {
+        let rows = (0..count)
+            .map(|index| {
+                (
+                    if index % 2 == 0 { "laptop" } else { "droplet" },
+                    "claude",
+                    AgentRosterState::Working,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut tui = home_tui(&rows);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let page_size = tui.home_page_size;
+        (tui, page_size)
+    }
+
+    /// A list longer than a page is paged, not scrolled, and `h`/`l` move a
+    /// whole page with the cursor rather than leaving it behind.
+    #[test]
+    fn h_and_l_turn_the_page_and_take_the_cursor_with_them() {
+        let (mut tui, page_size) = paged_tui(8);
+        assert_eq!(tui.home_page_count(), 2);
+        assert_eq!(tui.home_page(), 0);
+
+        let first = tui.home_selected.expect("a cursor on arrival");
+        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 1);
+        assert_eq!(
+            tui.home_selected,
+            tui.home_rows().get(page_size).map(|row| row.pane_id),
+            "the cursor lands on the first agent of the page it arrives at"
+        );
+
+        // Two pages, so `l` wraps back rather than stopping at the end.
+        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 0);
+        assert_eq!(tui.home_selected, Some(first));
+
+        tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 1);
+    }
+
+    /// The page follows the cursor. Walking off the bottom of one page has to
+    /// bring the next one into view, or `j` stops at the end of page one.
+    #[test]
+    fn walking_the_cursor_off_a_page_brings_the_next_one_into_view() {
+        let (mut tui, page_size) = paged_tui(8);
+
+        for _ in 0..page_size {
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
+        }
+        assert_eq!(tui.home_page(), 1);
+        assert_eq!(
+            tui.home_selected,
+            tui.home_rows().get(page_size).map(|row| row.pane_id)
+        );
+
+        // And back up over the same edge.
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 0);
+    }
+
+    /// A page must not survive the agents that were on it going away.
+    #[test]
+    fn a_page_that_empties_falls_back_to_one_that_has_something_on_it() {
+        let (mut tui, page_size) = paged_tui(8);
+        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_page(), 1);
+
+        let rows = tui.agent_rows[..page_size].to_vec();
+        tui.set_agent_rows(rows);
+        tui.repair_home_selection();
+        assert_eq!(tui.home_page_count(), 1);
+        assert_eq!(tui.home_page(), 0);
+    }
+
+    /// A card is one target, not three. Clicking the line an agent's words are
+    /// on has to open that agent — and clicking the gap under it belongs to the
+    /// card above, which is the one the pointer looks like it is on.
+    #[test]
+    fn every_line_of_a_card_opens_the_agent_it_belongs_to() {
+        let (tui, _) = paged_tui(3);
+        let rows = tui
+            .home_rows()
+            .into_iter()
+            .map(|row| row.pane_id)
+            .collect::<Vec<_>>();
+        let list = home_layout(tui.geometry(AREA).content, &tui).rows;
+        assert_eq!(home_card(list.height), HomeCard::Full);
+
+        for line in 0..HomeCard::Full.lines() as u16 {
+            assert_eq!(
+                tui.home_row_at(2, list.y + line, AREA),
+                Some(rows[0]),
+                "line {line} of the first card belongs to it"
+            );
+        }
+        assert_eq!(
+            tui.home_row_at(2, list.y + HomeCard::Full.lines() as u16, AREA),
+            Some(rows[1])
+        );
+        // The rail is not the list, and a click on it opens nothing.
+        assert_eq!(tui.home_row_at(AREA.width - 2, list.y, AREA), None);
+    }
+
+    /// One page means no paging: the keys do nothing rather than redrawing the
+    /// same agents under a page number that never changes.
+    #[test]
+    fn a_list_that_fits_on_one_page_has_no_pages_to_turn() {
+        let (mut tui, _) = paged_tui(3);
+
+        assert_eq!(tui.home_page_count(), 1);
+        assert!(!tui.turn_home_page(true));
+        assert_eq!(tui.home_page(), 0);
     }
 
     #[test]

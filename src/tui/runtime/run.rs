@@ -65,8 +65,17 @@ impl SharedLayoutRuntime {
                         self.invite.code.as_deref(),
                     ));
                 }
+                // A foreground session hands out the same invite an attached one
+                // does, so the add-machine panel has to record the ticket here
+                // too. Without it the machine that joins is never remembered.
+                if self.tui.take_pair_offer()
+                    && let Some(ticket) = self.invite.ticket.as_deref()
+                    && let Err(error) = crate::pairing::offer(ticket)
+                {
+                    self.share_notice = Some(format!("could not record the pairing: {error}"));
+                }
                 // The notice belongs to one visit to the modal, not to the session.
-                if !self.tui.share_open() {
+                if !self.tui.share_open() && !self.tui.add_machine_open() {
                     self.share_notice = None;
                 }
                 Ok(false)

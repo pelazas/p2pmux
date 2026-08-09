@@ -12,6 +12,15 @@ pub(in crate::tui) fn join_command(invite: &str) -> String {
     format!("p2pmux join {invite}")
 }
 
+/// The line a machine you own runs to be added to the fleet, permanently.
+///
+/// Deliberately not [`join_command`], which the same code would also satisfy: a
+/// join is one visit and pairing is a standing arrangement, and the word on
+/// screen is the only thing that tells the two apart before the fact.
+pub(in crate::tui) fn pair_command(invite: &str) -> String {
+    format!("p2pmux pair {invite}")
+}
+
 /// Run one share-modal copy and report the result back into the modal.
 ///
 /// A code request with no code falls back to the ticket rather than reporting nothing: the
@@ -28,11 +37,19 @@ pub(crate) fn share_copy_result(
             None => ("ticket command", ticket),
         },
         ShareCopy::Ticket => ("ticket command", ticket),
+        // The panel prefers the short code and falls back to the ticket for the
+        // same reason the share modal does: a rendezvous outage costs the code,
+        // never the invite.
+        ShareCopy::Pair => ("pair command", code.or(ticket)),
     };
     let Some(text) = text else {
         return format!("no {what} to copy");
     };
-    match copy_selection_to_clipboard(&join_command(text)) {
+    let line = match request {
+        ShareCopy::Pair => pair_command(text),
+        ShareCopy::Code | ShareCopy::Ticket => join_command(text),
+    };
+    match copy_selection_to_clipboard(&line) {
         Ok(_) => format!("✓ copied {what}"),
         Err(error) => format!("clipboard copy failed: {error}"),
     }
@@ -51,6 +68,23 @@ mod tests {
         assert_eq!(
             share_copy_result(ShareCopy::Code, None, None),
             "no ticket command to copy"
+        );
+    }
+
+    /// Pairing and joining resolve the same code, so the only thing that says
+    /// which one is happening is the word in the line that gets pasted.
+    #[test]
+    fn a_pair_copy_is_the_pair_line_and_falls_back_to_the_ticket_too() {
+        assert_eq!(pair_command("4KP7Q-M2XRW"), "p2pmux pair 4KP7Q-M2XRW");
+        assert_eq!(
+            share_copy_result(ShareCopy::Pair, None, None),
+            "no pair command to copy"
+        );
+        // A rendezvous outage costs the short code, never the invite, so the
+        // panel still has a line to hand over.
+        assert_ne!(
+            share_copy_result(ShareCopy::Pair, Some("p2pmux-v3:T"), None),
+            "no pair command to copy"
         );
     }
 

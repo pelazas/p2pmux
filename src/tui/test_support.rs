@@ -110,7 +110,7 @@ pub(in crate::tui) fn home_tui(
         .map(|pane_id| (pane_id, 2, 8))
         .collect::<Vec<_>>();
     let mut tui = MultiPaneTui::new(layout(tabs, &panes)).expect("valid layout");
-    // A real client always knows its own peer id, and the machine strip reads it
+    // A real client always knows its own peer id, and the machines rail reads it
     // to mark which row is the machine being looked at.
     tui.local_peer_id = Some(b"host".to_vec());
     tui.set_agent_rows(

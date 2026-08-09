@@ -291,23 +291,31 @@ are Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`
 ```
 p2pmux (paris) │ inbox 2 │ Tab #1 · Tab #2
 
- Agents · 2 need you
-
- ● desktop   claude   needs you   wants to run: rm -rf node_modules     2m
- ● droplet   codex    needs you   permission: write to /etc/hosts      12m
- ✓ laptop    codex    done        6 files changed, tests pass          31m
- ○ laptop    claude   running     editing the auth handler              4m
- ○ droplet   claude   running     running tests                        18m
- ○ desktop   cursor   running     state unknown — no hooks              7m
-
- laptop ✓   desktop ✓   droplet ✓   oldbox asleep
-
- enter open · n new terminal · m machines · q quit
+ Agents · 2 need you                                    │ MACHINES · 3
+                                                        │
+›● desktop    claude                  needs you    2m14s│ ● laptop
+   wants to run: rm -rf node_modules                    │   this machine · 2 agents
+   work/api · tab 1 · pane 2                            │
+                                                        │ ● droplet
+ ✗ laptop     codex                   error       1m02s │   1 agent
+   cargo test --all exited 101                          │
+   Desktop/p2pmux · tab 2 · pane 1                      │ ○ oldbox
+                                                        │   asleep
+ ✓ laptop     opencode                done        31m04s│
+   6 files changed, tests pass                          │
+   scratch/demo · tab 3 · pane 1                        │ ─────────────────────────
+                                                        │ a  add a machine
+ enter open · a add machine · n new terminal · q quit
 ```
 
-Each row is a status dot, the machine the agent is on, the agent, its state, what it last said it
-was doing, and how long it has been in that state. Rows sort blocked → done → running → idle: a
-row that needs you never appears below one that does not, and that is the point of the screen.
+Each agent gets a card: a status dot, the machine it is on, the agent, its state and how long it
+has been in that state; then its own words at whatever length it said them; then the repository it
+is in and the tab and pane `Enter` will put you on. Cards sort blocked → done → running → idle: an
+agent that needs you never appears below one that does not, and that is the point of the screen.
+
+The list is paged rather than scrolled, at most eight agents to a page, and the count beside the
+title is of the whole list — so a page you cannot see is never hiding something that needs you.
+A terminal too short for cards drops the location line, and then falls back to one line per agent.
 
 Opening a row puts you on the tab that agent lives on, focused on its pane, with the rest of that
 tab drawn around it. The focused pane's border says which one you landed in, so there is nothing
@@ -319,18 +327,58 @@ if you want the agent alone on screen.
 | `Ctrl+O` | The inbox, from anywhere including inside a live terminal |
 | `Ctrl+A` | The same, kept for the muscle memory the old agents overlay built |
 | `Enter` | Go to the selected agent's tab and focus its pane |
+| `a` | Add a machine to your fleet |
 | `n` | New terminal on this machine |
-| `m` | Expand the machine list |
 | `↑` `↓` | Move the selection |
+| `h` `l` | Turn the page, when there is more than one |
 | `q` | Quit |
 
 `Esc` is deliberately **not** the way back. Claude Code interrupts on it and vim needs it
 constantly, so swallowing it would break the terminal you just opened. Inside a pane every
 unmodified key belongs to the program running there.
 
-Left-clicking a row opens it. The mouse wheel scrolls the list. To retain readline's
+Left-clicking a card opens it. The mouse wheel turns the page. To retain readline's
 beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A to the focused
 PTY instead.
+
+### The machines rail
+
+Every machine you have paired with is listed down the right-hand side for as long as the inbox is
+up: whether it is answering, whether it accepts work from your machines, and how many agents it is
+running. A machine that is paired but not in the session is one you own that is not answering, and
+it says `asleep` rather than disappearing.
+
+The rail takes width the agents were not using. A terminal too narrow for it puts the same table
+under the agents instead, and one too narrow for that falls back to a line of names and ticks —
+which still answers "is my fleet up", which is what earns it the space.
+
+`a` adds one, without leaving the screen:
+
+```
+╭─ Add a machine ────────────────────────────────────────────╮
+│                                                            │
+│  On the machine you want to add, run:                      │
+│                                                            │
+│  p2pmux pair 4KP7Q-M2XRW                                   │
+│                                                            │
+│  Not installed there yet? First run:                       │
+│  curl -fsSL https://p2pmux.com/install.sh | sh             │
+│                                                            │
+│  ⠹ waiting for it to join…                                 │
+│  Anyone who runs it gets a full shell here.                │
+│                                                            │
+│ <c> COPY   <Esc> CLOSE                                     │
+╰────────────────────────────────────────────────────────────╯
+```
+
+The panel stays up and reports the machine arriving, so the half of pairing that used to mean
+running something else somewhere else happens on the screen you started from. It is the same
+invite `Ctrl+S` hands out, so it carries the same warning: anyone who runs that line gets a full
+shell on this machine. Only the machine hosting the session can offer one; a member is told so.
+
+It records the session's ticket in `pairing.toml`, which is what makes bare `p2pmux` rejoin on
+both machines afterwards. It does not answer the accepts-work question — that is asked once, by
+`p2pmux pair`, and its answer is default-deny.
 
 The `inbox` badge in the tab bar carries the count of agents blocked on a human, in amber, so it
 stays visible while you are deep inside a terminal. It never shows a zero: absence is quieter and
