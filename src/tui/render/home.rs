@@ -36,6 +36,23 @@ use crate::{
 /// and that the screen will change on its own once you do it.
 pub(in crate::tui) const HOME_EMPTY_NO_AGENTS: &str =
     "Start an agent in any terminal and it appears here.";
+/// The first run, at length, in the space the cards freed.
+///
+/// The screen is emptiest exactly when its reader is newest, so that is when
+/// there is room to answer the question one grey line could not: what do I do
+/// to make something appear here. The steps are in the order they have to
+/// happen — the hooks first, because an inbox that cannot say `needs you` is a
+/// list of processes, and running an agent before wiring them teaches that.
+const HOME_EMPTY_STEPS: &[(&str, &str)] = &[
+    (
+        "Run `p2pmux setup` once, so your agents can say what they need.",
+        "",
+    ),
+    (
+        "Start claude, codex or opencode in any terminal — on this machine",
+        "or on any machine in the list — and it appears here on its own.",
+    ),
+];
 /// The nudge shown when agents are running but nothing is reporting on them.
 ///
 /// This is the state a default install lands in — the hooks are opt-in — and it
@@ -136,13 +153,7 @@ fn render_home_in(
         let rows = tui.home_rows();
         if rows.is_empty() {
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::raw(""),
-                    Line::styled(
-                        format!(" {HOME_EMPTY_NO_AGENTS}"),
-                        Style::default().fg(theme.agent_overlay_muted),
-                    ),
-                ]),
+                Paragraph::new(home_empty_state(layout.rows.height, theme)),
                 layout.rows,
             );
         } else {
@@ -193,6 +204,46 @@ fn render_home_in(
     if keys.width > 0 && keys.height > 0 {
         render_home_keys(frame.buffer_mut(), theme, keys, tui.home_page_count() > 1);
     }
+}
+
+/// The screen a first run lands on: what is here (nothing), and what to do
+/// about it.
+///
+/// The numbered form only where there is room for it. A terminal too short
+/// falls back to the one line, which says the same thing in the space it has.
+fn home_empty_state(height: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(theme.agent_overlay_muted);
+    // A blank, the heading, a blank, and two lines per step.
+    let wanted = 3 + HOME_EMPTY_STEPS.len() * 3;
+    if usize::from(height) < wanted {
+        return vec![
+            Line::raw(""),
+            Line::styled(format!(" {HOME_EMPTY_NO_AGENTS}"), muted),
+        ];
+    }
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(
+            String::from(" Nothing running yet."),
+            Style::default()
+                .fg(theme.agent_overlay_foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for (index, (first, second)) in HOME_EMPTY_STEPS.iter().enumerate() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {}  ", index + 1),
+                Style::default().fg(theme.agent_overlay_chrome),
+            ),
+            Span::styled((*first).to_owned(), muted),
+        ]));
+        if !second.is_empty() {
+            lines.push(Line::styled(format!("    {second}"), muted));
+        }
+    }
+    lines
 }
 
 /// `Agents · 2 need you` — the whole value of the screen in one number, and the
@@ -1053,6 +1104,36 @@ mod tests {
             HOME_EMPTY_NO_HOOKS,
             "Run `p2pmux setup` to see which agents need you."
         );
+    }
+
+    /// The screen is emptiest exactly when its reader is newest, so that is
+    /// when there is room to say what to do rather than only that nothing is
+    /// here — and the hooks come first, because starting an agent before
+    /// wiring them teaches an inbox that cannot say `needs you`.
+    #[test]
+    fn a_first_run_gets_the_steps_rather_than_one_grey_line() {
+        let mut tui = crate::tui::test_support::home_tui(&[]);
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(drawn.contains("Nothing running yet."), "{drawn}");
+        let setup = drawn.find("p2pmux setup").expect("the first step");
+        let start = drawn.find("Start claude").expect("the second step");
+        assert!(setup < start, "wiring the hooks comes first: {drawn}");
+        assert!(drawn.contains(" 1  "), "{drawn}");
+        assert!(drawn.contains(" 2  "), "{drawn}");
+    }
+
+    /// A terminal too short for the steps says the same thing in one line
+    /// rather than showing half a checklist.
+    #[test]
+    fn a_short_first_run_keeps_the_one_line_it_has_room_for() {
+        let mut tui = crate::tui::test_support::home_tui(&[]);
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 8).join("\n");
+        assert!(drawn.contains(HOME_EMPTY_NO_AGENTS), "{drawn}");
+        assert!(!drawn.contains("Nothing running yet."), "{drawn}");
     }
 
     #[test]
