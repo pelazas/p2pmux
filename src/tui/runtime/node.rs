@@ -206,7 +206,16 @@ impl SharedLayoutRuntime {
             if self.invite.ticket.as_deref() == Some(ticket.as_str()) {
                 continue;
             }
-            let _ = self.control.try_fleet_invite(ticket);
+            let sent = self.control.try_fleet_invite(ticket.clone());
+            crate::tui::debug_log::ui_debug_log(
+                "fleet_invite_sent",
+                format_args!(
+                    "session={} sent_to={:?} ticket={}",
+                    session.name,
+                    sent,
+                    &ticket[..ticket.len().min(16)]
+                ),
+            );
         }
     }
 

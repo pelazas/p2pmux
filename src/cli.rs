@@ -850,7 +850,14 @@ async fn wait_for_peers(
                 live.into_iter()
                     .filter(|session| session.id == descriptor.id)
                     .flat_map(|session| session.peers.into_iter())
-                    .filter(|peer| !peer.this_machine && peer.kind.declared_machine())
+                    // Deliberately not filtered on what the peer says it is.
+                    // Somebody typed this machine's code here, on purpose, a
+                    // moment ago — that act is the consent, and asking the
+                    // other machine to also declare itself would rule out the
+                    // commonest case there is: the machine that *printed* the
+                    // code, whose node started before it had been paired and so
+                    // has nothing to declare yet.
+                    .filter(|peer| !peer.this_machine)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();

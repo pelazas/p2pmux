@@ -3202,9 +3202,11 @@ impl SharedLayoutHost {
     /// Stamped with this coordinator's own peer id, for the same reason the
     /// relay path stamps a member's: the receiver has to know whose invitation
     /// it is in order to ask its pairing record about it.
-    pub fn announce_fleet_invite(&self, ticket: String) -> Result<(), SessionError> {
-        broadcast_envelope(
+    pub fn announce_fleet_invite(&self, ticket: String) -> Result<usize, SessionError> {
+        // Queued, never published as state. See [`enqueue_except`].
+        Ok(enqueue_except(
             &self.peers,
+            &[],
             coordinator_envelope(
                 self.host.transport.endpoint_id().as_bytes(),
                 envelope::Body::FleetInvite(crate::protocol::FleetInvite {
@@ -3212,8 +3214,7 @@ impl SharedLayoutHost {
                     from_peer_id: self.host.transport.endpoint_id().as_bytes().to_vec(),
                 }),
             ),
-        );
-        Ok(())
+        ))
     }
 
     /// Invitations members sent, for the runtime to decide about.
@@ -3719,25 +3720,38 @@ fn broadcast_envelope(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelo
     }
 }
 
-/// Send one envelope to every peer but the one named.
+/// Send one invitation to every peer but the one it came from.
 ///
-/// Relaying an invitation back to the machine that made it would have it try to
+/// Relaying it back to the machine that made it would have that machine try to
 /// join a session it is already coordinating.
-fn broadcast_except(
+///
+/// Queued rather than published as state, and that distinction is the whole of
+/// it: the state channel is latest-wins, so an invitation put there is quietly
+/// replaced by the next layout snapshot — which arrives constantly. An
+/// invitation that is superseded is an invitation nobody ever receives, and
+/// that is exactly how this failed the first time it was run against a real
+/// second machine.
+fn enqueue_except(
     peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     except: &[u8],
     envelope: Envelope,
-) {
+) -> usize {
     let peers = match peers.lock() {
         Ok(peers) => peers,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let mut sent = 0;
     for (peer_id, peer) in peers.iter() {
         if peer_id.as_slice() == except {
             continue;
         }
-        peer.mailbox.publish_state(envelope.clone());
+        // A peer whose queue is full is a peer that is already far behind; it
+        // will hear about the session on the next announcement.
+        if peer.mailbox.enqueue_targeted(envelope.clone()) {
+            sent += 1;
+        }
     }
+    sent
 }
 
 /// Queue one layout commit for every peer, losslessly and in order.
@@ -4121,10 +4135,16 @@ async fn layout_member_reader_task(
             // Carried up with the peer that sent it: the invitation means
             // nothing without knowing whose it is, and the answer to "is that
             // one of my machines" is given locally against the pairing record.
-            Some(envelope::Body::FleetInvite(invite)) => LayoutControlEvent::FleetInvite {
-                from_peer_id: invite.from_peer_id,
-                ticket: invite.ticket,
-            },
+            Some(envelope::Body::FleetInvite(invite)) => {
+                crate::tui::debug_log::ui_debug_log(
+                    "fleet_invite_read",
+                    format_args!("ticket_len={}", invite.ticket.len()),
+                );
+                LayoutControlEvent::FleetInvite {
+                    from_peer_id: invite.from_peer_id,
+                    ticket: invite.ticket,
+                }
+            }
             Some(envelope::Body::PaneReservation(reservation)) => {
                 LayoutControlEvent::Reservation(reservation)
             }
@@ -4145,7 +4165,13 @@ async fn layout_member_reader_task(
                 LayoutControlEvent::Commit(commit)
             }
             Some(envelope::Body::LayoutReject(reject)) => LayoutControlEvent::Reject(reject),
-            _ => break,
+            other => {
+                crate::tui::debug_log::ui_debug_log(
+                    "member_reader_stopped",
+                    format_args!("body={:?}", other.is_some()),
+                );
+                break;
+            }
         };
         if events_tx.send(event).await.is_err() {
             return;
@@ -4244,7 +4270,7 @@ async fn layout_host_reader_task(
                     invite.from_peer_id.clone(),
                     invite.ticket.clone(),
                 );
-                broadcast_except(
+                enqueue_except(
                     &peers,
                     &peer_id,
                     coordinator_envelope(&coordinator_peer_id, envelope::Body::FleetInvite(invite)),

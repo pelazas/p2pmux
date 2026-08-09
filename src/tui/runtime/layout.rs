@@ -81,15 +81,28 @@ impl SharedLayoutRuntime {
             .find(|member| member.peer_id == from_peer_id)
             .map(|member| member.kind)
             .unwrap_or_default();
-        if !crate::pairing::load_or_empty().owns(
+        let owned = crate::pairing::load_or_empty().owns(
             &crate::pairing::peer_id_hex(from_peer_id),
             &name,
             kind,
-        ) {
+        );
+        crate::tui::debug_log::ui_debug_log(
+            "fleet_invite_considered",
+            format_args!("from={name} owned={owned} kind={kind:?}"),
+        );
+        if !owned {
             self.status = format!("ignored an invitation from {name}, which is not my machine");
             return;
         }
-        match crate::node::follow_fleet_invite(ticket) {
+        let followed = crate::node::follow_fleet_invite(ticket);
+        crate::tui::debug_log::ui_debug_log(
+            "fleet_invite_received",
+            format_args!(
+                "from={name} followed={:?}",
+                followed.as_ref().map_err(|error| error.to_string())
+            ),
+        );
+        match followed {
             Ok(true) => self.status = format!("joined the session {name} started"),
             Ok(false) => {}
             Err(error) => self.status = format!("could not follow {name}: {error}"),

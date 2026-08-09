@@ -95,13 +95,15 @@ impl SharedControl {
     /// member sends it to the coordinator, which does the same. Either way the
     /// decision to follow is made by each receiver against its own pairing
     /// record — see [`crate::protocol::FleetInvite`].
-    pub(in crate::tui) fn try_fleet_invite(&self, ticket: String) -> Result<(), String> {
+    pub(in crate::tui) fn try_fleet_invite(&self, ticket: String) -> Result<usize, String> {
         match self {
             Self::Host(host) => host
                 .announce_fleet_invite(ticket)
                 .map_err(|error| error.to_string()),
+            // A member sends one message, to the coordinator, which relays it.
             Self::Member(member) => member
                 .try_fleet_invite(ticket)
+                .map(|()| 1)
                 .map_err(layout_queue_message),
         }
     }

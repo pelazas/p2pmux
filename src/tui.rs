@@ -18,7 +18,7 @@
 
 mod app;
 mod clock;
-mod debug_log;
+pub mod debug_log;
 mod geometry;
 mod home;
 mod host;
