@@ -250,12 +250,18 @@ impl MultiPaneTui {
         self.ensure_home_selection_visible();
     }
 
-    /// Enter: leave Home and land in the selected agent's terminal, alone on
-    /// screen.
+    /// Enter: leave Home and land in the selected agent's terminal, on the tab
+    /// it lives on, with the rest of that tab still around it.
     ///
-    /// Full screen rather than the pane grid, because Home is what you open and
-    /// the terminal is what you land in — arriving in a four-way split means
-    /// hunting for the agent you just selected by name.
+    /// It used to arrive zoomed, on the argument that a four-way split means
+    /// hunting for the agent you just selected by name. It does not: the
+    /// focused pane carries its own border color, so the pane you landed in is
+    /// the one thing on the tab that cannot be missed. What the zoom cost was
+    /// the context. The siblings vanished, and because a zoom only holds while
+    /// it is the focused pane, the next focus change stood it down and the rest
+    /// of the tab appeared a beat later unasked — which reads as a glitch, not
+    /// as a choice. `Ctrl+P` then `z` is still there for anyone who wants the
+    /// pane alone on screen, now as something the user asks for.
     pub(in crate::tui) fn open_home_selection(&mut self) -> Vec<UiIntent> {
         let Some(pane_id) = self.home_selected else {
             return Vec::new();
@@ -274,7 +280,10 @@ impl MultiPaneTui {
         };
         let tab_id = tab.tab_id;
         self.select_pane(tab_id, pane_id, "home_enter");
-        self.zoomed_pane = Some(pane_id);
+        // A zoom left over from an earlier visit is stood down rather than
+        // carried into the tab the inbox just chose: arriving with a sibling
+        // hidden is the thing this path stopped doing.
+        self.clear_zoom();
         self.set_home_open(false, "enter");
         vec![UiIntent::FocusPane { pane_id }]
     }
@@ -548,8 +557,12 @@ mod tests {
 
     use super::{home_layout, machine_lines, machine_rows};
     use crate::{
+        layout::{Axis, Node, Tab},
         protocol::AgentRosterState,
-        tui::{KeyHandling, MultiPaneTui, UiIntent, test_support::home_tui},
+        tui::{
+            KeyHandling, MultiPaneTui, UiIntent,
+            test_support::{agent_row, home_tui, layout},
+        },
     };
 
     const AREA: Rect = Rect {
@@ -722,14 +735,63 @@ mod tests {
         assert_eq!(tui.focused_pane(), 1);
         assert_eq!(
             tui.zoomed_pane(),
-            Some(1),
-            "Enter lands in the terminal full screen, not in the pane grid"
+            None,
+            "Enter lands in the agent's pane on its tab, not zoomed over it"
         );
+    }
+
+    /// The fixture the other Home tests use gives every agent a tab to itself,
+    /// so only a tab with a sibling can say whether the sibling is drawn.
+    #[test]
+    fn enter_draws_the_rest_of_the_agents_tab_around_it() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 7,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 2, 8), (2, 2, 8)],
+        ))
+        .expect("valid layout");
+        tui.set_agent_rows(vec![agent_row(2, 1, 2)]);
+        tui.repair_home_selection();
+        tui.set_home_open(true, "test");
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
+        );
+        assert_eq!(tui.current_tab(), 7, "Enter goes to the agent's tab");
+        assert_eq!(tui.focused_pane(), 2, "and focuses the agent's pane");
         assert_eq!(
             tui.geometry(AREA).panes.len(),
-            1,
-            "nothing else on that tab is drawn while the agent is zoomed"
+            2,
+            "the pane it shares that tab with is still drawn"
         );
+    }
+
+    /// A zoom the user asked for on one tab must not follow them into the tab
+    /// the inbox hands them next.
+    #[test]
+    fn enter_stands_down_a_zoom_left_over_from_an_earlier_visit() {
+        let mut tui = home_tui(&[
+            ("laptop", "claude", AgentRosterState::Working),
+            ("desktop", "claude", AgentRosterState::Pending),
+        ]);
+        tui.select_pane(1, 1, "test");
+        tui.zoomed_pane = Some(1);
+        assert_eq!(tui.zoomed_pane(), Some(1));
+
+        tui.set_home_open(true, "test");
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA);
+
+        assert_eq!(tui.focused_pane(), 2);
+        assert_eq!(tui.zoomed_pane(), None);
     }
 
     #[test]
