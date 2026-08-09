@@ -74,6 +74,11 @@ impl MultiPaneTui {
         if matches!(self.modal, ModalState::Quit) {
             return self.handle_quit_key(key);
         }
+        // Above the rest, because it is the only modal with another machine
+        // waiting on the answer and a clock running out on it.
+        if self.remote_work_open() {
+            return self.handle_remote_work_key(key);
+        }
         if matches!(self.modal, ModalState::Rename(_)) {
             return self.handle_rename_key(key);
         }

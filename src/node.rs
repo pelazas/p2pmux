@@ -1106,6 +1106,9 @@ struct AttachmentPublishState {
     status: Option<String>,
     paths: Option<Vec<crate::transport::PeerPath>>,
     session_locked: Option<bool>,
+    /// The held remote-work request last told to the client. The outer `Option`
+    /// is "have we ever said"; the inner one is the answer itself.
+    remote_work: Option<Option<Vec<String>>>,
     focus: Option<(u64, u64)>,
     presence: Option<Vec<PresenceRow>>,
     screen_sequences: BTreeMap<u64, u64>,
@@ -1238,6 +1241,23 @@ fn queue_updates(
             return Ok(published);
         }
         publish.session_locked = Some(session_locked);
+        published = true;
+    }
+    // The question belongs on the machine the terminal would run on, and the
+    // client is the part of that machine a human is looking at. The node keeps
+    // holding the request either way; this only moves the asking.
+    let remote_work = node.runtime.pending_remote_work();
+    if publish.remote_work != Some(remote_work.clone()) {
+        if !queue_update(
+            writer,
+            publish,
+            NodeMessage::RemoteWork {
+                command: remote_work.clone(),
+            },
+        )? {
+            return Ok(published);
+        }
+        publish.remote_work = Some(remote_work);
         published = true;
     }
     if publish.rosters.as_ref() != Some(&rosters) {

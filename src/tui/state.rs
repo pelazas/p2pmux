@@ -58,6 +58,11 @@ pub enum UiIntent {
         grid_rows: u16,
         grid_cols: u16,
     },
+    /// The answer to a held remote-work request, travelling from the client a
+    /// human is looking at to the node that is holding the request.
+    AnswerRemoteWork {
+        approved: bool,
+    },
     /// A terminal on another machine in the session.
     ///
     /// Separate from [`Self::CreateTab`] rather than an option on it, because
@@ -237,6 +242,17 @@ pub(in crate::tui) enum ModalState {
     Quit,
     /// `a` on the inbox: the line to run on the machine being added.
     AddMachine(AddMachinePrompt),
+    /// Another machine of yours wants to start something here, and this
+    /// machine is configured to be asked first.
+    ///
+    /// It goes up on the machine the terminal would run on, never on the one
+    /// that asked, because that is the only machine whose owner's answer means
+    /// anything. Ignoring it is a refusal: the request expires.
+    ConfirmRemoteWork {
+        /// What would be launched, as it would be typed. Empty is a shell,
+        /// which the prompt says in those words.
+        command: Vec<String>,
+    },
 }
 /// The add-machine panel, and what it needs to notice the machine arriving.
 ///

@@ -135,6 +135,17 @@ impl SharedLayoutRuntime {
     /// This is what makes `p2pmux machines` able to answer "is that machine
     /// awake" without attaching to the session. Only the node knows, and only
     /// the node is always running.
+    /// What another machine of yours is waiting to be allowed to start here.
+    ///
+    /// The node holds the request; the attached client is what can ask a human
+    /// about it. `None` when nothing is held, which also retracts a question
+    /// that has since been answered or expired.
+    pub(crate) fn pending_remote_work(&self) -> Option<Vec<String>> {
+        self.pending_remote
+            .as_ref()
+            .map(|(_, pending)| pending.command.clone())
+    }
+
     pub(crate) fn session_peers(&self) -> Vec<crate::session_store::SessionPeer> {
         let local = self.local_peer_id();
         let members = &self.tui.snapshot().members;

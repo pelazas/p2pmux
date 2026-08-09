@@ -814,7 +814,36 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
         println!();
         println!("No other machines paired yet. Run `p2pmux pair` to add one.");
     }
+    // Only about this machine, because this machine's own file is the only
+    // policy it can honestly report. Every other row's `ACCEPTS WORK` column
+    // already says `—` for the same reason.
+    println!();
+    print!("{}", work_policy_summary(&crate::pairing::load()?));
     Ok(())
+}
+
+/// What this machine will let your other machines start on it, in words.
+fn work_policy_summary(pairing: &crate::pairing::Pairing) -> String {
+    let mut summary = String::from("On this machine, your other machines may start:\n");
+    if !pairing.accepts_work {
+        summary.push_str("  nothing — this machine has not agreed to accept work\n");
+        return summary;
+    }
+    if pairing.work.allow.is_empty() {
+        summary.push_str("  nothing yet — add commands to [work].allow in the pairing file\n");
+        return summary;
+    }
+    for entry in &pairing.work.allow {
+        if entry.trim() == crate::pairing::SHELL_ENTRY {
+            summary.push_str("  a login shell — everything this user account can do\n");
+        } else {
+            summary.push_str(&format!("  {entry}\n"));
+        }
+    }
+    if pairing.work.confirm {
+        summary.push_str("  ...and only after someone here says yes each time\n");
+    }
+    summary
 }
 
 /// Every machine this one knows about, session members first.

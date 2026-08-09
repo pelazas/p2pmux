@@ -921,6 +921,7 @@ fn pane_failure_clears_its_creator_reservation_immediately() {
             reservation_id: reservation.reservation_id,
             request_id: 203,
             base_revision: 1,
+            refused: false,
         },
     );
     assert_eq!(failed.peer_id, host_a());
@@ -936,6 +937,54 @@ fn pane_failure_clears_its_creator_reservation_immediately() {
         coordinator.ask(&host_a(), next),
         CoordinatorResponse::Reservation(_)
     ));
+}
+
+/// A machine that says no and a pty that would not start are different answers,
+/// and the person waiting does different things about them: ask the machine's
+/// owner, or try again.
+#[test]
+fn a_refusal_reaches_the_asker_as_a_refusal_rather_than_a_failure() {
+    let mut coordinator = coordinator();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member B joins");
+    // Revision 2: the coordinator started at 1 and admitting B advanced it.
+    let mut create = request(301, 2);
+    create.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+        target_peer_id: host_b(),
+        command: vec![String::from("hermes"), String::from("chat")],
+    });
+    let reservation = match coordinator.ask(&host_a(), create) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    assert_eq!(
+        reservation.host_peer_id,
+        host_b(),
+        "the reservation is addressed to the machine being asked"
+    );
+
+    let refused = coordinator.handle_pane_failed(
+        &host_b(),
+        PaneFailed {
+            reservation_id: reservation.reservation_id,
+            request_id: 301,
+            base_revision: reservation.base_revision,
+            refused: true,
+        },
+    );
+
+    assert_eq!(
+        refused.peer_id,
+        host_a(),
+        "the answer goes to the machine that asked, not the one that refused"
+    );
+    assert_eq!(
+        refused.reject.reason,
+        LayoutRejectReason::TargetRefused as i32
+    );
 }
 
 #[test]

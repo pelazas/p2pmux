@@ -585,6 +585,13 @@ pub struct PaneFailed {
     pub request_id: u64,
     #[prost(uint64, tag = "3")]
     pub base_revision: u64,
+    /// Whether the machine declined rather than failed.
+    ///
+    /// A pty that would not spawn and an owner who said no are different
+    /// answers to the person waiting: one is worth retrying and the other is
+    /// worth asking about. Only the machine being asked can tell them apart.
+    #[prost(bool, tag = "4")]
+    pub refused: bool,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

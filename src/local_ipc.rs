@@ -196,6 +196,16 @@ pub enum NodeMessage {
     SessionLock {
         locked: bool,
     },
+    /// A terminal another machine of yours wants to start on this one, held
+    /// until the person here answers.
+    ///
+    /// Sent to the client because the client is what a human is looking at,
+    /// while the node is what holds the request. `None` withdraws the question
+    /// — the request was answered, or it expired.
+    RemoteWork {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<Vec<String>>,
+    },
     Focus {
         tab_id: u64,
         pane_id: u64,

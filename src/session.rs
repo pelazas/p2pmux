@@ -843,10 +843,18 @@ impl LayoutCoordinator {
             failed.reservation_id,
         ) {
             Ok(()) => match self.reservations.remove(&failed.reservation_id) {
+                // The refusal is carried back to whoever asked, as a refusal.
+                // A machine that said no and a pty that would not start are
+                // different answers and the person waiting acts on them
+                // differently.
                 Some(context) => targeted_reject(
                     context.creator_peer_id,
                     context.request_id,
-                    LayoutRejectReason::ReservationFailure,
+                    if failed.refused {
+                        LayoutRejectReason::TargetRefused
+                    } else {
+                        LayoutRejectReason::ReservationFailure
+                    },
                 ),
                 None => targeted_reject(
                     authenticated_peer_id.to_vec(),

@@ -854,6 +854,7 @@ fn v2_envelopes() -> Vec<Envelope> {
             reservation_id: 1,
             request_id: 1,
             base_revision: 1,
+            refused: false,
         })),
     ]
 }
@@ -1151,6 +1152,7 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         reservation_id: 1,
         request_id: 0,
         base_revision: 1,
+        refused: false,
     }));
 
     for invalid in [

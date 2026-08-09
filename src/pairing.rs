@@ -19,19 +19,23 @@
 //!   the other end, but that claim can only ever *narrow* what this file says:
 //!   being one of your machines means being written in here, by a `p2pmux pair`
 //!   you ran. Nothing a peer sends can add a row.
-//! - **Whether this machine accepts work.** Off by default, asked once during
-//!   pairing rather than as a separate configuration step. Nothing acts on it
-//!   yet: it is the consent primitive that will later make starting a terminal
-//!   on another machine legal without widening the trust model, and it means
-//!   *accepts work from me*, never *from anyone with the join code*.
+//! - **Whether this machine accepts work, and what work.** Off by default,
+//!   asked once during pairing rather than as a separate configuration step. It
+//!   means *accepts work from my own machines*, never *from anyone with the
+//!   join code*.
+//!
+//!   It is now acted on, by [`Pairing::work_decision`], and it is deliberately
+//!   not enough on its own: saying yes at pair time is consent to be asked, and
+//!   an empty [`WorkPolicy::allow`] still permits nothing. A machine that meant
+//!   to hand out a shell has to write that down.
 //!
 //!   The answer is given on the machine it is about, and there is no channel
 //!   back: the only thing that crosses machines is the shared layout, whose
 //!   member list is signed and hash-chained, and the inbox is built on never
 //!   touching that. So each machine knows its own answer and records `None` for
 //!   everyone else, which the fleet list prints as `—` rather than as a refusal
-//!   nobody made. Carrying it between machines is a protocol change, and a
-//!   deliberate non-goal until something actually acts on the flag.
+//!   nobody made. That is not a gap to be closed: a policy that travelled could
+//!   be believed, and the point is that it never has to be.
 //!
 //! It deliberately holds no keys of its own. The ticket is the session's
 //! existing cryptographic address, and a machine that can read this file could
@@ -54,7 +58,7 @@ static PAIRING_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// that a code left on screen overnight does not adopt whoever turns up.
 const PAIRING_WINDOW_SECONDS: u64 = 10 * 60;
 
-const PAIRING_HEADER: &str = "# p2pmux pairing\n#\n# Machines you have paired with this one, and the session they share.\n# Written by `p2pmux pair`. Delete a [[machine]] block to unpair it.\n\n";
+const PAIRING_HEADER: &str = "# p2pmux pairing\n#\n# Machines you have paired with this one, and the session they share.\n# Written by `p2pmux pair`. Delete a [[machine]] block to unpair it.\n#\n# What your other machines may start here is [work.allow], below. It is empty\n# until you write something in it, and an empty list allows nothing even when\n# accepts_work is true. Each entry is a whole command, matched in full:\n#\n#   [work]\n#   allow = [\"hermes chat\", \"claude\"]\n#   confirm = true          # ask here first, every time\n#\n# The entry \"shell\" allows a plain login shell, which is everything this user\n# account can do. It is spelled out so nobody grants it by accident.\n\n";
 
 #[derive(Debug)]
 pub enum PairingError {
@@ -91,7 +95,8 @@ pub struct Pairing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
     /// Whether this machine agreed to let your other machines start work on
-    /// it. Recorded during pairing and, for now, only recorded.
+    /// it. Recorded during pairing, and the first of the two gates a remote
+    /// terminal has to pass — see [`Pairing::work_decision`].
     #[serde(default)]
     pub accepts_work: bool,
     /// Unix seconds until which an arriving machine is the one being paired.
@@ -108,6 +113,89 @@ pub struct Pairing {
     pub pending_until: Option<u64>,
     #[serde(default, rename = "machine")]
     pub machines: Vec<PairedMachine>,
+    /// What your other machines may start on this one. See [`WorkPolicy`].
+    #[serde(default)]
+    pub work: WorkPolicy,
+}
+
+/// What a machine allows other machines of yours to run on it.
+///
+/// Read only on the machine it governs, written only by whoever owns that
+/// machine, and never carried over the wire in either direction. That is the
+/// whole design: consent about a machine is given on it, so no message can
+/// grant it and no coordinator can be believed about it.
+///
+/// **This is not a filter on what someone may type into a terminal.** You
+/// cannot reliably filter commands typed into an interactive pty — shell
+/// aliases, `\sudo`, base64 piped to sh, `:!sh` from inside vim, and any REPL
+/// that shells out all defeat it, and so does everything nobody has thought of
+/// yet. What is enforced here is *what may be launched*, which is a different
+/// and answerable question. Allow a shell and you have allowed everything that
+/// user can do; the allowlist is honest about that rather than pretending a
+/// blocklist could help.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct WorkPolicy {
+    /// Complete commands that may be launched, each written as you would type
+    /// it: `"hermes chat"`. Matched in full, not as a prefix, so an allowed
+    /// command cannot be extended with arguments nobody agreed to.
+    ///
+    /// The one special entry is `"shell"`, which allows a plain login shell.
+    /// It has to be written down, because it is the entry that gives away
+    /// everything the others were carefully not giving away.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Ask on this machine before each remote pane, even an allowed one.
+    ///
+    /// The natural extension of `accepts_work`: consent given once at pair
+    /// time, then again at the moment it is used.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// What this machine will do about a remote pane it has been asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkDecision {
+    Allow,
+    /// Hold the request and ask the person at this machine.
+    Ask,
+    Refuse,
+}
+
+/// The entry that means a login shell rather than a named program.
+pub const SHELL_ENTRY: &str = "shell";
+
+impl WorkPolicy {
+    /// Whether this exact command may be launched here.
+    ///
+    /// Exact, because "starts with an allowed command" is not a permission
+    /// anyone gave: `claude` and `claude --dangerously-skip-permissions` are
+    /// different decisions, and p2pmux only ever asks for the commands in its
+    /// own capability table, so there is nothing to be gained by being loose.
+    pub fn permits(&self, command: &[String]) -> bool {
+        if command.is_empty() {
+            return self.allow.iter().any(|entry| entry.trim() == SHELL_ENTRY);
+        }
+        self.allow.iter().any(|entry| {
+            entry.split_whitespace().collect::<Vec<_>>() == command.iter().collect::<Vec<_>>()
+        })
+    }
+}
+
+impl Pairing {
+    /// What to do about a machine of yours asking for a pane here.
+    ///
+    /// Default closed twice over: `accepts_work` is off until this machine
+    /// says otherwise, and an empty allowlist permits nothing even once it is
+    /// on. A yes given at pair time is consent to be asked, not a free shell.
+    pub fn work_decision(&self, command: &[String]) -> WorkDecision {
+        if !self.accepts_work || !self.work.permits(command) {
+            return WorkDecision::Refuse;
+        }
+        if self.work.confirm {
+            return WorkDecision::Ask;
+        }
+        WorkDecision::Allow
+    }
 }
 
 impl Pairing {
@@ -394,8 +482,8 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), PairingError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemberKind, PAIRING_WINDOW_SECONDS, Pairing, SeenMachine, load_from, now_unix, pin_into,
-        save_to,
+        MemberKind, PAIRING_WINDOW_SECONDS, Pairing, SeenMachine, WorkDecision, load_from,
+        now_unix, pin_into, save_to,
     };
     use crate::tui::PairedMachine;
 
@@ -434,6 +522,7 @@ mod tests {
             accepts_work: true,
             pending_until: None,
             machines: Vec::new(),
+            work: Default::default(),
         };
         pairing.remember("desktop", Some(String::from("aa")), Some(false));
         pairing.remember("droplet", Some(String::from("bb")), Some(true));
@@ -625,6 +714,87 @@ mod tests {
         pin_into(&mut pairing, &seen, 9_999);
 
         assert_eq!(pairing.machines[0].peer_id.as_deref(), Some("beef"));
+    }
+
+    #[test]
+    fn a_machine_that_never_said_anything_allows_nothing() {
+        // Default closed, twice over. This is the criterion the whole issue
+        // turns on: `accepts_work` off refuses, and `accepts_work` on with
+        // nothing written down still refuses, because a yes at pair time is
+        // consent to be asked and not a free shell.
+        let mut pairing = Pairing::default();
+        assert_eq!(
+            pairing.work_decision(&[String::from("hermes"), String::from("chat")]),
+            WorkDecision::Refuse
+        );
+        assert_eq!(pairing.work_decision(&[]), WorkDecision::Refuse);
+
+        pairing.accepts_work = true;
+        assert_eq!(
+            pairing.work_decision(&[String::from("hermes"), String::from("chat")]),
+            WorkDecision::Refuse,
+            "saying yes to being asked is not saying yes to everything"
+        );
+    }
+
+    #[test]
+    fn the_allowlist_is_the_whole_command_and_not_a_prefix() {
+        let mut pairing = Pairing {
+            accepts_work: true,
+            ..Pairing::default()
+        };
+        pairing.work.allow = vec![String::from("hermes chat")];
+
+        assert_eq!(
+            pairing.work_decision(&[String::from("hermes"), String::from("chat")]),
+            WorkDecision::Allow
+        );
+        assert_eq!(
+            pairing.work_decision(&[
+                String::from("hermes"),
+                String::from("chat"),
+                String::from("--yolo"),
+            ]),
+            WorkDecision::Refuse,
+            "an allowed command must not be extendable with arguments nobody agreed to"
+        );
+        assert_eq!(
+            pairing.work_decision(&[String::from("hermes")]),
+            WorkDecision::Refuse
+        );
+    }
+
+    #[test]
+    fn a_free_shell_has_to_be_asked_for_by_name() {
+        // The entry that gives away everything the others were carefully not
+        // giving away. It is spelled out so that nobody grants it by accident
+        // while listing the agent commands they meant to allow.
+        let mut pairing = Pairing {
+            accepts_work: true,
+            ..Pairing::default()
+        };
+        pairing.work.allow = vec![String::from("hermes chat")];
+        assert_eq!(pairing.work_decision(&[]), WorkDecision::Refuse);
+
+        pairing.work.allow.push(String::from("shell"));
+        assert_eq!(pairing.work_decision(&[]), WorkDecision::Allow);
+    }
+
+    #[test]
+    fn confirm_turns_an_allowed_command_into_a_question() {
+        let mut pairing = Pairing {
+            accepts_work: true,
+            ..Pairing::default()
+        };
+        pairing.work.allow = vec![String::from("shell")];
+        pairing.work.confirm = true;
+
+        assert_eq!(pairing.work_decision(&[]), WorkDecision::Ask);
+        assert_eq!(
+            pairing.work_decision(&[String::from("claude")]),
+            WorkDecision::Refuse,
+            "asking is only ever about a command that was already allowed"
+        );
     }
 
     #[test]

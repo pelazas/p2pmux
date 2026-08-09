@@ -454,6 +454,20 @@ pub fn run_on(
                             dirty = true;
                         }
                     }
+                    NodeMessage::RemoteWork { command } => {
+                        if let Some(view) = tui.as_mut() {
+                            match command {
+                                Some(command) => view.ask_remote_work(&command),
+                                // Withdrawn: answered by someone else, or the
+                                // reservation ran out. Either way the question
+                                // is no longer live and must come off the
+                                // screen rather than sit there granting
+                                // nothing.
+                                None => view.close_remote_work(),
+                            }
+                            dirty = true;
+                        }
+                    }
                     NodeMessage::Paths { paths } => {
                         // An empty list means every peer disconnected, which must clear
                         // the badge: a stale `direct 30ms` beside a dead session is worse

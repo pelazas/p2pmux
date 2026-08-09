@@ -121,6 +121,60 @@ impl MultiPaneTui {
         matches!(self.modal, ModalState::AddMachine(_))
     }
 
+    /// Put the question to whoever is at this machine.
+    ///
+    /// It replaces whatever else was on screen, because it is about something
+    /// that is about to happen on this box and it stops happening if it is not
+    /// answered. Nothing here grants anything: a keystroke on this machine is
+    /// the only way out other than expiry.
+    pub fn ask_remote_work(&mut self, command: &[String]) {
+        self.modal = ModalState::ConfirmRemoteWork {
+            command: command.to_vec(),
+        };
+        self.exit_chord_mode();
+    }
+
+    pub fn remote_work_open(&self) -> bool {
+        matches!(self.modal, ModalState::ConfirmRemoteWork { .. })
+    }
+
+    /// Take the question down without answering it.
+    ///
+    /// For the client, when the node says the request is no longer live. It
+    /// deliberately records no answer: nothing was granted, and nothing was
+    /// refused by this machine's owner — the clock did it.
+    pub fn close_remote_work(&mut self) {
+        if self.remote_work_open() {
+            self.modal = ModalState::None;
+        }
+    }
+
+    /// What the held request would run, for the panel to show.
+    pub(in crate::tui) fn remote_work_command(&self) -> Option<&[String]> {
+        match &self.modal {
+            ModalState::ConfirmRemoteWork { command } => Some(command),
+            _ => None,
+        }
+    }
+
+    /// `y` allows this one terminal, `n` and `Esc` refuse it. Nothing else:
+    /// the machine that asked is waiting, and a third option would be a fourth
+    /// thing to read under time pressure.
+    ///
+    /// The answer leaves as an intent rather than as a flag, so it travels the
+    /// one route that already exists from a client to the node holding the
+    /// request — and so a foreground session, where the two are one process,
+    /// takes exactly the same path.
+    pub(in crate::tui) fn handle_remote_work_key(&mut self, key: KeyEvent) -> KeyHandling {
+        let approved = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => true,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => false,
+            _ => return KeyHandling::Consumed(vec![]),
+        };
+        self.modal = ModalState::None;
+        KeyHandling::Consumed(vec![UiIntent::AnswerRemoteWork { approved }])
+    }
+
     /// The machine that has joined since the panel went up, if one has.
     ///
     /// Read from the member list rather than from the pairing file: a machine

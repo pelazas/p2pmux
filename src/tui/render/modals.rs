@@ -388,6 +388,67 @@ pub(in crate::tui) fn render_delete_tab_confirmation(
 /// undone by typing `p2pmux attach`, the other takes every running pane with
 /// it. So each answer is labelled with its consequence rather than its verb,
 /// and the reflex answer — Enter — is the reversible one.
+/// The question a machine asks its owner before letting another machine start
+/// something on it.
+///
+/// It names the command in full, because that is the entire decision: the
+/// allowlist already said this command may run here, and this is the second
+/// consent, at the moment it is used. It does not offer "always allow" —
+/// that answer belongs in the file on this machine, written deliberately,
+/// not clicked past under time pressure.
+pub(in crate::tui) fn render_remote_work_prompt(
+    frame: &mut Frame<'_>,
+    theme: &UiTheme,
+    command: &[String],
+) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(8).clamp(40, 64).min(area.width);
+    let height = 9_u16.min(area.height);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::bordered().border_style(Style::default().fg(theme.footer_accent)),
+        panel,
+    );
+    let inner = Block::bordered().inner(panel);
+    let key = Style::default()
+        .fg(theme.footer_accent)
+        .add_modifier(Modifier::BOLD);
+    let what = if command.is_empty() {
+        String::from("a shell")
+    } else {
+        command.join(" ")
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "Start this here?",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                format!("  {what}"),
+                Style::default().fg(theme.agent_overlay_warm),
+            ),
+            Line::raw(""),
+            Line::from(vec![Span::styled("y", key), Span::raw("  allow this one")]),
+            Line::from(vec![Span::styled("n", key), Span::raw("  refuse")]),
+            Line::raw(""),
+            Line::styled(
+                "Unanswered is refused.",
+                Style::default().fg(theme.agent_overlay_muted),
+            ),
+        ]),
+        inner,
+    );
+}
+
 pub(in crate::tui) fn render_quit_prompt(frame: &mut Frame<'_>, theme: &UiTheme) {
     let area = frame.area();
     let width = area.width.saturating_sub(8).clamp(36, 60).min(area.width);

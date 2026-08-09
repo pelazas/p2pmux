@@ -317,6 +317,7 @@ impl SharedLayoutRuntime {
             } => {
                 self.begin_create(None, grid_rows, grid_cols, None)?;
             }
+            UiIntent::AnswerRemoteWork { approved } => self.answer_remote_work(approved)?,
             UiIntent::CreateTabOn {
                 peer_id,
                 command,
@@ -651,6 +652,67 @@ impl SharedLayoutRuntime {
             self.status = String::from("unexpected pane reservation");
             return Ok(());
         }
+        // A pane this machine asked for on itself needs no permission from
+        // itself. Everything else is a machine of yours asking, and the answer
+        // is given here, by whoever owns this box.
+        if !asked_here {
+            match crate::pairing::load_or_empty().work_decision(&pending.command) {
+                crate::pairing::WorkDecision::Refuse => {
+                    let _ = self.control.try_failed(PaneFailed {
+                        reservation_id: reservation.reservation_id,
+                        request_id: pending.request_id,
+                        base_revision: pending.base_revision,
+                        refused: true,
+                    });
+                    self.status =
+                        String::from("refused a remote terminal: not on this machine's allowlist");
+                    return Ok(());
+                }
+                crate::pairing::WorkDecision::Ask => {
+                    // Held rather than answered. Nobody may be at this machine,
+                    // and that is the point: an unanswered request expires with
+                    // the coordinator's reservation rather than being granted.
+                    self.tui.ask_remote_work(&pending.command);
+                    self.pending_remote = Some((reservation, pending));
+                    return Ok(());
+                }
+                crate::pairing::WorkDecision::Allow => {}
+            }
+        }
+        self.spawn_reserved_pane(reservation, pending, asked_here)
+    }
+
+    /// Answer a held request. `approved` is the owner's own keystroke on this
+    /// machine, and a `false` here and an expiry are the same outcome by
+    /// design: the only way to get a pane is somebody saying yes.
+    pub(in crate::tui) fn answer_remote_work(
+        &mut self,
+        approved: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some((reservation, pending)) = self.pending_remote.take() else {
+            return Ok(());
+        };
+        if !approved {
+            let _ = self.control.try_failed(PaneFailed {
+                reservation_id: reservation.reservation_id,
+                request_id: pending.request_id,
+                base_revision: pending.base_revision,
+                refused: true,
+            });
+            return Ok(());
+        }
+        // Never `asked_here`: a held request is by construction one another
+        // machine made, so the cursor of whoever is sitting here does not move.
+        self.spawn_reserved_pane(reservation, pending, false)
+    }
+
+    fn spawn_reserved_pane(
+        &mut self,
+        reservation: crate::protocol::PaneReservation,
+        pending: PendingCreate,
+        asked_here: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let host_peer_id = self.control.peer_id();
         let pane = match SharedLocalPane::spawn_program(
             reservation.pane_id,
             pending.grid_rows,
@@ -665,6 +727,7 @@ impl SharedLayoutRuntime {
                     reservation_id: reservation.reservation_id,
                     request_id: pending.request_id,
                     base_revision: pending.base_revision,
+                    refused: false,
                 });
                 self.status = format!("pane spawn failed: {error}");
                 return Ok(());
@@ -684,6 +747,7 @@ impl SharedLayoutRuntime {
                 reservation_id: reservation.reservation_id,
                 request_id: pending.request_id,
                 base_revision: pending.base_revision,
+                refused: false,
             });
             self.status = format!("pane registration failed: {error}");
             return Ok(());

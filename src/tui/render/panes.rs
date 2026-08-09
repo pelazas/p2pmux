@@ -26,7 +26,7 @@ use crate::{
             home::render_home,
             modals::{
                 render_add_machine_modal, render_delete_tab_confirmation, render_quit_prompt,
-                render_rename_prompt, render_share_modal,
+                render_remote_work_prompt, render_rename_prompt, render_share_modal,
             },
             vt::{VtScreen, viewed_screen},
         },
@@ -481,6 +481,11 @@ pub(in crate::tui) fn render_shared_multi_pane(
         if tui.quit_open() {
             render_quit_prompt(frame, theme);
         }
+        // Nor the one another machine is waiting on, which can arrive while the
+        // inbox is up and expires whether or not it is on screen.
+        if let Some(command) = tui.remote_work_command() {
+            render_remote_work_prompt(frame, theme, command);
+        }
         return;
     }
 
@@ -623,6 +628,9 @@ pub(in crate::tui) fn render_shared_multi_pane(
     }
     if tui.quit_open() {
         render_quit_prompt(frame, &tui.theme);
+    }
+    if let Some(command) = tui.remote_work_command() {
+        render_remote_work_prompt(frame, &tui.theme, command);
     }
 }
 

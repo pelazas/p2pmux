@@ -56,6 +56,14 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) subscription_rx:
         tokio::sync::mpsc::UnboundedReceiver<(PaneId, Result<GuestPane, String>)>,
     pub(in crate::tui) pending_create: Option<PendingCreate>,
+    /// A terminal another machine of yours asked for here, waiting for the
+    /// person at this machine to say yes.
+    ///
+    /// Held rather than queued: the coordinator allows one reservation at a
+    /// time, so an unanswered request expires on its own after thirty seconds
+    /// and nothing is granted by default. That is the whole safety property —
+    /// silence is a refusal.
+    pub(in crate::tui) pending_remote: Option<(crate::protocol::PaneReservation, PendingCreate)>,
     pub(in crate::tui) provisional: BTreeMap<u64, PaneId>,
     pub(in crate::tui) pending_locks: BTreeMap<u64, (PaneId, bool)>,
     pub(in crate::tui) pending_exits: BTreeMap<PaneId, u64>,
@@ -216,6 +224,7 @@ impl SharedLayoutRuntime {
             subscription_tx,
             subscription_rx,
             pending_create: None,
+            pending_remote: None,
             provisional: BTreeMap::new(),
             pending_locks: BTreeMap::new(),
             pending_exits: BTreeMap::new(),
