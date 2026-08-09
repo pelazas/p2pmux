@@ -598,6 +598,14 @@ fn run_socket_loop(
                 Ok(Some(ClientMessage::Focus { tab_id, pane_id })) => {
                     node.focus(tab_id, pane_id)
                         .map_err(|error| io::Error::other(error.to_string()))?;
+                    // Answer the request even when it asked for the focus this node
+                    // already had. The client holds its own optimistic focus until it
+                    // sees the node say the same thing back, and focus is otherwise
+                    // published only when it changes -- so a request that changed
+                    // nothing would never be answered, and that client would pin
+                    // itself to that pane and refuse every later focus, including the
+                    // one that follows a freshly created pane.
+                    client.publish.reannounce_focus();
                     changed = true;
                 }
                 Ok(Some(ClientMessage::Detach {
@@ -1076,6 +1084,17 @@ impl AttachmentPublishState {
         self.target_urgency = Some((pane_id, now + TARGET_SCREEN_URGENCY_TTL));
     }
 
+    /// Whether this client still has to be told where the focus is.
+    fn focus_due(&self, focus: (u64, u64)) -> bool {
+        self.focus != Some(focus)
+    }
+
+    /// Forget what this client was last told about focus, so the next publish
+    /// says it again even though nothing moved.
+    fn reannounce_focus(&mut self) {
+        self.focus = None;
+    }
+
     fn reset_for_snapshot(&mut self) {
         self.layout = None;
         self.leases = None;
@@ -1211,7 +1230,7 @@ fn queue_updates(
         publish.presence = Some(presence);
         published = true;
     }
-    if publish.focus != Some(focus) {
+    if publish.focus_due(focus) {
         if !queue_update(
             writer,
             publish,
@@ -1684,6 +1703,22 @@ mod tests {
         assert!(periodic_drain_due(Some(now), now + PERIODIC_DRAIN_INTERVAL));
         // Draining faster than the client can be sent frames is wasted parse/diff work.
         assert!(PERIODIC_DRAIN_INTERVAL >= TARGET_SCREEN_PUBLISH_INTERVAL);
+    }
+
+    #[test]
+    fn a_focus_request_is_answered_even_when_it_asks_for_the_focus_we_have() {
+        let mut publish = AttachmentPublishState {
+            focus: Some((1, 2)),
+            ..Default::default()
+        };
+        // Nothing moved, so ordinarily there is nothing to say.
+        assert!(!publish.focus_due((1, 2)));
+        // A client that asked for this pane is holding its own optimistic focus
+        // until it hears the node agree. Left unanswered it holds it forever and
+        // rejects every later focus, so the answer goes out even though the focus
+        // did not change.
+        publish.reannounce_focus();
+        assert!(publish.focus_due((1, 2)));
     }
 
     #[test]
