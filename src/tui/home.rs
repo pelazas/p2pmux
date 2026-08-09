@@ -1200,6 +1200,35 @@ mod tests {
         assert_eq!(tui.home_page(), 0);
     }
 
+    /// A card is one target, not three. Clicking the line an agent's words are
+    /// on has to open that agent — and clicking the gap under it belongs to the
+    /// card above, which is the one the pointer looks like it is on.
+    #[test]
+    fn every_line_of_a_card_opens_the_agent_it_belongs_to() {
+        let (tui, _) = paged_tui(3);
+        let rows = tui
+            .home_rows()
+            .into_iter()
+            .map(|row| row.pane_id)
+            .collect::<Vec<_>>();
+        let list = home_layout(tui.geometry(AREA).content, &tui).rows;
+        assert_eq!(home_card(list.height), HomeCard::Full);
+
+        for line in 0..HomeCard::Full.lines() as u16 {
+            assert_eq!(
+                tui.home_row_at(2, list.y + line, AREA),
+                Some(rows[0]),
+                "line {line} of the first card belongs to it"
+            );
+        }
+        assert_eq!(
+            tui.home_row_at(2, list.y + HomeCard::Full.lines() as u16, AREA),
+            Some(rows[1])
+        );
+        // The rail is not the list, and a click on it opens nothing.
+        assert_eq!(tui.home_row_at(AREA.width - 2, list.y, AREA), None);
+    }
+
     /// One page means no paging: the keys do nothing rather than redrawing the
     /// same agents under a page number that never changes.
     #[test]
