@@ -242,6 +242,19 @@ impl ChatAccess {
             Self::None => "no way to open a chat with this agent",
         }
     }
+
+    /// The same fact in the width an inbox row has for it.
+    ///
+    /// On the row rather than only in the answer afterwards, because "which of
+    /// the three is this" is worth knowing *before* pressing enter — which is
+    /// the whole reason the distinction exists.
+    pub const fn on_a_row(self) -> &'static str {
+        match self {
+            Self::Attach => "enter joins its conversation",
+            Self::NewSession => "enter starts a new conversation",
+            Self::None => "no way in from here",
+        }
+    }
 }
 
 fn matches_launcher(exe_basename: &str, name: &str, cmdline: &[String], launcher: &str) -> bool {

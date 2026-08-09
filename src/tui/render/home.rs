@@ -401,7 +401,13 @@ pub(in crate::tui) fn format_home_card(
 /// because the rest of the card cannot be told apart.
 fn home_location(row: &AgentOverlayRow, cwd_already_shown: bool) -> String {
     let where_it_runs = if row.outside_p2pmux() {
-        String::from("running outside p2pmux · enter opens a chat")
+        // Which of the three things enter does, said on the row. An agent that
+        // cannot join its own running conversation must not look like one that
+        // can, and the moment to say so is before the keypress.
+        let access = crate::agent_detect::AgentKind::from_wire(&row.kind)
+            .map(|kind| kind.chat().access.on_a_row())
+            .unwrap_or("no way in from here");
+        format!("running outside p2pmux · {access}")
     } else {
         format!("tab {} · pane {}", row.tab_ordinal, row.pane_ordinal)
     };
@@ -695,15 +701,18 @@ fn home_state_color(state: AgentRosterState, theme: &UiTheme) -> Color {
     }
 }
 
+/// The agent column, from the one list of agents rather than a second copy of
+/// it.
+///
+/// This used to enumerate the kinds itself and fell a release behind: Hermes
+/// and OpenClaw were detected, published, and drawn in this column as the word
+/// "agent". `from_wire` already refuses anything it does not know, so deriving
+/// the label from it keeps the fallback for a newer peer's agent while making
+/// it impossible for a kind this build *does* know to go unnamed.
 fn home_kind_label(kind: &str) -> &'static str {
-    match kind {
-        "claude" => "claude",
-        "codex" => "codex",
-        "cursor" => "cursor",
-        "pi" => "pi",
-        "opencode" => "opencode",
-        _ => "agent",
-    }
+    crate::agent_detect::AgentKind::from_wire(kind)
+        .map(crate::agent_detect::AgentKind::wire_value)
+        .unwrap_or("agent")
 }
 
 /// The fleet down the right-hand side: every machine, two lines each.
@@ -1033,7 +1042,8 @@ mod tests {
 
     use super::{
         ELAPSED_WIDTH, GUEST_DETAIL, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
-        format_home_row, header_line, home_card, home_elapsed, machine_detail, machine_line,
+        format_home_row, header_line, home_card, home_elapsed, home_kind_label, machine_detail,
+        machine_line,
     };
     use crate::{
         agent_detect::{AgentKind, AgentState, DetectedAgent, PaneAgentTracker},
@@ -1510,6 +1520,33 @@ mod tests {
         assert!(
             fleet_heading < guest_heading,
             "your machines come first: {drawn}"
+        );
+    }
+
+    /// The agent column named Hermes and OpenClaw "agent" for a release,
+    /// because it kept its own list of the kinds it knew. It reads the one
+    /// list now, and this is the test that says so.
+    #[test]
+    fn every_agent_this_build_knows_is_named_in_the_agent_column() {
+        for kind in [
+            crate::agent_detect::AgentKind::Claude,
+            crate::agent_detect::AgentKind::Codex,
+            crate::agent_detect::AgentKind::Cursor,
+            crate::agent_detect::AgentKind::Pi,
+            crate::agent_detect::AgentKind::OpenCode,
+            crate::agent_detect::AgentKind::Hermes,
+            crate::agent_detect::AgentKind::OpenClaw,
+        ] {
+            assert_eq!(
+                home_kind_label(kind.wire_value()),
+                kind.wire_value(),
+                "{kind:?} is drawn as something other than its own name"
+            );
+        }
+        assert_eq!(
+            home_kind_label("an-agent-from-a-newer-build"),
+            "agent",
+            "a kind this build does not know still gets a word rather than a blank"
         );
     }
 

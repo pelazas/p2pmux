@@ -174,12 +174,6 @@ def main() -> int:
         time.sleep(1.0)
 
         section("the inbox, on the machine you are sitting at")
-        # KNOWN GAP, and the reason this scenario exists: a node's peer id is
-        # generated per process, so the droplet's identity in *this* session is
-        # not the one the fleet record pinned when it was paired. It therefore
-        # draws as a guest here even though `p2pmux machines` calls it fleet.
-        # Ownership needs a machine identity that outlives one node; until it
-        # has one, the checks below fail.
         # Bare `p2pmux` rejoins the paired session and opens the inbox, which
         # is the screen all three remaining checks are about.
         inbox = harness.spawn("inbox", [])
@@ -199,16 +193,25 @@ def main() -> int:
         inbox.send("m")
         time.sleep(0.3)
         inbox.key("enter")
-        try:
-            inbox.wait_for(r"host: mybotvm|mybotvm", timeout=90.0)
-        except Exception:
-            print("--- screen when the remote terminal did not arrive ---")
-            print(inbox.snapshot())
-            raise
+        inbox.wait_for(r"host: mybotvm|mybotvm", timeout=90.0)
         step("a pane opened, hosted by the droplet")
         inbox.run_in_shell("hostname")
         screen = inbox.wait_for(r"mybotvm", timeout=60.0)
         step("`hostname` in it prints the droplet's name, not this Mac's")
+
+        section("a chat with the bot (#75)")
+        # Back to the inbox. The Hermes row says which of the three things
+        # enter will do, on the row, before anybody presses it — which is the
+        # whole point of the distinction and makes this readable without
+        # driving a cursor around.
+        inbox.send(b"\x0f")
+        inbox.wait_for(r"MACHINES", timeout=30.0)
+        screen = inbox.wait_for(r"enter starts a new c", timeout=60.0)
+        step("the Hermes row says enter starts a new conversation, not joins one")
+        assert "enter joins its" not in screen, (
+            "Hermes cannot join its gateway's conversation, and the inbox must "
+            f"not imply otherwise:\n{screen}"
+        )
 
     print("\nscenario R: every check passed")
     return 0
