@@ -58,6 +58,20 @@ pub enum UiIntent {
         grid_rows: u16,
         grid_cols: u16,
     },
+    /// A terminal on another machine in the session.
+    ///
+    /// Separate from [`Self::CreateTab`] rather than an option on it, because
+    /// every caller of that one means "here" and should not have to say so.
+    CreateTabOn {
+        peer_id: Vec<u8>,
+        /// What to run instead of a login shell. Empty for a shell.
+        command: Vec<String>,
+        /// The machine's name, carried so a refusal can name it. The layout
+        /// only knows peer ids, and "1a2b3c4d refused" is not a sentence.
+        name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+    },
     DeleteTab {
         tab_id: TabId,
     },

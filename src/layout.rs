@@ -153,6 +153,11 @@ pub struct PaneReservation {
     pub reservation_id: ReservationId,
     pub pane_id: PaneId,
     pub tab_id: Option<TabId>,
+    /// The peer that will spawn the pty and host the pane. Equal to the creator
+    /// for every pane created before machines could ask each other for one.
+    pub host_peer_id: Vec<u8>,
+    pub grid_rows: u16,
+    pub grid_cols: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,7 +193,14 @@ enum PendingReservationKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingReservation {
     reservation_id: ReservationId,
+    /// Who asked for the pane, and therefore who is told when it fails.
     creator_peer_id: Vec<u8>,
+    /// Who was asked to spawn it, and therefore who may report it ready.
+    ///
+    /// The same peer as the creator in every case but one: a pane opened on
+    /// another machine. Keeping them apart is what makes that case possible
+    /// without letting a peer report a pane ready that it was never asked for.
+    host_peer_id: Vec<u8>,
     base_revision: u64,
     kind: PendingReservationKind,
 }
@@ -207,8 +219,13 @@ pub struct SessionState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayoutError {
-    StaleRevision { expected: u64, got: u64 },
-    ConflictingSnapshotRevision { revision: u64 },
+    StaleRevision {
+        expected: u64,
+        got: u64,
+    },
+    ConflictingSnapshotRevision {
+        revision: u64,
+    },
     RevisionExhausted,
     MemberLimit,
     AlreadyMember,
@@ -222,15 +239,36 @@ pub enum LayoutError {
     SplitDepthLimit,
     InvalidGrid,
     InvalidSplitRatio,
-    UnknownPane { pane_id: PaneId },
-    NoMatchingSplit { pane_id: PaneId, axis: Axis },
-    UnknownTab { tab_id: TabId },
-    NotPaneHost { pane_id: PaneId },
-    NotTabHost { tab_id: TabId },
-    LastPaneInTab { tab_id: TabId },
+    UnknownPane {
+        pane_id: PaneId,
+    },
+    NoMatchingSplit {
+        pane_id: PaneId,
+        axis: Axis,
+    },
+    UnknownTab {
+        tab_id: TabId,
+    },
+    NotPaneHost {
+        pane_id: PaneId,
+    },
+    NotTabHost {
+        tab_id: TabId,
+    },
+    LastPaneInTab {
+        tab_id: TabId,
+    },
     LastTab,
     ReservationPending,
-    UnknownReservation { reservation_id: ReservationId },
+    /// A pane was asked for on a machine that is not in this session.
+    ///
+    /// Its own error rather than `NotMember`, which is about the peer doing the
+    /// asking. This one is about the machine being asked, and it is the failure
+    /// a user can actually act on: wake the machine.
+    UnknownTarget,
+    UnknownReservation {
+        reservation_id: ReservationId,
+    },
     ReservationCreatorMismatch,
     ReservationInvalid,
     InvalidSnapshot,
@@ -591,8 +629,42 @@ impl SessionState {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<PaneReservation, LayoutError> {
+        self.reserve_pane_on(
+            creator,
+            creator,
+            base_revision,
+            target_pane_id,
+            axis,
+            position,
+            grid_rows,
+            grid_cols,
+        )
+    }
+
+    /// Reserve a pane that another member will host.
+    ///
+    /// `host` is the machine whose shell the pane runs; `creator` is the one
+    /// that asked. They are the same peer for every split anyone types, and
+    /// differ only when a machine is asked to open a terminal on another.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_pane_on(
+        &mut self,
+        creator: &[u8],
+        host: &[u8],
+        base_revision: u64,
+        target_pane_id: PaneId,
+        axis: Axis,
+        position: NewPanePosition,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<PaneReservation, LayoutError> {
         self.check_reservation(base_revision)?;
         self.require_member(creator)?;
+        // The machine being asked has to be in the session. A pane reserved for
+        // a peer that is not here would sit unfulfilled until it timed out,
+        // which reads to the user as nothing happening.
+        self.require_member(host)
+            .map_err(|_| LayoutError::UnknownTarget)?;
         validate_grid(grid_rows, grid_cols)?;
         self.ensure_no_reservation()?;
         self.validate_pane_create(target_pane_id)?;
@@ -605,6 +677,7 @@ impl SessionState {
         self.pending_reservation = Some(PendingReservation {
             reservation_id,
             creator_peer_id: creator.to_vec(),
+            host_peer_id: host.to_vec(),
             base_revision,
             kind: PendingReservationKind::Pane {
                 pane_id,
@@ -619,6 +692,9 @@ impl SessionState {
             reservation_id,
             pane_id,
             tab_id: None,
+            host_peer_id: host.to_vec(),
+            grid_rows,
+            grid_cols,
         })
     }
 
@@ -629,8 +705,23 @@ impl SessionState {
         grid_rows: u16,
         grid_cols: u16,
     ) -> Result<PaneReservation, LayoutError> {
+        self.reserve_tab_on(creator, creator, base_revision, grid_rows, grid_cols)
+    }
+
+    /// Reserve a tab whose first pane another member will host. See
+    /// [`Self::reserve_pane_on`].
+    pub fn reserve_tab_on(
+        &mut self,
+        creator: &[u8],
+        host: &[u8],
+        base_revision: u64,
+        grid_rows: u16,
+        grid_cols: u16,
+    ) -> Result<PaneReservation, LayoutError> {
         self.check_reservation(base_revision)?;
         self.require_member(creator)?;
+        self.require_member(host)
+            .map_err(|_| LayoutError::UnknownTarget)?;
         validate_grid(grid_rows, grid_cols)?;
         self.ensure_no_reservation()?;
         if self.tabs.len() >= MAX_TABS {
@@ -648,6 +739,7 @@ impl SessionState {
         self.pending_reservation = Some(PendingReservation {
             reservation_id,
             creator_peer_id: creator.to_vec(),
+            host_peer_id: host.to_vec(),
             base_revision,
             kind: PendingReservationKind::Tab {
                 tab_id,
@@ -660,16 +752,25 @@ impl SessionState {
             reservation_id,
             pane_id,
             tab_id: Some(tab_id),
+            host_peer_id: host.to_vec(),
+            grid_rows,
+            grid_cols,
         })
     }
 
+    /// Commit a reservation the host has fulfilled.
+    ///
+    /// `host` is authenticated by the caller and must be the peer the
+    /// reservation named, not the one that asked for it: the pane is going to
+    /// be served by whoever says it is ready, so that claim has to come from
+    /// the machine the coordinator actually asked.
     pub fn pane_ready(
         &mut self,
-        creator: &[u8],
+        host: &[u8],
         base_revision: u64,
         reservation_id: ReservationId,
     ) -> Result<ReservationCommit, LayoutError> {
-        let reservation = self.match_reservation(creator, reservation_id)?;
+        let reservation = self.match_reservation(host, reservation_id)?;
         if reservation.base_revision != base_revision {
             return Err(LayoutError::StaleRevision {
                 expected: reservation.base_revision,
@@ -714,7 +815,7 @@ impl SessionState {
                     pane_id,
                     Pane {
                         pane_id,
-                        host_peer_id: creator.to_vec(),
+                        host_peer_id: reservation.host_peer_id.clone(),
                         locked: false,
                         exited: false,
                         grid_rows,
@@ -744,7 +845,7 @@ impl SessionState {
                     pane_id,
                     Pane {
                         pane_id,
-                        host_peer_id: creator.to_vec(),
+                        host_peer_id: reservation.host_peer_id.clone(),
                         locked: false,
                         exited: false,
                         grid_rows,
@@ -1110,9 +1211,14 @@ impl SessionState {
             .ok_or(LayoutError::ReservationPending)
     }
 
+    /// The pending reservation, if `host` is the peer it was handed to.
+    ///
+    /// Matched on the host rather than the creator: the peer that reports a
+    /// pane ready is the peer that spawned it, and for a terminal opened on
+    /// another machine those are not the same peer as the one that asked.
     fn match_reservation(
         &self,
-        creator: &[u8],
+        host: &[u8],
         reservation_id: ReservationId,
     ) -> Result<PendingReservation, LayoutError> {
         let pending = self
@@ -1122,7 +1228,7 @@ impl SessionState {
         if pending.reservation_id != reservation_id {
             return Err(LayoutError::UnknownReservation { reservation_id });
         }
-        if pending.creator_peer_id != creator {
+        if pending.host_peer_id != host {
             return Err(LayoutError::ReservationCreatorMismatch);
         }
         Ok(pending.clone())

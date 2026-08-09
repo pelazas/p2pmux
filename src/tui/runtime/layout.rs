@@ -9,9 +9,9 @@ use crate::{
     agent_detect::cwd_for_pid,
     layout::{Axis, NewPanePosition, PaneId},
     protocol::{
-        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRequest, MarkPaneExited,
-        NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed, PaneReady,
-        RenamePane, RenameTab, SetPaneLock, SplitAxis,
+        CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRejectReason, LayoutRequest,
+        MarkPaneExited, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed,
+        PaneReady, RenamePane, RenameTab, SetPaneLock, SplitAxis,
     },
     session::{
         CoordinatorResponse, LayoutControlEvent, layout_snapshot_from_state, subscribe_pane,
@@ -47,7 +47,9 @@ impl SharedLayoutRuntime {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }
             LayoutControlEvent::Reservation(reservation) => self.accept_reservation(reservation)?,
-            LayoutControlEvent::Reject(reject) => self.reject_request(reject.request_id),
+            LayoutControlEvent::Reject(reject) => {
+                self.reject_request_with_reason(reject.request_id, reject.reason)
+            }
             LayoutControlEvent::Disconnected => self.note_coordinator_lost(),
         }
         Ok(())
@@ -315,6 +317,15 @@ impl SharedLayoutRuntime {
             } => {
                 self.begin_create(None, grid_rows, grid_cols, None)?;
             }
+            UiIntent::CreateTabOn {
+                peer_id,
+                command,
+                name,
+                grid_rows,
+                grid_cols,
+            } => {
+                self.begin_create_on(None, grid_rows, grid_cols, None, peer_id, command, name)?;
+            }
             UiIntent::DeletePane { pane_id } => {
                 let request_id = self.next_id();
                 self.send_request(LayoutRequest {
@@ -456,18 +467,49 @@ impl SharedLayoutRuntime {
         grid_cols: u16,
         cwd: Option<PathBuf>,
     ) -> Result<(), Box<dyn Error>> {
+        self.begin_create_on(
+            pane,
+            grid_rows,
+            grid_cols,
+            cwd,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+        )
+    }
+
+    /// Ask for a pane, optionally on another machine and optionally running
+    /// something other than a shell.
+    ///
+    /// `target` empty means here, which is what every split and every new tab
+    /// means and what this did before machines could ask each other.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::tui) fn begin_create_on(
+        &mut self,
+        pane: Option<(PaneId, Axis, NewPanePosition)>,
+        grid_rows: u16,
+        grid_cols: u16,
+        cwd: Option<PathBuf>,
+        target: Vec<u8>,
+        command: Vec<String>,
+        target_name: String,
+    ) -> Result<(), Box<dyn Error>> {
         if self.pending_create.is_some() {
             self.status = String::from("waiting for current pane reservation");
             return Ok(());
         }
         let request_id = self.next_id();
         let base_revision = self.tui.snapshot().revision;
+        let hosted_here = target.is_empty() || target == self.control.peer_id();
         self.pending_create = Some(PendingCreate {
             request_id,
             base_revision,
             grid_rows,
             grid_cols,
             cwd,
+            command: command.clone(),
+            hosted_here,
+            target_name,
         });
         self.send_request(LayoutRequest {
             request_id,
@@ -484,11 +526,15 @@ impl SharedLayoutRuntime {
                     NewPanePosition::First => ProtocolNewPanePosition::First as i32,
                     NewPanePosition::Second => ProtocolNewPanePosition::Second as i32,
                 }),
+                target_peer_id: target.clone(),
+                command: command.clone(),
             }),
             delete_pane: None,
             create_tab: pane.is_none().then_some(CreateTab {
                 grid_rows: u32::from(grid_rows),
                 grid_cols: u32::from(grid_cols),
+                target_peer_id: target,
+                command,
             }),
             delete_tab: None,
             set_split_ratio: None,
@@ -562,7 +608,9 @@ impl SharedLayoutRuntime {
                 CoordinatorResponse::Commit(commit) => {
                     self.handle_control_event(LayoutControlEvent::Commit(commit))?
                 }
-                CoordinatorResponse::Reject(reject) => self.reject_request(reject.request_id),
+                CoordinatorResponse::Reject(reject) => {
+                    self.reject_request_with_reason(reject.request_id, reject.reason)
+                }
             }
         }
         Ok(())
@@ -572,17 +620,44 @@ impl SharedLayoutRuntime {
         &mut self,
         reservation: crate::protocol::PaneReservation,
     ) -> Result<(), Box<dyn Error>> {
-        let Some(pending) = self.pending_create.take() else {
+        let host_peer_id = self.control.peer_id();
+        if !reservation.host_peer_id.is_empty() && reservation.host_peer_id != host_peer_id {
+            // Ours to have asked for, another machine's to serve. The pane
+            // arrives with the commit that machine's `PaneReady` produces.
+            return Ok(());
+        }
+        // Either this process asked for the pane, or a machine of yours asked
+        // for one here. In the second case there is no local record of the
+        // request, which is why the reservation carries everything needed to
+        // serve it.
+        let asked_here = self.pending_create.as_ref().is_some_and(|pending| {
+            pending.hosted_here
+                && (reservation.request_id == 0 || pending.request_id == reservation.request_id)
+        });
+        let pending = match asked_here {
+            true => self.pending_create.take().unwrap_or_else(|| unreachable!()),
+            false => PendingCreate {
+                request_id: reservation.request_id,
+                base_revision: reservation.base_revision,
+                grid_rows: u16::try_from(reservation.grid_rows).unwrap_or_default(),
+                grid_cols: u16::try_from(reservation.grid_cols).unwrap_or_default(),
+                cwd: None,
+                command: reservation.command.clone(),
+                hosted_here: true,
+                target_name: String::new(),
+            },
+        };
+        if pending.request_id == 0 || pending.grid_rows == 0 || pending.grid_cols == 0 {
             self.status = String::from("unexpected pane reservation");
             return Ok(());
-        };
-        let host_peer_id = self.control.peer_id();
-        let pane = match SharedLocalPane::spawn_with_cwd(
+        }
+        let pane = match SharedLocalPane::spawn_program(
             reservation.pane_id,
             pending.grid_rows,
             pending.grid_cols,
             host_peer_id.clone(),
             pending.cwd.as_deref(),
+            &pending.command,
         ) {
             Ok(pane) => pane,
             Err(error) => {
@@ -616,10 +691,15 @@ impl SharedLayoutRuntime {
         self.provisional
             .insert(pending.request_id, reservation.pane_id);
         self.local.insert(reservation.pane_id, pane);
-        if let Some(tab_id) = reservation.tab_id {
-            self.tui.select_created_tab(tab_id);
-        } else {
-            self.tui.select_created_pane(reservation.pane_id);
+        // Only when this machine is the one that asked. A terminal somebody
+        // else opened here must not move the cursor of whoever is sitting at
+        // this keyboard.
+        if asked_here {
+            if let Some(tab_id) = reservation.tab_id {
+                self.tui.select_created_tab(tab_id);
+            } else {
+                self.tui.select_created_pane(reservation.pane_id);
+            }
         }
         match self.control.try_ready(PaneReady {
             reservation_id: reservation.reservation_id,
@@ -630,10 +710,46 @@ impl SharedLayoutRuntime {
             Some(CoordinatorResponse::Commit(commit)) => {
                 self.handle_control_event(LayoutControlEvent::Commit(commit))?
             }
-            Some(CoordinatorResponse::Reject(reject)) => self.reject_request(reject.request_id),
+            Some(CoordinatorResponse::Reject(reject)) => {
+                self.reject_request_with_reason(reject.request_id, reject.reason)
+            }
             Some(CoordinatorResponse::Reservation(_)) | None => {}
         }
         Ok(())
+    }
+
+    /// What to tell the user when the coordinator refused a request.
+    ///
+    /// The three that can happen to a terminal asked for on another machine get
+    /// sentences, because each one has a different thing to do about it: wake
+    /// the machine, ask its owner, or wait. Everything else keeps the old line,
+    /// which is fine for failures the user did not cause and cannot act on.
+    fn rejection_notice(&self, reason: i32, request_id: u64) -> String {
+        let machine = self
+            .pending_create
+            .as_ref()
+            .filter(|pending| pending.request_id == request_id)
+            .map(|pending| pending.target_name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| String::from("that machine"));
+        match LayoutRejectReason::try_from(reason) {
+            Ok(LayoutRejectReason::UnknownTarget) => {
+                format!("{machine} is not in this session — start p2pmux on it and it rejoins")
+            }
+            Ok(LayoutRejectReason::TargetRefused) => {
+                format!("{machine} refused: it does not accept work from your machines")
+            }
+            Ok(LayoutRejectReason::ReservationFailure) => {
+                format!("{machine} did not answer in time")
+            }
+            _ => format!("layout request {request_id} rejected"),
+        }
+    }
+
+    pub(in crate::tui) fn reject_request_with_reason(&mut self, request_id: u64, reason: i32) {
+        let notice = self.rejection_notice(reason, request_id);
+        self.reject_request(request_id);
+        self.footer_notice = Some(notice);
     }
 
     pub(in crate::tui) fn reject_request(&mut self, request_id: u64) {

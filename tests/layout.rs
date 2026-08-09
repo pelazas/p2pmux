@@ -836,3 +836,70 @@ fn snapshots_associate_pane_hosts_with_bounded_member_addresses_and_reject_malfo
         Err(LayoutError::InvalidSnapshot)
     );
 }
+
+/// The whole of "open a terminal on that machine", at the layer that decides
+/// which machine a pane belongs to.
+///
+/// The pane must commit against the machine that was asked, not the one that
+/// asked — otherwise the pty runs in one place while the layout says another,
+/// which is worse than the feature not existing.
+#[test]
+fn a_pane_asked_for_on_another_machine_is_hosted_by_that_machine() {
+    let mut state = state();
+    state
+        .add_member(state.revision(), HOST_B.to_vec(), ADDR_B.to_vec())
+        .expect("member B joins");
+    let reservation = state
+        .reserve_tab_on(HOST_A, HOST_B, state.revision(), 30, 100)
+        .expect("A asks B for a terminal");
+
+    assert_eq!(reservation.host_peer_id, HOST_B);
+    assert_eq!(
+        state.pane_ready(HOST_A, state.revision(), reservation.reservation_id),
+        Err(LayoutError::ReservationCreatorMismatch),
+        "the machine that asked cannot report a pane it is not hosting ready"
+    );
+    state
+        .pane_ready(HOST_B, state.revision(), reservation.reservation_id)
+        .expect("B reports the terminal it spawned");
+
+    let snapshot = snapshot(&state);
+    assert_eq!(snapshot.panes[&reservation.pane_id].host_peer_id, HOST_B);
+}
+
+/// Asking a machine that is not here is its own refusal, not a silence and not
+/// a pane that quietly opens somewhere else.
+#[test]
+fn a_pane_asked_for_on_a_machine_that_is_not_here_is_refused() {
+    let mut state = state();
+
+    assert_eq!(
+        state.reserve_tab_on(HOST_A, HOST_B, state.revision(), 24, 80),
+        Err(LayoutError::UnknownTarget)
+    );
+    assert_eq!(
+        state.reserve_pane_on(
+            HOST_A,
+            HOST_B,
+            state.revision(),
+            1,
+            Axis::LeftRight,
+            NewPanePosition::Second,
+            24,
+            80,
+        ),
+        Err(LayoutError::UnknownTarget)
+    );
+}
+
+/// The default has to be exactly what it was, or every split anyone types
+/// changes meaning.
+#[test]
+fn a_reservation_that_names_no_machine_is_hosted_by_the_one_that_asked() {
+    let mut state = state();
+    let reservation = state
+        .reserve_tab(HOST_A, state.revision(), 24, 80)
+        .expect("reserve");
+
+    assert_eq!(reservation.host_peer_id, HOST_A);
+}

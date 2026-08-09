@@ -74,6 +74,10 @@ impl MultiPaneTui {
             // where the user put it, and a row changing state under it must
             // never drag it somewhere else.
             self.home_selected = None;
+            // And on the agents, not on the fleet. Arriving with a machine
+            // still picked from a previous visit would put Enter on "open a
+            // terminal somewhere" when the screen is about what needs you.
+            self.home_machine = None;
             self.home_page = 0;
             self.repair_home_selection();
         }
@@ -294,6 +298,80 @@ impl MultiPaneTui {
         self.ensure_home_selection_visible();
     }
 
+    /// The machine the cursor is on, if it is on the fleet at all.
+    pub(in crate::tui) fn selected_machine(&self) -> Option<MachineRow> {
+        let index = self.home_machine?;
+        machine_rows(self).into_iter().nth(index)
+    }
+
+    /// Step the cursor through the fleet, and off the end of it.
+    ///
+    /// Off the end rather than wrapping: the fleet is a short list next to a
+    /// long one, and a cursor that could only be escaped by walking all the way
+    /// round it would be a trap. `m` past the last machine puts the cursor back
+    /// on the agents, which is also what `Esc` does.
+    pub(in crate::tui) fn step_home_machine(&mut self) {
+        let machines = machine_rows(self).len();
+        if machines == 0 {
+            self.home_machine = None;
+            return;
+        }
+        self.home_machine = match self.home_machine {
+            None => Some(0),
+            Some(index) if index + 1 < machines => Some(index + 1),
+            Some(_) => None,
+        };
+    }
+
+    /// `n` or Enter on a machine: a terminal there.
+    ///
+    /// Every refusal here is a sentence about that machine rather than a
+    /// silence or an error code, because each one has a different thing the
+    /// user would do about it.
+    pub(in crate::tui) fn open_terminal_on_selected_machine(
+        &mut self,
+        area: Rect,
+        command: Vec<String>,
+    ) -> Vec<UiIntent> {
+        let Some(machine) = self.selected_machine() else {
+            return Vec::new();
+        };
+        if !machine.owned {
+            self.home_notice = Some(format!(
+                "{} is someone else's machine — p2pmux does not start terminals on it",
+                machine.name
+            ));
+            return Vec::new();
+        }
+        let Some(peer_id) = machine.peer_id.clone() else {
+            self.home_notice = Some(format!(
+                "{} is asleep — start p2pmux on it and it rejoins on its own",
+                machine.name
+            ));
+            return Vec::new();
+        };
+        let (grid_rows, grid_cols) =
+            crate::tui::geometry::grid_for_pane(self.geometry(area).content);
+        self.set_home_open(false, "new_remote_terminal");
+        self.clear_zoom();
+        if machine.this_machine {
+            // Asking this machine for a terminal on this machine is a new tab.
+            // Routing it through the coordinator and back would work and would
+            // be slower for no reason.
+            return vec![UiIntent::CreateTab {
+                grid_rows,
+                grid_cols,
+            }];
+        }
+        vec![UiIntent::CreateTabOn {
+            peer_id,
+            command,
+            name: machine.name,
+            grid_rows,
+            grid_cols,
+        }]
+    }
+
     /// Enter: leave Home and land in the selected agent's terminal, on the tab
     /// it lives on, with the rest of that tab still around it.
     ///
@@ -418,6 +496,9 @@ impl MultiPaneTui {
     ) -> crate::tui::KeyHandling {
         use crate::tui::KeyHandling;
         self.set_home_viewport_for(area);
+        // Whatever Home last had to say was about the key before this one. The
+        // handlers below set it again when this key needs an answer too.
+        self.home_notice = None;
         match key.code {
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
                 self.move_home_selection(false);
@@ -438,10 +519,30 @@ impl MultiPaneTui {
                 self.turn_home_page(false);
                 KeyHandling::Consumed(vec![])
             }
+            // `m` walks the fleet, which is what turns a list you could only
+            // read into one you can act on.
+            KeyCode::Char('m') if key.modifiers.is_empty() => {
+                self.step_home_machine();
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Esc if self.home_machine.is_some() => {
+                self.home_machine = None;
+                KeyHandling::Consumed(vec![])
+            }
             KeyCode::Enter if key.modifiers.is_empty() => {
+                if self.home_machine.is_some() {
+                    return KeyHandling::Consumed(
+                        self.open_terminal_on_selected_machine(area, Vec::new()),
+                    );
+                }
                 KeyHandling::Consumed(self.open_home_selection())
             }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
+                if self.home_machine.is_some() {
+                    return KeyHandling::Consumed(
+                        self.open_terminal_on_selected_machine(area, Vec::new()),
+                    );
+                }
                 let (grid_rows, grid_cols) =
                     crate::tui::geometry::grid_for_pane(self.geometry(area).content);
                 // A new terminal, not a split: there is no pane in view to
@@ -630,6 +731,7 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
                     ),
                 this_machine,
                 reachable: true,
+                peer_id: Some(member.peer_id.clone()),
                 name,
             }
         })
@@ -640,6 +742,7 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
         }
         rows.push(MachineRow {
             name: paired.name.clone(),
+            peer_id: None,
             reachable: false,
             accepts_work: paired.accepts_work,
             agents: 0,
@@ -661,6 +764,9 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MachineRow {
     pub name: String,
+    /// The member's peer id, when it is in the session. `None` for a machine
+    /// that is paired but not answering — there is nothing to address.
+    pub peer_id: Option<Vec<u8>>,
     pub reachable: bool,
     /// `None` when that machine has never said. See [`crate::tui::PairedMachine`].
     pub accepts_work: Option<bool>,
@@ -764,7 +870,7 @@ fn stacked(area: Rect, tui: &MultiPaneTui, machines_height: u16) -> (Rect, Rect,
         .height
         .saturating_sub(header_height)
         .saturating_sub(machines_height);
-    let hint_height = u16::from(tui.home_all_unwired()).min(left);
+    let hint_height = u16::from(tui.home_all_unwired() || tui.home_notice.is_some()).min(left);
     let rows_height = left.saturating_sub(hint_height);
     let header = Rect::new(area.x, area.y, area.width, header_height);
     let rows = Rect::new(area.x, header.bottom(), area.width, rows_height);
@@ -1353,5 +1459,119 @@ mod tests {
         tui.set_agent_rows(Vec::new());
         tui.repair_home_selection();
         assert_eq!(tui.home_selected, None);
+    }
+
+    /// A fleet you can only read is a fleet you cannot open a terminal on.
+    #[test]
+    fn m_walks_the_fleet_and_lets_go_of_it() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("droplet"),
+            peer_id: None,
+            accepts_work: None,
+        }];
+        tui.set_home_open(true, "test");
+        assert_eq!(tui.home_machine, None, "the cursor starts on the agents");
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_machine, Some(0));
+        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_machine, Some(1));
+        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.home_machine, None,
+            "stepping past the last machine gives the cursor back rather than wrapping"
+        );
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), AREA);
+        assert_eq!(tui.home_machine, None, "and Esc is the other way back");
+    }
+
+    /// The three refusals the issue asks for, each a sentence with something to
+    /// do about it rather than a silence.
+    #[test]
+    fn a_machine_that_cannot_take_a_terminal_says_why() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("droplet"),
+            peer_id: None,
+            accepts_work: None,
+        }];
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: vec![0xca, 0xfe],
+            endpoint_addr: vec![2],
+            display_name: String::from("sam"),
+            kind: crate::layout::MemberKind::Machine,
+        });
+        tui.set_home_open(true, "test");
+
+        // The paired machine that is not answering.
+        let asleep = machine_rows(&tui)
+            .iter()
+            .position(|row| row.name == "droplet")
+            .expect("droplet is in the fleet");
+        tui.home_machine = Some(asleep);
+        assert_eq!(
+            tui.open_terminal_on_selected_machine(AREA, Vec::new()),
+            Vec::new()
+        );
+        let notice = tui.home_notice.clone().expect("a reason");
+        assert!(
+            notice.contains("droplet") && notice.contains("asleep"),
+            "{notice}"
+        );
+
+        // The person collaborating from their own laptop.
+        let guest = machine_rows(&tui)
+            .iter()
+            .position(|row| row.name == "sam")
+            .expect("sam is in the session");
+        tui.home_machine = Some(guest);
+        assert_eq!(
+            tui.open_terminal_on_selected_machine(AREA, Vec::new()),
+            Vec::new()
+        );
+        let notice = tui.home_notice.clone().expect("a reason");
+        assert!(
+            notice.contains("sam") && notice.contains("someone else's"),
+            "p2pmux must never offer to spawn a shell on a stranger's laptop: {notice}"
+        );
+    }
+
+    /// And the case that works: a machine of yours that is in the session.
+    #[test]
+    fn a_machine_of_yours_that_is_here_gets_the_terminal() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("droplet"),
+            peer_id: Some(String::from("cafe")),
+            accepts_work: Some(true),
+        }];
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: vec![0xca, 0xfe],
+            endpoint_addr: vec![2],
+            display_name: String::from("droplet"),
+            kind: crate::layout::MemberKind::Machine,
+        });
+        tui.set_home_open(true, "test");
+
+        let index = machine_rows(&tui)
+            .iter()
+            .position(|row| row.name == "droplet")
+            .expect("droplet is a member");
+        tui.home_machine = Some(index);
+        let intents = tui.open_terminal_on_selected_machine(AREA, Vec::new());
+
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [UiIntent::CreateTabOn { peer_id, name, .. }]
+                    if peer_id == &vec![0xca, 0xfe] && name == "droplet"
+            ),
+            "{intents:?}"
+        );
+        assert!(!tui.home_open(), "and the screen gets out of the way");
     }
 }

@@ -67,16 +67,30 @@ pub(in crate::tui) const HOME_EMPTY_NO_HOOKS: &str =
 /// long as it is true.
 pub(in crate::tui) const HOME_ROW_NO_HOOKS: &str = "state unknown — no hooks";
 
-/// `m machines` is gone from here: it expanded the strip into a table, and the
-/// rail is that table, permanently. A key that changes nothing is worse on a
-/// key bar than a key that is missing from one.
+/// `m` is back, and means something different from what it used to. It expanded
+/// the strip into a table, which the rail now is permanently; it now walks the
+/// fleet, so that `n` and `enter` have a machine to be about.
 const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
     FooterSegment::Text(" open   "),
+    FooterSegment::Key("m"),
+    FooterSegment::Text(" pick machine   "),
     FooterSegment::Key("a"),
     FooterSegment::Text(" add machine   "),
     FooterSegment::Key("n"),
     FooterSegment::Text(" new terminal   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
+/// The bar while the cursor is on a machine, which is when both keys that open
+/// something mean "there" rather than "here".
+const HOME_KEYS_MACHINE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" terminal on this machine   "),
+    FooterSegment::Key("m"),
+    FooterSegment::Text(" next machine   "),
+    FooterSegment::Key("esc"),
+    FooterSegment::Text(" back to agents   "),
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
@@ -184,9 +198,16 @@ fn render_home_in(
     }
 
     if layout.hint.height > 0 {
+        // An answer to something the reader just did outranks a standing nudge:
+        // the nudge will still be true next frame, and "that machine is asleep"
+        // is only worth saying now.
+        let hint = tui
+            .home_notice
+            .clone()
+            .unwrap_or_else(|| String::from(HOME_EMPTY_NO_HOOKS));
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" {HOME_EMPTY_NO_HOOKS}"),
+                format!(" {hint}"),
                 Style::default()
                     .fg(theme.agent_overlay_attention)
                     .add_modifier(Modifier::BOLD),
@@ -206,7 +227,13 @@ fn render_home_in(
     }
 
     if keys.width > 0 && keys.height > 0 {
-        render_home_keys(frame.buffer_mut(), theme, keys, tui.home_page_count() > 1);
+        render_home_keys(
+            frame.buffer_mut(),
+            theme,
+            keys,
+            tui.home_page_count() > 1,
+            tui.home_machine.is_some(),
+        );
     }
 }
 
@@ -702,7 +729,8 @@ fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'s
     if shown < machines.len() {
         shown = body.saturating_sub(2) / RAIL_LINES_PER_MACHINE;
     }
-    for machine in machines.iter().take(shown) {
+    for (index, machine) in machines.iter().enumerate().take(shown) {
+        let selected = tui.home_machine == Some(index);
         lines.push(rail_line(Vec::new(), theme));
         lines.push(rail_line(
             vec![
@@ -716,7 +744,14 @@ fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'s
                 ),
                 Span::styled(
                     truncate_trailing(&sanitize_single_line(&machine.name), RAIL_TEXT_WIDTH - 2),
-                    Style::default().fg(theme.agent_overlay_foreground),
+                    if selected {
+                        Style::default()
+                            .fg(theme.agent_overlay_foreground)
+                            .bg(theme.agent_overlay_selected_background)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.agent_overlay_foreground)
+                    },
                 ),
             ],
             theme,
@@ -929,7 +964,13 @@ pub fn machine_line(machine: &MachineRow) -> String {
     )
 }
 
-fn render_home_keys(buffer: &mut Buffer, theme: &UiTheme, keys: Rect, paged: bool) {
+fn render_home_keys(
+    buffer: &mut Buffer,
+    theme: &UiTheme,
+    keys: Rect,
+    paged: bool,
+    on_machine: bool,
+) {
     if keys.height == 0 {
         return;
     }
@@ -946,7 +987,12 @@ fn render_home_keys(buffer: &mut Buffer, theme: &UiTheme, keys: Rect, paged: boo
         keys.x.saturating_add(1),
         keys.y,
         keys.right(),
-        if paged { HOME_KEYS_PAGED } else { HOME_KEYS },
+        match (on_machine, paged) {
+            // What the keys do now outranks how to page a list they are not on.
+            (true, _) => HOME_KEYS_MACHINE,
+            (false, true) => HOME_KEYS_PAGED,
+            (false, false) => HOME_KEYS,
+        },
     );
 }
 
@@ -1210,6 +1256,7 @@ mod tests {
     fn an_unanswered_accepts_work_column_reads_as_a_dash_not_a_refusal() {
         let here = MachineRow {
             name: String::from("laptop"),
+            peer_id: None,
             owned: true,
             reachable: true,
             accepts_work: None,
@@ -1238,6 +1285,7 @@ mod tests {
     fn an_unreachable_machine_reads_asleep() {
         let asleep = MachineRow {
             name: String::from("oldbox"),
+            peer_id: None,
             owned: true,
             reachable: false,
             accepts_work: Some(true),
@@ -1255,6 +1303,7 @@ mod tests {
     fn the_line_under_a_machine_names_what_it_is_and_what_it_runs() {
         let base = MachineRow {
             name: String::from("droplet"),
+            peer_id: None,
             owned: true,
             reachable: true,
             accepts_work: None,

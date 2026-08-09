@@ -876,8 +876,9 @@ impl LayoutCoordinator {
         if create.target_pane_id == 0 {
             return Err(LayoutError::InvalidSnapshot);
         }
-        let reservation = self.state.reserve_pane_at(
+        let reservation = self.state.reserve_pane_on(
             authenticated_peer_id,
+            target_peer(authenticated_peer_id, &create.target_peer_id),
             base_revision,
             create.target_pane_id,
             axis,
@@ -893,7 +894,12 @@ impl LayoutCoordinator {
                 deadline: now + self.reservation_timeout,
             },
         );
-        Ok(Applied::Reserved(protocol_reservation(reservation)))
+        Ok(Applied::Reserved(protocol_reservation(
+            reservation,
+            request_id,
+            base_revision,
+            create.command,
+        )))
     }
 
     fn reserve_tab(
@@ -905,9 +911,13 @@ impl LayoutCoordinator {
         now: Instant,
     ) -> Result<Applied, LayoutError> {
         let (grid_rows, grid_cols) = protocol_grid(create.grid_rows, create.grid_cols)?;
-        let reservation =
-            self.state
-                .reserve_tab(authenticated_peer_id, base_revision, grid_rows, grid_cols)?;
+        let reservation = self.state.reserve_tab_on(
+            authenticated_peer_id,
+            target_peer(authenticated_peer_id, &create.target_peer_id),
+            base_revision,
+            grid_rows,
+            grid_cols,
+        )?;
         self.reservations.insert(
             reservation.reservation_id,
             ReservationContext {
@@ -916,7 +926,12 @@ impl LayoutCoordinator {
                 deadline: now + self.reservation_timeout,
             },
         );
-        Ok(Applied::Reserved(protocol_reservation(reservation)))
+        Ok(Applied::Reserved(protocol_reservation(
+            reservation,
+            request_id,
+            base_revision,
+            create.command,
+        )))
     }
 
     fn delete_pane(
@@ -1288,11 +1303,27 @@ fn model_member_kind(kind: i32) -> LayoutMemberKind {
     }
 }
 
-fn protocol_reservation(reservation: crate::layout::PaneReservation) -> PaneReservation {
+/// The reservation as the peer that has to act on it needs to see it.
+///
+/// `request_id`, `base_revision` and the grid are copied in because the host
+/// may be a machine that never saw the request: a peer asked to open a terminal
+/// has nothing of its own to look them up in.
+fn protocol_reservation(
+    reservation: crate::layout::PaneReservation,
+    request_id: u64,
+    base_revision: u64,
+    command: Vec<String>,
+) -> PaneReservation {
     PaneReservation {
         reservation_id: reservation.reservation_id,
         pane_id: reservation.pane_id,
         tab_id: reservation.tab_id,
+        host_peer_id: reservation.host_peer_id,
+        grid_rows: u32::from(reservation.grid_rows),
+        grid_cols: u32::from(reservation.grid_cols),
+        request_id,
+        base_revision,
+        command,
     }
 }
 
@@ -1445,6 +1476,15 @@ fn reject(request_id: u64, reason: LayoutRejectReason) -> CoordinatorResponse {
     })
 }
 
+/// Which machine a create request named, defaulting to the one that asked.
+///
+/// An empty target is what every caller meant before panes could be opened
+/// elsewhere, and it still means the same thing, so an older peer's request
+/// keeps working unchanged.
+fn target_peer<'a>(requester: &'a [u8], target: &'a [u8]) -> &'a [u8] {
+    if target.is_empty() { requester } else { target }
+}
+
 fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
     match error {
         LayoutError::StaleRevision { .. } | LayoutError::RevisionExhausted => {
@@ -1463,6 +1503,7 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         LayoutError::LastPaneInTab { .. } | LayoutError::LastTab => {
             LayoutRejectReason::LastPaneOrTab
         }
+        LayoutError::UnknownTarget => LayoutRejectReason::UnknownTarget,
         LayoutError::ReservationPending
         | LayoutError::UnknownReservation { .. }
         | LayoutError::ReservationCreatorMismatch
@@ -3045,15 +3086,43 @@ impl SharedLayoutHost {
     }
 
     fn publish_local_response(&self, response: &CoordinatorResponse) -> Result<(), SessionError> {
-        if let CoordinatorResponse::Commit(commit) = response {
-            let state = commit
-                .state
-                .as_ref()
-                .ok_or(SessionError::InvalidPostWelcome)?;
-            self.pane_server.replace_roster_from_layout(state)?;
-            self.broadcast_commit(commit.clone());
+        match response {
+            CoordinatorResponse::Commit(commit) => {
+                let state = commit
+                    .state
+                    .as_ref()
+                    .ok_or(SessionError::InvalidPostWelcome)?;
+                self.pane_server.replace_roster_from_layout(state)?;
+                self.broadcast_commit(commit.clone());
+            }
+            // The coordinator asked for a terminal on somebody else's machine.
+            // Its own runtime must not act on the reservation — see
+            // [`Self::reservation_is_local`] — so the peer that has to is sent
+            // it here, over the same control stream a member request uses.
+            CoordinatorResponse::Reservation(reservation)
+                if !self.reservation_is_local(reservation) =>
+            {
+                send_to_peer(
+                    &self.peers,
+                    &reservation.host_peer_id,
+                    coordinator_envelope(
+                        self.host.transport.endpoint_id().as_bytes(),
+                        envelope::Body::PaneReservation(reservation.clone()),
+                    ),
+                );
+            }
+            CoordinatorResponse::Reservation(_) | CoordinatorResponse::Reject(_) => {}
         }
         Ok(())
+    }
+
+    /// Whether a reservation is one this process has to fulfil itself.
+    ///
+    /// Empty means "the peer that asked", which on this path is always this
+    /// one, so a request that named no machine stays exactly as it was.
+    pub fn reservation_is_local(&self, reservation: &PaneReservation) -> bool {
+        reservation.host_peer_id.is_empty()
+            || reservation.host_peer_id == self.host.transport.endpoint_id().as_bytes()
     }
 
     /// Creates the coordinator-owned pane registry. The runtime must keep this registry's roster
@@ -4125,14 +4194,24 @@ fn dispatch_coordinator_response(
     response: CoordinatorResponse,
 ) {
     match response {
-        CoordinatorResponse::Reservation(reservation) => send_to_peer(
-            peers,
-            requester_peer_id,
-            coordinator_envelope(
-                coordinator_peer_id,
-                envelope::Body::PaneReservation(reservation),
-            ),
-        ),
+        // To the machine that has to spawn the pty, which is not always the one
+        // that asked. A reservation sent back to the requester for a pane on
+        // someone else's machine would sit there until it timed out.
+        CoordinatorResponse::Reservation(reservation) => {
+            let host = if reservation.host_peer_id.is_empty() {
+                requester_peer_id.to_vec()
+            } else {
+                reservation.host_peer_id.clone()
+            };
+            send_to_peer(
+                peers,
+                &host,
+                coordinator_envelope(
+                    coordinator_peer_id,
+                    envelope::Body::PaneReservation(reservation),
+                ),
+            )
+        }
         CoordinatorResponse::Commit(commit) => {
             if let Some(state) = commit.state.as_ref() {
                 let _ = pane_server.replace_roster_from_layout(state);

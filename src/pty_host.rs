@@ -119,9 +119,37 @@ impl PtyHost {
         cwd: Option<&Path>,
         pane_id: Option<u64>,
     ) -> Result<Self, Box<dyn Error>> {
-        let shell = std::env::var_os("SHELL").unwrap_or_else(Self::fallback_shell);
-        let mut command = CommandBuilder::new(shell);
-        command.arg("-l");
+        Self::spawn_program_with_cwd(size, cwd, pane_id, &[])
+    }
+
+    /// Spawn a specific program in the pane, or the login shell when none is
+    /// named.
+    ///
+    /// The program is passed as an argv rather than a string to run through a
+    /// shell, so nothing in it is interpreted: the machine that hosts a pane
+    /// decides what may be launched on it, and that decision has to be about
+    /// the same words that end up being executed.
+    pub fn spawn_program_with_cwd(
+        size: PtySize,
+        cwd: Option<&Path>,
+        pane_id: Option<u64>,
+        program: &[String],
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut command = match program.split_first() {
+            Some((argv0, arguments)) => {
+                let mut command = CommandBuilder::new(argv0);
+                for argument in arguments {
+                    command.arg(argument);
+                }
+                command
+            }
+            None => {
+                let shell = std::env::var_os("SHELL").unwrap_or_else(Self::fallback_shell);
+                let mut command = CommandBuilder::new(shell);
+                command.arg("-l");
+                command
+            }
+        };
         command.env("TERM", "xterm-256color");
         if let Some(pane_id) = pane_id {
             command.env(PANE_ID_ENV, pane_id.to_string());

@@ -804,6 +804,8 @@ fn v2_envelopes() -> Vec<Envelope> {
                 grid_rows: 24,
                 grid_cols: 80,
                 position: None,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             delete_pane: None,
             create_tab: None,
@@ -821,6 +823,12 @@ fn v2_envelopes() -> Vec<Envelope> {
             reservation_id: 1,
             pane_id: 2,
             tab_id: None,
+            host_peer_id: Default::default(),
+            grid_rows: 0,
+            grid_cols: 0,
+            request_id: 0,
+            base_revision: 0,
+            command: Default::default(),
         })),
         envelope(envelope::Body::PaneReady(PaneReady {
             reservation_id: 1,
@@ -917,6 +925,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             grid_rows: 24,
             grid_cols: 80,
             position: None,
+            target_peer_id: Default::default(),
+            command: Default::default(),
         }),
         delete_pane: Some(DeletePane { pane_id: 1 }),
         ..empty_action.clone()
@@ -1001,6 +1011,8 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
         create_tab: Some(CreateTab {
             grid_rows: 0,
             grid_cols: 80,
+            target_peer_id: Default::default(),
+            command: Default::default(),
         }),
         ..empty_action.clone()
     };
@@ -1082,6 +1094,12 @@ fn layout_messages_reject_invalid_shapes_and_bounds() {
             reservation_id: 0,
             pane_id: 1,
             tab_id: None,
+            host_peer_id: Default::default(),
+            grid_rows: 0,
+            grid_cols: 0,
+            request_id: 0,
+            base_revision: 0,
+            command: Default::default(),
         })),
         envelope(envelope::Body::PaneReady(PaneReady {
             reservation_id: 0,
@@ -1165,6 +1183,8 @@ fn create_pane_axis_and_position_are_validated() {
                 grid_rows: 24,
                 grid_cols: 80,
                 position,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             delete_pane: None,
             create_tab: None,
@@ -1250,6 +1270,8 @@ fn create_pane_position_has_a_stable_new_wire_tag_and_defaults_to_second() {
         grid_rows: 24,
         grid_cols: 80,
         position: None,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     };
     assert_eq!(
         field_shape(&parse_fields(&default.encode_to_vec())),
@@ -1300,6 +1322,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
                 grid_rows: maximum,
                 grid_cols: maximum,
                 position: None,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..empty_action.clone()
         })),
@@ -1307,6 +1331,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
             create_tab: Some(CreateTab {
                 grid_rows: maximum,
                 grid_cols: maximum,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..empty_action.clone()
         })),
@@ -1335,6 +1361,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
                 grid_rows: oversized,
                 grid_cols: 80,
                 position: None,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..empty_action.clone()
         })),
@@ -1345,6 +1373,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
                 grid_rows: 24,
                 grid_cols: oversized,
                 position: None,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..empty_action.clone()
         })),
@@ -1352,6 +1382,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
             create_tab: Some(CreateTab {
                 grid_rows: oversized,
                 grid_cols: 80,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..empty_action.clone()
         })),
@@ -1359,6 +1391,8 @@ fn layout_grids_must_fit_the_reducer_u16_grid() {
             create_tab: Some(CreateTab {
                 grid_rows: 24,
                 grid_cols: oversized,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..empty_action.clone()
         })),
@@ -1399,6 +1433,12 @@ fn pane_reservation_rejects_a_zero_present_tab_id() {
                     reservation_id: 1,
                     pane_id: 2,
                     tab_id,
+                    host_peer_id: Default::default(),
+                    grid_rows: 0,
+                    grid_cols: 0,
+                    request_id: 0,
+                    base_revision: 0,
+                    command: Default::default(),
                 }
             )))
             .is_ok(),
@@ -1410,6 +1450,12 @@ fn pane_reservation_rejects_a_zero_present_tab_id() {
         reservation_id: 1,
         pane_id: 2,
         tab_id: Some(0),
+        host_peer_id: Default::default(),
+        grid_rows: 0,
+        grid_cols: 0,
+        request_id: 0,
+        base_revision: 0,
+        command: Default::default(),
     }));
 
     assert!(

@@ -88,6 +88,21 @@ impl SharedLocalPane {
         host_peer_id: Vec<u8>,
         cwd: Option<&Path>,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_program(pane_id, grid_rows, grid_cols, host_peer_id, cwd, &[])
+    }
+
+    /// Spawn a pane running a named program rather than a login shell.
+    ///
+    /// What a remote terminal uses when it was asked for something specific —
+    /// an agent's chat client, say — instead of a prompt.
+    pub(crate) fn spawn_program(
+        pane_id: PaneId,
+        grid_rows: u16,
+        grid_cols: u16,
+        host_peer_id: Vec<u8>,
+        cwd: Option<&Path>,
+        program: &[String],
+    ) -> Result<Self, Box<dyn Error>> {
         let size = PtySize {
             rows: grid_rows,
             cols: grid_cols,
@@ -95,10 +110,10 @@ impl SharedLocalPane {
             pixel_height: 0,
         };
         let cwd = cwd.filter(|path| path.is_dir());
-        let host = match PtyHost::spawn_default_shell_with_cwd(size, cwd, Some(pane_id)) {
+        let host = match PtyHost::spawn_program_with_cwd(size, cwd, Some(pane_id), program) {
             Ok(host) => host,
             Err(_) if cwd.is_some_and(|path| !path.is_dir()) => {
-                PtyHost::spawn_default_shell_with_cwd(size, None, Some(pane_id))?
+                PtyHost::spawn_program_with_cwd(size, None, Some(pane_id), program)?
             }
             Err(error) => return Err(error),
         };

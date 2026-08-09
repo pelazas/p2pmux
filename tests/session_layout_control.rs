@@ -108,6 +108,8 @@ fn create_request(request_id: u64, base_revision: u64) -> LayoutRequest {
             grid_rows: 24,
             grid_cols: 80,
             position: None,
+            target_peer_id: Default::default(),
+            command: Default::default(),
         }),
         delete_pane: None,
         create_tab: None,
@@ -527,6 +529,8 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
                 create_tab: Some(CreateTab {
                     grid_rows: 24,
                     grid_cols: 80,
+                    target_peer_id: Default::default(),
+                    command: Default::default(),
                 }),
                 delete_tab: None,
                 set_split_ratio: None,
@@ -600,6 +604,8 @@ async fn deleting_a_member_owned_tab_broadcasts_the_full_commit() {
             create_tab: Some(CreateTab {
                 grid_rows: 24,
                 grid_cols: 80,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             delete_tab: None,
             set_split_ratio: None,

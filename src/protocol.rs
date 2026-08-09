@@ -471,6 +471,17 @@ pub struct CreatePane {
     pub grid_cols: u32,
     #[prost(enumeration = "NewPanePosition", optional, tag = "5")]
     pub position: Option<i32>,
+    /// Which machine's shell this pane runs. Empty means "the one asking",
+    /// which is what every caller before this field meant and still means.
+    #[prost(bytes = "vec", tag = "6")]
+    pub target_peer_id: Vec<u8>,
+    /// What to run in it instead of a login shell. Empty means a shell.
+    ///
+    /// Carried here rather than typed into the pane afterwards because the
+    /// machine that hosts the pane is the one that decides whether it is
+    /// allowed to run this, and it can only decide about something it was told.
+    #[prost(string, repeated, tag = "7")]
+    pub command: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -485,6 +496,11 @@ pub struct CreateTab {
     pub grid_rows: u32,
     #[prost(uint32, tag = "2")]
     pub grid_cols: u32,
+    /// As on [`CreatePane`]: empty means the machine that asked.
+    #[prost(bytes = "vec", tag = "3")]
+    pub target_peer_id: Vec<u8>,
+    #[prost(string, repeated, tag = "4")]
+    pub command: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -527,6 +543,25 @@ pub struct PaneReservation {
     pub pane_id: u64,
     #[prost(uint64, optional, tag = "3")]
     pub tab_id: Option<u64>,
+    /// Which peer is being asked to spawn the pty. Empty when it is the peer
+    /// that asked, which is every reservation before remote terminals existed.
+    #[prost(bytes = "vec", tag = "4")]
+    pub host_peer_id: Vec<u8>,
+    /// Everything a peer that did *not* ask for this pane needs to serve it.
+    ///
+    /// The requester already knows all of it and remembers it locally. A target
+    /// peer has never seen the request, so a reservation that only named a pane
+    /// id would be an instruction it could not carry out.
+    #[prost(uint32, tag = "5")]
+    pub grid_rows: u32,
+    #[prost(uint32, tag = "6")]
+    pub grid_cols: u32,
+    #[prost(uint64, tag = "7")]
+    pub request_id: u64,
+    #[prost(uint64, tag = "8")]
+    pub base_revision: u64,
+    #[prost(string, repeated, tag = "9")]
+    pub command: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -694,6 +729,18 @@ pub enum LayoutRejectReason {
     /// The connection is authentic -- QUIC saw to that -- but the ledger records authorship
     /// for readers who were never on it, and that needs the author's own signature.
     Unsigned = 11,
+    /// The machine a pane was asked for is not in this session.
+    ///
+    /// Its own reason rather than `UnknownId`, because it is the one failure a
+    /// user can act on: the machine is asleep, or has no p2pmux running, and
+    /// the answer is to wake it rather than to try again.
+    UnknownTarget = 12,
+    /// The machine a pane was asked for refused to host it.
+    ///
+    /// The refusal is made on that machine, by whoever owns it. Distinct from
+    /// `UnknownTarget` because the machine answered: it is awake, and it said
+    /// no.
+    TargetRefused = 13,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

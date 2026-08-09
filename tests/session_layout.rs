@@ -135,6 +135,8 @@ fn admitted_members_set_ratios_and_hosts_reconcile_their_grids() {
                 grid_rows: 24,
                 grid_cols: 80,
                 position: None,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..request(1, 2)
         },
@@ -476,6 +478,8 @@ fn pane_creation_is_hidden_until_its_creator_marks_the_reservation_ready() {
         grid_rows: 30,
         grid_cols: 100,
         position: None,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
 
     let reservation = match coordinator.ask(&host_a(), create) {
@@ -522,6 +526,8 @@ fn pane_creation_maps_protocol_placement_to_authoritative_child_order() {
         grid_rows: 24,
         grid_cols: 80,
         position: Some(NewPanePosition::First as i32),
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -563,6 +569,8 @@ fn ready_cannot_commit_a_reservation_after_membership_advances_its_revision() {
         grid_rows: 30,
         grid_cols: 100,
         position: None,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -598,6 +606,8 @@ fn ready_cannot_commit_a_reservation_after_membership_advances_its_revision() {
     next.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     assert!(matches!(
         coordinator.ask(&host_a(), next),
@@ -616,6 +626,8 @@ fn admitted_guest_hosts_its_own_pane_after_ready() {
         grid_rows: 31,
         grid_cols: 101,
         position: None,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_b(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -648,6 +660,8 @@ fn stale_request_is_rejected_without_a_layout_change() {
     create.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
 
     let rejection = reject(coordinator.ask(&host_a(), create));
@@ -688,6 +702,8 @@ fn mixed_host_tab_deletion_is_rejected() {
         grid_rows: 24,
         grid_cols: 80,
         position: None,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_b(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -706,6 +722,8 @@ fn mixed_host_tab_deletion_is_rejected() {
     create_tab.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_a(), create_tab) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -736,6 +754,8 @@ fn limits_are_rejected_without_creating_visible_layout() {
         create.create_tab = Some(CreateTab {
             grid_rows: 24,
             grid_cols: 80,
+            target_peer_id: Default::default(),
+            command: Default::default(),
         });
         let reservation = match coordinator.ask(&host_a(), create) {
             CoordinatorResponse::Reservation(reservation) => reservation,
@@ -756,6 +776,8 @@ fn limits_are_rejected_without_creating_visible_layout() {
     one_too_many.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
 
     let rejection = reject(coordinator.ask(&host_a(), one_too_many));
@@ -780,6 +802,8 @@ fn wrong_creator_and_ready_revision_are_rejected_with_the_original_request_id() 
     create.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -841,6 +865,8 @@ fn reservation_expiry_is_deterministic_and_unwedges_new_requests() {
     create.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     match coordinator.ask_at(&host_a(), create, now) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -866,6 +892,8 @@ fn reservation_expiry_is_deterministic_and_unwedges_new_requests() {
     next.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     assert!(matches!(
         coordinator.ask_at(&host_a(), next, now),
@@ -880,6 +908,8 @@ fn pane_failure_clears_its_creator_reservation_immediately() {
     create.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -899,6 +929,8 @@ fn pane_failure_clears_its_creator_reservation_immediately() {
     next.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     assert!(matches!(
         coordinator.ask(&host_a(), next),
@@ -938,6 +970,8 @@ fn endpoints_and_ready_request_ids_must_match_authenticated_reservations() {
     create.create_tab = Some(CreateTab {
         grid_rows: 24,
         grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
     });
     let reservation = match coordinator.ask(&host_a(), create) {
         CoordinatorResponse::Reservation(reservation) => reservation,
@@ -1173,6 +1207,8 @@ fn a_change_is_recorded_under_the_key_that_asked_for_it() {
             create_tab: Some(CreateTab {
                 grid_rows: 24,
                 grid_cols: 80,
+                target_peer_id: Default::default(),
+                command: Default::default(),
             }),
             ..request(1, 2)
         },

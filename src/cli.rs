@@ -841,6 +841,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
             .map(|peer| peer.agents)
             .sum(),
         name: here.clone(),
+        peer_id: None,
         reachable: true,
         // The one row whose answer is genuinely known here: it was given on
         // this machine, about this machine.
@@ -858,6 +859,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
         }
         rows.push(crate::tui::MachineRow {
             name: peer.name.clone(),
+            peer_id: None,
             reachable: true,
             accepts_work: accepts_work(&peer.name),
             agents: peer.agents,
@@ -871,6 +873,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
         }
         rows.push(crate::tui::MachineRow {
             name: machine.name.clone(),
+            peer_id: None,
             reachable: false,
             accepts_work: machine.accepts_work,
             agents: 0,

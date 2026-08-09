@@ -163,6 +163,17 @@ pub(in crate::tui) struct PendingCreate {
     pub(in crate::tui) grid_rows: u16,
     pub(in crate::tui) grid_cols: u16,
     pub(in crate::tui) cwd: Option<PathBuf>,
+    /// What the pane should run instead of a login shell. Empty for a shell.
+    pub(in crate::tui) command: Vec<String>,
+    /// Whether the pty for this request will be spawned here.
+    ///
+    /// False when the pane was asked for on another machine: the request is
+    /// still ours to track, so a rejection lands somewhere, but the pane
+    /// arrives with a commit rather than out of a pty this process opened.
+    pub(in crate::tui) hosted_here: bool,
+    /// The name of the machine it was asked for on, so a refusal can say which
+    /// machine refused. Empty when the pane is being opened here.
+    pub(in crate::tui) target_name: String,
 }
 /// Pure retry state for direct remote-pane subscriptions. Ticks are supplied by the UI drain
 /// loop, which keeps retry behavior deterministic in tests and prevents a failed connect from

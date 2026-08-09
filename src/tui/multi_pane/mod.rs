@@ -71,6 +71,20 @@ pub struct MultiPaneTui {
     /// Local to this client and never replicated: see [`crate::tui::home`].
     pub(in crate::tui) home_open: bool,
     pub(in crate::tui) home_selected: Option<PaneId>,
+    /// Which machine the cursor is on, when it is on the fleet rather than on
+    /// the agents.
+    ///
+    /// The fleet used to be a read-only strip. It is a picker now because
+    /// "open a terminal on that machine" needs somewhere to say *which*, and
+    /// the list of machines was already on screen. `None` means the cursor is
+    /// back on the agents, which is where it starts and where `Esc` returns it.
+    pub(in crate::tui) home_machine: Option<usize>,
+    /// One line Home has to say about the last thing that was asked of it.
+    ///
+    /// Home's own rather than the window footer's, because the answers it gives
+    /// are about the screen you are still looking at — which machine is asleep,
+    /// which one is not yours — and the reader has not gone anywhere.
+    pub(in crate::tui) home_notice: Option<String>,
     /// Which page of the agent list is drawn. Derived from the selection
     /// everywhere except the wheel, which moves both.
     pub(in crate::tui) home_page: usize,
@@ -142,6 +156,8 @@ impl MultiPaneTui {
             pending_home_toggle: None,
             home_open: false,
             home_selected: None,
+            home_machine: None,
+            home_notice: None,
             home_page: 0,
             home_page_size: crate::tui::home::HOME_PAGE_MAX,
             zoomed_pane: None,
