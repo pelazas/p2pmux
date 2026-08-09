@@ -121,9 +121,10 @@ def record(out: Path) -> int:
         note("Same build on both machines", versions, kind="console")
         check("both machines report the same version",
               mac(home, "--version").split()[-1] == remote.cli("--version").strip().split()[-1])
-        # `--version` cannot tell these six fixes from the release they sit on
-        # top of — they landed without a version bump, so both machines say
-        # 0.1.4 either way. Ask the droplet something only the new code answers.
+        # `--version` cannot tell work in progress from the release it sits on
+        # top of: anything merged since the last tag ships under the tag's own
+        # number, so both machines agree whether or not the droplet has it. Ask
+        # it something only the code under test answers.
         droplet_probe = remote.cli("machines", timeout=60)
         check("the droplet is running the code under test, not the release under it",
               "No other machines paired yet" in droplet_probe, droplet_probe)
