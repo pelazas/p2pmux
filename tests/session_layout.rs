@@ -941,6 +941,65 @@ fn pane_failure_clears_its_creator_reservation_immediately() {
     ));
 }
 
+/// The timeout that makes "ask me first" safe.
+///
+/// A machine configured to be asked holds the request rather than answering it,
+/// and nobody may be sitting at that machine. Nothing grants the pane in the
+/// meantime: the reservation runs out and the person who asked is told, which
+/// is the same outcome as a refusal and the reason the panel can say
+/// "unanswered is refused" and mean it.
+#[test]
+fn a_remote_terminal_nobody_answers_expires_rather_than_opening() {
+    let now = Instant::now();
+    let mut coordinator = LayoutCoordinator::with_reservation_timeout(
+        host_a(),
+        addr_a(),
+        ledger(),
+        24,
+        80,
+        Duration::from_secs(5),
+        now,
+    )
+    .unwrap();
+    coordinator
+        .admit(host_b(), addr_b())
+        .expect("member B joins");
+    let mut create = request(401, 2);
+    create.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+        target_peer_id: host_b(),
+        command: vec![String::from("shell")],
+    });
+    let reservation = match coordinator.ask_at(&host_a(), create, now) {
+        CoordinatorResponse::Reservation(reservation) => reservation,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    assert_eq!(reservation.host_peer_id, host_b());
+
+    // B is holding the question in front of a keyboard nobody is at.
+    let expired = coordinator
+        .expire_reservation_at(now + Duration::from_secs(5))
+        .unwrap()
+        .expect("an unanswered reservation expires");
+
+    assert_eq!(expired.peer_id, host_a(), "the machine that asked is told");
+    assert_eq!(expired.reject.request_id, 401);
+    // And nothing was created while nobody was answering: the next request
+    // gets a reservation, which only an empty slot allows.
+    let mut next = request(402, 2);
+    next.create_tab = Some(CreateTab {
+        grid_rows: 24,
+        grid_cols: 80,
+        target_peer_id: Default::default(),
+        command: Default::default(),
+    });
+    assert!(matches!(
+        coordinator.ask_at(&host_a(), next, now + Duration::from_secs(6)),
+        CoordinatorResponse::Reservation(_)
+    ));
+}
+
 /// A machine that says no and a pty that would not start are different answers,
 /// and the person waiting does different things about them: ask the machine's
 /// owner, or try again.
