@@ -70,6 +70,15 @@ enum Command {
     },
     /// List the machines paired with this one.
     Machines,
+    /// Keep this machine in its fleet, so it is there when you start a session
+    /// somewhere else.
+    ///
+    /// With no subcommand, runs in the foreground — which is what the installed
+    /// service does. `install` is how it comes back after a reboot.
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
     /// Forget a paired machine.
     Unpair {
         /// The machine's name, as listed by `p2pmux machines`.
@@ -150,6 +159,16 @@ enum SetupAgent {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Start the fleet agent at boot and keep it running.
+    Install,
+    /// Stop it and remove the service.
+    Uninstall,
+    /// Say whether it is installed, and where.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -524,6 +543,35 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
         }
         Some(Command::Machines) => print_machines(),
+        Some(Command::Daemon { command }) => match command {
+            None => crate::daemon::run().await,
+            Some(DaemonCommand::Install) => {
+                let path = crate::daemon::install()?;
+                println!("fleet agent installed: {}", path.display());
+                println!(
+                    "This machine now rejoins its home session at boot, so your other\n\
+                     machines can find it — and invite it into sessions you start later."
+                );
+                Ok(())
+            }
+            Some(DaemonCommand::Uninstall) => {
+                match crate::daemon::uninstall()? {
+                    Some(path) => println!("fleet agent removed: {}", path.display()),
+                    None => println!("no fleet agent was installed"),
+                }
+                Ok(())
+            }
+            Some(DaemonCommand::Status) => {
+                let path = crate::daemon::unit_path()?;
+                if crate::daemon::installed() {
+                    println!("fleet agent installed: {}", path.display());
+                } else {
+                    println!("no fleet agent installed");
+                    println!("Run `p2pmux daemon install` to keep this machine in its fleet.");
+                }
+                Ok(())
+            }
+        },
         Some(Command::Unpair { name }) => {
             let mut pairing = crate::pairing::load()?;
             if !pairing.forget(&name) {
@@ -583,10 +631,9 @@ fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<
 ///
 /// Default-deny, and the wording matters: it means *accepts work from me*,
 /// never *from anyone in the session*. Otherwise a join code you hand to a
-/// colleague becomes remote code execution on your desktop. Nothing acts on the
-/// flag yet — it is only recorded, and it is the consent primitive that will
-/// later make starting a terminal on another machine legal without widening the
-/// trust model.
+/// colleague becomes remote code execution on your desktop. Saying yes here is
+/// consent to be asked; what may actually be started is the allowlist in the
+/// pairing file, which is empty until somebody writes in it.
 fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error>> {
     if accept {
         return Ok(true);
@@ -599,6 +646,44 @@ fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Offer to keep this machine in its fleet across reboots.
+///
+/// Asked here because this is the moment the user decided this box is part of
+/// a fleet, and a machine that is only in it until the next restart is not one.
+/// Declining is remembered — see [`crate::pairing::Pairing::daemon_declined`] —
+/// so a person who said no once is not asked again by every later pairing.
+fn offer_fleet_daemon() -> Result<(), Box<dyn Error>> {
+    if crate::daemon::installed() {
+        return Ok(());
+    }
+    let mut pairing = crate::pairing::load()?;
+    if pairing.daemon_declined || !io::stdin().is_terminal() {
+        return Ok(());
+    }
+    println!();
+    println!(
+        "Keep this machine in its fleet after a reboot? Without this it is only\n\
+         reachable while a p2pmux is running here by hand."
+    );
+    print!("Install the fleet agent? [Y/n] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim(), "n" | "N" | "no") {
+        pairing.daemon_declined = true;
+        crate::pairing::save(&pairing)?;
+        println!("Not installed. `p2pmux daemon install` does it later.");
+        return Ok(());
+    }
+    match crate::daemon::install() {
+        Ok(path) => println!("fleet agent installed: {}", path.display()),
+        // Worth a line, not worth failing the pairing: the machines are paired
+        // either way, and this is about what happens after the next reboot.
+        Err(error) => println!("could not install the fleet agent: {error}"),
+    }
+    Ok(())
 }
 
 /// `p2pmux pair` with no code: print one for the other machine to type.
@@ -661,6 +746,8 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
         "\naccepts work from your machines: {}",
         if accepts_work { "yes" } else { "no" }
     )?;
+    drop(stdout);
+    offer_fleet_daemon()?;
     Ok(())
 }
 
@@ -710,6 +797,10 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
         }
     }
     writeln!(stdout, "\nFrom now on, bare `p2pmux` rejoins with no code.")?;
+    drop(stdout);
+    // Asked after the pairing is reported, not before: the machines are paired
+    // either way, and this question is about what happens after a reboot.
+    offer_fleet_daemon()?;
     Ok(())
 }
 

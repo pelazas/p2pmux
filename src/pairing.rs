@@ -111,6 +111,13 @@ pub struct Pairing {
     /// and resolved that by treating every peer as fleet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_until: Option<u64>,
+    /// Whether the user has already said no to installing the fleet agent.
+    ///
+    /// Pairing is where the offer belongs — it is the moment somebody decided
+    /// this box is fleet — but a person who declined once should not be asked
+    /// again by every machine they pair afterwards.
+    #[serde(default)]
+    pub daemon_declined: bool,
     #[serde(default, rename = "machine")]
     pub machines: Vec<PairedMachine>,
     /// What your other machines may start on this one. See [`WorkPolicy`].
@@ -521,6 +528,7 @@ mod tests {
             ticket: Some(String::from("p2pmux-ticket")),
             accepts_work: true,
             pending_until: None,
+            daemon_declined: false,
             machines: Vec::new(),
             work: Default::default(),
         };
