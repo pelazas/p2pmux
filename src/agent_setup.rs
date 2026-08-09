@@ -256,30 +256,169 @@ pub fn setup_claude(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
         CLAUDE_HOOKS.len(),
         path.display()
     );
-    if !installed("p2pmux") {
-        println!(
-            "claude: warning — `p2pmux` is not on PATH, so the hooks will not run. \
-             Install it, or edit the commands to use an absolute path."
-        );
-    }
+    warn_if_not_on_path("claude");
     println!("claude: new Claude Code sessions pick this up; restart any that are running");
     Ok(())
 }
 
+/// The plugin `setup_opencode` writes, verbatim.
+///
+/// opencode has no hook list to merge into: a plugin is a file it imports, and
+/// this file is entirely ours. That makes install a write and uninstall a
+/// delete — but only of a file carrying [`MARKER`], so a plugin a user wrote
+/// and happened to name `p2pmux.js` is refused rather than removed.
+const OPENCODE_PLUGIN: &str = include_str!("assets/opencode_plugin.js");
+
+pub fn opencode_plugin_path() -> Option<PathBuf> {
+    Some(
+        home()?
+            .join(".config")
+            .join("opencode")
+            .join("plugin")
+            .join("p2pmux.js"),
+    )
+}
+
+/// Whether a file at `path` is one this module wrote.
+fn ours_on_disk(path: &PathBuf) -> bool {
+    fs::read_to_string(path).is_ok_and(|body| body.contains(&format!("owner: {MARKER}")))
+}
+
+pub fn opencode_wiring() -> Wiring {
+    if !installed("opencode") {
+        return Wiring::Absent;
+    }
+    match opencode_plugin_path() {
+        Some(path) if ours_on_disk(&path) => Wiring::Wired,
+        _ => Wiring::Unwired,
+    }
+}
+
+/// Install (or remove) the opencode plugin. Idempotent in both directions.
+pub fn setup_opencode(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>> {
+    let Some(path) = opencode_plugin_path() else {
+        return Err(Box::from("cannot locate $HOME"));
+    };
+    let present = path.exists();
+
+    if uninstall {
+        if !present {
+            println!(
+                "opencode: already removed (no plugin at {})",
+                path.display()
+            );
+            return Ok(());
+        }
+        if !ours_on_disk(&path) {
+            return Err(Box::from(format!(
+                "{} was not written by p2pmux — refusing to delete it",
+                path.display()
+            )));
+        }
+        if dry_run {
+            println!("opencode: would delete {} (dry run)", path.display());
+            return Ok(());
+        }
+        fs::remove_file(&path)?;
+        println!(
+            "opencode: removed the p2pmux plugin from {}",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    if present && !ours_on_disk(&path) {
+        return Err(Box::from(format!(
+            "{} exists and was not written by p2pmux — refusing to overwrite it",
+            path.display()
+        )));
+    }
+    if dry_run {
+        println!(
+            "opencode: would write the p2pmux plugin to {} (dry run)",
+            path.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("js.p2pmux-tmp");
+    fs::write(&temporary, OPENCODE_PLUGIN)?;
+    fs::rename(&temporary, &path)?;
+    println!("opencode: wrote the p2pmux plugin to {}", path.display());
+    warn_if_not_on_path("opencode");
+    println!("opencode: new opencode sessions pick this up; restart any that are running");
+    Ok(())
+}
+
+fn warn_if_not_on_path(agent: &str) {
+    if !installed("p2pmux") {
+        println!(
+            "{agent}: warning — `p2pmux` is not on PATH, so the hooks will not run. \
+             Install it, or edit the commands to use an absolute path."
+        );
+    }
+}
+
+/// Wire up every agent this build knows how to, for `p2pmux setup` with no
+/// agent named — the form the inbox's own nudge tells people to run.
+///
+/// One agent failing does not stop the others: a machine with an unreadable
+/// `settings.json` should still come out of this with its opencode plugin
+/// installed, and be told exactly which half did not happen.
+pub fn setup_all(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>> {
+    let results = [
+        setup_claude(uninstall, dry_run),
+        setup_opencode(uninstall, dry_run),
+    ];
+    let mut failures = Vec::new();
+    for result in results {
+        if let Err(error) = result {
+            println!("{error}");
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Box::from(failures.join("; ")))
+    }
+}
+
 /// Report what is wired, for every agent p2pmux can report on.
 pub fn doctor() -> Result<(), Box<dyn Error>> {
-    let claude = claude_wiring();
-    let path = claude_settings_path()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
-    println!("{:<8} {:<14} {path}", "claude", claude.label());
-    match claude {
-        Wiring::Wired => println!("\nThe inbox reads agent state from these hooks."),
-        Wiring::Unwired => println!(
+    let rows = [
+        (
+            "claude",
+            claude_wiring(),
+            claude_settings_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "opencode",
+            opencode_wiring(),
+            opencode_plugin_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
+    ];
+    for (agent, wiring, path) in &rows {
+        println!("{agent:<9} {:<14} {path}", wiring.label());
+    }
+    let states: Vec<&Wiring> = rows.iter().map(|(_, wiring, _)| wiring).collect();
+    if states.iter().any(|wiring| **wiring == Wiring::Wired) {
+        println!("\nThe inbox reads agent state from these hooks.");
+    }
+    if states.iter().any(|wiring| **wiring == Wiring::Unwired) {
+        println!(
             "\nThe inbox can see that an agent is running but not what it is doing,\n\
              and can never say `needs you`. Run `p2pmux setup` to fix that."
-        ),
-        Wiring::Absent => println!("\nNothing to wire up on this machine."),
+        );
+    }
+    if states.iter().all(|wiring| **wiring == Wiring::Absent) {
+        println!("\nNothing to wire up on this machine.");
     }
     if !installed("p2pmux") {
         println!("\nwarning: `p2pmux` is not on PATH — hooks invoke it by name and would not run.");
@@ -414,5 +553,55 @@ mod tests {
                 "{event} registers `{status}`, which `p2pmux notify` would refuse"
             );
         }
+    }
+
+    /// The plugin is a whole file rather than entries in a shared one, so
+    /// ownership is a line in it. Without the marker, uninstall would refuse to
+    /// remove what install had just written.
+    #[test]
+    fn the_opencode_plugin_says_who_owns_it() {
+        assert!(
+            OPENCODE_PLUGIN.contains(&format!("owner: {MARKER}")),
+            "install writes a file uninstall would then refuse to delete"
+        );
+    }
+
+    /// The plugin's other half is a shell command line, and the two halves are
+    /// in different languages: nothing but this test connects the statuses the
+    /// JavaScript pushes to the ones the Rust producer will accept.
+    #[test]
+    fn every_status_the_opencode_plugin_pushes_is_one_the_producer_accepts() {
+        let mut seen = 0;
+        for (index, _) in OPENCODE_PLUGIN.match_indices("push(\"") {
+            let rest = &OPENCODE_PLUGIN[index + "push(\"".len()..];
+            let status = rest.split('"').next().expect("a quoted status");
+            assert!(
+                crate::agent_detect::AgentState::from_wire(status).is_some(),
+                "the plugin pushes `{status}`, which `p2pmux notify` would refuse"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 5, "only {seen} pushes found — did the plugin move?");
+        assert!(
+            OPENCODE_PLUGIN.contains("p2pmux\", [\"notify\", \"opencode\""),
+            "the plugin must report as opencode, or its rows file under the wrong agent"
+        );
+    }
+
+    /// A user's own `p2pmux.js` is not ours to overwrite or delete, and the
+    /// only thing that can tell them apart is the marker.
+    #[test]
+    fn a_plugin_file_we_did_not_write_is_left_alone() {
+        let directory = std::env::temp_dir().join(format!("p2pmux-plugin-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("p2pmux.js");
+
+        fs::write(&path, b"export const Mine = async () => ({})").expect("write");
+        assert!(!ours_on_disk(&path));
+
+        fs::write(&path, OPENCODE_PLUGIN).expect("write");
+        assert!(ours_on_disk(&path));
+
+        fs::remove_dir_all(&directory).expect("cleanup");
     }
 }

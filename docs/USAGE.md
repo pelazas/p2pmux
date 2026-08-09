@@ -369,13 +369,21 @@ Run `p2pmux setup` to see which agents need you.
 Row text is the agent's own words, never a model-written summary. A richer sentence that can lie
 about what an agent did would defeat the entire point of not reading the terminal yourself.
 
-### Wiring up Claude Code
+### Wiring up an agent
 
 ```
-p2pmux setup claude          # write the hooks
+p2pmux setup                 # every agent this build knows how to wire
 p2pmux doctor                # check they are wired
-p2pmux setup claude --uninstall
+p2pmux setup claude          # or name one
+p2pmux setup opencode --uninstall
 ```
+
+Two agents have a hook surface today: Claude Code and OpenCode. `setup` with no agent named wires
+both, and reports each on its own line — that is the form the inbox's nudge tells you to run, and a
+machine whose agents are unreported should not then have to pick which of them to fix. One agent
+failing does not stop the other.
+
+#### Claude Code
 
 `setup` writes six marker-owned entries into `~/.claude/settings.json` — one per lifecycle event —
 through a temporary file and a rename. Every entry it writes carries `"owner": "p2pmux"`, so
@@ -387,6 +395,22 @@ and `--dry-run` says what it would do.
 Each hook pipes its payload to `p2pmux notify`, which writes one line to the pane's session and
 exits. Outside a p2pmux pane it is a silent no-op, so it is safe to leave registered everywhere.
 Restart any running Claude Code sessions to pick the hooks up.
+
+#### OpenCode
+
+`p2pmux setup opencode` writes one file, `~/.config/opencode/plugin/p2pmux.js`, and uninstalling
+deletes it. OpenCode has no hook list to merge into — a plugin is a file it imports — so ownership
+is a line inside the file rather than a marker on an entry: a `p2pmux.js` p2pmux did not write is
+refused rather than overwritten or deleted.
+
+The plugin subscribes to the four events that say who a turn is waiting on: `tool.execute.before`
+and `message.updated` report `running`, `permission.asked` reports `needs you` and names the command
+it is asking about, `session.idle` reports `done`, and `session.error` reports an error. A
+permission event the plugin cannot name raises nothing at all, for the same reason Claude's
+placeholder notification is dropped: a row that says an agent wants *something* is a row you learn
+to ignore. Restart any running opencode sessions to pick the plugin up.
+
+#### What a hook may say
 
 A turn that ends by asking a question reports `needs you` rather than `done`, since a green row on
 a turn that is actually waiting reads as safe to ignore. A hook only ever reports for the pane it

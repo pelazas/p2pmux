@@ -140,6 +140,16 @@ enum SetupAgent {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+    /// OpenCode, via a plugin at ~/.config/opencode/plugin/p2pmux.js.
+    #[command(name = "opencode")]
+    OpenCode {
+        /// Delete the plugin p2pmux installed.
+        #[arg(long)]
+        uninstall: bool,
+        /// Say what would change without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,6 +166,14 @@ enum NotifyAgent {
         /// The status this hook reports, when the registration knows it
         /// (`running`, `pending`, `done`, `idle`, `error`). Without it the
         /// payload's own `hook_event_name` decides.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Read an OpenCode plugin payload on stdin.
+    #[command(name = "opencode")]
+    OpenCode {
+        /// The status this event reports (`running`, `pending`, `done`,
+        /// `idle`, `error`). Without it the payload's own `event` decides.
         #[arg(long)]
         status: Option<String>,
     },
@@ -211,6 +229,10 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
             NotifyAgent::Claude { status } => {
                 crate::agent_notify::run(crate::agent_detect::AgentKind::Claude, status.as_deref())
             }
+            NotifyAgent::OpenCode { status } => crate::agent_notify::run(
+                crate::agent_detect::AgentKind::OpenCode,
+                status.as_deref(),
+            ),
         }),
         // Reading the finder records is a directory scan; it needs no runtime either.
         Some(Command::Ls) => Some(print_sessions()),
@@ -220,10 +242,13 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
             Some(SetupAgent::Claude { uninstall, dry_run }) => {
                 crate::agent_setup::setup_claude(*uninstall, *dry_run)
             }
-            // Every agent with a hook surface, which today is one. When a
-            // second lands, this is the line that has to grow -- not the
-            // sentence the inbox shows a first-time user.
-            None => crate::agent_setup::setup_claude(false, false),
+            Some(SetupAgent::OpenCode { uninstall, dry_run }) => {
+                crate::agent_setup::setup_opencode(*uninstall, *dry_run)
+            }
+            // Every agent with a hook surface. Naming one is the exception —
+            // the sentence the inbox shows a first-time user is the bare
+            // command, and it has to leave that machine fully wired.
+            None => crate::agent_setup::setup_all(false, false),
         }),
         Some(Command::Doctor) => Some(crate::agent_setup::doctor()),
         _ => None,

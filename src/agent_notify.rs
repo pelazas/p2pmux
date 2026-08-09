@@ -117,6 +117,73 @@ fn ends_with_a_question(message: &str) -> bool {
         .is_some_and(|line| line.trim_end().ends_with('?'))
 }
 
+/// Map an opencode plugin event name to a status.
+///
+/// opencode's vocabulary is an event bus rather than a hook list, so the plugin
+/// subscribes to the four that say something about who the turn is waiting on.
+/// `session.error` is the one Claude has no equivalent for: opencode reports a
+/// turn that failed, and a failed turn is not a finished one.
+fn state_from_opencode_event(event: &str) -> Option<AgentState> {
+    match event {
+        "message.updated" | "tool.execute.before" | "tool.execute.after" => {
+            Some(AgentState::Working)
+        }
+        "permission.asked" | "permission.updated" => Some(AgentState::Pending),
+        "session.idle" => Some(AgentState::Done),
+        "session.error" => Some(AgentState::Error),
+        "session.deleted" => Some(AgentState::Idle),
+        _ => None,
+    }
+}
+
+/// Decide what an opencode plugin payload means. `None` is a deliberate no-op.
+///
+/// The payload is the plugin's own JSON — `{"event":…,"message":…,"cwd":…}` —
+/// rather than Claude's hook envelope, but everything downstream of the state
+/// is identical, including the rule that a "needs you" with nothing to say is
+/// dropped: opencode raises `permission.asked` for every tool call it is
+/// configured to ask about, and a badge that lights without saying what for is
+/// a badge people learn to ignore.
+pub fn derive_opencode(raw: &str, status_arg: Option<&str>) -> Option<HookUpdate> {
+    let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let state = match status_arg {
+        Some(argument) => AgentState::from_wire(argument)?,
+        None => state_from_opencode_event(payload.get("event").and_then(Value::as_str)?)?,
+    };
+
+    finish(state, message, &payload)
+}
+
+/// The half of a derivation that no agent's vocabulary changes: drop an empty
+/// "needs you", read the working directory, and bound the message.
+fn finish(state: AgentState, message: &str, payload: &Value) -> Option<HookUpdate> {
+    if state == AgentState::Pending && message.trim().is_empty() {
+        return None;
+    }
+
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+
+    Some(HookUpdate {
+        state,
+        cwd,
+        message: summarize(message),
+    })
+}
+
 /// Decide what a Claude hook payload means. `None` is a deliberate no-op.
 ///
 /// `status_arg` comes from the hook registration (`notify.sh running`) and wins
@@ -149,29 +216,14 @@ pub fn derive_claude(raw: &str, status_arg: Option<&str>) -> Option<HookUpdate> 
         state = AgentState::Pending;
     }
 
-    if state == AgentState::Pending {
-        let trimmed = message.trim();
-        if trimmed.is_empty() || GENERIC_PENDING.contains(&trimmed) {
-            return None;
-        }
+    // Claude's own placeholder text says nothing about what is being asked, so
+    // it is dropped here on top of the empty-message rule `finish` applies to
+    // every agent.
+    if state == AgentState::Pending && GENERIC_PENDING.contains(&message.trim()) {
+        return None;
     }
 
-    let cwd = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned())
-        })
-        .unwrap_or_default();
-
-    Some(HookUpdate {
-        state,
-        cwd,
-        message: summarize(message),
-    })
+    finish(state, message, &payload)
 }
 
 /// The pane this process is running in, and the node socket to report to.
@@ -221,7 +273,8 @@ pub fn run(kind: AgentKind, status_arg: Option<&str>) -> Result<(), Box<dyn Erro
     let raw = read_payload();
     let update = match kind {
         AgentKind::Claude => derive_claude(&raw, status_arg),
-        // Other agents have no hook vocabulary wired up yet, but `--status`
+        AgentKind::OpenCode => derive_opencode(&raw, status_arg),
+        // The rest have no hook vocabulary wired up yet, but `--status`
         // already makes this usable from any script that knows its own state.
         _ => status_arg
             .and_then(AgentState::from_wire)
@@ -364,6 +417,75 @@ mod tests {
                 .expect("current dir")
                 .to_string_lossy()
                 .into_owned()
+        );
+    }
+
+    fn opencode_state(raw: &str, status_arg: Option<&str>) -> Option<AgentState> {
+        derive_opencode(raw, status_arg).map(|update| update.state)
+    }
+
+    #[test]
+    fn opencode_events_map_to_states_when_no_status_is_given() {
+        assert_eq!(
+            opencode_state(r#"{"event":"tool.execute.before"}"#, None),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            opencode_state(r#"{"event":"session.idle"}"#, None),
+            Some(AgentState::Done)
+        );
+        assert_eq!(
+            opencode_state(r#"{"event":"session.error"}"#, None),
+            Some(AgentState::Error)
+        );
+        assert_eq!(
+            opencode_state(
+                r#"{"event":"permission.updated","message":"needs permission: cargo test"}"#,
+                None
+            ),
+            Some(AgentState::Pending)
+        );
+        assert_eq!(opencode_state(r#"{"event":"tui.toast.show"}"#, None), None);
+    }
+
+    /// The same rule Claude's placeholder notification gets, for the same
+    /// reason: opencode raises a permission event for every ask, and a row that
+    /// says an agent wants *something* is a row people stop reading.
+    #[test]
+    fn an_opencode_permission_it_cannot_name_raises_nothing() {
+        assert_eq!(
+            opencode_state(r#"{"event":"permission.updated","message":""}"#, None),
+            None
+        );
+        assert_eq!(
+            opencode_state(r#"{"event":"permission.updated"}"#, None),
+            None
+        );
+        assert_eq!(opencode_state("{}", Some("pending")), None);
+    }
+
+    #[test]
+    fn an_opencode_payload_carries_its_own_cwd_and_message() {
+        let update = derive_opencode(
+            r#"{"event":"permission.updated","message":"needs permission: rm -rf build","cwd":"/root/work"}"#,
+            None,
+        )
+        .expect("update");
+        assert_eq!(update.cwd, "/root/work");
+        assert_eq!(update.message, "needs permission: rm -rf build");
+
+        // The plugin passes `--status` on every call, so that path is the one
+        // that actually runs in production.
+        assert_eq!(
+            opencode_state(
+                r#"{"event":"session.idle","cwd":"/root/work"}"#,
+                Some("done")
+            ),
+            Some(AgentState::Done)
+        );
+        assert_eq!(
+            opencode_state(r#"{"event":"session.idle"}"#, Some("dnoe")),
+            None
         );
     }
 }
