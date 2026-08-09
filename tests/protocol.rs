@@ -1,16 +1,16 @@
 use p2pmux::protocol::{
     AgentRoster, AgentRosterEntry, AgentRosterState, ControlLease, CreatePane, CreateTab,
-    DeletePane, DeleteTab, Delta, Envelope, Input, Join, LEDGER_HASH_BYTES, LEDGER_SIGNATURE_BYTES,
-    LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason, LayoutRequest, LayoutSplit,
-    LayoutState, LedgerEntry, LedgerEntryKind, MAX_AGENT_CWD_BYTES, MAX_AGENT_KIND_BYTES,
-    MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES, MAX_ENVELOPE_BYTES,
-    MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_LEDGER_PAYLOAD_BYTES, MAX_PANE_ID_BYTES,
-    MAX_PEER_ID_BYTES, MAX_PRESENCE_ENTRIES, MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES,
-    MarkPaneExited, MemberDescriptor, MemberKind, NewPanePosition, PROTOCOL_VERSION,
-    PaneDescriptor, PaneFailed, PaneGrid, PaneReady, PaneReservation, PaneSubscribe, Presence,
-    PresenceRoster, ProtocolError, SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot,
-    SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids, Welcome, decode_frame, encode_frame,
-    envelope,
+    DeletePane, DeleteTab, Delta, Envelope, FleetInvite, Input, Join, LEDGER_HASH_BYTES,
+    LEDGER_SIGNATURE_BYTES, LayoutCommit, LayoutNode, LayoutReject, LayoutRejectReason,
+    LayoutRequest, LayoutSplit, LayoutState, LedgerEntry, LedgerEntryKind, MAX_AGENT_CWD_BYTES,
+    MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_FLEET_TICKET_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
+    MAX_LEDGER_PAYLOAD_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_PRESENCE_ENTRIES,
+    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited, MemberDescriptor, MemberKind,
+    NewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneGrid, PaneReady,
+    PaneReservation, PaneSubscribe, Presence, PresenceRoster, ProtocolError, SessionSnapshot,
+    SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids,
+    Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -2125,6 +2125,35 @@ fn a_member_kind_survives_the_wire_and_an_unknown_one_reads_as_silence() {
     assert!(
         MemberKind::try_from(9_999).is_err(),
         "a kind this build does not know is not coerced into one it does"
+    );
+}
+
+/// The message that makes a fleet follow you into a session it was never
+/// paired into.
+#[test]
+fn a_fleet_invitation_carries_a_ticket_and_who_is_offering_it() {
+    let invite = envelope(envelope::Body::FleetInvite(FleetInvite {
+        ticket: String::from("p2pmux-ticket"),
+        from_peer_id: b"peer-a".to_vec(),
+    }));
+    let frame = encode_frame(&invite).expect("an invitation encodes");
+    assert_eq!(decode_frame(&frame).expect("decodes"), invite);
+
+    // An invitation to nowhere is refused at the framing layer rather than
+    // being handed to a machine to puzzle over.
+    assert!(
+        encode_frame(&envelope(envelope::Body::FleetInvite(FleetInvite {
+            ticket: String::new(),
+            from_peer_id: b"peer-a".to_vec(),
+        })))
+        .is_err()
+    );
+    assert!(
+        encode_frame(&envelope(envelope::Body::FleetInvite(FleetInvite {
+            ticket: "x".repeat(MAX_FLEET_TICKET_BYTES + 1),
+            from_peer_id: b"peer-a".to_vec(),
+        })))
+        .is_err()
     );
 }
 

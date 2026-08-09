@@ -170,6 +170,46 @@ impl SharedLayoutRuntime {
             .collect()
     }
 
+    /// Tell the fleet about every other session this machine is coordinating,
+    /// and act on the invitations it has been sent.
+    ///
+    /// This is what makes your machines follow you: `p2pmux create` on a laptop
+    /// starts a node that knows nothing about any fleet, but the laptop's *home
+    /// session* node — the one pairing left running — sees the new session in
+    /// the local store and offers its ticket to the machines already with it.
+    ///
+    /// Re-announced every time rather than once, because a machine that was
+    /// asleep when a session started has to hear about it when it wakes. The
+    /// receiving side makes that cheap: it already knows which sessions it is
+    /// in, and an invitation to one of them does nothing.
+    pub(crate) fn exchange_fleet_invites(&mut self) {
+        // Only a machine that has been paired has a fleet to talk to, and only
+        // it has a record to judge invitations against.
+        if !crate::pairing::load_or_empty().can_rejoin() {
+            return;
+        }
+        for (from_peer_id, ticket) in self.control.take_fleet_invites() {
+            self.consider_fleet_invite(&from_peer_id, &ticket);
+        }
+        let Ok(store) = crate::session_store::SessionStore::for_current_user() else {
+            return;
+        };
+        let Ok(live) = store.list_live() else {
+            return;
+        };
+        for session in live {
+            let Some(ticket) = session.ticket else {
+                continue;
+            };
+            // Not this session: announcing the one everybody is already in is
+            // the one invitation guaranteed to be useless.
+            if self.invite.ticket.as_deref() == Some(ticket.as_str()) {
+                continue;
+            }
+            let _ = self.control.try_fleet_invite(ticket);
+        }
+    }
+
     /// What another machine of yours is waiting to be allowed to start here.
     ///
     /// The node holds the request; the attached client is what can ask a human

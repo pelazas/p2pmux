@@ -1094,8 +1094,14 @@ pub(crate) fn launch_background_node(
     let store = crate::session_store::SessionStore::for_current_user()?;
     let id = crate::session_store::generate_id()?;
     let socket_path = store.socket_path(&id)?;
-    let descriptor =
+    let mut descriptor =
         crate::session_store::SessionDescriptor::new(id.clone(), name, socket_path, 1, role);
+    // Recorded before the node starts, because it is what a *later* invitation
+    // is compared against: a machine has to be able to say "I am already in
+    // that session" without attaching to it.
+    if let crate::node::NodeBootstrapKind::Join { ticket, .. } = &kind {
+        descriptor.joined_ticket = Some(ticket.clone());
+    }
     let bootstrap = crate::node::NodeBootstrap {
         descriptor: descriptor.clone(),
         kind,
@@ -1179,7 +1185,7 @@ pub(crate) fn launch_background_node(
 /// *machine* an agent is on, so `desktop` and `droplet` are exactly what a user
 /// would have typed anyway. A name typed later with `p2pmux config set name`
 /// still wins, and so does one already saved.
-fn display_name_or_hostname() -> Result<String, Box<dyn Error>> {
+pub(crate) fn display_name_or_hostname() -> Result<String, Box<dyn Error>> {
     if let Some(name) = crate::config::load()? {
         return Ok(name);
     }

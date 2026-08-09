@@ -91,6 +91,49 @@ pub struct NodeBootstrap {
     pub kind: NodeBootstrapKind,
 }
 
+/// Join a session one of your machines invited you to, in a node of its own.
+///
+/// A node hosts one session, so following an invitation means starting another
+/// node rather than teaching this one to be in two places. That is also what
+/// `p2pmux join` does, which is the point: an invited machine ends up in
+/// exactly the state it would have been in had somebody typed the code on it.
+///
+/// Returns whether anything was started. Already being in that session is the
+/// ordinary case, not a failure: invitations are re-announced on a timer so
+/// that a machine which was asleep still hears about a session started while
+/// it was, and every announcement after the first is a no-op.
+pub fn follow_fleet_invite(ticket: &str) -> Result<bool, Box<dyn Error>> {
+    let parsed = ticket
+        .parse::<crate::ticket::JoinTicket>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid invitation ticket"))?;
+    let ticket = parsed.to_string();
+    let store = crate::session_store::SessionStore::for_current_user()?;
+    // Both sides of the same question: the session this machine coordinates,
+    // and any it has already been invited into. Without the first, a machine
+    // would follow its own invitation back into the session it just started.
+    if store.list_live()?.iter().any(|session| {
+        session.ticket.as_deref() == Some(ticket.as_str())
+            || session.joined_ticket.as_deref() == Some(ticket.as_str())
+    }) {
+        return Ok(false);
+    }
+    let display_name = crate::cli::display_name_or_hostname()?;
+    crate::cli::launch_background_node(
+        NodeBootstrapKind::Join {
+            ticket,
+            display_name,
+            // No terminal is attached to a machine following an invitation, so
+            // the grid is the one a client will reflow the moment somebody
+            // attaches. Guessing small would make the first frame a resize.
+            cols: 80,
+            rows: 24,
+        },
+        crate::session_store::generate_name()?,
+        crate::session_store::SessionRole::Member,
+    )?;
+    Ok(true)
+}
+
 pub fn write_bootstrap(path: &std::path::Path, bootstrap: &NodeBootstrap) -> io::Result<()> {
     let bytes = serde_json::to_vec(bootstrap).map_err(io::Error::other)?;
     let mut file = std::fs::OpenOptions::new()
@@ -513,6 +556,11 @@ fn run_socket_loop(
                     eprintln!("p2pmux node: failed to record paired machines: {error}");
                 }
             }
+            // On the same timer, and deliberately not only when the membership
+            // changed: a session started on this machine is not a membership
+            // change here, and it is exactly the thing the fleet has to hear
+            // about. See `exchange_fleet_invites`.
+            node.runtime.exchange_fleet_invites();
         }
         did_work |= changed;
         let mut detached = false;

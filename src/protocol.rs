@@ -19,6 +19,9 @@ pub const MAX_AGENT_ROSTER_ENTRIES: usize = 32;
 pub const MAX_PRESENCE_ENTRIES: usize = 8;
 pub const MAX_AGENT_KIND_BYTES: usize = 32;
 pub const MAX_AGENT_CWD_BYTES: usize = 512;
+/// The longest invitation ticket accepted. Comfortably above a real one, and
+/// small enough that a peer cannot make its neighbours parse a novel.
+pub const MAX_FLEET_TICKET_BYTES: usize = 4096;
 /// Cap on an agent's activity message.
 ///
 /// Not a wire limit: the message never leaves the machine that produced it (see
@@ -129,7 +132,7 @@ pub struct Envelope {
     pub sender_peer_id: Vec<u8>,
     #[prost(
         oneof = "envelope::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -175,7 +178,36 @@ pub mod envelope {
         Presence(super::Presence),
         #[prost(message, tag = "28")]
         PresenceRoster(super::PresenceRoster),
+        #[prost(message, tag = "29")]
+        FleetInvite(super::FleetInvite),
     }
+}
+
+/// "I started a session; come to it."
+///
+/// The message that makes a fleet a property of *you* rather than of the one
+/// session pairing happened to record. A machine that has been paired keeps a
+/// node in the home session for exactly this: it is the standing channel over
+/// which your other machines can be told where you are now.
+///
+/// Nothing here is authority. The ticket is an invitation, and each machine
+/// decides whether to accept it by asking its own pairing record whether the
+/// sender is one of its own — the sender's peer id is authenticated by the
+/// transport, so a guest in the session cannot pretend to be your laptop.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FleetInvite {
+    /// The session to join, as a printable ticket.
+    #[prost(string, tag = "1")]
+    pub ticket: String,
+    /// Who is inviting. Written by the coordinator from the authenticated peer
+    /// that sent it, overwriting whatever the sender put here — a member only
+    /// ever receives invitations relayed by the coordinator, and would
+    /// otherwise have no way to tell whose they were.
+    ///
+    /// It is not authority either way: it decides which pairing record entry to
+    /// look for, and the record is what decides.
+    #[prost(bytes = "vec", tag = "2")]
+    pub from_peer_id: Vec<u8>,
 }
 
 /// What is at the other end of a member: a machine, a person, or no answer.
@@ -1200,6 +1232,19 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
         envelope::Body::AgentRoster(roster) => validate_agent_roster(roster)?,
         envelope::Body::Presence(presence) => validate_presence(presence)?,
         envelope::Body::PresenceRoster(roster) => validate_presence_roster(roster)?,
+        envelope::Body::FleetInvite(invite) => {
+            // Bounded and non-empty, and nothing more: whether the ticket
+            // parses is the receiving machine's business, and it will refuse
+            // the invitation rather than the connection if it does not.
+            validate_field_size(
+                "fleet_invite.ticket",
+                invite.ticket.len(),
+                MAX_FLEET_TICKET_BYTES,
+            )?;
+            if invite.ticket.is_empty() {
+                return Err(ProtocolError::InvalidLayout("fleet_invite.ticket"));
+            }
+        }
     }
 
     Ok(())

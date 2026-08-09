@@ -50,9 +50,50 @@ impl SharedLayoutRuntime {
             LayoutControlEvent::Reject(reject) => {
                 self.reject_request_with_reason(reject.request_id, reject.reason)
             }
+            LayoutControlEvent::FleetInvite {
+                from_peer_id,
+                ticket,
+            } => self.consider_fleet_invite(&from_peer_id, &ticket),
             LayoutControlEvent::Disconnected => self.note_coordinator_lost(),
         }
         Ok(())
+    }
+
+    /// Decide whether to follow a machine into a session it has started.
+    ///
+    /// This is what makes the fleet a property of *you* rather than of the one
+    /// session pairing recorded: your other machines are already here, in the
+    /// home session, and this is how they are told where you went.
+    ///
+    /// Two questions, both answered locally. Is the inviter one of my machines
+    /// — asked of this machine's own pairing record, against a peer id the
+    /// transport authenticated, so a guest in the session cannot summon your
+    /// droplet anywhere. And am I already there — because a session announces
+    /// itself on a timer, and joining twice would leave two nodes of the same
+    /// machine in one member list.
+    pub(in crate::tui) fn consider_fleet_invite(&mut self, from_peer_id: &[u8], ticket: &str) {
+        let name = crate::tui::member_label(from_peer_id, &self.tui.snapshot().members);
+        let kind = self
+            .tui
+            .snapshot()
+            .members
+            .iter()
+            .find(|member| member.peer_id == from_peer_id)
+            .map(|member| member.kind)
+            .unwrap_or_default();
+        if !crate::pairing::load_or_empty().owns(
+            &crate::pairing::peer_id_hex(from_peer_id),
+            &name,
+            kind,
+        ) {
+            self.status = format!("ignored an invitation from {name}, which is not my machine");
+            return;
+        }
+        match crate::node::follow_fleet_invite(ticket) {
+            Ok(true) => self.status = format!("joined the session {name} started"),
+            Ok(false) => {}
+            Err(error) => self.status = format!("could not follow {name}: {error}"),
+        }
     }
 
     pub(in crate::tui) fn apply_layout_state(

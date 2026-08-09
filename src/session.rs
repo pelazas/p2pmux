@@ -2433,6 +2433,30 @@ pub struct SharedLayoutHost {
     /// The coordinator signs its own requests like anybody else. Exempting it would leave
     /// exactly one identity in the session whose entries nobody could check.
     signer: IntentSigner,
+    /// Invitations from members, waiting for the runtime to decide about them.
+    ///
+    /// A queue rather than a channel because the peer tasks are spawned one per
+    /// member and the runtime is one loop that drains everything it owns; this
+    /// is the same shape as `peers` and is drained the same way.
+    fleet_invites: FleetInviteQueue,
+}
+
+/// Invitations received but not yet decided about. See
+/// [`crate::protocol::FleetInvite`].
+type FleetInviteQueue = Arc<Mutex<Vec<(Vec<u8>, String)>>>;
+
+/// Record an invitation for the runtime to pick up.
+///
+/// Bounded, because a peer that is misbehaving must not be able to grow this
+/// without limit while nobody is draining it. Dropping the newest is right:
+/// the ones already queued are older invitations that are still just as valid.
+fn push_fleet_invite(queue: &FleetInviteQueue, from_peer_id: Vec<u8>, ticket: String) {
+    const MAX_QUEUED_INVITES: usize = 16;
+    if let Ok(mut queue) = queue.lock()
+        && queue.len() < MAX_QUEUED_INVITES
+    {
+        queue.push((from_peer_id, ticket));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2443,6 +2467,14 @@ pub enum LayoutControlEvent {
     Reservation(PaneReservation),
     Commit(LayoutCommit),
     Reject(LayoutReject),
+    /// A machine in this session says it has started another one.
+    ///
+    /// Whether to go is decided by the receiver, against its own pairing
+    /// record. See [`crate::protocol::FleetInvite`].
+    FleetInvite {
+        from_peer_id: Vec<u8>,
+        ticket: String,
+    },
     Disconnected,
 }
 
@@ -2463,6 +2495,7 @@ impl PaneLayoutReconciler {
             LayoutControlEvent::Snapshot(snapshot) => snapshot.state.as_ref(),
             LayoutControlEvent::Commit(commit) => commit.state.as_ref(),
             LayoutControlEvent::AgentRoster(_)
+            | LayoutControlEvent::FleetInvite { .. }
             | LayoutControlEvent::Presence(_)
             | LayoutControlEvent::Reservation(_)
             | LayoutControlEvent::Reject(_)
@@ -2489,6 +2522,7 @@ enum LayoutClientMessage {
     Failed(PaneFailed),
     AgentRoster(AgentRoster),
     Presence(Presence),
+    FleetInvite(crate::protocol::FleetInvite),
 }
 
 const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
@@ -2739,6 +2773,22 @@ impl SharedLayoutMember {
             .map_err(layout_queue_error)
     }
 
+    /// Offer a session this machine started to the rest of the fleet.
+    ///
+    /// `from_peer_id` is left empty: the coordinator overwrites it with the
+    /// peer it authenticated, which is the only value a member receiving the
+    /// relay could act on safely.
+    pub fn try_fleet_invite(&self, ticket: String) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::FleetInvite(
+                crate::protocol::FleetInvite {
+                    ticket,
+                    from_peer_id: Vec::new(),
+                },
+            ))
+            .map_err(layout_queue_error)
+    }
+
     /// Publish where this member is now looking to the coordinator.
     pub fn try_presence(&self, presence: Presence) -> Result<(), LayoutControlQueueError> {
         self.outbound
@@ -2840,6 +2890,7 @@ impl SharedLayoutHost {
         Ok(Self {
             host,
             pane_server,
+            fleet_invites: FleetInviteQueue::default(),
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
@@ -2879,6 +2930,7 @@ impl SharedLayoutHost {
         Ok(Self {
             host,
             pane_server,
+            fleet_invites: FleetInviteQueue::default(),
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
@@ -3145,6 +3197,33 @@ impl SharedLayoutHost {
     ///
     /// Only the coordinator can do this, because only the coordinator answers joins.
     /// Returns the resulting state so a caller can report it without a second lookup.
+    /// Offer a session this machine started to every member.
+    ///
+    /// Stamped with this coordinator's own peer id, for the same reason the
+    /// relay path stamps a member's: the receiver has to know whose invitation
+    /// it is in order to ask its pairing record about it.
+    pub fn announce_fleet_invite(&self, ticket: String) -> Result<(), SessionError> {
+        broadcast_envelope(
+            &self.peers,
+            coordinator_envelope(
+                self.host.transport.endpoint_id().as_bytes(),
+                envelope::Body::FleetInvite(crate::protocol::FleetInvite {
+                    ticket,
+                    from_peer_id: self.host.transport.endpoint_id().as_bytes().to_vec(),
+                }),
+            ),
+        );
+        Ok(())
+    }
+
+    /// Invitations members sent, for the runtime to decide about.
+    pub fn take_fleet_invites(&self) -> Vec<(Vec<u8>, String)> {
+        self.fleet_invites
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    }
+
     pub fn set_session_lock(&self, locked: bool) -> Result<bool, SessionError> {
         let mut coordinator = self
             .coordinator
@@ -3391,6 +3470,7 @@ impl SharedLayoutHost {
                 self.peers.clone(),
                 self.pane_server.clone(),
                 self.reservation_timeout,
+                self.fleet_invites.clone(),
             ));
             if let Ok(mut slot) = reader_abort.lock() {
                 *slot = Some(reader_task.abort_handle());
@@ -3635,6 +3715,27 @@ fn broadcast_envelope(peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>, envelo
         // Full-state broadcasts are revisioned and supersede older ones, so each peer needs only
         // the latest state while its writer catches up. Layout commits are NOT in this class --
         // they are chain links and go through `broadcast_commit_envelope`.
+        peer.mailbox.publish_state(envelope.clone());
+    }
+}
+
+/// Send one envelope to every peer but the one named.
+///
+/// Relaying an invitation back to the machine that made it would have it try to
+/// join a session it is already coordinating.
+fn broadcast_except(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    except: &[u8],
+    envelope: Envelope,
+) {
+    let peers = match peers.lock() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+    for (peer_id, peer) in peers.iter() {
+        if peer_id.as_slice() == except {
+            continue;
+        }
         peer.mailbox.publish_state(envelope.clone());
     }
 }
@@ -3989,6 +4090,7 @@ async fn layout_member_writer_task(
             LayoutClientMessage::Failed(failed) => envelope::Body::PaneFailed(failed),
             LayoutClientMessage::AgentRoster(roster) => envelope::Body::AgentRoster(roster),
             LayoutClientMessage::Presence(presence) => envelope::Body::Presence(presence),
+            LayoutClientMessage::FleetInvite(invite) => envelope::Body::FleetInvite(invite),
         };
         if writer
             .write_next(&coordinator_envelope(&peer_id, body))
@@ -4016,6 +4118,13 @@ async fn layout_member_reader_task(
             }
             Some(envelope::Body::AgentRoster(roster)) => LayoutControlEvent::AgentRoster(roster),
             Some(envelope::Body::PresenceRoster(roster)) => LayoutControlEvent::Presence(roster),
+            // Carried up with the peer that sent it: the invitation means
+            // nothing without knowing whose it is, and the answer to "is that
+            // one of my machines" is given locally against the pairing record.
+            Some(envelope::Body::FleetInvite(invite)) => LayoutControlEvent::FleetInvite {
+                from_peer_id: invite.from_peer_id,
+                ticket: invite.ticket,
+            },
             Some(envelope::Body::PaneReservation(reservation)) => {
                 LayoutControlEvent::Reservation(reservation)
             }
@@ -4045,6 +4154,7 @@ async fn layout_member_reader_task(
     let _ = events_tx.send(LayoutControlEvent::Disconnected).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn layout_host_reader_task(
     mut reader: crate::transport::FrameReader,
     peer_id: Vec<u8>,
@@ -4053,6 +4163,7 @@ async fn layout_host_reader_task(
     peers: Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
     pane_server: PaneServer,
     reservation_timeout: Duration,
+    fleet_invites: FleetInviteQueue,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != peer_id {
@@ -4119,6 +4230,25 @@ async fn layout_host_reader_task(
                     ),
                 );
                 drop(coordinator_guard);
+            }
+            Some(envelope::Body::FleetInvite(invite)) => {
+                // Stamped with the peer QUIC proved, not with whatever the
+                // sender wrote: members see only what the coordinator relays,
+                // so this is the one place the claim can be made true.
+                let invite = crate::protocol::FleetInvite {
+                    ticket: invite.ticket,
+                    from_peer_id: peer_id.clone(),
+                };
+                push_fleet_invite(
+                    &fleet_invites,
+                    invite.from_peer_id.clone(),
+                    invite.ticket.clone(),
+                );
+                broadcast_except(
+                    &peers,
+                    &peer_id,
+                    coordinator_envelope(&coordinator_peer_id, envelope::Body::FleetInvite(invite)),
+                );
             }
             Some(envelope::Body::AgentRoster(roster)) => {
                 let accepted = match coordinator.lock() {

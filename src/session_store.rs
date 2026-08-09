@@ -143,6 +143,16 @@ pub struct SessionDescriptor {
     /// Absent on a member, and on a coordinator that could not reach the service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_code: Option<String>,
+    /// The ticket this machine joined, for a session it did not create.
+    ///
+    /// A coordinator's own ticket is above; this is the mirror image, and it
+    /// exists so that a machine following an invitation can tell whether it is
+    /// already in that session. Invitations are re-announced on a timer — a
+    /// machine that was asleep has to hear about a session started while it was
+    /// — so "am I already there" is asked constantly and has to survive the
+    /// node being restarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_ticket: Option<String>,
     /// The machines currently in this session, with how many agents each is
     /// running. Written by the node whenever membership changes.
     ///
@@ -190,6 +200,7 @@ impl SessionDescriptor {
             created_at: now_secs(),
             ticket: None,
             join_code: None,
+            joined_ticket: None,
             peers: Vec::new(),
         }
     }

@@ -80,6 +80,32 @@ impl SharedControl {
         }
     }
 
+    /// Invitations members sent this coordinator. Empty on a member, which
+    /// receives them as control events instead.
+    pub(in crate::tui) fn take_fleet_invites(&self) -> Vec<(Vec<u8>, String)> {
+        match self {
+            Self::Host(host) => host.take_fleet_invites(),
+            Self::Member(_) => Vec::new(),
+        }
+    }
+
+    /// Tell the other machines in this session about a session started here.
+    ///
+    /// The coordinator relays it to every member and acts on it itself; a
+    /// member sends it to the coordinator, which does the same. Either way the
+    /// decision to follow is made by each receiver against its own pairing
+    /// record — see [`crate::protocol::FleetInvite`].
+    pub(in crate::tui) fn try_fleet_invite(&self, ticket: String) -> Result<(), String> {
+        match self {
+            Self::Host(host) => host
+                .announce_fleet_invite(ticket)
+                .map_err(|error| error.to_string()),
+            Self::Member(member) => member
+                .try_fleet_invite(ticket)
+                .map_err(layout_queue_message),
+        }
+    }
+
     /// Publishes this member's focus. The coordinator applies it locally and gets the
     /// resulting full roster back; a member has to wait for the broadcast.
     pub(in crate::tui) fn try_presence(
