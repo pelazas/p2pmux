@@ -80,7 +80,10 @@ fn start_fake_agent() -> Option<Fake> {
     fs::write(&script, AGENT).expect("write agent script");
     let pid_file = root.join("pid");
 
-    let status = Command::new("/bin/sh")
+    // `bash`, not `sh`: `exec -a` is a bash builtin extension, and `/bin/sh` on
+    // Debian and Ubuntu — which is what CI's Linux runner is — is `dash`, which
+    // does not have it. The process it execs is still plain `sh`.
+    let status = Command::new("/bin/bash")
         .arg("-c")
         .arg(format!(
             "(exec -a claude /bin/sh {} {} {} &) </dev/null >/dev/null 2>&1",

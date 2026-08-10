@@ -292,6 +292,10 @@ pub fn run_on(
     let mut detach_sent = false;
     let mut killed = false;
     let mut last_agent_overlay_animation = Instant::now();
+    // Started before the attach rather than after it, so the answer is usually
+    // already waiting by the first frame — and started here rather than in the
+    // node, because the notice is for the person sitting at this terminal.
+    let update_notices = crate::update_check::spawn();
     let mut pending_focus = None;
     let mut pending_resync = BTreeSet::new();
     let mut history_refresh = BTreeSet::new();
@@ -596,6 +600,12 @@ pub fn run_on(
         }
         if let Some(tui) = tui.as_mut() {
             dirty |= refresh_tui_timers(tui, Instant::now(), &mut last_agent_overlay_animation);
+            // Whenever it turns up, or never. The check runs on its own thread
+            // from the moment this client started, so nothing here waited for
+            // it and a machine with no network simply never fills this in.
+            if let Ok(notice) = update_notices.try_recv() {
+                dirty |= tui.set_update_notice(notice.line());
+            }
             // A pointer held past a pane's edge sends no further drag events —
             // a terminal reports a drag when the cell under the pointer
             // changes, and it is not changing. This clock is what keeps the

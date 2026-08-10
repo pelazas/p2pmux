@@ -716,6 +716,8 @@ pub(in crate::tui) struct HomeLayout {
     pub(in crate::tui) rows: Rect,
     /// The `p2pmux setup` nudge. Zero-height unless every row is unreported.
     pub(in crate::tui) hint: Rect,
+    /// One line saying a newer p2pmux is out. Zero-height until a check says so.
+    pub(in crate::tui) update: Rect,
     /// Where the machines go. Zero-height only before the member list has
     /// arrived, and shaped by [`HomeLayout::machine_panel`].
     pub(in crate::tui) machines: Rect,
@@ -920,12 +922,13 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
     let rows_for_machines = machine_rows(tui);
     let machines = rows_for_machines.len();
     if machines == 0 {
-        let (header, rows, hint) = stacked(area, tui, 0);
+        let (header, rows, hint, update) = stacked(area, tui, 0);
         return HomeLayout {
             header,
             rows,
             hint,
-            machines: Rect::new(area.x, hint.bottom(), area.width, 0),
+            update,
+            machines: Rect::new(area.x, update.bottom(), area.width, 0),
             machine_panel: MachinePanel::Empty,
         };
     }
@@ -939,7 +942,7 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
             MACHINE_RAIL_WIDTH,
             area.height,
         );
-        let (header, rows, hint) = stacked(
+        let (header, rows, hint, update) = stacked(
             Rect::new(
                 area.x,
                 area.y,
@@ -953,6 +956,7 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
             header,
             rows,
             hint,
+            update,
             machines: rail,
             machine_panel: MachinePanel::Rail,
         };
@@ -971,30 +975,41 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
     } else {
         (MachinePanel::Empty, 0)
     };
-    let (header, rows, hint) = stacked(area, tui, height);
+    let (header, rows, hint, update) = stacked(area, tui, height);
     HomeLayout {
         header,
         rows,
         hint,
-        machines: Rect::new(area.x, hint.bottom(), area.width, height),
+        update,
+        machines: Rect::new(area.x, update.bottom(), area.width, height),
         machine_panel: panel,
     }
 }
 
-/// The header, the agent rows and the hint, stacked into whatever width and
-/// height are left once the machines have taken their share.
-fn stacked(area: Rect, tui: &MultiPaneTui, machines_height: u16) -> (Rect, Rect, Rect) {
+/// The header, the agent rows, the hint and the update line, stacked into
+/// whatever width and height are left once the machines have taken their share.
+///
+/// The update line gets a row of its own rather than sharing the hint's. They
+/// are different kinds of message — one says this install cannot do its job
+/// yet, the other says a newer one exists — and putting them in one slot means
+/// whichever loses is never seen by the people most likely to need it.
+fn stacked(area: Rect, tui: &MultiPaneTui, machines_height: u16) -> (Rect, Rect, Rect, Rect) {
     let header_height = 2u16.min(area.height);
     let left = area
         .height
         .saturating_sub(header_height)
         .saturating_sub(machines_height);
     let hint_height = u16::from(tui.home_all_unwired() || tui.home_notice.is_some()).min(left);
-    let rows_height = left.saturating_sub(hint_height);
+    let update_height =
+        u16::from(tui.update_notice.is_some()).min(left.saturating_sub(hint_height));
+    let rows_height = left
+        .saturating_sub(hint_height)
+        .saturating_sub(update_height);
     let header = Rect::new(area.x, area.y, area.width, header_height);
     let rows = Rect::new(area.x, header.bottom(), area.width, rows_height);
     let hint = Rect::new(area.x, rows.bottom(), area.width, hint_height);
-    (header, rows, hint)
+    let update = Rect::new(area.x, hint.bottom(), area.width, update_height);
+    (header, rows, hint, update)
 }
 
 #[cfg(test)]

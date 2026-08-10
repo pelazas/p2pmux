@@ -27,3 +27,4 @@ pub mod session_store;
 pub mod ticket;
 pub mod transport;
 pub mod tui;
+pub mod update_check;

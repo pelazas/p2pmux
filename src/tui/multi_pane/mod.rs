@@ -89,6 +89,14 @@ pub struct MultiPaneTui {
     /// are about the screen you are still looking at — which machine is asleep,
     /// which one is not yours — and the reader has not gone anywhere.
     pub(in crate::tui) home_notice: Option<String>,
+    /// One line saying a newer p2pmux has been released, and what to run.
+    ///
+    /// Set once, when the check that runs at launch comes back with something,
+    /// and left standing for the session — unlike [`Self::home_notice`], which
+    /// answers something the reader just did and is gone by the next thing they
+    /// do. A release is worth saying once and worth still being there when they
+    /// look back at the inbox an hour later.
+    pub(in crate::tui) update_notice: Option<String>,
     /// The area Home was last measured against.
     ///
     /// Kept so that a key handler which decides to open a terminal can size it
@@ -169,6 +177,7 @@ impl MultiPaneTui {
             home_selected: None,
             home_machine: None,
             home_notice: None,
+            update_notice: None,
             last_home_area: Rect::new(0, 0, 80, 24),
             home_page: 0,
             home_page_size: crate::tui::home::HOME_PAGE_MAX,
@@ -528,6 +537,18 @@ impl MultiPaneTui {
         }
         self.select_pane(tab_id, pane_id, "node_sync");
         Ok(())
+    }
+
+    /// Say on the inbox that a newer p2pmux has been released.
+    ///
+    /// Returns whether anything changed, so the answer arriving from a
+    /// background check costs one repaint rather than one a frame.
+    pub fn set_update_notice(&mut self, line: String) -> bool {
+        if self.update_notice.as_deref() == Some(line.as_str()) {
+            return false;
+        }
+        self.update_notice = Some(line);
+        true
     }
 
     /// Mirror the coordinator's current session lock, for display and for the toggle.

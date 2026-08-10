@@ -216,6 +216,21 @@ fn render_home_in(
         );
     }
 
+    if layout.update.height > 0
+        && let Some(update) = tui.update_notice.as_deref()
+    {
+        // Quieter than the nudge above it, and deliberately so: an install with
+        // no hooks cannot do its job, while this one only has a newer version
+        // to go and get. Both are worth a line; only one is worth the bold.
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {update}"),
+                Style::default().fg(theme.agent_overlay_secondary),
+            )),
+            layout.update,
+        );
+    }
+
     if layout.machines.height > 0 {
         let lines = match layout.machine_panel {
             MachinePanel::Rail => machine_rail(tui, theme, layout.machines.height),
@@ -1239,6 +1254,60 @@ mod tests {
             HOME_EMPTY_NO_HOOKS,
             "Run `p2pmux setup` to see which agents need you."
         );
+    }
+
+    /// Issue #77: a release nobody is told about is a release nobody installs.
+    /// It has to say the version *and* the command, because "an update is
+    /// available" with no way to take it is a line people learn to skip.
+    #[test]
+    fn a_new_release_says_so_on_the_inbox_with_the_command_to_take_it() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        assert!(!screen(&tui, 120, 30).join("\n").contains("is out"));
+
+        assert!(
+            tui.set_update_notice(
+                crate::update_check::UpdateNotice {
+                    version: String::from("9.9.9"),
+                    command: "brew update && brew upgrade p2pmux",
+                }
+                .line()
+            )
+        );
+        // Once. A repeat answer from a later check costs no repaint.
+        assert!(
+            !tui.set_update_notice(
+                crate::update_check::UpdateNotice {
+                    version: String::from("9.9.9"),
+                    command: "brew update && brew upgrade p2pmux",
+                }
+                .line()
+            )
+        );
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(drawn.contains("9.9.9 is out"), "{drawn}");
+        assert!(drawn.contains("brew upgrade p2pmux"), "{drawn}");
+
+        // The setup nudge keeps its own line too: an install that cannot say
+        // `needs you` and an install that is a version behind are two different
+        // problems, and the one that loses a shared slot is the one nobody sees.
+        let mut unwired =
+            crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Unknown)]);
+        unwired.set_home_open(true, "test");
+        assert!(unwired.set_update_notice(String::from("p2pmux 9.9.9 is out")));
+        let drawn = screen(&unwired, 120, 30).join("\n");
+        assert!(drawn.contains(HOME_EMPTY_NO_HOOKS), "{drawn}");
+        assert!(drawn.contains("9.9.9 is out"), "{drawn}");
+
+        // It has a line of its own, so an answer to something the reader just
+        // did does not push it off the screen — the two are different messages
+        // and the loser of one slot is the one nobody would ever see.
+        tui.home_notice = Some(String::from("that machine is asleep"));
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(drawn.contains("that machine is asleep"), "{drawn}");
+        assert!(drawn.contains("9.9.9 is out"), "{drawn}");
     }
 
     /// The screen is emptiest exactly when its reader is newest, so that is

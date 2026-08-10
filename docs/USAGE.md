@@ -584,6 +584,28 @@ config block that tuned it is gone with it. A hook-reported completion is alread
 overlay and the unread mark, and an agent that should make a noise can do it from its own `Stop`
 hook, where it knows it has actually finished.
 
+### Updates
+
+p2pmux checks once a day whether a newer release exists, and says so on its own line at the bottom
+of the inbox, with the one command that fits how this copy was installed:
+
+```
+p2pmux 0.1.7 is out — you have 0.1.6. Update with `brew update && brew upgrade p2pmux`
+```
+
+`p2pmux doctor` asks the same question and answers it either way, which is the one to run when you
+want to know now.
+
+What it does not do is install anything. Replacing the binary you are running, under whichever
+package manager put it there, is not a thing to do behind a `y/n` prompt at startup — so it names
+the command and leaves it to you.
+
+The check is a `HEAD` request to `github.com/pelazas/p2pmux/releases/latest`, whose redirect names
+the newest tag. It runs on its own thread from the moment a client starts, so nothing waits for it;
+a machine with no network simply never shows the line. The answer is cached with the time it was
+fetched in `~/.config/p2pmux/update-check.json`, so ten sessions in a day make one request. Delete
+that file to ask again immediately.
+
 ## Performance logging
 
 Set `P2PMUX_PERF=1` to write optional local performance timing logs. By default they append to

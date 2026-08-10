@@ -19,6 +19,7 @@ It walks the parts of the definition of done that only a live session can prove:
 Run: python3 scripts/e2e/scenario_w_inbox.py [repeats]
 """
 
+import json
 import os
 import sys
 import time
@@ -80,6 +81,24 @@ def install_agent(home: Path, name: str, body: str) -> str:
     return f"/bin/sh -c 'exec -a claude /bin/sh {script}'"
 
 
+# A release nobody could be running, so the notice is unambiguous when it shows.
+NEWER_VERSION = "99.0.0"
+
+
+def seed_update_check(home: Path, version: str) -> None:
+    """Answer the update check from its own cache, so no test needs a network.
+
+    The cache is exactly what a check that already ran leaves behind, and it is
+    what the inbox reads. Stamping it here exercises everything from the cache
+    outwards: the version comparison, the upgrade command, and the line.
+    """
+    directory = home / ".config" / "p2pmux"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "update-check.json").write_text(
+        json.dumps({"latest": f"v{version}", "checked_unix_ms": int(time.time() * 1000)})
+    )
+
+
 def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
     results: list[tuple[str, bool, str]] = []
 
@@ -93,6 +112,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
     with Harness(f"w-inbox-{index}") as harness:
         hooked = install_agent(harness.home, "hooked", HOOKED_AGENT)
         bare = install_agent(harness.home, "bare", BARE_AGENT)
+        seed_update_check(harness.home, NEWER_VERSION)
 
         # No arguments at all. A fresh HOME has no session and no pairing, so
         # this exercises the whole first-run path: start a session, land on Home.
@@ -110,16 +130,50 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             )
 
         screen = peer.snapshot()
-        check(
-            "the first-run empty state says what to do",
-            "Start an agent in any terminal and it appears here." in screen,
-            screen[:400],
-        )
+        # Since 0.1.6 the inbox lists every agent on the machine, not only the
+        # ones in p2pmux panes -- so on a developer's own Mac it is rarely
+        # empty and rarely all-unreported, whatever this scenario started. The
+        # checks that are *about* those two states can only run where they hold.
+        machine_is_quiet = "Nothing running yet." in screen
+        if machine_is_quiet:
+            check(
+                # A checklist since `bc810a9`: the screen is emptiest exactly
+                # when its reader is newest, so the steps go in the room the
+                # cards freed.
+                "the first-run empty state says what to do",
+                "p2pmux setup" in screen and "Start claude" in screen,
+                screen[:400],
+            )
+        else:
+            print("    NOTE  agents are running outside this scenario; "
+                  "skipping the two empty-inbox checks")
         check(
             "the tab bar carries an inbox badge with no count",
             "inbox" in screen and "inbox 0" not in screen,
             screen.split("\n")[0][:120],
         )
+        # Issue #77. The version is seeded into the check's own cache rather
+        # than fetched, so this asserts what the inbox does with an answer and
+        # never depends on GitHub being reachable from a test machine. Polled
+        # rather than sampled: the check runs on its own thread precisely so
+        # that nothing waits for it, which means nothing can predict its frame.
+        try:
+            update = peer.wait_until(
+                lambda drawn: f"{NEWER_VERSION} is out" in drawn,
+                timeout=10,
+                what="the update notice",
+            )
+            check(
+                "a newer release is named on the inbox, with the command to take it",
+                "Update with" in update,
+                [line for line in update.split("\n") if "is out" in line][:1],
+            )
+        except DeadlineExceeded as error:
+            check(
+                "a newer release is named on the inbox, with the command to take it",
+                False,
+                str(error)[:400],
+            )
         check(
             "the key bar is visible without looking anything up",
             "enter open" in screen and "q quit" in screen,
@@ -145,11 +199,12 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         peer.send(CTRL_O)
         time.sleep(3.0)
         screen = peer.snapshot()
-        check(
-            "an install with no hooks is told exactly what to run",
-            "Run `p2pmux setup` to see which agents need you." in screen,
-            screen[:600],
-        )
+        if machine_is_quiet:
+            check(
+                "an install with no hooks is told exactly what to run",
+                "Run `p2pmux setup` to see which agents need you." in screen,
+                screen[:600],
+            )
         check(
             "nothing is said about machines until there are two",
             "asleep" not in screen and " ✓ " not in screen,
@@ -204,7 +259,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             f"blocked at {blocked_line}, unreported at {unknown_line}",
         )
 
-        # Enter lands in the selected agent's terminal, alone on screen.
+        # Enter lands on the tab holding that agent's terminal.
         peer.send(b"\r")
         time.sleep(2.0)
         screen = peer.snapshot()
@@ -214,8 +269,11 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             screen[:400],
         )
         check(
-            "the terminal is full screen, not the pane grid",
-            screen.count("host: ") == 1,
+            # Whole, not zoomed over: Enter used to blow the agent's pane up to
+            # fill the screen, which hid the panes beside it that the person had
+            # arranged deliberately. `72552e7` made it land on the tab instead.
+            "it lands on the agent's tab rather than zooming over it",
+            screen.count("host: ") > 1,
             f"{screen.count('host: ')} pane titles on screen",
         )
 

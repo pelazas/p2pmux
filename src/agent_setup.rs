@@ -449,6 +449,16 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
     if !installed("p2pmux") {
         println!("\nwarning: `p2pmux` is not on PATH — hooks invoke it by name and would not run.");
     }
+    // Synchronous here, unlike the inbox's: `doctor` is a command whose whole
+    // job is to answer questions about this install, and waiting a moment for
+    // one of the answers is what its reader is here for.
+    match crate::update_check::check() {
+        Some(notice) => println!("\n{}", notice.line()),
+        None => println!(
+            "\np2pmux {} — the latest release, as far as this machine could tell.",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
     Ok(())
 }
 
