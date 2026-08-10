@@ -19,17 +19,26 @@ use crate::{
 pub(in crate::tui) struct VtScreen<'a> {
     screen: &'a vt100::Screen,
     selection: Option<PaneTextSelection>,
+    /// How far back the pane is scrolled, so a selection pinned to its lines
+    /// can be drawn on the rows those lines are on now.
+    scrollback: usize,
 }
 impl<'a> VtScreen<'a> {
     pub(in crate::tui) fn new(screen: &'a vt100::Screen) -> Self {
         Self {
             screen,
             selection: None,
+            scrollback: 0,
         }
     }
 
     pub(in crate::tui) fn with_selection(mut self, selection: Option<PaneTextSelection>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    pub(in crate::tui) fn at_scrollback(mut self, scrollback: usize) -> Self {
+        self.scrollback = scrollback;
         self
     }
 }
@@ -70,10 +79,9 @@ impl Widget for VtScreen<'_> {
                 let target = &mut buf[(area.x + col, area.y + row)];
                 let contents = source.contents();
                 target.set_symbol(if contents.is_empty() { " " } else { contents });
-                let style = if self
-                    .selection
-                    .is_some_and(|selection| selection.contains(ScreenCell { row, col }))
-                {
+                let style = if self.selection.is_some_and(|selection| {
+                    selection.contains(ScreenCell { row, col }, self.scrollback)
+                }) {
                     vt_style(source)
                         .bg(Color::DarkGray)
                         .add_modifier(Modifier::REVERSED)
@@ -154,7 +162,7 @@ mod tests {
 
     use crate::{
         screen::{GuestScreen, HostScreen},
-        tui::{PaneTextSelection, ScreenCell},
+        tui::{PaneTextSelection, ScreenCell, SelectionPoint},
     };
 
     use super::{VtScreen, render_guest_screen, viewed_screen};
@@ -230,8 +238,14 @@ mod tests {
         parser.process(b"abcd\r\nefgh\r\nijkl");
         let selection = PaneTextSelection {
             pane_id: 1,
-            anchor: ScreenCell { row: 2, col: 1 },
-            cursor: ScreenCell { row: 0, col: 2 },
+            anchor: SelectionPoint {
+                scrollback: 0,
+                cell: ScreenCell { row: 2, col: 1 },
+            },
+            cursor: SelectionPoint {
+                scrollback: 0,
+                cell: ScreenCell { row: 0, col: 2 },
+            },
         };
         let mut terminal = Terminal::new(TestBackend::new(4, 3)).expect("test terminal");
 

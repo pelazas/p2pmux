@@ -7,6 +7,7 @@ mod agents;
 pub(in crate::tui) mod keys;
 mod modal;
 mod mouse;
+pub(in crate::tui) use mouse::SelectionAutoscroll;
 mod scrollback;
 
 use std::{
@@ -52,6 +53,9 @@ pub struct MultiPaneTui {
     pub(in crate::tui) pending_created_pane: Option<PaneId>,
     pub(in crate::tui) selection: Option<PaneTextSelection>,
     pub(in crate::tui) selection_dragging: bool,
+    /// A drag that has left the pane through its top or bottom edge, and the
+    /// pane it is pulling. `None` whenever the pointer is back inside.
+    pub(in crate::tui) selection_autoscroll: Option<SelectionAutoscroll>,
     pub(in crate::tui) agent_rows: Vec<AgentOverlayRow>,
     pub(in crate::tui) presence: Vec<crate::local_ipc::PresenceRow>,
     pub(in crate::tui) prior_agent_states: BTreeMap<PaneId, AgentRosterState>,
@@ -152,6 +156,7 @@ impl MultiPaneTui {
             pending_created_pane: None,
             selection: None,
             selection_dragging: false,
+            selection_autoscroll: None,
             agent_rows: Vec::new(),
             presence: Vec::new(),
             prior_agent_states: BTreeMap::new(),

@@ -1,6 +1,7 @@
 //! Terminal-facing half of a local session attachment.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
@@ -77,16 +78,21 @@ fn copy_attach_selection(
     history: &BTreeMap<u64, HistoryCache>,
 ) -> Option<usize> {
     let pane_id = tui.selection_pane()?;
-    let offset = tui.pane_scrollback_offset(pane_id);
-    let viewport = if offset == 0 {
-        screens.get(&pane_id)?.screen()?
-    } else {
+    // A client holds no scrollback of its own — it asks the node for a viewport
+    // at a time and keeps what comes back. That cache is exactly the set of
+    // offsets the selection can reach: dragging past the top scrolled through
+    // every one of them to get there, and each of those steps fetched its rows.
+    let text = tui.selected_text(|offset| {
+        if offset == 0 {
+            return screens.get(&pane_id)?.screen().map(Cow::Borrowed);
+        }
         history
-            .get(&pane_id)
-            .and_then(|history| history.viewports.get(&offset))
-            .and_then(GuestScreen::screen)?
-    };
-    let text = tui.selected_text(viewport)?;
+            .get(&pane_id)?
+            .viewports
+            .get(&offset)
+            .and_then(GuestScreen::screen)
+            .map(Cow::Borrowed)
+    })?;
     copy_selection_to_clipboard(&text).ok()
 }
 
@@ -115,6 +121,13 @@ fn take_matching_pending(
 
 const PANE_SCROLL_WHEEL_STEP: usize = 3;
 
+/// Rows pulled in per step by a selection dragged past a pane's edge.
+///
+/// One, unlike the wheel's three. Every step fetches its own viewport from the
+/// node, and those viewports are what the copy is assembled from: a step of
+/// three would leave two rows out of every three with no viewport to read.
+const SELECTION_AUTOSCROLL_STEP: usize = 1;
+
 /// Where one wheel notch should land, measured from the furthest point already asked
 /// for rather than from what is on screen.
 ///
@@ -127,13 +140,80 @@ fn next_scroll_target(
     requested: Option<usize>,
     max_rows: usize,
     up: bool,
+    step: usize,
 ) -> usize {
     let base = requested.unwrap_or(visible);
     if up {
-        base.saturating_add(PANE_SCROLL_WHEEL_STEP).min(max_rows)
+        base.saturating_add(step).min(max_rows)
     } else {
-        base.saturating_sub(PANE_SCROLL_WHEEL_STEP)
+        base.saturating_sub(step)
     }
+}
+
+/// Move a pane's viewport `step` rows, fetching the rows if they are not here.
+///
+/// A client keeps no scrollback: the node holds it and hands over one viewport
+/// at a time. So a scroll is either instant — the rows are cached, or it is a
+/// return to the live edge — or a request whose reply moves the viewport later.
+/// Both the wheel and a selection dragged past a pane's edge go through here,
+/// which is what keeps the fetched viewports the drag scrolled through in the
+/// cache that the eventual copy reads from.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site's locals, threaded"
+)]
+fn scroll_pane_toward(
+    stream: &mut UnixStream,
+    tui: &mut MultiPaneTui,
+    history: &mut BTreeMap<u64, HistoryCache>,
+    desired_scroll: &mut BTreeMap<u64, usize>,
+    pending_scroll: &mut BTreeMap<u64, PendingScroll>,
+    next_scrollback_request_id: &mut u64,
+    pane_id: u64,
+    up: bool,
+    step: usize,
+) -> io::Result<()> {
+    let scrollback_len = history
+        .get(&pane_id)
+        .map(HistoryCache::available_rows)
+        .unwrap_or(1_000);
+    let target = next_scroll_target(
+        tui.pane_scrollback_offset(pane_id),
+        desired_scroll
+            .get(&pane_id)
+            .copied()
+            .or_else(|| pending_scroll.get(&pane_id).map(|pending| pending.target)),
+        scrollback_len,
+        up,
+        step,
+    );
+    let held = target == 0
+        || history
+            .get(&pane_id)
+            .is_some_and(|history| history.viewports.contains_key(&target));
+    if held {
+        // The rows are already here, or the wheel is back at the live
+        // edge. Move now and abandon whatever the burst had queued.
+        desired_scroll.remove(&pane_id);
+        pending_scroll.remove(&pane_id);
+        tui.set_pane_scrollback_offset(pane_id, target);
+        if target == 0 {
+            history.remove(&pane_id);
+        }
+    } else if pending_scroll.contains_key(&pane_id) {
+        desired_scroll.insert(pane_id, target);
+    } else {
+        desired_scroll.remove(&pane_id);
+        request_scrollback(
+            stream,
+            pane_id,
+            target,
+            history,
+            pending_scroll,
+            next_scrollback_request_id,
+        )?;
+    }
+    Ok(())
 }
 
 /// Which screen an attaching client lands on.
@@ -516,6 +596,29 @@ pub fn run_on(
         }
         if let Some(tui) = tui.as_mut() {
             dirty |= refresh_tui_timers(tui, Instant::now(), &mut last_agent_overlay_animation);
+            // A pointer held past a pane's edge sends no further drag events —
+            // a terminal reports a drag when the cell under the pointer
+            // changes, and it is not changing. This clock is what keeps the
+            // rows coming while it sits there.
+            if let Some((pane_id, up)) = tui.selection_autoscroll_due(Instant::now()) {
+                scroll_pane_toward(
+                    &mut stream,
+                    tui,
+                    &mut history,
+                    &mut desired_scroll,
+                    &mut pending_scroll,
+                    &mut next_scrollback_request_id,
+                    pane_id,
+                    up,
+                    SELECTION_AUTOSCROLL_STEP,
+                )?;
+            }
+            // Every pass, not only the ones that stepped: a step whose rows had
+            // to be fetched moves the viewport when the reply lands, which is
+            // some later pass than the one that asked.
+            if tui.selection_autoscroll_pane().is_some() {
+                dirty |= tui.follow_selection_autoscroll(terminal.size()?.into());
+            }
         }
         if dirty {
             if let Some(tui) = tui.as_ref() {
@@ -732,45 +835,17 @@ pub fn run_on(
                     } else {
                         let pane_id =
                             tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
-                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-                        let scrollback_len = history
-                            .get(&pane_id)
-                            .map(HistoryCache::available_rows)
-                            .unwrap_or(1_000);
-                        let target = next_scroll_target(
-                            tui.pane_scrollback_offset(pane_id),
-                            desired_scroll.get(&pane_id).copied().or_else(|| {
-                                pending_scroll.get(&pane_id).map(|pending| pending.target)
-                            }),
-                            scrollback_len,
-                            up,
-                        );
-                        let held = target == 0
-                            || history
-                                .get(&pane_id)
-                                .is_some_and(|history| history.viewports.contains_key(&target));
-                        if held {
-                            // The rows are already here, or the wheel is back at the live
-                            // edge. Move now and abandon whatever the burst had queued.
-                            desired_scroll.remove(&pane_id);
-                            pending_scroll.remove(&pane_id);
-                            tui.set_pane_scrollback_offset(pane_id, target);
-                            if target == 0 {
-                                history.remove(&pane_id);
-                            }
-                        } else if pending_scroll.contains_key(&pane_id) {
-                            desired_scroll.insert(pane_id, target);
-                        } else {
-                            desired_scroll.remove(&pane_id);
-                            request_scrollback(
-                                &mut stream,
-                                pane_id,
-                                target,
-                                &history,
-                                &mut pending_scroll,
-                                &mut next_scrollback_request_id,
-                            )?;
-                        }
+                        scroll_pane_toward(
+                            &mut stream,
+                            tui,
+                            &mut history,
+                            &mut desired_scroll,
+                            &mut pending_scroll,
+                            &mut next_scrollback_request_id,
+                            pane_id,
+                            matches!(mouse.kind, MouseEventKind::ScrollUp),
+                            PANE_SCROLL_WHEEL_STEP,
+                        )?;
                     }
                 } else {
                     // Read before the click, which is allowed to move focus: the
@@ -1558,25 +1633,46 @@ mod tests {
     #[test]
     fn a_wheel_burst_accumulates_instead_of_asking_for_the_same_row() {
         // Nothing outstanding: step from what is on screen.
-        assert_eq!(next_scroll_target(0, None, 1_000, true), 3);
-        assert_eq!(next_scroll_target(9, None, 1_000, false), 6);
+        assert_eq!(
+            next_scroll_target(0, None, 1_000, true, PANE_SCROLL_WHEEL_STEP),
+            3
+        );
+        assert_eq!(
+            next_scroll_target(9, None, 1_000, false, PANE_SCROLL_WHEEL_STEP),
+            6
+        );
 
         // Mid-burst the visible offset lags, so each notch steps from the request.
         let mut requested = None;
         for expected in [3, 6, 9, 12] {
-            let target = next_scroll_target(0, requested, 1_000, true);
+            let target = next_scroll_target(0, requested, 1_000, true, PANE_SCROLL_WHEEL_STEP);
             assert_eq!(target, expected);
             requested = Some(target);
         }
 
         // Reversing mid-burst walks the same accumulated position back down.
-        assert_eq!(next_scroll_target(0, Some(12), 1_000, false), 9);
+        assert_eq!(
+            next_scroll_target(0, Some(12), 1_000, false, PANE_SCROLL_WHEEL_STEP),
+            9
+        );
 
         // Bounds: never past the retained history, never below the live edge.
-        assert_eq!(next_scroll_target(0, Some(9), 10, true), 10);
-        assert_eq!(next_scroll_target(0, Some(10), 10, true), 10);
-        assert_eq!(next_scroll_target(0, Some(2), 10, false), 0);
-        assert_eq!(next_scroll_target(0, Some(0), 10, false), 0);
+        assert_eq!(
+            next_scroll_target(0, Some(9), 10, true, PANE_SCROLL_WHEEL_STEP),
+            10
+        );
+        assert_eq!(
+            next_scroll_target(0, Some(10), 10, true, PANE_SCROLL_WHEEL_STEP),
+            10
+        );
+        assert_eq!(
+            next_scroll_target(0, Some(2), 10, false, PANE_SCROLL_WHEEL_STEP),
+            0
+        );
+        assert_eq!(
+            next_scroll_target(0, Some(0), 10, false, PANE_SCROLL_WHEEL_STEP),
+            0
+        );
     }
 
     #[test]

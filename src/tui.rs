@@ -58,7 +58,8 @@ pub(crate) use snapshot::{
     LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot, NodeScreenSnapshots,
 };
 pub(in crate::tui) use state::{
-    AddMachinePrompt, Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget, ScreenCell,
+    AddMachinePrompt, Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget,
+    ScreenCell, SelectionPoint,
 };
 pub use state::{
     AgentOverlayRow, ChordMode, HomeRowId, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,

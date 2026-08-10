@@ -334,29 +334,76 @@ pub(in crate::tui) struct ScreenCell {
     pub(in crate::tui) row: u16,
     pub(in crate::tui) col: u16,
 }
+/// One end of a selection, pinned to the text under it rather than to a place
+/// on the screen.
+///
+/// A cell alone cannot say what was selected once the pane scrolls: row 3 is a
+/// different line before and after a scroll, so an end recorded as row 3 slides
+/// onto whatever moves under it. Recording the offset the end was placed at
+/// fixes it to its line instead, and scrolling the pane then moves the *screen*
+/// rather than the selection — which is what dragging past the edge has to do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) struct SelectionPoint {
+    /// The pane's scrollback offset when this end was placed.
+    pub(in crate::tui) scrollback: usize,
+    pub(in crate::tui) cell: ScreenCell,
+}
+
+impl SelectionPoint {
+    /// This end's line, in a coordinate that no amount of scrolling changes.
+    ///
+    /// Scrolling back by one moves every line down one row, so `row -
+    /// scrollback` is the same number before and after — smaller for older
+    /// lines. Signed, because an end above the viewport has a negative one.
+    pub(in crate::tui) fn line(self) -> i64 {
+        i64::from(self.cell.row) - self.scrollback as i64
+    }
+
+    /// Which screen row this end sits on with the pane scrolled back
+    /// `scrollback` rows. Off-screen ends are ordinary here: that is what a
+    /// selection extending past the top of the viewport *is*.
+    pub(in crate::tui) fn row_at(self, scrollback: usize) -> i64 {
+        self.line() + scrollback as i64
+    }
+
+    fn order(self) -> (i64, u16) {
+        (self.line(), self.cell.col)
+    }
+}
+
 /// A local, pane-scoped text selection. Both ends are inclusive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::tui) struct PaneTextSelection {
     pub(in crate::tui) pane_id: PaneId,
-    pub(in crate::tui) anchor: ScreenCell,
-    pub(in crate::tui) cursor: ScreenCell,
+    pub(in crate::tui) anchor: SelectionPoint,
+    pub(in crate::tui) cursor: SelectionPoint,
 }
 impl PaneTextSelection {
     pub(in crate::tui) fn is_empty(self) -> bool {
-        self.anchor == self.cursor
+        self.anchor.order() == self.cursor.order()
     }
 
-    pub(in crate::tui) fn contains(self, cell: ScreenCell) -> bool {
+    /// Whether `cell` is inside the selection, on a pane scrolled back
+    /// `scrollback` rows.
+    pub(in crate::tui) fn contains(self, cell: ScreenCell, scrollback: usize) -> bool {
         let (start, end) = self.bounds();
-        match cell.row {
-            row if row == start.row && row == end.row => (start.col..=end.col).contains(&cell.col),
-            row if row == start.row => cell.col >= start.col,
-            row if row == end.row => cell.col <= end.col,
-            row => (start.row..end.row).contains(&row),
+        let (start_row, end_row) = (start.row_at(scrollback), end.row_at(scrollback));
+        let row = i64::from(cell.row);
+        match row {
+            row if row == start_row && row == end_row => {
+                (start.cell.col..=end.cell.col).contains(&cell.col)
+            }
+            row if row == start_row => cell.col >= start.cell.col,
+            row if row == end_row => cell.col <= end.cell.col,
+            row => (start_row..end_row).contains(&row),
         }
     }
 
-    pub(in crate::tui) fn bounds(self) -> (ScreenCell, ScreenCell) {
-        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    pub(in crate::tui) fn bounds(self) -> (SelectionPoint, SelectionPoint) {
+        if self.anchor.order() <= self.cursor.order() {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
     }
 }

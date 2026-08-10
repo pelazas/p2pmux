@@ -149,6 +149,25 @@ impl SharedLayoutRuntime {
             if self.tui.expire_home_toggle(Instant::now()) {
                 dirty = true;
             }
+            // A pointer parked past a pane's edge sends no more drag events, so
+            // this clock is what keeps the rows coming while it sits there.
+            if let Some((pane_id, up)) = self.tui.selection_autoscroll_due(Instant::now()) {
+                let scrollback_len = self
+                    .local
+                    .get(&pane_id)
+                    .map(|pane| pane.screen.retained_scrollback())
+                    .or_else(|| {
+                        self.remote
+                            .get(&pane_id)
+                            .and_then(|pane| pane.screen.screen())
+                            .map(available_scrollback)
+                    })
+                    .unwrap_or(0);
+                self.tui.scroll_pane(pane_id, scrollback_len, up);
+                dirty |= self
+                    .tui
+                    .follow_selection_autoscroll(Rect::new(0, 0, cols, rows));
+            }
             let now = Instant::now();
             if self.tui.home_has_working_rows()
                 && now.duration_since(self.last_agent_overlay_animation)
@@ -394,22 +413,22 @@ impl SharedLayoutRuntime {
         let Some(selection) = self.tui.selection() else {
             return;
         };
-        let scrollback = self.tui.scrollback_offset(selection.pane_id);
+        // A pane this process hosts keeps its whole buffer, so any offset the
+        // selection reaches is one `viewed_screen` can produce.
         let text = self
             .local
             .get(&selection.pane_id)
             .and_then(|pane| {
-                selection_text(
-                    viewed_screen(pane.screen.screen(), scrollback).as_ref(),
-                    selection,
-                )
+                selection_text(selection, |offset| {
+                    Some(viewed_screen(pane.screen.screen(), offset))
+                })
             })
             .or_else(|| {
                 self.remote
                     .get(&selection.pane_id)
                     .and_then(|pane| pane.screen.screen())
                     .and_then(|screen| {
-                        selection_text(viewed_screen(screen, scrollback).as_ref(), selection)
+                        selection_text(selection, |offset| Some(viewed_screen(screen, offset)))
                     })
             });
         let Some(text) = text else {

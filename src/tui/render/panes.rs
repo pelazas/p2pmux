@@ -591,12 +591,15 @@ pub(in crate::tui) fn render_shared_multi_pane(
             // most visible on a zoom, where the pane doubles in size in one frame.
             let (grid_rows, grid_cols) = screen.size();
             let viewport = fixed_grid_viewport(content, grid_rows, grid_cols);
-            let screen = viewed_screen(screen, tui.scrollback_offset(pane_id));
+            let scrollback = tui.scrollback_offset(pane_id);
+            let screen = viewed_screen(screen, scrollback);
             frame.render_widget(
-                VtScreen::new(screen.as_ref()).with_selection(
-                    tui.selection()
-                        .filter(|selection| selection.pane_id == pane_id),
-                ),
+                VtScreen::new(screen.as_ref())
+                    .with_selection(
+                        tui.selection()
+                            .filter(|selection| selection.pane_id == pane_id),
+                    )
+                    .at_scrollback(scrollback),
                 viewport,
             );
             let (row, col) = screen.cursor_position();

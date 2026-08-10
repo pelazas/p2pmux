@@ -1,6 +1,8 @@
 //! What a click, drag, or wheel does: focus, text selection, border resizes,
 //! and forwarding to a child that asked for mouse reporting.
 
+use std::time::{Duration, Instant};
+
 use ratatui::layout::Rect;
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
@@ -8,7 +10,8 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use crate::{
     layout::{Axis, PaneId},
     tui::{
-        MouseHandling, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, ScreenCell, UiIntent,
+        MouseHandling, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, ScreenCell,
+        SelectionPoint, UiIntent,
         geometry::{
             ResizeDrag, clamp_to_viewport, fixed_grid_viewport, mouse_to_screen_cell,
             nearest_split_for_pane, pane_at, pane_content_rect, rect_contains, resize_border_hit,
@@ -19,10 +22,31 @@ use crate::{
     },
 };
 
+/// How often a drag held past a pane's edge pulls one more row into view.
+///
+/// A terminal only reports a drag when the pointer changes cell, so a pointer
+/// parked at the edge sends nothing at all: without a clock of its own this
+/// would scroll one row and stop. Slow enough to read what goes past, fast
+/// enough that reaching for something a page back is not a wait.
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(60);
+
+/// A selection drag that has left its pane through the top or the bottom.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) struct SelectionAutoscroll {
+    pub(in crate::tui) pane_id: PaneId,
+    /// Which way the *content* moves: past the top pulls older rows in.
+    pub(in crate::tui) up: bool,
+    /// Where the pointer is across the pane, so the row it drags over is
+    /// selected up to the same column it would be inside the pane.
+    column: u16,
+    last_step: Option<Instant>,
+}
+
 impl MultiPaneTui {
     pub(in crate::tui) fn clear_selection(&mut self) -> bool {
         let changed = self.selection.take().is_some();
         self.selection_dragging = false;
+        self.selection_autoscroll = None;
         changed
     }
 
@@ -30,12 +54,17 @@ impl MultiPaneTui {
         let Some((pane_id, cell)) = self.screen_cell_at(column, row, area) else {
             return false;
         };
+        let point = SelectionPoint {
+            scrollback: self.scrollback_offset(pane_id),
+            cell,
+        };
         self.selection = Some(PaneTextSelection {
             pane_id,
-            anchor: cell,
-            cursor: cell,
+            anchor: point,
+            cursor: point,
         });
         self.selection_dragging = true;
+        self.selection_autoscroll = None;
         true
     }
 
@@ -51,17 +80,140 @@ impl MultiPaneTui {
         let Some((pane_id, cell)) = self.screen_cell_at(column, row, area) else {
             return false;
         };
+        let scrollback = self.scrollback_offset(pane_id);
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
-        if selection.pane_id != pane_id || selection.cursor == cell {
+        let point = SelectionPoint { scrollback, cell };
+        if selection.pane_id != pane_id || selection.cursor == point {
             return false;
         }
-        selection.cursor = cell;
+        selection.cursor = point;
         true
     }
 
+    /// Note whether this drag has left the selection's pane through an edge,
+    /// and which one.
+    ///
+    /// Only the top and the bottom: dragging out of the side of a pane is
+    /// reaching for the pane next door, not for more of this one, and pulling
+    /// the buffer under the pointer there would be a surprise.
+    pub(in crate::tui) fn aim_selection_autoscroll(
+        &mut self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> bool {
+        let previous = self.selection_autoscroll;
+        self.selection_autoscroll = self.aimed_autoscroll(column, row, area).map(|aim| {
+            match previous {
+                // Keep the clock running across a pointer still outside the
+                // same edge, so a mouse wobbling above a pane does not scroll
+                // faster than one held still.
+                Some(previous) if previous.pane_id == aim.pane_id && previous.up == aim.up => {
+                    SelectionAutoscroll {
+                        column: aim.column,
+                        ..previous
+                    }
+                }
+                _ => aim,
+            }
+        });
+        self.selection_autoscroll != previous
+    }
+
+    fn aimed_autoscroll(&self, column: u16, row: u16, area: Rect) -> Option<SelectionAutoscroll> {
+        if !self.selection_dragging {
+            return None;
+        }
+        let selection = self.selection?;
+        let viewport = self.pane_screen_viewport(selection.pane_id, area)?;
+        let up = if row < viewport.y {
+            true
+        } else if row >= viewport.y.saturating_add(viewport.height) {
+            false
+        } else {
+            return None;
+        };
+        Some(SelectionAutoscroll {
+            pane_id: selection.pane_id,
+            up,
+            column: column
+                .saturating_sub(viewport.x)
+                .min(viewport.width.saturating_sub(1)),
+            // Pulled immediately: the drag that crossed the edge is itself the
+            // first step, and waiting an interval before the first row makes
+            // the edge feel dead.
+            last_step: None,
+        })
+    }
+
+    /// The pane the pointer is currently dragging out of, if any.
+    pub(crate) fn selection_autoscroll_pane(&self) -> Option<PaneId> {
+        self.selection_autoscroll.map(|aim| aim.pane_id)
+    }
+
+    /// Whether another row is due, and which way. Rate-limited, so a caller may
+    /// ask on every loop iteration.
+    pub(crate) fn selection_autoscroll_due(&mut self, now: Instant) -> Option<(PaneId, bool)> {
+        let aim = self.selection_autoscroll.as_mut()?;
+        if aim
+            .last_step
+            .is_some_and(|last| now.duration_since(last) < SELECTION_AUTOSCROLL_INTERVAL)
+        {
+            return None;
+        }
+        aim.last_step = Some(now);
+        Some((aim.pane_id, aim.up))
+    }
+
+    /// Put the selection's moving end on the edge row the drag is pulling at.
+    ///
+    /// Called after the caller has actually scrolled the pane — which is not
+    /// something this type can do for an attached client, where the rows have
+    /// to be fetched before the viewport may move.
+    pub(crate) fn follow_selection_autoscroll(&mut self, area: Rect) -> bool {
+        let Some(aim) = self.selection_autoscroll else {
+            return false;
+        };
+        let Some(viewport) = self.pane_screen_viewport(aim.pane_id, area) else {
+            return false;
+        };
+        let scrollback = self.scrollback_offset(aim.pane_id);
+        let point = SelectionPoint {
+            scrollback,
+            cell: ScreenCell {
+                row: if aim.up {
+                    0
+                } else {
+                    viewport.height.saturating_sub(1)
+                },
+                col: aim.column,
+            },
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        if selection.pane_id != aim.pane_id || selection.cursor == point {
+            return false;
+        }
+        selection.cursor = point;
+        true
+    }
+
+    /// A pane's screen area — where its cells are drawn, inside its border.
+    fn pane_screen_viewport(&self, pane_id: PaneId, area: Rect) -> Option<Rect> {
+        let rect = *self.geometry(area).panes.get(&pane_id)?;
+        let pane = self.snapshot.panes.get(&pane_id)?;
+        Some(fixed_grid_viewport(
+            pane_content_rect(rect),
+            pane.grid_rows,
+            pane.grid_cols,
+        ))
+    }
+
     pub(in crate::tui) fn end_selection_drag(&mut self) -> bool {
+        self.selection_autoscroll = None;
         std::mem::replace(&mut self.selection_dragging, false)
     }
 
@@ -169,9 +321,17 @@ impl MultiPaneTui {
         self.selection().map(|selection| selection.pane_id)
     }
 
-    pub(crate) fn selected_text(&self, screen: &vt100::Screen) -> Option<String> {
+    /// The selected text, read from whichever views the caller can supply.
+    ///
+    /// `view_at` answers "the pane, scrolled back this many rows". A selection
+    /// that never left the viewport only ever asks for `0`; one dragged past
+    /// the edge asks for the offsets it scrolled through.
+    pub(crate) fn selected_text<'a>(
+        &self,
+        view_at: impl Fn(usize) -> Option<std::borrow::Cow<'a, vt100::Screen>>,
+    ) -> Option<String> {
         self.selection()
-            .and_then(|selection| selection_text(screen, selection))
+            .and_then(|selection| selection_text(selection, view_at))
     }
 
     pub(in crate::tui) fn screen_cell_at(
@@ -314,6 +474,10 @@ impl MultiPaneTui {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if !self.extend_resize_drag(mouse.column, mouse.row) {
                     self.extend_selection_at(mouse.column, mouse.row, area);
+                    // Aimed after extending, not instead of it: a drag that
+                    // leaves through the top still has a last position inside
+                    // the pane worth selecting to.
+                    self.aim_selection_autoscroll(mouse.column, mouse.row, area);
                 }
                 MouseHandling::default()
             }
@@ -390,6 +554,8 @@ impl MultiPaneTui {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use ratatui::layout::Rect;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -402,6 +568,8 @@ mod tests {
         },
     };
 
+    use super::SELECTION_AUTOSCROLL_INTERVAL;
+
     #[test]
     fn content_drag_keeps_the_selection_path() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
@@ -412,6 +580,122 @@ mod tests {
         assert!(tui.extend_selection_at(3, 3, area));
         assert!(tui.end_selection_drag());
         assert!(tui.selection().is_some());
+    }
+
+    /// Issue #79: dragging out through the top of a pane has to keep pulling
+    /// rows in for as long as the pointer stays there, and the pointer stops
+    /// sending events the moment it stops moving.
+    #[test]
+    fn a_drag_out_of_a_panes_top_keeps_asking_for_another_row() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let viewport = tui.pane_screen_viewport(1, area).expect("pane 1 viewport");
+        let inside = viewport.y + 2;
+        let above = viewport.y.saturating_sub(1);
+
+        assert!(tui.begin_selection_at(viewport.x + 3, inside, area));
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                viewport.x + 3,
+                inside,
+            ),
+            area,
+            PaneMouseProtocol::default(),
+        );
+        assert_eq!(tui.selection_autoscroll_pane(), None, "still inside");
+
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                viewport.x + 3,
+                above,
+            ),
+            area,
+            PaneMouseProtocol::default(),
+        );
+        assert_eq!(tui.selection_autoscroll_pane(), Some(1));
+
+        // The first step is due immediately — an edge that waits before it
+        // moves reads as an edge that does nothing.
+        let start = Instant::now();
+        assert_eq!(tui.selection_autoscroll_due(start), Some((1, true)));
+        // …and the second is not, however many times it is asked. This is the
+        // check that matters: this method is called on every pass of a loop
+        // that runs at sixty frames a second.
+        assert_eq!(tui.selection_autoscroll_due(start), None);
+        assert_eq!(
+            tui.selection_autoscroll_due(start + SELECTION_AUTOSCROLL_INTERVAL),
+            Some((1, true))
+        );
+
+        // A pointer back inside the pane stops pulling; letting go stops it too.
+        tui.handle_mouse(
+            left_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                viewport.x + 3,
+                inside,
+            ),
+            area,
+            PaneMouseProtocol::default(),
+        );
+        assert_eq!(tui.selection_autoscroll_pane(), None);
+        tui.aim_selection_autoscroll(viewport.x + 3, above, area);
+        assert_eq!(tui.selection_autoscroll_pane(), Some(1));
+        tui.end_selection_drag();
+        assert_eq!(tui.selection_autoscroll_pane(), None);
+    }
+
+    /// Out through the bottom pulls the other way; out through the side pulls
+    /// nothing, because that is reaching for the pane next door.
+    #[test]
+    fn only_the_top_and_bottom_edges_pull_a_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let viewport = tui.pane_screen_viewport(1, area).expect("pane 1 viewport");
+
+        assert!(tui.begin_selection_at(viewport.x + 3, viewport.y + 2, area));
+
+        tui.aim_selection_autoscroll(viewport.x + 3, viewport.y + viewport.height, area);
+        assert_eq!(
+            tui.selection_autoscroll_due(Instant::now()),
+            Some((1, false))
+        );
+
+        tui.aim_selection_autoscroll(viewport.x + viewport.width + 4, viewport.y + 2, area);
+        assert_eq!(tui.selection_autoscroll_pane(), None);
+    }
+
+    /// The selection has to stay on the *text* it was dragged over. If it stayed
+    /// on the screen rows instead, scrolling would drag the anchor along with
+    /// the view and the selection would never grow.
+    #[test]
+    fn scrolling_under_a_drag_grows_the_selection_instead_of_moving_it() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let viewport = tui.pane_screen_viewport(1, area).expect("pane 1 viewport");
+
+        assert!(tui.begin_selection_at(viewport.x + 3, viewport.y + 2, area));
+        let anchor = tui.selection.expect("a selection").anchor;
+        tui.aim_selection_autoscroll(viewport.x + 3, viewport.y.saturating_sub(1), area);
+
+        let mut now = Instant::now();
+        for expected in 1..=3 {
+            assert!(tui.selection_autoscroll_due(now).is_some());
+            now += SELECTION_AUTOSCROLL_INTERVAL;
+            assert!(tui.scroll_pane(1, 100, true));
+            tui.follow_selection_autoscroll(area);
+            let selection = tui.selection.expect("a selection");
+            assert_eq!(selection.anchor, anchor, "the anchor stays on its line");
+            // Three wheel steps back, and the moving end is on the top row of
+            // what is now on screen — which is three lines further from the
+            // anchor each time.
+            assert_eq!(selection.cursor.cell.row, 0);
+            assert_eq!(
+                selection.cursor.line(),
+                anchor.line() - i64::from(expected) * 3 - 2
+            );
+        }
     }
 
     fn left_mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {

@@ -233,7 +233,15 @@ Drag inside a pane's terminal content to select text; releasing the mouse copies
 clipboard — `pbcopy` on macOS, and `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed.
 Over `ssh` or in a bare TTY, where none of those exist, p2pmux asks the terminal emulator itself
 via OSC 52; terminals that do not implement it drop the request silently, so a copy can be
-reported that did not land. Drag a shared pane border to resize its split. Corner drags lock to one axis after a
+reported that did not land.
+
+Dragging out through the top or the bottom of a pane scrolls it, and keeps scrolling while you hold
+the pointer there, so a selection is not limited to what fits on screen. Both ends stay on the lines
+they were placed on rather than on the rows they happened to land on, so what you copy is every line
+between them — including the ones that scrolled past on the way. Out through a *side* scrolls
+nothing: that is reaching for the pane next door.
+
+Drag a shared pane border to resize its split. Corner drags lock to one axis after a
 short motion threshold, preview locally, and commit one shared ratio on release. The affected pane
 hosts then resize their own PTY and VT screen and publish their local grids.
 
