@@ -43,7 +43,7 @@ pub(in crate::tui) const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(5)
 const SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Map an agent state onto its wire value.
-fn roster_state(state: AgentState) -> AgentRosterState {
+pub(in crate::tui) fn roster_state(state: AgentState) -> AgentRosterState {
     match state {
         AgentState::Unknown => AgentRosterState::Unknown,
         AgentState::Idle => AgentRosterState::Idle,

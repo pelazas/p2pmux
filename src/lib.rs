@@ -3,6 +3,7 @@
 pub mod agent_detect;
 pub mod agent_notify;
 pub mod agent_setup;
+pub mod agent_status;
 pub mod cli;
 pub mod client;
 pub mod config;

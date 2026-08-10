@@ -1,7 +1,7 @@
 //! Pure helpers for detecting supported coding agents in a hosted PTY tree.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -359,6 +359,71 @@ pub fn sample_global_snapshot(sampler: &mut dyn ProcessSampler) -> Vec<ProcessSn
     sampler.snapshot()
 }
 
+/// How far up the process tree a hook looks for the agent that spawned it.
+///
+/// A hook runner is a child or a grandchild of the agent — `claude` runs
+/// `/bin/sh -c 'p2pmux notify …'`, which is two — and no supported agent puts
+/// more than a couple of processes in between. The bound is what stops a walk
+/// from `init` costing a lap of the process table on the agent's critical path.
+const MAX_ANCESTOR_HOPS: usize = 8;
+
+/// The agent process a hook is running underneath, if there is one.
+///
+/// This is how a hook outside a p2pmux pane learns *whose* status it is
+/// reporting: there is no pane id to name, so the row is keyed by the agent's
+/// own process, which is what [`AgentScan::loose_agents`] keys its rows by too.
+///
+/// Deliberately walked one process at a time rather than by taking a whole
+/// snapshot: this runs on `UserPromptSubmit`, which blocks the user's prompt,
+/// and on every single tool call. Eight targeted refreshes cost microseconds;
+/// one global refresh reads every process on the machine.
+///
+/// `preferred` is the kind the hook says it belongs to, and wins over a nearer
+/// ancestor of another kind: an agent run from inside another agent's terminal
+/// must file its status under its own process, not its host's. A match of any
+/// kind is still better than none, so one is kept as a fallback.
+pub fn agent_ancestor(from_pid: u32, preferred: AgentKind) -> Option<(u32, AgentKind, u64)> {
+    let mut system = System::new();
+    let mut pid = Pid::from_u32(from_pid);
+    let mut fallback = None;
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let parent = refreshed(&mut system, pid)?.parent()?;
+        let process = refreshed(&mut system, parent)?;
+        let exe_basename = process
+            .exe()
+            .and_then(|path| path.file_name())
+            .unwrap_or(process.name())
+            .to_string_lossy()
+            .into_owned();
+        let name = process.name().to_string_lossy().into_owned();
+        let cmdline = process
+            .cmd()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if let Some(kind) = AgentKind::from_process(&exe_basename, &name, &cmdline) {
+            let found = (parent.as_u32(), kind, process.start_time());
+            if kind == preferred {
+                return Some(found);
+            }
+            fallback = fallback.or(Some(found));
+        }
+        pid = parent;
+    }
+    fallback
+}
+
+fn refreshed(system: &mut System, pid: Pid) -> Option<&sysinfo::Process> {
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always),
+    );
+    system.process(pid)
+}
+
 /// The supported agent selected from a hosted pane's process tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetectedAgent {
@@ -376,6 +441,20 @@ pub struct LooseAgent {
     /// Identity for a row that has no pane to be identified by.
     pub pid: u32,
     pub cwd: String,
+    /// When the process started, as the process table reports it. Only ever
+    /// used to tell this agent from an older one that had the same pid — see
+    /// [`crate::agent_status::read`].
+    pub start_time: Option<u64>,
+    /// What its hooks last said, or [`AgentState::Unknown`] if nothing has.
+    ///
+    /// Filled in from [`crate::agent_status`] after the scan, not by it: which
+    /// agent is running is a question about processes, what it is doing is a
+    /// question only the agent can answer.
+    pub state: AgentState,
+    /// The agent's own words. Local to this machine, exactly as on the pane
+    /// path — the roster published to peers has no field for it.
+    pub message: String,
+    pub working_since_unix_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -477,39 +556,78 @@ impl<'a> AgentScan<'a> {
     /// started in a p2pmux pane, so an assistant running under systemd — which
     /// is how both Hermes and OpenClaw are meant to run — was invisible to it.
     /// This is the other half: every agent the scan found whose process is not
-    /// descended from a pane, deduplicated by kind so one daemon's worker
-    /// processes do not each get a row.
+    /// descended from a pane.
     ///
-    /// The shallowest process wins within a kind, which is the daemon itself
-    /// rather than whatever it forked.
+    /// A daemon's own workers are the same agent, so a process that descends
+    /// from another loose agent of its kind is folded into it and only the
+    /// outermost gets a row. Two agents that are not each other's ancestors are
+    /// two agents, however alike they look: a person with `claude` open in
+    /// three terminals has three of these, and collapsing them to one row would
+    /// mean two agents whose `needs you` nobody is ever shown.
+    ///
+    /// State is not answered here. The scan says which agents are running; a
+    /// hook says what they are doing, and the caller reads those from
+    /// [`crate::agent_status`].
     pub fn loose_agents(&self, pane_roots: &[u32]) -> Vec<LooseAgent> {
-        let mut found: BTreeMap<AgentKind, &ProcessSnapshot> = BTreeMap::new();
-        for &(process, kind) in &self.agents {
-            if pane_roots
-                .iter()
-                .any(|&root| self.descendant_depth(root, process.pid).is_some())
-            {
-                continue;
-            }
-            // A daemon's own children are the same agent, so the one nearest
-            // the top of the tree is the one worth a row. `parents` holds every
-            // pid that is somebody's parent, so a process whose own parent is
-            // also an agent of this kind is a child of it.
-            match found.get(&kind) {
-                Some(existing) if self.descendant_depth(existing.pid, process.pid).is_some() => {}
-                _ => {
-                    found.insert(kind, process);
-                }
-            }
-        }
-        found
-            .into_iter()
-            .map(|(kind, process)| LooseAgent {
-                kind,
+        let outside = self
+            .agents
+            .iter()
+            .filter(|(process, _)| {
+                !pane_roots
+                    .iter()
+                    .any(|&root| self.descendant_depth(root, process.pid).is_some())
+            })
+            .collect::<Vec<_>>();
+        let kind_by_pid = outside
+            .iter()
+            .map(|(process, kind)| (process.pid, *kind))
+            .collect::<HashMap<_, _>>();
+        let mut found = outside
+            .iter()
+            .filter(|(process, kind)| {
+                !self
+                    .ancestors_of(process.pid)
+                    .any(|pid| kind_by_pid.get(&pid) == Some(kind))
+            })
+            .map(|(process, kind)| LooseAgent {
+                kind: *kind,
                 pid: process.pid,
                 cwd: process.cwd.clone().unwrap_or_default(),
+                start_time: process.start_time,
+                state: AgentState::Unknown,
+                message: String::new(),
+                working_since_unix_ms: 0,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // Ordered so the rows do not shuffle between two scans that found the
+        // same agents: the process table hands them over in whatever order it
+        // likes, and the inbox compares this list to decide it changed.
+        found.sort_by_key(|agent| (agent.kind, agent.pid));
+        found
+    }
+
+    /// Whether the snapshot this scan was built from saw `pid` at all.
+    ///
+    /// Not "is it an agent" — any process. It answers the only question the
+    /// status sweep has: is the process that wrote this record still there.
+    pub fn knows_pid(&self, pid: u32) -> bool {
+        self.by_pid.contains_key(&pid)
+    }
+
+    /// Every pid above `pid`, nearest first, bounded by the snapshot's size so
+    /// a cycle in a stale process table cannot spin.
+    fn ancestors_of(&self, pid: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut current = Some(pid);
+        let mut steps = 0;
+        std::iter::from_fn(move || {
+            let parent = self.by_pid.get(&current?)?.parent_pid?;
+            steps += 1;
+            if steps > self.by_pid.len() {
+                return None;
+            }
+            current = Some(parent);
+            Some(parent)
+        })
     }
 
     fn descendant_depth(&self, root_pid: u32, pid: u32) -> Option<usize> {
@@ -860,6 +978,76 @@ mod tests {
             start_time,
             cwd: None,
         }
+    }
+
+    /// A person with `claude` open in three terminals has three agents, and an
+    /// inbox that shows one of them is an inbox that hides two `needs you`.
+    /// Only a process descended from another agent of its own kind is the same
+    /// agent — that is a daemon's worker, not a second session.
+    #[test]
+    fn every_agent_outside_a_pane_gets_its_own_row_unless_it_is_another_ones_child() {
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            // Two independent claude sessions, in two terminals.
+            process(10, Some(1), "claude", Some(10)),
+            process(11, Some(1), "claude", Some(11)),
+            // …and one worker each of them forked, which is the same agent.
+            process(12, Some(10), "claude", Some(12)),
+            // A different kind, on its own.
+            process(20, Some(1), "codex", Some(20)),
+            // One inside a pane, which the pane's own row already covers.
+            process(30, Some(99), "claude", Some(30)),
+            process(99, Some(1), "zsh", Some(99)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        let loose = scan.loose_agents(&[99]);
+
+        assert_eq!(
+            loose
+                .iter()
+                .map(|agent| (agent.kind, agent.pid))
+                .collect::<Vec<_>>(),
+            vec![
+                (AgentKind::Claude, 10),
+                (AgentKind::Claude, 11),
+                (AgentKind::Codex, 20)
+            ]
+        );
+        // Nothing here answers what any of them is doing.
+        assert!(
+            loose
+                .iter()
+                .all(|agent| agent.state == AgentState::Unknown
+                    && agent.working_since_unix_ms == 0)
+        );
+        assert_eq!(loose[0].start_time, Some(10));
+    }
+
+    /// The list is compared against the previous scan's to decide the inbox
+    /// changed, so an unstable order would republish the roster forever.
+    #[test]
+    fn the_same_agents_come_back_in_the_same_order() {
+        let forwards = vec![
+            process(1, None, "launchd", Some(1)),
+            process(10, Some(1), "claude", Some(10)),
+            process(11, Some(1), "codex", Some(11)),
+        ];
+        let backwards = forwards.iter().rev().cloned().collect::<Vec<_>>();
+
+        assert_eq!(
+            AgentScan::new(&forwards).loose_agents(&[]),
+            AgentScan::new(&backwards).loose_agents(&[])
+        );
+    }
+
+    #[test]
+    fn the_scan_knows_which_pids_it_saw() {
+        let processes = vec![process(1, None, "launchd", Some(1))];
+        let scan = AgentScan::new(&processes);
+
+        assert!(scan.knows_pid(1));
+        assert!(!scan.knows_pid(2));
     }
 
     #[test]

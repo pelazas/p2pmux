@@ -483,7 +483,19 @@ impl SharedLayoutRuntime {
             // machine are in none of those trees. That is a bot under systemd,
             // which is how both assistant agents are meant to run and the one
             // shape the inbox could not see.
-            let loose = scan.loose_agents(&pane_roots);
+            let mut loose = scan.loose_agents(&pane_roots);
+            // …and then what each of them is doing, which the scan cannot know
+            // and their hooks have left on this machine for exactly this. An
+            // agent with no hooks stays `Unknown` and the row still says so.
+            if let Some(directory) = crate::agent_status::default_dir() {
+                crate::agent_status::attach(directory, &mut loose);
+                // Records outlive nothing: the process that wrote one is the
+                // only thing keeping it, and this scan just listed every
+                // process on the machine.
+                crate::agent_status::sweep(directory, crate::agent_status::SWEEP_GRACE, |pid| {
+                    scan.knows_pid(pid)
+                });
+            }
             if loose != self.loose_agents {
                 self.loose_agents = loose;
                 changed = true;

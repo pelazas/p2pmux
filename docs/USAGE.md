@@ -427,6 +427,13 @@ Run `p2pmux setup` to see which agents need you.
 Row text is the agent's own words, never a model-written summary. A richer sentence that can lie
 about what an agent did would defeat the entire point of not reading the terminal yourself.
 
+This holds for an agent p2pmux never started, too. A `claude` you left running in another terminal
+has no pane to report for and no node socket to report over, so its hooks leave one small record in
+your private runtime directory instead, named after the agent's own process; the same scan that
+found the process reads it back. Nothing else expires those records — a loose agent *is* its
+process, so a `needs you` from one that has been waiting an hour is still waiting, and the row goes
+when the process does.
+
 ### Wiring up an agent
 
 ```
@@ -451,8 +458,14 @@ as running it once. It refuses to rewrite a `settings.json` it cannot parse rath
 and `--dry-run` says what it would do.
 
 Each hook pipes its payload to `p2pmux notify`, which writes one line to the pane's session and
-exits. Outside a p2pmux pane it is a silent no-op, so it is safe to leave registered everywhere.
-Restart any running Claude Code sessions to pick the hooks up.
+exits. Outside a p2pmux pane it writes the same status to a record named after the agent's own
+process instead, so an agent you started in any other terminal still reports; either way it fails
+silently and never errors into the agent, so it is safe to leave registered everywhere. Restart any
+running Claude Code sessions to pick the hooks up.
+
+An entry written by a p2pmux old enough to predate the `owner` marker still counts as ours:
+`doctor` reports it as wired, and `setup` replaces it rather than installing a second copy beside
+it.
 
 #### OpenCode
 

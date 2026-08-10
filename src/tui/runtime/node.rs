@@ -362,10 +362,15 @@ impl SharedLayoutRuntime {
             .filter_map(crate::tui::SharedLocalPane::agent_roster_entry)
             .collect::<Vec<_>>();
         // The agents nobody started in a pane go out on the same roster, keyed
-        // by their own process because they have no pane to be keyed by. State
-        // is `Unknown` and stays that way: these agents have no p2pmux hooks,
+        // by their own process because they have no pane to be keyed by. Their
+        // state is whatever their hooks left in `agent_status` — the same hooks
+        // a pane's agent reports over the node socket, which have nowhere to
+        // send from outside one. An agent that has never reported is `Unknown`
         // and the row says "running, and I cannot tell you more" rather than
         // inventing an answer from how quiet the process is.
+        //
+        // The agent's own words are not here, for the same reason they are not
+        // on a pane's entry: this roster goes to every member of the session.
         entries.extend(
             self.loose_agents
                 .iter()
@@ -377,8 +382,8 @@ impl SharedLayoutRuntime {
                         sanitize_single_line(&agent.cwd),
                         crate::protocol::MAX_AGENT_CWD_BYTES,
                     ),
-                    state: AgentRosterState::Unknown as i32,
-                    working_since_unix_ms: 0,
+                    state: crate::tui::pane::local::roster_state(agent.state) as i32,
+                    working_since_unix_ms: agent.working_since_unix_ms,
                 }),
         );
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
@@ -490,7 +495,19 @@ impl SharedLayoutRuntime {
                                 &self.tui.snapshot().members,
                             )),
                             controller: String::from("—"),
-                            message: String::new(),
+                            // Read from this node's own scan rather than the
+                            // roster entry, so it is only ever present for an
+                            // agent on this machine — the same rule a pane's
+                            // message follows, for the same reason.
+                            message: self
+                                .loose_agents
+                                .iter()
+                                .find(|agent| {
+                                    *host_peer_id == self.control.peer_id()
+                                        && agent.pid == entry.process_pid
+                                })
+                                .map(|agent| agent.message.clone())
+                                .unwrap_or_default(),
                         }
                     })
                     .collect::<Vec<_>>();

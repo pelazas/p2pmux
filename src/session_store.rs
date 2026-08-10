@@ -255,6 +255,16 @@ impl SessionStore {
         }
     }
 
+    /// Where an agent running outside every pane leaves its status.
+    ///
+    /// Beside the session sockets rather than in the state directory: these
+    /// records are about processes that are running *now*, they are worthless
+    /// once the machine reboots, and this is the directory that already gets
+    /// `0700` and already gets cleared with the sockets. See [`crate::agent_status`].
+    pub fn agent_status_dir(&self) -> PathBuf {
+        self.socket_dir.join(crate::agent_status::DIRECTORY_NAME)
+    }
+
     pub fn socket_path(&self, id: &str) -> io::Result<PathBuf> {
         if !valid_id(id) {
             return Err(io::Error::new(

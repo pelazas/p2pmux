@@ -35,6 +35,7 @@ use serde_json::Value;
 
 use crate::{
     agent_detect::{AgentKind, AgentState},
+    agent_status::AgentStatusRecord,
     local_ipc::ClientMessage,
     pty_host::{PANE_ID_ENV, SOCKET_ENV},
 };
@@ -262,14 +263,87 @@ fn send(pane_id: u64, socket: &PathBuf, kind: AgentKind, update: HookUpdate) -> 
     (&stream).write_all(&line).ok()
 }
 
+/// Report a status for an agent that is not running in a p2pmux pane.
+///
+/// There is no pane to name and no node socket to write to — the mux did not
+/// start this agent and may not be running at all — so the status goes to the
+/// machine-local record the process scan reads, keyed by the agent's own pid.
+/// See [`crate::agent_status`] for why that is a file and not a socket.
+///
+/// The agent is found by walking up from this process: a hook runner is a child
+/// of the agent that spawned it. Nothing is written when no agent is found —
+/// the row this would name does not exist either.
+fn report_outside_a_pane(kind: AgentKind, update: HookUpdate) -> Option<()> {
+    let (pid, _, start_time) = crate::agent_detect::agent_ancestor(std::process::id(), kind)?;
+    let directory = crate::agent_status::default_dir()?;
+
+    // An agent that has stopped hands its row back to the process scan, which
+    // is what an absent record means. Nothing else expires one: a loose agent
+    // *is* its process, so the row lives exactly as long as the agent does.
+    if update.state == AgentState::Idle {
+        let _ = std::fs::remove_file(directory.join(format!("{pid}.json")));
+        return Some(());
+    }
+
+    let previous = crate::agent_status::read(directory, pid, Some(start_time));
+    let record = merged_record(previous, kind, update, start_time, unix_ms_now());
+    crate::agent_status::write(directory, pid, &record).ok()
+}
+
+/// This hook's status, folded onto the one before it.
+///
+/// The same two carries the pane path makes in `record_pushed_status`, for the
+/// same reasons: a stream of per-tool-call `working` pushes is one interval
+/// rather than a clock that restarts every few seconds, and a hook with nothing
+/// to say leaves the last thing the agent said standing. Kept a pure function
+/// because that is the only part of writing a record worth asserting on.
+fn merged_record(
+    previous: Option<AgentStatusRecord>,
+    kind: AgentKind,
+    update: HookUpdate,
+    start_time: u64,
+    unix_ms_now: u64,
+) -> AgentStatusRecord {
+    // A record filed under another kind belongs to whatever ran in this process
+    // before, and carrying its clock forward would date this agent's turn from
+    // the last one's.
+    let previous = previous.filter(|record| record.kind == kind.wire_value());
+    let working_since_unix_ms = match update.state {
+        AgentState::Working => previous
+            .as_ref()
+            .filter(|record| record.state == AgentState::Working.wire_value())
+            .map(|record| record.working_since_unix_ms)
+            .filter(|since| *since != 0)
+            .unwrap_or(unix_ms_now),
+        _ => 0,
+    };
+    let message = if update.message.is_empty() {
+        previous.map(|record| record.message).unwrap_or_default()
+    } else {
+        update.message
+    };
+    AgentStatusRecord {
+        kind: kind.wire_value().to_owned(),
+        state: update.state.wire_value().to_owned(),
+        cwd: update.cwd,
+        message,
+        working_since_unix_ms,
+        start_time,
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
 /// Run the producer for one hook invocation.
 ///
 /// Always `Ok`. Every failure path is a silent no-op by design — see the module
 /// documentation.
 pub fn run(kind: AgentKind, status_arg: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let Some((pane_id, socket)) = pane_and_socket() else {
-        return Ok(());
-    };
     let raw = read_payload();
     let update = match kind {
         AgentKind::Claude => derive_claude(&raw, status_arg),
@@ -286,8 +360,16 @@ pub fn run(kind: AgentKind, status_arg: Option<&str>) -> Result<(), Box<dyn Erro
                 message: String::new(),
             }),
     };
-    if let Some(update) = update {
-        let _ = send(pane_id, &socket, kind, update);
+    let Some(update) = update else {
+        return Ok(());
+    };
+    match pane_and_socket() {
+        Some((pane_id, socket)) => {
+            let _ = send(pane_id, &socket, kind, update);
+        }
+        None => {
+            let _ = report_outside_a_pane(kind, update);
+        }
     }
     Ok(())
 }
@@ -418,6 +500,90 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         );
+    }
+
+    fn update(state: AgentState, message: &str) -> HookUpdate {
+        HookUpdate {
+            state,
+            cwd: String::from("/repo"),
+            message: message.to_owned(),
+        }
+    }
+
+    /// What an agent outside a pane leaves on disk, over a turn's worth of
+    /// hooks. Every one of these carries is the difference between an elapsed
+    /// clock that counts a turn and one that counts the gap between two tool
+    /// calls.
+    #[test]
+    fn a_record_carries_the_turn_forward_across_a_turns_worth_of_hooks() {
+        let first = merged_record(
+            None,
+            AgentKind::Claude,
+            update(AgentState::Working, "reading the tests"),
+            77,
+            1_000,
+        );
+        assert_eq!(first.working_since_unix_ms, 1_000);
+        assert_eq!(first.start_time, 77);
+
+        // A `PreToolUse` five seconds later has nothing to say and does not
+        // restart the clock.
+        let second = merged_record(
+            Some(first),
+            AgentKind::Claude,
+            update(AgentState::Working, ""),
+            77,
+            6_000,
+        );
+        assert_eq!(second.working_since_unix_ms, 1_000);
+        assert_eq!(second.message, "reading the tests");
+
+        // The turn ends: no clock, and the agent's closing words.
+        let third = merged_record(
+            Some(second),
+            AgentKind::Claude,
+            update(AgentState::Done, "all green"),
+            77,
+            9_000,
+        );
+        assert_eq!(third.working_since_unix_ms, 0);
+        assert_eq!(third.message, "all green");
+        assert_eq!(third.state, "done");
+
+        // And the next turn starts its own clock rather than resuming the last.
+        let fourth = merged_record(
+            Some(third),
+            AgentKind::Claude,
+            update(AgentState::Working, ""),
+            77,
+            20_000,
+        );
+        assert_eq!(fourth.working_since_unix_ms, 20_000);
+    }
+
+    /// Pids are reused, and a record left by a different agent is not this
+    /// agent's history.
+    #[test]
+    fn a_record_from_another_agent_is_not_carried_forward() {
+        let theirs = merged_record(
+            None,
+            AgentKind::OpenCode,
+            update(AgentState::Working, "their turn"),
+            5,
+            1_000,
+        );
+
+        let ours = merged_record(
+            Some(theirs),
+            AgentKind::Claude,
+            update(AgentState::Working, ""),
+            5,
+            8_000,
+        );
+
+        assert_eq!(ours.working_since_unix_ms, 8_000);
+        assert_eq!(ours.message, "");
+        assert_eq!(ours.kind, "claude");
     }
 
     fn opencode_state(raw: &str, status_arg: Option<&str>) -> Option<AgentState> {

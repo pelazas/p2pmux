@@ -116,15 +116,41 @@ fn write_settings(path: &PathBuf, settings: &Map<String, Value>) -> Result<(), B
     Ok(())
 }
 
+/// Whether this entry is one of ours: it carries the marker, or it runs
+/// `p2pmux notify`.
+///
+/// The second half is not belt and braces. Installs from before the marker
+/// existed are still out there working perfectly, and `doctor` calling them
+/// "not wired" sends someone to fix hooks that are already reporting — while
+/// `setup` would leave the old entry beside the new one and report everything
+/// twice. Matching on the command it runs recognizes a hand-written
+/// registration too, which is the same hook by any other name.
 fn is_ours(entry: &Value) -> bool {
     entry
         .get("hooks")
         .and_then(Value::as_array)
         .is_some_and(|hooks| {
-            hooks
-                .iter()
-                .any(|hook| hook.get("owner").and_then(Value::as_str) == Some(MARKER))
+            hooks.iter().any(|hook| {
+                hook.get("owner").and_then(Value::as_str) == Some(MARKER)
+                    || hook
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(runs_our_producer)
+            })
         })
+}
+
+/// Whether a hook command invokes `p2pmux notify`, however p2pmux was spelled.
+///
+/// An absolute path is as much ours as a bare name; anything else on the line
+/// is not, so a user's own script that merely *mentions* p2pmux keeps its entry.
+fn runs_our_producer(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    program == "p2pmux" && words.next() == Some("notify")
 }
 
 fn hook_entry(status: &str, matcher: bool) -> Value {
@@ -429,6 +455,59 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registrations from before the marker existed are still installed on real
+    /// machines and still reporting. Calling them "not wired" sends someone to
+    /// fix what already works, and installing beside them reports twice.
+    #[test]
+    fn a_registration_without_the_marker_is_still_ours_if_it_runs_the_producer() {
+        let ours = serde_json::json!({
+            "hooks": [{"type": "command", "command": "p2pmux notify claude --status running"}]
+        });
+        assert!(is_ours(&ours));
+        // Installed somewhere that is not on `PATH`, which is what the install
+        // script does when it cannot write to /usr/local/bin.
+        let absolute = serde_json::json!({
+            "hooks": [{"type": "command", "command": "/opt/homebrew/bin/p2pmux notify claude"}]
+        });
+        assert!(is_ours(&absolute));
+
+        // A hook of the user's own that merely mentions p2pmux is theirs, and
+        // uninstall must leave it exactly where it is.
+        for command in [
+            "echo 'p2pmux notify' >> /tmp/log",
+            "p2pmux ls",
+            "notify p2pmux",
+            "",
+        ] {
+            let theirs = serde_json::json!({
+                "hooks": [{"type": "command", "command": command}]
+            });
+            assert!(!is_ours(&theirs), "{command:?} is not ours to remove");
+        }
+    }
+
+    /// Installing over hooks an older build wrote replaces them rather than
+    /// doubling up: every event ends with exactly one p2pmux entry.
+    #[test]
+    fn installing_over_an_unmarked_registration_leaves_one_entry_per_event() {
+        let mut settings: Map<String, Value> = serde_json::from_str(
+            r#"{"hooks": {"Stop": [
+                 {"hooks": [{"type": "command", "command": "p2pmux notify claude --status done"}]},
+                 {"hooks": [{"type": "command", "command": "afplay /System/Library/Sounds/Glass.aiff"}]}
+               ]}}"#,
+        )
+        .expect("fixture parses");
+
+        assert!(strip_ours(&mut settings), "the old entry was recognized");
+
+        let stop = settings["hooks"]["Stop"].as_array().expect("Stop entries");
+        assert_eq!(stop.len(), 1, "only the user's own chime is left");
+        assert_eq!(
+            stop[0]["hooks"][0]["command"],
+            "afplay /System/Library/Sounds/Glass.aiff"
+        );
+    }
 
     fn settings_with_user_hooks() -> Map<String, Value> {
         serde_json::from_str(
