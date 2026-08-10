@@ -109,7 +109,7 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.6 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.7 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. Bare `p2pmux` opens the inbox, two machines pair
 once and rejoin without a code, and two agents report their own state through hooks — Claude Code
 and OpenCode. A coordinator that dies no longer ends the session — a survivor takes the role over,
@@ -128,9 +128,17 @@ inbox too, and pressing enter opens their own chat client on their own machine. 
 OpenClaw are detected; the row says which of the two things enter does, because `openclaw chat`
 joins the conversation its gateway is having and `hermes chat` starts a new one.
 
-**Upgrading from v0.1.5 is not optional if you share sessions.** The wire protocol moved, so a
-v0.1.5 peer cannot join a v0.1.6 session at all — it is refused with an unsupported-protocol
-error rather than half-joining.
+v0.1.7 finishes that thought. An agent running outside p2pmux — one you started in another
+terminal, or a bot under systemd — now reports *what it is doing*, so the inbox shows it working,
+blocked or done rather than listing a process it knows nothing about: its hooks leave a record on
+the machine, and the scan that found the process reads it back. Dragging a selection past a pane's
+top or bottom scrolls it, and keeps scrolling for as long as you hold it there, so what you copy is
+no longer limited to what fits on screen. And when a newer release exists the inbox says so, naming
+the one command that fits how your copy was installed.
+
+**v0.1.6 and v0.1.7 share sessions.** The wire protocol did not move, so a peer on either can join
+the other. v0.1.5 and older still cannot join either: that pin moved in v0.1.6, and a peer on the
+wrong side of it is refused with an unsupported-protocol error rather than half-joining.
 
 ## Install
 

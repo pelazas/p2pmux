@@ -55,7 +55,8 @@ down, so a peer on a different one fails its join — reported as an unsupported
 rather than entering a session it only half understands. v0.1.6 moved that pin: it added a message
 older peers cannot decode, so a v0.1.5 peer is refused at the door rather than dropping its control
 stream the first time one arrives. v0.1.4 and v0.1.5 still share sessions with each other, and
-neither can join a v0.1.6 one.
+neither can join a v0.1.6 one. v0.1.7 left the pin where v0.1.6 put it, so those two do share
+sessions.
 
 To dogfood the shared layout on one machine:
 
@@ -590,7 +591,7 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.7 is out — you have 0.1.6. Update with `brew update && brew upgrade p2pmux`
+p2pmux 0.1.8 is out — you have 0.1.7. Update with `brew update && brew upgrade p2pmux`
 ```
 
 `p2pmux doctor` asks the same question and answers it either way, which is the one to run when you
