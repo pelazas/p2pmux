@@ -332,23 +332,43 @@ impl MultiPaneTui {
         machine_rows(self).into_iter().nth(index)
     }
 
-    /// Step the cursor through the fleet, and off the end of it.
+    /// `m`: move the cursor to the fleet, or give it back to the agents.
     ///
-    /// Off the end rather than wrapping: the fleet is a short list next to a
-    /// long one, and a cursor that could only be escaped by walking all the way
-    /// round it would be a trap. `m` past the last machine puts the cursor back
-    /// on the agents, which is also what `Esc` does.
+    /// `m` used to step one machine per press, which made it the only way to
+    /// walk the fleet — the arrow keys stayed on the agents the whole time, so
+    /// selecting the third of four machines meant pressing a letter three
+    /// times while the obvious keys did something else. `m` now says *which
+    /// list the cursor is in*, and the arrows walk whichever one that is.
+    ///
+    /// A press with no fleet to move to is not an error and not a beep: there
+    /// is one machine in the list even with nothing paired — this one — so the
+    /// empty case only happens before the first snapshot.
     pub(in crate::tui) fn step_home_machine(&mut self) {
+        if self.home_machine.is_some() || machine_rows(self).is_empty() {
+            self.home_machine = None;
+            return;
+        }
+        self.home_machine = Some(0);
+    }
+
+    /// Walk the fleet with the same keys that walk the agents.
+    ///
+    /// Wraps, unlike the old `m`, because there is nothing to fall off onto:
+    /// leaving the fleet is `m` again or `Esc`, both of which say so. A cursor
+    /// that silently jumped back to the agents at the end of a four-machine
+    /// list would be a surprise in the middle of an ordinary key repeat.
+    pub(in crate::tui) fn move_home_machine(&mut self, forward: bool) {
         let machines = machine_rows(self).len();
         if machines == 0 {
             self.home_machine = None;
             return;
         }
-        self.home_machine = match self.home_machine {
-            None => Some(0),
-            Some(index) if index + 1 < machines => Some(index + 1),
-            Some(_) => None,
-        };
+        let current = self.home_machine.unwrap_or(0).min(machines - 1);
+        self.home_machine = Some(if forward {
+            (current + 1) % machines
+        } else {
+            (current + machines - 1) % machines
+        });
     }
 
     /// `n` or Enter on a machine: a terminal there.
@@ -679,12 +699,22 @@ impl MultiPaneTui {
         // handlers below set it again when this key needs an answer too.
         self.home_notice = None;
         match key.code {
+            // The arrows walk whichever list the cursor is in. Which one that
+            // is, is the only thing `m` decides.
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
-                self.move_home_selection(false);
+                if self.home_machine.is_some() {
+                    self.move_home_machine(false);
+                } else {
+                    self.move_home_selection(false);
+                }
                 KeyHandling::Consumed(vec![])
             }
             KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
-                self.move_home_selection(true);
+                if self.home_machine.is_some() {
+                    self.move_home_machine(true);
+                } else {
+                    self.move_home_selection(true);
+                }
                 KeyHandling::Consumed(vec![])
             }
             // Pages step sideways, so the sideways keys move them. Not `←` and
@@ -698,8 +728,8 @@ impl MultiPaneTui {
                 self.turn_home_page(false);
                 KeyHandling::Consumed(vec![])
             }
-            // `m` walks the fleet, which is what turns a list you could only
-            // read into one you can act on.
+            // `m` moves the cursor between the two lists. The arrows do the
+            // walking once it is there.
             KeyCode::Char('m') if key.modifiers.is_empty() => {
                 self.step_home_machine();
                 KeyHandling::Consumed(vec![])
@@ -1972,31 +2002,61 @@ mod tests {
         assert_eq!(tui.current_tab(), 9);
     }
 
-    /// A fleet you can only read is a fleet you cannot open a terminal on.
+    /// A fleet you can only read is a fleet you cannot open a terminal on —
+    /// and one you can only walk by pressing a letter once per machine is
+    /// barely better. `m` says which list the cursor is in; the arrows walk it.
     #[test]
-    fn m_walks_the_fleet_and_lets_go_of_it() {
+    fn m_moves_the_cursor_to_the_fleet_and_the_arrows_walk_it() {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
-        tui.paired_machines = vec![crate::tui::PairedMachine {
-            name: String::from("droplet"),
-            machine_id: None,
-            accepts_work: None,
-        }];
+        tui.paired_machines = vec![
+            crate::tui::PairedMachine {
+                name: String::from("droplet"),
+                machine_id: None,
+                accepts_work: None,
+            },
+            crate::tui::PairedMachine {
+                name: String::from("desktop"),
+                machine_id: None,
+                accepts_work: None,
+            },
+        ];
         tui.set_home_open(true, "test");
+        let selected_agent = tui.home_selected.clone();
         assert_eq!(tui.home_machine, None, "the cursor starts on the agents");
 
-        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
-        assert_eq!(tui.home_machine, Some(0));
-        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
-        assert_eq!(tui.home_machine, Some(1));
-        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
+        let key = |tui: &mut MultiPaneTui, code| {
+            tui.handle_key(KeyEvent::new(code, KeyModifiers::NONE), AREA);
+        };
+
+        key(&mut tui, KeyCode::Char('m'));
         assert_eq!(
-            tui.home_machine, None,
-            "stepping past the last machine gives the cursor back rather than wrapping"
+            tui.home_machine,
+            Some(0),
+            "one press, and the cursor is there"
         );
 
-        tui.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), AREA);
-        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), AREA);
-        assert_eq!(tui.home_machine, None, "and Esc is the other way back");
+        key(&mut tui, KeyCode::Down);
+        assert_eq!(tui.home_machine, Some(1));
+        key(&mut tui, KeyCode::Char('j'));
+        assert_eq!(tui.home_machine, Some(2));
+        key(&mut tui, KeyCode::Down);
+        assert_eq!(tui.home_machine, Some(0), "the short list wraps");
+        key(&mut tui, KeyCode::Up);
+        assert_eq!(tui.home_machine, Some(2), "and wraps back");
+        assert_eq!(
+            tui.home_selected, selected_agent,
+            "walking the fleet must not drag the agent cursor along with it"
+        );
+
+        key(&mut tui, KeyCode::Char('m'));
+        assert_eq!(tui.home_machine, None, "and the same key hands it back");
+        key(&mut tui, KeyCode::Char('m'));
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.home_machine, None, "Esc is the other way back");
+
+        // Back on the agents, the arrows are the agents' again.
+        key(&mut tui, KeyCode::Down);
+        assert_eq!(tui.home_machine, None);
     }
 
     /// The three refusals the issue asks for, each a sentence with something to

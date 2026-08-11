@@ -185,7 +185,12 @@ fn render_home_in(
                     format_home_card(
                         row,
                         card,
-                        tui.home_selected.as_ref() == Some(&row.row_id()),
+                        // Only one list holds the cursor at a time. With it on
+                        // the fleet, an agent card still wearing the selection
+                        // band would make two rows look live and leave the user
+                        // guessing which one Enter is about.
+                        tui.home_machine.is_none()
+                            && tui.home_selected.as_ref() == Some(&row.row_id()),
                         layout.rows.width,
                         now_unix_ms,
                         animation_phase,
