@@ -864,6 +864,7 @@ async fn post_welcome_screen_stream_starts_with_a_snapshot_then_sends_delta() {
                     member_kind: Default::default(),
                     machine_proof: Default::default(),
                     machine_id: Default::default(),
+                    enrol_secret: String::new(),
                 })),
             },
         )
@@ -954,6 +955,7 @@ async fn host_keeps_a_silent_spectator_connected_after_control_stream_setup_wind
                     member_kind: Default::default(),
                     machine_proof: Default::default(),
                     machine_id: Default::default(),
+                    enrol_secret: String::new(),
                 })),
             },
         )

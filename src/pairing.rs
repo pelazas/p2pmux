@@ -123,6 +123,32 @@ pub struct Pairing {
     /// What your other machines may start on this one. See [`WorkPolicy`].
     #[serde(default)]
     pub work: WorkPolicy,
+    /// The standing invitation for machines you own. See [`EnrolToken`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrol: Option<EnrolToken>,
+}
+
+/// A long-lived, revocable secret that admits a machine to this fleet.
+///
+/// `p2pmux pair` is a code one human types on one machine within ten minutes.
+/// That is right for two laptops and wrong for a VM: the box you want in your
+/// fleet is created by a script, has nobody sitting at it, and is often gone by
+/// the end of the week. Asking a provisioning run to hold a ten-minute window
+/// open makes the fleet something you assemble by hand.
+///
+/// So a machine can be enrolled with a token you baked into its cloud-init
+/// instead. The trade is deliberate and worth stating plainly: this is a
+/// credential, and anyone who holds it can put a machine in your fleet until
+/// you revoke it. What that buys them is *membership*, which grants nothing on
+/// its own — starting anything on one of your machines still has to pass that
+/// machine's own `[work].allow`, which is written on it and travels nowhere.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EnrolToken {
+    /// Hex, 32 bytes of randomness. Compared whole.
+    pub secret: String,
+    /// When it was minted, for `p2pmux enroll` to print.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 /// What a machine allows other machines of yours to run on it.
@@ -328,6 +354,20 @@ impl Pairing {
     /// Open the window an arriving machine may join the fleet through.
     pub fn open_pairing_window(&mut self, now: u64) {
         self.pending_until = Some(now.saturating_add(PAIRING_WINDOW_SECONDS));
+    }
+
+    /// Whether `secret` is this fleet's standing invitation.
+    ///
+    /// Constant-time-ish by construction rather than by care: the secret is
+    /// compared whole and the caller reaches this only over an authenticated
+    /// transport, so there is no oracle to time. An empty secret never matches,
+    /// which is what makes a revoked token a refusal rather than a wildcard.
+    pub fn enrolment_admits(&self, secret: &str) -> bool {
+        !secret.is_empty()
+            && self
+                .enrol
+                .as_ref()
+                .is_some_and(|token| token.secret == secret)
     }
 
     pub fn forget(&mut self, name: &str) -> bool {
@@ -572,6 +612,7 @@ mod tests {
             daemon_declined: false,
             machines: Vec::new(),
             work: Default::default(),
+            enrol: None,
         };
         pairing.remember("desktop", Some(String::from("aa")), Some(false));
         pairing.remember("droplet", Some(String::from("bb")), Some(true));
@@ -905,6 +946,83 @@ mod tests {
         );
     }
 
+    /// The token is meant to live in a provisioning script, so printing it
+    /// twice has to give the same string — one that rotated on being looked at
+    /// would strand every machine image built from the last look.
+    #[test]
+    fn an_enrolment_token_is_stable_until_it_is_revoked() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-v3:abc")),
+            ..Pairing::default()
+        };
+
+        let first = super::enrolment_token(&mut pairing, 10).expect("mint");
+        let again = super::enrolment_token(&mut pairing, 20).expect("mint");
+        assert_eq!(first, again, "looking at it must not rotate it");
+        assert!(pairing.enrolment_admits(&first));
+
+        assert!(super::revoke_enrolment(&mut pairing));
+        assert!(!super::revoke_enrolment(&mut pairing));
+        assert!(
+            !pairing.enrolment_admits(&first),
+            "a revoked token is a refusal"
+        );
+        assert!(
+            !pairing.enrolment_admits(""),
+            "and an empty secret is never a wildcard, whatever is recorded"
+        );
+
+        let rotated = super::enrolment_token(&mut pairing, 30).expect("mint");
+        assert_ne!(first, rotated);
+        assert!(!pairing.enrolment_admits(&first));
+    }
+
+    /// The invitation carries both halves in one string, because a form that
+    /// needs two values pasted in the right order is a form that gets pasted
+    /// wrong. Anything else is refused rather than half-understood: on a box
+    /// with nobody at it, "enrolled into nothing, reported success" is
+    /// invisible until you go looking for a machine that is not there.
+    #[test]
+    fn an_enrolment_invite_round_trips_and_refuses_everything_else() {
+        let invite = super::EnrolInvite {
+            ticket: String::from("p2pmux-v3:abc"),
+            secret: String::from("f00d"),
+        };
+        let encoded = invite.encode();
+        assert!(encoded.starts_with(super::ENROL_PREFIX));
+        assert_eq!(
+            super::EnrolInvite::decode(&encoded).expect("decode"),
+            invite
+        );
+        // Survives the whitespace a YAML block or a copy-paste adds.
+        assert_eq!(
+            super::EnrolInvite::decode(&format!("  {encoded}\n")).expect("decode"),
+            invite
+        );
+
+        for refused in [
+            "",
+            "p2pmux-v3:abc",
+            super::ENROL_PREFIX,
+            &format!("{}!!!not-base64", super::ENROL_PREFIX),
+            &super::EnrolInvite {
+                ticket: String::new(),
+                secret: String::from("f00d"),
+            }
+            .encode(),
+            &super::EnrolInvite {
+                ticket: String::from("p2pmux-v3:abc"),
+                secret: String::new(),
+            }
+            .encode(),
+        ] {
+            assert!(
+                super::EnrolInvite::decode(refused).is_err(),
+                "must refuse {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn confirm_turns_an_allowed_command_into_a_question() {
         let mut pairing = Pairing {
@@ -933,4 +1051,108 @@ mod tests {
         let pairing = load_from(&path).expect("load");
         assert!(!pairing.accepts_work);
     }
+}
+
+/// The printable form of an enrolment invitation: the fleet's session ticket
+/// and the secret that admits a machine to it, in one string.
+///
+/// One string because it is meant to be pasted into a provisioning script, and
+/// a form that needs two values pasted in the right order is a form that gets
+/// pasted wrong. Same shape as a join ticket for the same reason — a prefix so
+/// it can be recognized, base64 so it survives YAML.
+pub const ENROL_PREFIX: &str = "p2pmux-enrol-v1:";
+
+/// The two halves of an enrolment invitation, as they travel.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EnrolInvite {
+    /// The session every machine in this fleet rejoins.
+    pub ticket: String,
+    /// The standing secret. See [`EnrolToken`].
+    pub secret: String,
+}
+
+impl EnrolInvite {
+    pub fn encode(&self) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let json = serde_json::to_vec(self).unwrap_or_default();
+        format!("{ENROL_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
+    }
+
+    /// Parse one, refusing anything that is not exactly this shape.
+    ///
+    /// Strict on purpose: the failure this has to avoid is a half-understood
+    /// token that enrols a machine into nothing and reports success, which on a
+    /// box with nobody sitting at it is invisible until you go looking for a
+    /// machine that is not there.
+    pub fn decode(input: &str) -> Result<Self, PairingError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let body = input
+            .trim()
+            .strip_prefix(ENROL_PREFIX)
+            .ok_or_else(|| PairingError::Invalid(String::from("not an enrolment token")))?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(body)
+            .map_err(|_| PairingError::Invalid(String::from("malformed enrolment token")))?;
+        let invite: Self = serde_json::from_slice(&bytes)
+            .map_err(|_| PairingError::Invalid(String::from("malformed enrolment token")))?;
+        if invite.ticket.is_empty() || invite.secret.is_empty() {
+            return Err(PairingError::Invalid(String::from(
+                "incomplete enrolment token",
+            )));
+        }
+        Ok(invite)
+    }
+}
+
+/// Mint a secret for this fleet, or return the one already minted.
+///
+/// Stable across calls, because the token is meant to live in a provisioning
+/// script: one that changed every time you printed it would silently strand
+/// every machine image built from the last one. Replacing it is
+/// [`revoke_enrolment`] followed by printing a new one, which is an act with a
+/// visible consequence rather than a side effect of looking.
+pub fn enrolment_token(pairing: &mut Pairing, now: u64) -> Result<String, PairingError> {
+    if let Some(token) = &pairing.enrol {
+        return Ok(token.secret.clone());
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| PairingError::Invalid(error.to_string()))?;
+    let secret = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    pairing.enrol = Some(EnrolToken {
+        secret: secret.clone(),
+        created_at: now,
+    });
+    Ok(secret)
+}
+
+/// Withdraw the standing invitation. Machines already in the fleet stay: they
+/// were enrolled, and unenrolling one is `p2pmux unpair`.
+pub fn revoke_enrolment(pairing: &mut Pairing) -> bool {
+    pairing.enrol.take().is_some()
+}
+
+/// Write a machine that presented this fleet's enrolment secret into the fleet.
+///
+/// The one path into a pairing record that is not a human typing a code, and
+/// it is deliberately narrow: the caller has already checked the secret against
+/// this machine's own record and that the joiner declared itself a machine.
+/// What is left here is the write, and the guard that there is a fleet to write
+/// to at all — a box with no ticket has no fleet, and a machine "enrolled" into
+/// nothing would be a row nobody could reach.
+pub fn enrol_machine(name: &str, machine_id: &str) -> Result<(), PairingError> {
+    let path = pairing_path()?;
+    let mut pairing = load_from(&path)?;
+    if !pairing.can_rejoin() || pairing.enrol.is_none() {
+        return Ok(());
+    }
+    let before = pairing.clone();
+    let identity = (!machine_id.is_empty()).then(|| machine_id.to_owned());
+    pairing.remember(name, identity, None);
+    if pairing == before {
+        return Ok(());
+    }
+    save_to(&path, &pairing)
 }

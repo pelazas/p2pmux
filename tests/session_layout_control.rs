@@ -502,6 +502,7 @@ async fn forged_post_welcome_sender_is_rejected_without_a_layout_mutation() {
                 member_kind: Default::default(),
                 machine_proof: Default::default(),
                 machine_id: Default::default(),
+                enrol_secret: String::new(),
             })),
         },
     )
@@ -955,6 +956,7 @@ async fn closing_after_welcome_rolls_back_admission_before_control_setup() {
                 member_kind: Default::default(),
                 machine_proof: Default::default(),
                 machine_id: Default::default(),
+                enrol_secret: String::new(),
             })),
         },
     )

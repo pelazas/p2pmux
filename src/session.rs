@@ -2111,6 +2111,12 @@ pub struct JoinReceipt {
     /// How many takeovers this session has been through, so a joiner knows which
     /// coordinator's signatures to expect without having to read the history it missed.
     pub coordinator_epoch: u64,
+    /// Whether the joiner presented this fleet's standing enrolment secret.
+    ///
+    /// Checked here, at the one point the secret is visible, and carried on as
+    /// a yes or no — so nothing downstream holds the secret or can be confused
+    /// about what it proved. See `pairing::EnrolToken`.
+    pub enrolled: bool,
 }
 
 #[derive(Debug)]
@@ -2422,6 +2428,9 @@ impl HostSession {
             },
             session_name: self.session_name.clone(),
             coordinator_epoch: self.coordinator_epoch,
+            // Asked of this machine's own pairing record, which is the only
+            // thing that can answer it and never leaves this box.
+            enrolled: crate::pairing::load_or_empty().enrolment_admits(&join.enrol_secret),
         };
         self.transport
             .write_frame(
@@ -3583,6 +3592,23 @@ impl SharedLayoutHost {
                     .lock()
                     .map_err(|_| SessionError::PeerTask)?;
                 coordinator_guard.remember_admitted(receipt.admitted_peer_id.clone());
+            }
+            // A machine that presented this fleet's enrolment secret joins the
+            // fleet record now, rather than waiting for somebody to be at this
+            // machine holding a ten-minute window open. That wait is exactly
+            // what makes `p2pmux pair` unusable from a provisioning script, and
+            // the token is the consent the window was standing in for.
+            //
+            // Still only ever a machine that says it is one: an enrolment token
+            // pasted into a laptop somebody is sitting at should put a *machine*
+            // in your fleet or nothing.
+            if receipt.enrolled && receipt.identity.kind.declared_machine() {
+                if let Err(error) = crate::pairing::enrol_machine(
+                    &receipt.display_name,
+                    &crate::machine_id::to_hex(&receipt.identity.machine_id),
+                ) {
+                    eprintln!("p2pmux node: failed to record an enrolled machine: {error}");
+                }
             }
             admitted_peer_id = Some(receipt.admitted_peer_id.clone());
 
@@ -4989,6 +5015,12 @@ async fn join_handshake_with_display_name(
                     member_kind: wire_member_kind(local_member_kind()) as i32,
                     machine_id: crate::machine_id::machine_id(),
                     machine_proof: crate::machine_id::prove(client_id.as_bytes()),
+                    // Whatever `p2pmux enroll <token>` wrote here, and empty on
+                    // every machine that was never given one.
+                    enrol_secret: crate::pairing::load_or_empty()
+                        .enrol
+                        .map(|token| token.secret)
+                        .unwrap_or_default(),
                 })),
             },
         )
@@ -5020,6 +5052,9 @@ async fn join_handshake_with_display_name(
         identity: crate::layout::MemberIdentity::default(),
         session_name: welcome.session_name,
         coordinator_epoch: welcome.coordinator_epoch,
+        // A question the coordinator answers about *us*, and this receipt is
+        // the one we build about *it*.
+        enrolled: false,
     })
 }
 

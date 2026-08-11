@@ -276,6 +276,18 @@ pub struct Join {
     /// ask again.
     #[prost(bytes = "vec", tag = "7")]
     pub machine_proof: Vec<u8>,
+    /// The fleet's standing enrolment secret, when this machine was given one.
+    ///
+    /// Presented to the coordinator and nobody else — it rides the join
+    /// handshake, which is inside the authenticated transport, and is never put
+    /// in a member list or relayed. It says "the person who owns this fleet
+    /// gave me this", and it is the whole of what makes an unattended VM
+    /// admissible without a human holding a ten-minute window open.
+    ///
+    /// Empty on every ordinary join, which is what a peer that was never given
+    /// one sends and what a revoked token amounts to.
+    #[prost(string, tag = "8")]
+    pub enrol_secret: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

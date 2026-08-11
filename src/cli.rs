@@ -113,6 +113,29 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Put a machine you own in your fleet without anybody sitting at it.
+    ///
+    /// `p2pmux pair` is a code one human types on one machine within ten
+    /// minutes, which is right for two laptops and unusable from a provisioning
+    /// script. With no arguments this prints a token to paste into one; on the
+    /// new machine, `p2pmux enroll <token>` joins the fleet unattended.
+    Enroll {
+        /// The token printed by `p2pmux enroll` on a machine already in the
+        /// fleet. Omit it to print one here instead.
+        token: Option<String>,
+        /// The name this machine goes by in the fleet. Defaults to its
+        /// hostname, which on a droplet is rarely what you want to read.
+        #[arg(long)]
+        name: Option<String>,
+        /// Withdraw the standing invitation. Machines already enrolled stay;
+        /// `p2pmux unpair` is how one leaves.
+        #[arg(long)]
+        revoke: bool,
+        /// Let your other machines start a login shell here. Unattended boxes
+        /// usually want this, and it is the same thing `p2pmux work allow` does.
+        #[arg(long = "accept-work")]
+        accept_work: bool,
+    },
     /// Say what your other machines may start on this one.
     ///
     /// Two gates gate a remote terminal, and both are closed until you open
@@ -418,6 +441,25 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             _ => Err(CliError("config key must be name").into()),
         },
         Some(Command::Work { action }) => run_work(action),
+        Some(Command::Enroll {
+            token,
+            name,
+            revoke,
+            accept_work,
+        }) => match (token, revoke) {
+            (_, true) => {
+                let mut pairing = crate::pairing::load()?;
+                if crate::pairing::revoke_enrolment(&mut pairing) {
+                    crate::pairing::save(&pairing)?;
+                    println!("enrolment token revoked; machines already in the fleet stay");
+                } else {
+                    println!("no enrolment token to revoke");
+                }
+                Ok(())
+            }
+            (None, false) => print_enrolment_token(),
+            (Some(token), false) => enroll_with_token(&token, name.as_deref(), accept_work).await,
+        },
         Some(Command::Create { name, session_name }) => {
             {
                 let mut stdout = io::stdout().lock();
@@ -1035,6 +1077,105 @@ fn run_work(action: Option<WorkCommand>) -> Result<(), Box<dyn Error>> {
     }
     println!();
     print!("{}", work_policy_summary(&crate::pairing::load()?));
+    Ok(())
+}
+
+/// Print the standing invitation for this fleet, and the line to run with it.
+///
+/// The line rather than the token alone, because what a person does next is
+/// paste it into a cloud-init file, and a token with the command left off is a
+/// token that gets pasted into the wrong one.
+fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
+    let mut pairing = crate::pairing::load()?;
+    let Some(ticket) = pairing.ticket.clone() else {
+        return Err(CliError(
+            "this machine is not in a fleet yet — run `p2pmux pair` on it once, \
+             or start a session with `p2pmux create`, and try again",
+        )
+        .into());
+    };
+    let minted = pairing.enrol.is_none();
+    let secret = crate::pairing::enrolment_token(&mut pairing, crate::pairing::now_unix())?;
+    if minted {
+        crate::pairing::save(&pairing)?;
+    }
+    let invite = crate::pairing::EnrolInvite { ticket, secret }.encode();
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{TRUST_WARNING}\n")?;
+    writeln!(
+        stdout,
+        "Anyone holding this token can put a machine in your fleet until you run\n\
+         `p2pmux enroll --revoke`. Membership on its own starts nothing: what may\n\
+         run on a machine is that machine's own `p2pmux work allow`.\n"
+    )?;
+    writeln!(stdout, "On the machine you are adding, run:\n")?;
+    writeln!(stdout, "  p2pmux enroll {invite} --name <name>\n")?;
+    writeln!(
+        stdout,
+        "In cloud-init, with nobody there to type it:\n\n  \
+         runcmd:\n    - [ sh, -c, \"p2pmux enroll {invite} --name build-box --accept-work\" ]"
+    )?;
+    Ok(())
+}
+
+/// Join the fleet a token names, with nobody sitting at this machine.
+///
+/// Everything is written *before* the join, exactly as `pair_with_code` does
+/// it and for the same reason: a join that connects and then drops has still
+/// enrolled the machine, and losing the record to a network blip on a box with
+/// nobody at it means nobody finds out.
+async fn enroll_with_token(
+    token: &str,
+    name: Option<&str>,
+    accept_work: bool,
+) -> Result<(), Box<dyn Error>> {
+    let invite = crate::pairing::EnrolInvite::decode(token)?;
+    if let Some(name) = name {
+        crate::config::save(name)?;
+    }
+    let mut pairing = crate::pairing::load()?;
+    pairing.ticket = Some(invite.ticket.clone());
+    pairing.enrol = Some(crate::pairing::EnrolToken {
+        secret: invite.secret.clone(),
+        created_at: crate::pairing::now_unix(),
+    });
+    if accept_work {
+        pairing.accepts_work = true;
+        pairing.work.allow(&[]);
+    }
+    // The window the classic flow opens by hand. The machine that minted the
+    // token is about to write this one into its fleet on sight; this is the
+    // other direction, so that the two records agree without a second command.
+    pairing.open_pairing_window(crate::pairing::now_unix());
+    crate::pairing::save(&pairing)?;
+
+    let descriptor = rejoin_paired_session(&invite.ticket).await?;
+    let peers = wait_for_peers(&descriptor).await;
+    let mut pairing = crate::pairing::load()?;
+    for peer in &peers {
+        pairing.remember(
+            &peer.name,
+            (!peer.machine_id.is_empty()).then(|| peer.machine_id.clone()),
+            None,
+        );
+    }
+    crate::pairing::save(&pairing)?;
+
+    let mut stdout = io::stdout().lock();
+    let here = crate::config::load()?.unwrap_or_else(hostname_label);
+    writeln!(stdout, "enrolled as {here}")?;
+    if peers.is_empty() {
+        writeln!(
+            stdout,
+            "no other machine answered yet — it joins the fleet when one is running"
+        )?;
+    } else {
+        for peer in &peers {
+            writeln!(stdout, "  in a fleet with {}", peer.name)?;
+        }
+    }
+    writeln!(stdout)?;
+    write!(stdout, "{}", work_policy_summary(&crate::pairing::load()?))?;
     Ok(())
 }
 

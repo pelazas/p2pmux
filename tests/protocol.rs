@@ -236,6 +236,7 @@ fn envelope_exposes_each_v1_body() {
             member_kind: Default::default(),
             machine_proof: Default::default(),
             machine_id: Default::default(),
+            enrol_secret: String::new(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -368,6 +369,7 @@ fn sample_envelopes() -> Vec<Envelope> {
             member_kind: Default::default(),
             machine_proof: Default::default(),
             machine_id: Default::default(),
+            enrol_secret: String::new(),
         })),
         envelope(envelope::Body::Welcome(Welcome {
             session_id: b"session-a".to_vec(),
@@ -1147,6 +1149,7 @@ fn join_endpoint_and_reservation_lifecycle_identifiers_are_required() {
         member_kind: Default::default(),
         machine_proof: Default::default(),
         machine_id: Default::default(),
+        enrol_secret: String::new(),
     }));
     let missing_ready_revision = envelope(envelope::Body::PaneReady(PaneReady {
         reservation_id: 1,
@@ -1700,6 +1703,7 @@ fn join_wire_shape_encodes_a_present_endpoint_address() {
         member_kind: Default::default(),
         machine_proof: Default::default(),
         machine_id: Default::default(),
+        enrol_secret: String::new(),
     };
 
     assert_eq!(
@@ -1757,6 +1761,7 @@ fn layout_messages_reject_deep_or_wide_trees_and_oversize_join_endpoint() {
         member_kind: Default::default(),
         machine_proof: Default::default(),
         machine_id: Default::default(),
+        enrol_secret: String::new(),
     }));
 
     for invalid in [
@@ -1919,6 +1924,7 @@ fn decoder_rejects_missing_fields_and_invalid_sequences() {
         member_kind: Default::default(),
         machine_proof: Default::default(),
         machine_id: Default::default(),
+        enrol_secret: String::new(),
     }));
     let mut empty_id_frame = Vec::new();
     empty_id
@@ -2055,6 +2061,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 member_kind: Default::default(),
                 machine_proof: Default::default(),
                 machine_id: Default::default(),
+                enrol_secret: String::new(),
             })),
         ),
         (
@@ -2067,6 +2074,7 @@ fn encode_frame_rejects_invalid_envelopes() {
                 member_kind: Default::default(),
                 machine_proof: Default::default(),
                 machine_id: Default::default(),
+                enrol_secret: String::new(),
             })),
         ),
         (
@@ -2128,6 +2136,7 @@ fn a_member_kind_survives_the_wire_and_an_unknown_one_reads_as_silence() {
         member_kind: MemberKind::Machine as i32,
         machine_proof: Default::default(),
         machine_id: Default::default(),
+        enrol_secret: String::new(),
     };
     let decoded = Join::decode(joined.encode_to_vec().as_slice()).expect("join decodes");
     assert_eq!(decoded.member_kind, MemberKind::Machine as i32);
