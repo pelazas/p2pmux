@@ -50,15 +50,59 @@ impl MultiPaneTui {
                 row.process_pid,
             )
         });
-        if self.agent_rows == rows {
+        let unchanged = self.agent_rows == rows;
+        if !unchanged {
+            self.agent_rows = rows;
+            // Home reads these rows in its own order, so its cursor is repaired
+            // from the same place they are set. Doing it here rather than at
+            // each call site is what keeps the two from drifting apart.
+            self.repair_home_selection();
+        }
+        // Runs even when nothing changed: the agent that stopped needing a
+        // human is the common case, and its answered mark has to be dropped so
+        // the next question counts.
+        let answered = self.forget_answers_that_are_spent() | self.answer_focused_agent();
+        !unchanged || answered
+    }
+
+    /// Mark the focused pane's agent as one whose question has been seen.
+    ///
+    /// Only when it is actually asking. Marking a pane that is merely focused
+    /// would mute the question the user has not been asked yet — sit in a pane,
+    /// wait for the agent to block on a permission prompt, and the count would
+    /// never appear.
+    pub(in crate::tui) fn answer_focused_agent(&mut self) -> bool {
+        let focused = self.focused_pane;
+        // `0` is the pane id a row with no pane carries, and there is no
+        // focusing an agent that has none — its summons is answered by going to
+        // it, which is a different key and a different screen.
+        if focused == 0 {
             return false;
         }
-        self.agent_rows = rows;
-        // Home reads these rows in its own order, so its cursor is repaired
-        // from the same place they are set. Doing it here rather than at each
-        // call site is what keeps the two from drifting apart.
-        self.repair_home_selection();
-        true
+        let asking = self
+            .agent_rows
+            .iter()
+            .any(|row| row.pane_id == focused && row.state.needs_you());
+        asking && self.answered_agent_panes.insert(focused)
+    }
+
+    /// Drop the marks whose questions are over, so the next one counts.
+    ///
+    /// A pane whose agent has stopped needing a human, and a pane that is no
+    /// longer in the layout at all. Without the first the mark would mute every
+    /// later question from an agent the user answered once; without the second
+    /// the set would grow for as long as the session lives.
+    fn forget_answers_that_are_spent(&mut self) -> bool {
+        let still_asking = self
+            .agent_rows
+            .iter()
+            .filter(|row| row.state.needs_you())
+            .map(|row| row.pane_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let before = self.answered_agent_panes.len();
+        self.answered_agent_panes
+            .retain(|pane_id| still_asking.contains(pane_id));
+        before != self.answered_agent_panes.len()
     }
 
     /// Updates attached-client agent rows and reports panes that just started wanting a human.

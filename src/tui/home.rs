@@ -118,12 +118,20 @@ impl MultiPaneTui {
         rows
     }
 
-    /// How many rows are blocked on a human. The header count, the tab-bar
-    /// badge and the eventual notification all read this one number.
+    /// How many rows are blocked on a human *and* have not been visited. The
+    /// header count, the tab-bar badge and the eventual notification all read
+    /// this one number.
+    ///
+    /// A pane the user has gone to since its agent got stuck does not count.
+    /// The number is a summons, and standing in front of the thing summoning
+    /// you answers it — leaving `inbox 1` up while the user reads the question
+    /// it refers to makes the badge mean "there is an agent" rather than "you
+    /// are needed". See `answered_agent_panes`.
     pub fn home_needs_you_count(&self) -> usize {
         self.agent_rows
             .iter()
             .filter(|row| row.state.needs_you())
+            .filter(|row| !self.answered_agent_panes.contains(&row.pane_id))
             .count()
     }
 
@@ -1152,19 +1160,89 @@ mod tests {
         );
     }
 
+    /// Pane 1 is where a fresh client's focus sits, so the fixtures below put
+    /// something unblocked there. Otherwise every count would be measuring the
+    /// answered-summons rule as well as whatever it meant to measure.
     #[test]
     fn the_header_count_only_counts_rows_a_hook_reported_as_blocked() {
         let tui = home_tui(&[
+            ("laptop", "codex", AgentRosterState::Working),
             ("laptop", "claude", AgentRosterState::Pending),
             ("droplet", "codex", AgentRosterState::Pending),
             // Detection knows this process is alive and nothing more. It must
             // never reach the count that a notification will one day carry.
             ("desktop", "cursor", AgentRosterState::Unknown),
-            ("laptop", "codex", AgentRosterState::Working),
         ]);
 
         assert_eq!(tui.home_needs_you_count(), 2);
         assert!(!tui.home_all_unwired());
+    }
+
+    /// The count is a summons. Standing in front of the agent doing the
+    /// summoning answers it, and `inbox 1` over the pane whose question the
+    /// user is reading is the badge saying "there is an agent" — which is not
+    /// what it is for.
+    #[test]
+    fn going_to_a_blocked_agents_pane_answers_its_summons() {
+        let mut tui = home_tui(&[
+            ("laptop", "codex", AgentRosterState::Working),
+            ("laptop", "claude", AgentRosterState::Pending),
+            ("droplet", "codex", AgentRosterState::Pending),
+        ]);
+        assert_eq!(tui.home_needs_you_count(), 2);
+
+        assert!(tui.select_pane(2, 2, "test"), "a repaint is owed");
+        assert_eq!(tui.home_needs_you_count(), 1);
+        tui.select_pane(3, 3, "test");
+        assert_eq!(tui.home_needs_you_count(), 0);
+
+        // Leaving does not bring them back: the questions were seen, and a
+        // summons that returns the moment you look away is one you can never
+        // answer.
+        tui.select_pane(1, 1, "test");
+        assert_eq!(tui.home_needs_you_count(), 0);
+    }
+
+    /// …but the *next* question does count. Answering one is not muting the
+    /// pane, and an agent that asks, is answered, works, and asks again has
+    /// asked twice.
+    #[test]
+    fn the_next_question_from_an_answered_pane_counts_again() {
+        let mut tui = home_tui(&[
+            ("laptop", "codex", AgentRosterState::Working),
+            ("laptop", "claude", AgentRosterState::Pending),
+        ]);
+        tui.select_pane(2, 2, "test");
+        assert_eq!(tui.home_needs_you_count(), 0);
+        tui.select_pane(1, 1, "test");
+
+        let claude = |state| {
+            vec![
+                crate::tui::AgentOverlayRow {
+                    host: String::from("laptop"),
+                    kind: String::from("codex"),
+                    state: AgentRosterState::Working,
+                    ..crate::tui::test_support::agent_row(1, 1, 1)
+                },
+                crate::tui::AgentOverlayRow {
+                    host: String::from("laptop"),
+                    kind: String::from("claude"),
+                    state,
+                    ..crate::tui::test_support::agent_row(2, 2, 1)
+                },
+            ]
+        };
+        // The turn resumes, and then blocks again — a second question, asked
+        // while the user is in another pane.
+        tui.set_agent_rows(claude(AgentRosterState::Working));
+        assert_eq!(tui.home_needs_you_count(), 0);
+        tui.set_agent_rows(claude(AgentRosterState::Pending));
+
+        assert_eq!(
+            tui.home_needs_you_count(),
+            1,
+            "answering one question is not muting the pane"
+        );
     }
 
     #[test]

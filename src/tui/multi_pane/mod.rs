@@ -66,6 +66,17 @@ pub struct MultiPaneTui {
     /// `unread_agent_panes` because that set is cleared by focusing the pane.
     pub(in crate::tui) notified_agent_episodes: BTreeMap<PaneId, u64>,
     pub(in crate::tui) unread_agent_panes: BTreeSet<PaneId>,
+    /// Panes whose `needs you` the user has already gone and looked at.
+    ///
+    /// The count beside `inbox` in the top bar is a summons: it says somebody
+    /// is waiting on you and you have not been. Going to the pane answers it,
+    /// and a summons that survives being answered is noise — the number sat at
+    /// `inbox 1` while the user was reading the very question it was about.
+    ///
+    /// Cleared per pane the moment its agent stops needing a human, so the
+    /// *next* question counts again. That is the difference between
+    /// acknowledging one question and muting the pane.
+    pub(in crate::tui) answered_agent_panes: BTreeSet<PaneId>,
     pub(in crate::tui) modal: ModalState,
     /// A first Ctrl+A, waiting to see whether a second follows. See
     /// [`crate::tui::HOME_TOGGLE_WINDOW`].
@@ -171,6 +182,7 @@ impl MultiPaneTui {
             prior_agent_episodes: BTreeMap::new(),
             notified_agent_episodes: BTreeMap::new(),
             unread_agent_panes: BTreeSet::new(),
+            answered_agent_panes: BTreeSet::new(),
             modal: ModalState::None,
             pending_home_toggle: None,
             home_open: false,
@@ -614,8 +626,12 @@ impl MultiPaneTui {
         self.current_tab = tab_id;
         self.focused_pane = pane_id;
         let unread_cleared = self.unread_agent_panes.remove(&pane_id);
+        // Arriving at the pane answers its summons. Done here rather than on
+        // the next roster refresh because the top bar is redrawn by this very
+        // keypress, and a count that clears a second later reads as a glitch.
+        let answered = self.answer_focused_agent();
         self.log_selection_change(reason, old_tab, old_pane, tab_id, pane_id);
-        old_tab != tab_id || old_pane != pane_id || unread_cleared
+        old_tab != tab_id || old_pane != pane_id || unread_cleared || answered
     }
 
     pub(in crate::tui) fn log_selection_change(
