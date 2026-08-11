@@ -4,6 +4,10 @@
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300
 
+# The demo gif only changes when a release does.
+/demo.gif
+  Cache-Control: public, max-age=604800
+
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer

@@ -89,6 +89,18 @@ impl SharedControl {
         }
     }
 
+    /// Answers to this coordinator's own requests that a member refused.
+    ///
+    /// Empty on a member, which is sent its rejections down the control stream
+    /// like any other frame. Only the coordinator has to fetch its own,
+    /// because it has no stream to itself to be sent them on.
+    pub(in crate::tui) fn take_own_rejects(&self) -> Vec<crate::protocol::LayoutReject> {
+        match self {
+            Self::Host(host) => host.take_own_rejects(),
+            Self::Member(_) => Vec::new(),
+        }
+    }
+
     /// Tell the other machines in this session about a session started here.
     ///
     /// The coordinator relays it to every member and acts on it itself; a

@@ -3,122 +3,932 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>p2pmux — a terminal room where every pane runs on its owner's machine</title>
-<meta name="description" content="A terminal multiplexer for two or more people, on macOS and Linux. Each pane's process runs on its host's machine, under its host's credentials.">
+<title>p2pmux — everyone brings their own terminal</title>
+<meta name="description" content="A peer-to-peer terminal multiplexer for macOS and Linux. Every pane runs on the machine of whoever opened it — their shell, their toolchain, their env, their AI subscription. Ten characters to join.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="canonical" href="https://p2pmux.com/">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://p2pmux.com/">
-<meta property="og:title" content="p2pmux — every pane runs on the machine of whoever opened it">
-<meta property="og:description" content="A terminal multiplexer for two or more people, on macOS and Linux. Each pane's process runs on its host's machine, under its host's credentials.">
+<meta property="og:title" content="p2pmux — everyone brings their own terminal">
+<meta property="og:description" content="A peer-to-peer terminal multiplexer. Every pane runs on the machine of whoever opened it. Hop into a teammate's pane and you get a real shell on their machine, without ever holding their keys.">
 <meta property="og:image" content="https://p2pmux.com/og.png">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0d0e11">
+<script>document.documentElement.classList.add("js")</script>
 <style>
+/* ─────────────────────────────────────────────────────────────────────────
+   p2pmux.com — no webfonts, no third-party requests, no analytics.
+   An audience that reads install.sh before running it will check.
+   ───────────────────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: dark light;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono",
+          Menlo, Consolas, "Liberation Mono", monospace;
+  --serif: "Iowan Old Style", Charter, "Bitstream Charter", "Source Serif 4", "Source Serif Pro",
+           "Noto Serif", Georgia, "DejaVu Serif", serif;
+
+  --bg:        #0d0e11;
+  --bg-deep:   #090a0c;
+  --surface:   #101217;
+  --surface-2: #16181e;
+  --fg:        #e7e4dd;
+  --fg-dim:    #b6b4ae;
+  --muted:     #82858e;
+  --faint:     #5a5d66;
+  --rule:      #22252c;
+  --rule-soft: #191c22;
+
+  --ember:     #ff7a45;
+  --ember-dim: #c95527;
+  --ember-ink: #1a0d07;
+  --jade:      #4ec9a5;
+  --amber:     #e3b341;
+
+  --grid:      rgba(255,255,255,.028);
+  --shadow:    0 1px 2px rgba(0,0,0,.5), 0 12px 40px -12px rgba(0,0,0,.7);
+  --glow:      0 0 0 1px rgba(255,122,69,.16), 0 18px 60px -20px rgba(255,122,69,.22);
+
+  --measure: 34rem;
+  --wide: 68rem;
+}
+
+@media (prefers-color-scheme: light) {
   :root {
-    color-scheme: light dark;
-    --bg: #fbfbf9; --fg: #1c1c1a; --muted: #5d5d57; --rule: #e0e0d8;
-    --accent: #b3401f; --code-bg: #f2f2ec;
+    --bg:        #faf8f4;
+    --bg-deep:   #f2efe8;
+    --surface:   #ffffff;
+    --surface-2: #f5f2ec;
+    --fg:        #17171a;
+    --fg-dim:    #35363b;
+    --muted:     #63656d;
+    --faint:     #8e9099;
+    --rule:      #e0dcd2;
+    --rule-soft: #ebe7de;
+
+    --ember:     #c2451d;
+    --ember-dim: #a03a17;
+    --ember-ink: #fff6f1;
+    --jade:      #1f8c69;
+    --amber:     #9a6b0e;
+
+    --grid:      rgba(0,0,0,.032);
+    --shadow:    0 1px 2px rgba(30,25,20,.06), 0 14px 44px -16px rgba(30,25,20,.18);
+    --glow:      0 0 0 1px rgba(194,69,29,.14), 0 18px 60px -22px rgba(194,69,29,.20);
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #16161a; --fg: #e8e8e3; --muted: #9a9a93; --rule: #2e2e34;
-      --accent: #ff8a63; --code-bg: #1f1f25;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
-    -webkit-text-size-adjust: 100%;
-  }
-  main { max-width: 42rem; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
-  .logo { display: block; width: 190px; height: auto; margin: 0 0 2.25rem; }
-  h1 { font-size: 1.9rem; line-height: 1.25; letter-spacing: -0.02em; margin: 0 0 .5rem; }
-  h2 { font-size: 1.05rem; letter-spacing: .04em; text-transform: uppercase;
-       color: var(--muted); margin: 3rem 0 .75rem; font-weight: 600; }
-  .lede { font-size: 1.15rem; color: var(--muted); margin: 0 0 2.5rem; }
-  pre {
-    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
-    padding: .9rem 1rem; overflow-x: auto; margin: 0 0 .5rem;
-    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
-  p code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
-  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
-  ul { padding-left: 1.1rem; }
-  li { margin: .35rem 0; }
-  .note { color: var(--muted); font-size: .93rem; }
-  .warn {
-    border-left: 3px solid var(--accent); padding: .1rem 0 .1rem 1rem; margin: 2rem 0;
-  }
-  footer { border-top: 1px solid var(--rule); margin-top: 4rem; padding-top: 1.25rem;
-           color: var(--muted); font-size: .9rem; }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 400 17px/1.7 var(--serif);
+  font-feature-settings: "kern" 1, "liga" 1;
+  text-rendering: optimizeLegibility;
+  overflow-wrap: break-word;
+}
+
+/* The character grid: this is a terminal multiplexer, so the page sits on cells. */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 60px 60px;
+  -webkit-mask-image: radial-gradient(ellipse 120% 70% at 50% 0%, #000 0%, transparent 78%);
+          mask-image: radial-gradient(ellipse 120% 70% at 50% 0%, #000 0%, transparent 78%);
+}
+
+.shell { position: relative; z-index: 1; }
+
+::selection { background: var(--ember); color: var(--ember-ink); }
+
+a {
+  color: var(--ember);
+  text-decoration: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--ember) 34%, transparent);
+  transition: border-color .18s ease, color .18s ease;
+}
+a:hover { border-bottom-color: var(--ember); }
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+
+.wrap { width: 100%; max-width: var(--wide); margin: 0 auto; padding: 0 1.5rem; }
+.prose { max-width: var(--measure); }
+
+section { padding: 6rem 0; }
+@media (max-width: 700px) { section { padding: 4rem 0; } }
+
+.rule-top { border-top: 1px solid var(--rule-soft); }
+
+/* ── Type ───────────────────────────────────────────────────────────────── */
+
+h1, h2, h3 { font-family: var(--mono); font-weight: 500; letter-spacing: -0.02em; }
+
+h1 {
+  font-size: clamp(1.85rem, 6.4vw, 3.9rem);
+  line-height: 1.06;
+  margin: 0 0 1.5rem;
+  letter-spacing: -0.045em;
+  text-wrap: balance;
+}
+/* The hard break is a wide-screen composition. Narrow screens wrap naturally,
+   because a 21-character monospace line does not fit a phone. */
+@media (max-width: 620px) { h1 br { display: none; } }
+
+h2 {
+  font-size: clamp(1.45rem, 3.2vw, 2.05rem);
+  line-height: 1.18;
+  margin: 0 0 1.25rem;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+}
+
+h3 {
+  font-size: .82rem;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--fg);
+  margin: 0 0 .55rem;
+  font-weight: 600;
+}
+
+p { margin: 0 0 1.15rem; color: var(--fg-dim); }
+p.lede {
+  font-size: clamp(1.1rem, 2vw, 1.28rem);
+  line-height: 1.62;
+  color: var(--fg-dim);
+  max-width: 38rem;
+}
+p:last-child { margin-bottom: 0; }
+
+strong { color: var(--fg); font-weight: 600; }
+em { font-style: italic; }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: .74rem;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+  display: flex; align-items: center; gap: .7rem; flex-wrap: wrap;
+}
+.eyebrow .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--jade); flex: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--jade) 18%, transparent); }
+.eyebrow .sep { color: var(--faint); }
+
+.note {
+  font-family: var(--mono);
+  font-size: .82rem;
+  line-height: 1.65;
+  color: var(--muted);
+  letter-spacing: -0.005em;
+}
+.note a { color: var(--muted); border-bottom-color: color-mix(in srgb, var(--muted) 40%, transparent); }
+.note a:hover { color: var(--ember); border-bottom-color: var(--ember); }
+
+code { font-family: var(--mono); font-size: .88em; }
+p code, li code, .note code {
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  padding: .08em .38em;
+  border-radius: 3px;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+header.bar {
+  position: sticky; top: 0; z-index: 50;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+          backdrop-filter: blur(14px) saturate(1.4);
+  border-bottom: 1px solid transparent;
+  transition: border-color .25s ease;
+}
+header.bar.stuck { border-bottom-color: var(--rule-soft); }
+header.bar .wrap {
+  display: flex; align-items: center; gap: 1.5rem;
+  height: 60px;
+}
+header.bar .logo { display: block; width: 118px; height: auto; }
+header.bar a.brand { border: 0; display: flex; align-items: center; }
+header.bar nav { margin-left: auto; display: flex; align-items: center; gap: 1.6rem; }
+header.bar nav a {
+  font-family: var(--mono); font-size: .82rem; color: var(--muted);
+  border: 0; letter-spacing: -0.01em;
+}
+header.bar nav a:hover { color: var(--fg); }
+@media (max-width: 620px) {
+  header.bar nav { gap: 1.1rem; }
+  header.bar nav a.hide-sm { display: none; }
+}
+
+/* ── Hero ───────────────────────────────────────────────────────────────── */
+
+.hero { padding: clamp(3.5rem, 9vw, 7rem) 0 3rem; }
+.hero h1 .accent { color: var(--ember); }
+
+.cta-row {
+  display: flex; align-items: center; gap: 1.1rem; flex-wrap: wrap;
+  margin: 2.25rem 0 .85rem;
+}
+
+/* The install command. This is the primary CTA — it gets the weight. */
+.cmd {
+  display: flex; align-items: stretch;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  box-shadow: var(--glow);
+  overflow: hidden;
+  max-width: 100%;
+}
+.cmd pre {
+  margin: 0; padding: .95rem 1.1rem;
+  font: 500 14.5px/1.4 var(--mono);
+  color: var(--fg);
+  overflow-x: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  letter-spacing: -0.015em;
+}
+.cmd pre .prompt { color: var(--ember); -webkit-user-select: none; user-select: none; }
+.cmd button {
+  flex: none;
+  border: 0; border-left: 1px solid var(--rule);
+  background: var(--surface-2);
+  color: var(--muted);
+  font: 500 .74rem/1 var(--mono);
+  letter-spacing: .1em; text-transform: uppercase;
+  padding: 0 1.05rem;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease;
+}
+.cmd button:hover { color: var(--fg); background: var(--rule-soft); }
+.cmd button.done { color: var(--jade); }
+@media (max-width: 620px) {
+  .cmd pre { font-size: 12.5px; padding: .85rem .8rem; }
+  .cmd button { padding: 0 .75rem; font-size: .68rem; }
+}
+
+.ghost {
+  font-family: var(--mono); font-size: .84rem;
+  color: var(--fg-dim); border: 0;
+  display: inline-flex; align-items: center; gap: .45rem;
+}
+.ghost:hover { color: var(--ember); }
+.ghost .arr { transition: transform .2s ease; display: inline-block; }
+.ghost:hover .arr { transform: translateX(3px); }
+
+/* ── Terminal frame ─────────────────────────────────────────────────────── */
+
+.term {
+  margin: 0;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.term-bar {
+  display: flex; align-items: center; gap: .6rem;
+  padding: .5rem .8rem;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--rule);
+  font: 500 .74rem/1 var(--mono);
+  color: var(--muted);
+  letter-spacing: -0.005em;
+  min-height: 34px;
+}
+.term-bar .lamps { display: flex; gap: .38rem; margin-right: .35rem; flex: none; }
+.term-bar .lamps i { width: 9px; height: 9px; border-radius: 50%; background: var(--rule); display: block; }
+.term-bar .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.term-bar .title b { color: var(--fg-dim); font-weight: 500; }
+@media (max-width: 560px) { .term-bar .title { display: none; } }
+
+.term-body { background: var(--bg-deep); }
+.term-body img { display: block; width: 100%; height: auto; }
+
+/* 96 columns, sized to fill the frame, and leaded like a terminal rather than
+   like prose — at prose leading the `│` of the machines rail breaks into
+   dashes between rows. */
+.term-ascii {
+  margin: 0; padding: 1.1rem 1.25rem 1.2rem;
+  font: 400 17px/1.2 var(--mono);
+  overflow-x: auto;
+  white-space: pre;
+  letter-spacing: 0;
+}
+@media (max-width: 1080px) { .term-ascii { font-size: 12.5px; } }
+@media (max-width: 900px)  { .term-ascii { font-size: 10.5px; } }
+@media (max-width: 700px)  { .term-ascii { font-size: 9px; padding: .9rem; } }
+@media (max-width: 560px)  { .term-ascii { font-size: 7.5px; padding: .8rem; } }
+/* The inbox below is a verbatim capture of what `render_home` draws — the
+   columns, the sort order, the truncation and these exact colours all come
+   from the binary. It stays dark in both themes: a terminal does not invert
+   with the page around it. */
+.term-ascii { background: #0b0c0f; color: #d7d9e0; }
+.term-ascii b { font-weight: 400; }
+.term-ascii .o { color: #ff4500; }   /* selection, spinner, running, hotkeys */
+.term-ascii .p { color: #ffb000; }   /* blocked on a human */
+.term-ascii .k { color: #ffb84d; }   /* done */
+.term-ascii .s { color: #919db4; }   /* what the agent said, and durations */
+.term-ascii .g { color: #6b7280; }   /* rules and locations */
+.term-ascii .w { color: #e9ecf2; }   /* machine and agent names */
+.term-ascii .r { color: #dc322f; }   /* key letters */
+
+figure { margin: 0; }
+figcaption {
+  font-family: var(--mono); font-size: .78rem; line-height: 1.6;
+  color: var(--muted);
+  margin-top: .9rem;
+  max-width: 46rem;
+}
+
+/* ── Split sections ─────────────────────────────────────────────────────── */
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: clamp(2rem, 5vw, 4.5rem);
+  align-items: center;
+}
+@media (max-width: 860px) { .split { grid-template-columns: minmax(0, 1fr); gap: 2.5rem; } }
+/* Grid and flex children default to min-width:auto, which lets an unbreakable
+   <pre> push the whole page wider than the phone it is being read on. */
+.split > *, .cell, .install-block { min-width: 0; }
+
+/* ── Diagram ────────────────────────────────────────────────────────────── */
+
+.diagram { width: 100%; height: auto; display: block; }
+.diagram .lbl { font: 500 11px var(--mono); fill: var(--muted); letter-spacing: .06em; }
+.diagram .lbl-hi { font: 500 11px var(--mono); fill: var(--ember); letter-spacing: .06em; }
+.diagram .box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.5; }
+.diagram .box-hi { fill: var(--surface); stroke: var(--ember); stroke-width: 1.5; }
+.diagram .wire { stroke: var(--faint); stroke-width: 1.5; fill: none; }
+.diagram .wire-hi { stroke: var(--ember); stroke-width: 1.5; fill: none; }
+.diagram .chip { fill: var(--faint); }
+.diagram .chip-hi { fill: var(--ember); }
+.diagram .surface { fill: none; stroke: var(--ember); stroke-width: 1.5; stroke-dasharray: 4 4; }
+
+/* ── Feature grid ───────────────────────────────────────────────────────── */
+
+/* Column counts are exact divisors of each grid's item count, so a row never
+   ends in an empty cell. Features has 6; .quad (agents) has 4. */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--rule-soft);
+  border: 1px solid var(--rule-soft);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-top: 2.75rem;
+}
+.grid.quad { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1000px) { .grid.quad { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 900px)  { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px)  {
+  .grid, .grid.quad { grid-template-columns: minmax(0, 1fr); }
+}
+
+.cell {
+  background: var(--bg);
+  padding: 1.75rem 1.6rem;
+  transition: background .2s ease;
+}
+.cell:hover { background: var(--surface); }
+.cell .num {
+  font: 500 .72rem/1 var(--mono);
+  color: var(--ember);
+  letter-spacing: .12em;
+  display: block;
+  margin-bottom: 1rem;
+}
+.cell p { font-size: .95rem; line-height: 1.6; margin: 0; color: var(--muted); }
+
+/* ── Trust ──────────────────────────────────────────────────────────────── */
+
+.trust {
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--ember);
+  border-radius: 0 10px 10px 0;
+  background: var(--surface);
+  padding: clamp(1.6rem, 3.5vw, 2.4rem);
+  max-width: 46rem;
+}
+.trust h2 { font-size: clamp(1.2rem, 2.4vw, 1.5rem); margin-bottom: 1rem; }
+
+/* ── Install ────────────────────────────────────────────────────────────── */
+
+.installs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2.25rem; max-width: 44rem; }
+.install-block pre {
+  margin: 0 0 .7rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: .9rem 1.05rem;
+  font: 500 13.5px/1.65 var(--mono);
+  color: var(--fg);
+  overflow-x: auto;
+  letter-spacing: -0.01em;
+}
+.install-block pre .prompt { color: var(--ember); -webkit-user-select: none; user-select: none; }
+.install-block pre .cmt { color: var(--faint); }
+
+/* ── Footer ─────────────────────────────────────────────────────────────── */
+
+footer {
+  border-top: 1px solid var(--rule-soft);
+  padding: 2.5rem 0 4rem;
+  font-family: var(--mono);
+  font-size: .82rem;
+  color: var(--muted);
+}
+footer .wrap { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: baseline; }
+footer a { color: var(--muted); border-bottom-color: color-mix(in srgb, var(--muted) 35%, transparent); }
+footer a:hover { color: var(--ember); border-bottom-color: var(--ember); }
+footer .spacer { margin-left: auto; }
+@media (max-width: 620px) { footer .spacer { margin-left: 0; flex-basis: 100%; } }
+
+/* ── Motion ─────────────────────────────────────────────────────────────── */
+
+/* Scoped to .js, which the head script sets. With scripting off nothing is
+   ever hidden — the entrance is the enhancement, not the page. */
+.js .rise { opacity: 0; transform: translateY(14px); }
+.js .rise.in {
+  opacity: 1; transform: none;
+  transition: opacity .7s cubic-bezier(.22,.61,.36,1), transform .7s cubic-bezier(.22,.61,.36,1);
+}
+.d1 { transition-delay: .06s; } .d2 { transition-delay: .12s; }
+.d3 { transition-delay: .18s; } .d4 { transition-delay: .24s; }
+.d5 { transition-delay: .32s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .rise { opacity: 1 !important; transform: none !important; transition: none !important; }
+}
 </style>
 </head>
 <body>
-<main>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/logo-wordmark-dark.svg">
-    <img class="logo" src="/logo-wordmark-light.svg" alt="p2pmux" width="190" height="72">
-  </picture>
+<div class="shell">
 
-  <h1>Every pane runs on its owner's machine.</h1>
-  <p class="lede">
-    p2pmux is a terminal multiplexer for two or more people. You share a layout, not a computer:
-    each pane's shell runs on the machine of whoever created it, under that person's PATH, environment
-    and credentials.
-  </p>
-
-  <h2>Install</h2>
-  <pre><code>curl -fsSL https://p2pmux.com/install.sh | sh</code></pre>
-  <p class="note">
-    macOS and Linux, Apple Silicon, Intel and arm64. The script is served as plain text —
-    <a href="/install.sh">read it first</a>. It downloads a binary and its SHA256 from GitHub
-    Releases, checks the hash, and copies one file into place.
-  </p>
-  <p class="note">Linux builds need glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and
-    up. A musl system builds from source.</p>
-  <p class="note">Or with Homebrew, on either platform:</p>
-  <pre><code>brew tap pelazas/tap
-brew trust pelazas/tap
-brew install p2pmux</code></pre>
-  <p class="note">
-    Homebrew 6 will not load a formula from a third-party tap until you trust it, so the middle
-    line is not optional there. On Homebrew 5 that command does not exist — skip it.
-  </p>
-
-  <p class="note">Or build it yourself:</p>
-  <pre><code>cargo install --git https://github.com/pelazas/p2pmux --locked</code></pre>
-
-  <h2>Use</h2>
-  <pre><code>p2pmux create                # you host; Ctrl+S shows the line to send
-p2pmux join 4KP7Q-M2XRW      # them, on their own machine</code></pre>
-  <p class="note">
-    Ctrl+S copies that second line ready to paste; ten characters is the whole invite.
-    Ctrl+P then arrows for panes, Ctrl+T for tabs, Ctrl+Q to leave the session running.
-  </p>
-
-  <h2>What that buys you</h2>
-  <ul>
-    <li>Start an agent in your pane, on your subscription. A teammate can take control and drive it
-        without ever holding your API key.</li>
-    <li>They host panes too. Same session, their machine, their credentials.</li>
-    <li>Direct peer-to-peer when the network allows, relayed when NAT says no. Encrypted either way,
-        and the status bar tells you which path you are on.</li>
-  </ul>
-
-  <div class="warn">
-    <strong>This is a trusted shared shell.</strong> Whoever holds a pane can run commands as that
-    machine's user and read anything that user can read — including printing a secret to the
-    screen. Credential <em>files</em> and processes never leave the host machine, but that is not
-    the same as being sandboxed. <a href="/trust">Both halves, in detail →</a>
+<header class="bar" id="bar">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="p2pmux home">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="/logo-wordmark-dark.svg">
+        <img class="logo" src="/logo-wordmark-light.svg" alt="p2pmux" width="118" height="45">
+      </picture>
+    </a>
+    <nav>
+      <a href="#agents" class="hide-sm">Agents</a>
+      <a href="#install">Install</a>
+      <a href="/trust">Trust</a>
+      <a href="https://github.com/pelazas/p2pmux">GitHub</a>
+    </nav>
   </div>
+</header>
 
-  <footer>
-    <a href="https://github.com/pelazas/p2pmux">Source</a> ·
-    <a href="/trust">Trust model</a> ·
-    Free, MIT licensed
-  </footer>
+<main>
+
+  <!-- ── Hero ──────────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow rise"><span class="dot"></span> v0.1.7 <span class="sep">·</span> macOS &amp; Linux <span class="sep">·</span> MIT <span class="sep">·</span> written in Rust</p>
+
+      <h1 class="rise d1">Everyone brings their<br> <span class="accent">own terminal.</span></h1>
+
+      <p class="lede rise d2">
+        p2pmux is a peer-to-peer terminal multiplexer. Every pane runs on the machine of whoever
+        opened it — their shell, their toolchain, their env, their AI subscription. Hop into a
+        teammate's pane and you get a real shell on <em>their</em> machine, without ever holding
+        their keys.
+      </p>
+
+      <div class="cta-row rise d3">
+        <div class="cmd">
+          <pre id="installcmd"><span class="prompt">$ </span>curl -fsSL https://p2pmux.com/install.sh | sh</pre>
+          <button type="button" id="copy" aria-label="Copy install command">Copy</button>
+        </div>
+        <a class="ghost" href="https://github.com/pelazas/p2pmux">Source on GitHub <span class="arr">→</span></a>
+      </div>
+
+      <p class="note rise d3" style="max-width:40rem">
+        One binary. Nothing to sign up for, no account, no server of ours in the data path.
+        The script is served as plain text so you can <a href="/install.sh">read it first</a>.
+      </p>
+    </div>
+  </section>
+
+  <!-- ── Demo ──────────────────────────────────────────────────────────── -->
+  <section style="padding-top:1rem">
+    <div class="wrap">
+      <figure class="rise d4">
+        <div class="term">
+          <div class="term-bar">
+            <span class="lamps"><i></i><i></i><i></i></span>
+            <span class="title"><b>userA@mac</b> — p2pmux create</span>
+          </div>
+          <div class="term-body">
+            <img src="/demo.gif" width="900" height="616" alt="userB joins a p2pmux session with a ten-character code, opens a pane on their own machine, then takes control of userA's pane and runs a command in it" loading="eager" decoding="async">
+          </div>
+        </div>
+        <figcaption>
+          Two real clients. userB joins with the ten-character code, opens a pane of their own, then
+          takes control of userA's pane and runs a command in it. The pane titles say who hosts what.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ── Join ──────────────────────────────────────────────────────────── -->
+  <section class="rule-top">
+    <div class="wrap split">
+      <div>
+        <h2>Ten characters is the whole invite.</h2>
+        <p>
+          <code>Ctrl+S</code> gives you a line ready to paste into a chat window. Your teammate runs
+          it on their own machine, on their own network, and lands in your grid. A Mac and a Linux
+          box work the same session; nobody has to match anybody.
+        </p>
+        <p class="note">
+          The code is good for six hours, and it is backed by a ticket that contacts no service at
+          all — for when our rendezvous is down.
+        </p>
+      </div>
+      <div class="install-block">
+        <pre><span class="prompt">$ </span>p2pmux create             <span class="cmt"># you host</span>
+<span class="prompt">$ </span>p2pmux join 4KP7Q-M2XRW   <span class="cmt"># them, on their own machine</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Contrast ──────────────────────────────────────────────────────── -->
+  <section class="rule-top">
+    <div class="wrap split">
+      <div>
+        <h2>Every other way collapses onto one box.</h2>
+        <p>
+          SSH, tmux, tmate, screen sharing, cloud dev environments — one machine runs everything,
+          one person's toolchain is the only one in the room, and one person's keys pay for it.
+          Whoever joins arrives empty-handed.
+        </p>
+        <p>
+          <strong>p2pmux keeps the machines separate and joins the surface instead.</strong> You
+          bring your laptop, your dotfiles, your language versions and your Claude subscription.
+          Your teammate brings theirs. Both setups are live in the same grid at once, and either of
+          you can reach into the other's.
+        </p>
+        <p class="note">
+          Concretely: your teammate opens a pane on your machine and runs Claude Code on your
+          subscription — they drive it, you pay for it, they never see the key. The pane beside it
+          is on their box, with their Python env and their GPU, and you drive that one without
+          installing a thing.
+        </p>
+      </div>
+
+      <div>
+        <svg class="diagram" viewBox="-4 -14 428 236" role="img" aria-label="Diagram: other tools funnel every person into one machine; p2pmux gives each person their own machine joined by one shared surface">
+          <!-- ── Everything else ─────────────────────────────── -->
+          <text class="lbl" x="0" y="12">EVERYTHING ELSE</text>
+
+          <circle class="chip" cx="24"  cy="44" r="6"/>
+          <circle class="chip" cx="84"  cy="44" r="6"/>
+          <circle class="chip" cx="144" cy="44" r="6"/>
+
+          <path class="wire" d="M24 54 C24 78, 84 74, 84 92"/>
+          <path class="wire" d="M84 54 L84 92"/>
+          <path class="wire" d="M144 54 C144 78, 84 74, 84 92"/>
+
+          <rect class="box" x="16" y="94" width="136" height="46" rx="6"/>
+          <text class="lbl" x="30" y="114">one machine</text>
+          <text class="lbl" x="30" y="130" style="fill:var(--faint)">one set of keys</text>
+
+          <text class="lbl" x="0" y="163" style="fill:var(--faint)">everyone else arrives</text>
+          <text class="lbl" x="0" y="178" style="fill:var(--faint)">empty-handed</text>
+
+          <!-- ── p2pmux ──────────────────────────────────────── -->
+          <text class="lbl-hi" x="240" y="12">P2PMUX</text>
+
+          <circle class="chip-hi" cx="264" cy="44" r="6"/>
+          <circle class="chip-hi" cx="324" cy="44" r="6"/>
+          <circle class="chip-hi" cx="384" cy="44" r="6"/>
+
+          <path class="wire-hi" d="M264 54 L264 68"/>
+          <path class="wire-hi" d="M324 54 L324 68"/>
+          <path class="wire-hi" d="M384 54 L384 68"/>
+
+          <rect class="box-hi" x="246" y="70" width="36" height="40" rx="5"/>
+          <rect class="box-hi" x="306" y="70" width="36" height="40" rx="5"/>
+          <rect class="box-hi" x="366" y="70" width="36" height="40" rx="5"/>
+
+          <path class="wire-hi" d="M264 110 L264 126"/>
+          <path class="wire-hi" d="M324 110 L324 126"/>
+          <path class="wire-hi" d="M384 110 L384 126"/>
+
+          <rect class="surface" x="240" y="126" width="168" height="30" rx="6"/>
+          <text class="lbl-hi" x="256" y="146">one shared surface</text>
+
+          <text class="lbl-hi" x="240" y="178">three machines</text>
+          <text class="lbl-hi" x="240" y="193">three toolchains</text>
+          <text class="lbl-hi" x="240" y="208">three subscriptions</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Agents ────────────────────────────────────────────────────────── -->
+  <section class="rule-top" id="agents">
+    <div class="wrap">
+      <div class="prose" style="max-width:40rem">
+        <h2>Every agent you're running. Every machine you own. One screen.</h2>
+        <p>
+          Bare <code>p2pmux</code> opens the inbox: every Claude Code, Codex, Cursor, Pi and
+          OpenCode process running on <em>every machine in the session</em>, sorted by which one is
+          blocking you. Press <code>Enter</code> on a row and you are typing in that terminal —
+          on whichever machine it lives on. <code>Ctrl+O</code> brings you back.
+        </p>
+      </div>
+
+      <figure style="margin-top:2.5rem">
+        <div class="term">
+          <div class="term-bar">
+            <span class="lamps"><i></i><i></i><i></i></span>
+            <span class="title"><b>sam@laptop</b> — p2pmux</span>
+          </div>
+<pre class="term-ascii">                                                                    <b class="g">│ </b>
+<b class="w"> Agents</b><b class="p"> · 1 needs you</b>                                               <b class="g">│ </b><b class="s">MACHINES · 4</b>
+<b class="o">›</b><b class="p">●</b> <b class="w">desktop   </b> <b class="w">claude   </b>                        <b class="p">needs you   </b><b class="s">   2m14s</b> <b class="g">│ </b>
+   <b class="s">wants to run: rm -rf node_modules                                </b><b class="g">│ </b><b class="o">● </b><b class="w">laptop</b>
+   <b class="g">work/api · tab 1 · pane 1                                        │ </b><b class="s">  this machine · 1 agent</b>
+                                                                    <b class="g">│ </b>
+ <b class="k">✓</b> <b class="w">laptop    </b> <b class="w">claude   </b>                        <b class="k">done        </b><b class="s">  31m04s</b> <b class="g">│ ○ </b><b class="w">oldbox</b>
+   <b class="s">6 files changed, tests pass                                      </b><b class="g">│ </b><b class="s">  asleep</b>
+   <b class="g">scratch/demo · tab 3 · pane 1                                    │ </b>
+                                                                    <b class="g">│ ◇ </b><b class="w">desktop</b>
+<b class="o"> ⠋</b> <b class="w">droplet   </b> <b class="w">opencode </b>                        <b class="o">running     </b><b class="s">   8m41s</b> <b class="g">│ </b><b class="s">  joined this session · 1…</b>
+   <b class="s">running the migration against staging                            </b><b class="g">│ </b>
+   <b class="g">srv/checkout · tab 2 · pane 1                                    │ ◇ </b><b class="w">droplet</b>
+                                                                    <b class="g">│ </b><b class="s">  joined this session · 1…</b>
+                                                                    <b class="g">│ </b>
+                                                                    <b class="g">│ ─────────────────────────</b>
+                                                                    <b class="g">│ </b><b class="o">a</b><b class="w">  add a machine</b>
+ <b class="r">enter</b><b class="w"> open   </b><b class="r">m</b><b class="w"> pick machine   </b><b class="r">a</b><b class="w"> add machine   </b><b class="r">n</b><b class="w"> new terminal   </b><b class="r">q</b><b class="w"> quit</b></pre>
+        </div>
+      </figure>
+
+      <div class="grid quad" style="margin-top:2.5rem">
+        <div class="cell">
+          <span class="num">01</span>
+          <h3>Not just this laptop</h3>
+          <p>Your desktop, your droplets, your teammate's box. Agent supervision that stops at the
+             edge of one machine stops one machine too early.</p>
+        </div>
+        <div class="cell">
+          <span class="num">02</span>
+          <h3>Hooks, never guesswork</h3>
+          <p><em>needs you</em> comes from the agent's own hooks — never from guessing at output
+             timing. Run <code>p2pmux setup</code> once; <code>p2pmux doctor</code> checks it.</p>
+        </div>
+        <div class="cell">
+          <span class="num">03</span>
+          <h3>Honest about what it can't see</h3>
+          <p>An agent with no hooks wired up says <em>state unknown — no hooks</em> on its own row,
+             rather than being guessed about.</p>
+        </div>
+        <div class="cell">
+          <span class="num">04</span>
+          <h3>Agents outside p2pmux too</h3>
+          <p>A bot under systemd, something in a stray tmux — it shows up in the inbox with what
+             it is doing, and <code>Enter</code> opens its own chat client on its own machine.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ── Features ──────────────────────────────────────────────────────── -->
+  <section class="rule-top">
+    <div class="wrap">
+      <div class="prose">
+        <h2>What you actually get.</h2>
+        <p>A real multiplexer, not a screen share. Tabs, splits, nesting, scrollback, mouse — with
+           the panes scattered across everybody's hardware.</p>
+      </div>
+
+      <div class="grid">
+        <div class="cell">
+          <span class="num">01</span>
+          <h3>Panes belong to their owner</h3>
+          <p>Every pane is a PTY on its owner's machine, with that machine's PATH, env and
+             subscriptions. Host and guest are <em>per pane</em>, not per person.</p>
+        </div>
+        <div class="cell">
+          <span class="num">02</span>
+          <h3>Control, never a forced takeover</h3>
+          <p>Take control of any free pane by typing into it, or hand yours over. Active typing is
+             protected, so nobody can yank the keyboard out from under you.</p>
+        </div>
+        <div class="cell">
+          <span class="num">03</span>
+          <h3>Zellij-like layout, shared live</h3>
+          <p>Tabs, panes and nested splits, mirrored to everyone in the room. Up to 8 members,
+             9 tabs, and 8 panes to a tab.</p>
+        </div>
+        <div class="cell">
+          <span class="num">04</span>
+          <h3>Encrypted, direct when it can be</h3>
+          <p>End-to-end encrypted peer-to-peer, over an iroh relay only when NAT requires it. The
+             tab bar tells you which you got: <code>direct 55ms</code> or <code>relayed 120ms</code>.</p>
+        </div>
+        <div class="cell">
+          <span class="num">05</span>
+          <h3>Outlives the machine that started it</h3>
+          <p>If the coordinator's laptop closes, every pane on every other machine keeps running and
+             keeps taking input. After five minutes the earliest-joined survivor takes the role over.</p>
+        </div>
+        <div class="cell">
+          <span class="num">06</span>
+          <h3>Pair once, rejoin forever</h3>
+          <p><code>p2pmux pair</code> associates two machines you own, permanently. After that, bare
+             <code>p2pmux</code> rejoins on either with no code typed at all.</p>
+        </div>
+      </div>
+
+      <p class="note" style="margin-top:1.75rem">
+        Presence gives every member a colour, and shows who is on which tab and watching which pane.
+        Full walkthrough — keys, control leases, mouse, scrollback, agent hooks and every config
+        key — is in <a href="https://github.com/pelazas/p2pmux/blob/main/docs/USAGE.md">the usage docs</a>.
+      </p>
+    </div>
+  </section>
+
+  <!-- ── Trust ─────────────────────────────────────────────────────────── -->
+  <section class="rule-top">
+    <div class="wrap">
+      <div class="trust">
+        <h2>Read this before you share a code.</h2>
+        <p>
+          <strong>A p2pmux session is a fully trusted shared shell.</strong> Anyone with the join
+          code can see every pane and can obtain interactive control of the terminals in it — run
+          commands, read output, touch any file that user account can touch.
+        </p>
+        <p>
+          Processes and credential <em>files</em> stay on the pane host's machine and are never
+          uploaded to peers. That is a real boundary, and it is the point of the design. It is
+          <strong>not</strong> a sandbox: a controller can still use your credentials, or print one
+          to the screen, through the shell you handed them.
+        </p>
+        <p class="note">
+          So treat the code like a password, and share it only with people you would hand an
+          unlocked laptop to. For anyone else, use a separate low-privilege account and keep
+          production credentials out of shared panes.
+          <a href="/trust">Both halves, in detail →</a>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Install ───────────────────────────────────────────────────────── -->
+  <section class="rule-top" id="install">
+    <div class="wrap">
+      <div class="prose">
+        <h2>Install.</h2>
+        <p>macOS and Linux, Apple Silicon, Intel and arm64. One binary, no daemon to configure.</p>
+      </div>
+
+      <div class="installs" style="margin-top:2.25rem">
+        <div class="install-block">
+          <h3>The install script</h3>
+          <pre><span class="prompt">$ </span>curl -fsSL https://p2pmux.com/install.sh | sh</pre>
+          <p class="note">
+            It fetches a binary and its SHA256 from GitHub Releases and checks the hash before
+            installing. Served as <code>text/plain</code>, so you can
+            <a href="/install.sh">read it in a browser</a> first — the binaries never come from
+            this domain, only from GitHub.
+          </p>
+        </div>
+
+        <div class="install-block">
+          <h3>Homebrew</h3>
+          <pre><span class="prompt">$ </span>brew tap pelazas/tap
+<span class="prompt">$ </span>brew trust pelazas/tap
+<span class="prompt">$ </span>brew install p2pmux</pre>
+          <p class="note">
+            Homebrew 6 will not load a formula from a third-party tap until you trust it, so the
+            middle line is not optional there. On Homebrew 5 that command does not exist — skip it.
+          </p>
+        </div>
+
+        <div class="install-block">
+          <h3>From source</h3>
+          <pre><span class="prompt">$ </span>cargo install p2pmux --locked</pre>
+          <p class="note">
+            Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up.
+            A musl system has to build from source.
+          </p>
+        </div>
+
+        <div class="install-block">
+          <h3>Then</h3>
+          <pre><span class="prompt">$ </span>p2pmux                       <span class="cmt"># the inbox</span>
+<span class="prompt">$ </span>p2pmux setup                 <span class="cmt"># wire up agent hooks, once</span>
+<span class="prompt">$ </span>p2pmux create                <span class="cmt"># host a session; Ctrl+S to invite</span></pre>
+          <p class="note">
+            <code>p2pmux --version</code> says what you are running. Sessions already running keep
+            the binary they started with, so <code>p2pmux kill &lt;name&gt;</code> and start again
+            to pick up a new version.
+          </p>
+        </div>
+      </div>
+
+      <p class="note" style="margin-top:2.5rem; max-width:40rem">
+        <strong style="font-family:var(--mono)">Early, but real.</strong> v0.1.7 runs sessions
+        between machines on different networks and different continents. Found a rough edge?
+        <a href="https://github.com/pelazas/p2pmux/issues">Open an issue</a> — a specific report of
+        what broke is the most useful thing anyone can send right now.
+      </p>
+    </div>
+  </section>
+
 </main>
+
+<footer>
+  <div class="wrap">
+    <a href="https://github.com/pelazas/p2pmux">Source</a>
+    <a href="https://github.com/pelazas/p2pmux/blob/main/docs/USAGE.md">Docs</a>
+    <a href="/trust">Trust model</a>
+    <a href="https://crates.io/crates/p2pmux">crates.io</a>
+    <span class="spacer">Free, MIT licensed · built with ratatui, portable-pty, vt100 and iroh</span>
+  </div>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Copy the install command.
+  var btn = document.getElementById("copy");
+  var cmd = document.getElementById("installcmd");
+  if (btn && cmd && navigator.clipboard) {
+    btn.addEventListener("click", function () {
+      var text = cmd.textContent.replace(/^\$\s*/, "");
+      navigator.clipboard.writeText(text).then(function () {
+        btn.textContent = "Copied";
+        btn.classList.add("done");
+        setTimeout(function () {
+          btn.textContent = "Copy";
+          btn.classList.remove("done");
+        }, 1600);
+      });
+    });
+  } else if (btn) {
+    btn.hidden = true;
+  }
+
+  // Hairline under the header once the page scrolls.
+  var bar = document.getElementById("bar");
+  var onScroll = function () {
+    bar.classList.toggle("stuck", window.scrollY > 8);
+  };
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  // Staggered entrance, once, per section.
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var risers = document.querySelectorAll(".rise");
+  if (reduce || !("IntersectionObserver" in window)) {
+    Array.prototype.forEach.call(risers, function (el) { el.classList.add("in"); });
+    return;
+  }
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+    });
+  }, { rootMargin: "0px 0px -8% 0px", threshold: 0.05 });
+  Array.prototype.forEach.call(risers, function (el) { io.observe(el); });
+})();
+</script>
+
 </body>
 </html>

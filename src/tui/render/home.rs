@@ -68,8 +68,9 @@ pub(in crate::tui) const HOME_EMPTY_NO_HOOKS: &str =
 pub(in crate::tui) const HOME_ROW_NO_HOOKS: &str = "state unknown — no hooks";
 
 /// `m` is back, and means something different from what it used to. It expanded
-/// the strip into a table, which the rail now is permanently; it now walks the
-/// fleet, so that `n` and `enter` have a machine to be about.
+/// the strip into a table, which the rail now is permanently; it now moves the
+/// cursor to the fleet, so that `n` and `enter` have a machine to be about and
+/// the arrow keys have a second list to walk.
 const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
     FooterSegment::Text(" open   "),
@@ -87,9 +88,9 @@ const HOME_KEYS: &[FooterSegment] = &[
 const HOME_KEYS_MACHINE: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
     FooterSegment::Text(" terminal on this machine   "),
-    FooterSegment::Key("m"),
-    FooterSegment::Text(" next machine   "),
-    FooterSegment::Key("esc"),
+    FooterSegment::Key("↑↓"),
+    FooterSegment::Text(" pick   "),
+    FooterSegment::Key("m esc"),
     FooterSegment::Text(" back to agents   "),
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),

@@ -547,6 +547,13 @@ impl SharedLayoutRuntime {
             }
             changed = true;
         }
+        // A rejection this coordinator produced for its own request. Drained on
+        // the main loop rather than the membership timer, because it is an
+        // answer to a keypress and the person who pressed the key is watching.
+        for reject in self.control.take_own_rejects() {
+            self.reject_request_with_reason(reject.request_id, reject.reason);
+            changed = true;
+        }
         changed |= self.tick_failover()?;
         changed |= self.refresh_local_views();
         changed |= self.refresh_agent_rows();

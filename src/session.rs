@@ -2485,11 +2485,61 @@ pub struct SharedLayoutHost {
     /// member and the runtime is one loop that drains everything it owns; this
     /// is the same shape as `peers` and is drained the same way.
     fleet_invites: FleetInviteQueue,
+    /// Rejections this coordinator produced for requests it made itself,
+    /// waiting for its own runtime to pick them up. See [`push_own_reject`].
+    own_rejects: OwnRejectQueue,
 }
 
 /// Invitations received but not yet decided about. See
 /// [`crate::protocol::FleetInvite`].
 type FleetInviteQueue = Arc<Mutex<Vec<(Vec<u8>, String)>>>;
+
+/// Rejections the coordinator produced for its own request. See
+/// [`push_own_reject`].
+type OwnRejectQueue = Arc<Mutex<Vec<LayoutReject>>>;
+
+/// Record a rejection addressed to the coordinator itself.
+///
+/// Every other rejection is written to a control stream, and the coordinator
+/// has no control stream to itself: `peers` holds the machines that connected
+/// *to* this one, so `send_to_peer` handed its own peer id to a map that could
+/// never contain it and dropped the frame without a word.
+///
+/// That silence is the whole bug. Ask for a terminal on a machine that refuses
+/// it, from the machine that started the session — the overwhelmingly common
+/// shape, since the machine you are sitting at is usually the one that opened
+/// the room — and the screen left Home, opened nothing, and said nothing, for
+/// ever. Every sentence written for that moment was addressed to a peer that
+/// does not exist.
+///
+/// Bounded like the invite queue and for the same reason, and dropping the
+/// newest for the same reason too: the queued ones are older answers to
+/// requests that are still waiting for them.
+fn deliver_reject(
+    peers: &Arc<Mutex<BTreeMap<Vec<u8>, ControlPeer>>>,
+    own_peer_id: &[u8],
+    own_rejects: &OwnRejectQueue,
+    targeted: TargetedLayoutReject,
+) {
+    if targeted.peer_id == own_peer_id {
+        push_own_reject(own_rejects, targeted.reject);
+        return;
+    }
+    send_to_peer(
+        peers,
+        &targeted.peer_id,
+        coordinator_envelope(own_peer_id, envelope::Body::LayoutReject(targeted.reject)),
+    );
+}
+
+fn push_own_reject(queue: &OwnRejectQueue, reject: LayoutReject) {
+    const MAX_QUEUED_REJECTS: usize = 16;
+    if let Ok(mut queue) = queue.lock()
+        && queue.len() < MAX_QUEUED_REJECTS
+    {
+        queue.push(reject);
+    }
+}
 
 /// Record an invitation for the runtime to pick up.
 ///
@@ -2937,6 +2987,7 @@ impl SharedLayoutHost {
             host,
             pane_server,
             fleet_invites: FleetInviteQueue::default(),
+            own_rejects: OwnRejectQueue::default(),
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
@@ -2977,6 +3028,7 @@ impl SharedLayoutHost {
             host,
             pane_server,
             fleet_invites: FleetInviteQueue::default(),
+            own_rejects: OwnRejectQueue::default(),
             coordinator: Arc::new(Mutex::new(coordinator)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             reservation_timeout,
@@ -3271,6 +3323,15 @@ impl SharedLayoutHost {
             .unwrap_or_default()
     }
 
+    /// Answers to this coordinator's own requests that a member refused. See
+    /// [`push_own_reject`].
+    pub fn take_own_rejects(&self) -> Vec<LayoutReject> {
+        self.own_rejects
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    }
+
     pub fn set_session_lock(&self, locked: bool) -> Result<bool, SessionError> {
         let mut coordinator = self
             .coordinator
@@ -3517,6 +3578,7 @@ impl SharedLayoutHost {
                 self.pane_server.clone(),
                 self.reservation_timeout,
                 self.fleet_invites.clone(),
+                self.own_rejects.clone(),
             ));
             if let Ok(mut slot) = reader_abort.lock() {
                 *slot = Some(reader_task.abort_handle());
@@ -3591,13 +3653,11 @@ impl SharedLayoutHost {
     }
 
     fn send_reject(&self, targeted: TargetedLayoutReject) {
-        send_to_peer(
+        deliver_reject(
             &self.peers,
-            &targeted.peer_id,
-            coordinator_envelope(
-                self.host.ticket().endpoint_addr().id.as_bytes(),
-                envelope::Body::LayoutReject(targeted.reject),
-            ),
+            self.host.ticket().endpoint_addr().id.as_bytes(),
+            &self.own_rejects,
+            targeted,
         );
     }
 }
@@ -4235,6 +4295,7 @@ async fn layout_host_reader_task(
     pane_server: PaneServer,
     reservation_timeout: Duration,
     fleet_invites: FleetInviteQueue,
+    own_rejects: OwnRejectQueue,
 ) {
     while let Ok(Some(envelope)) = reader.read_next().await {
         if envelope.sender_peer_id != peer_id {
@@ -4292,14 +4353,11 @@ async fn layout_host_reader_task(
                     Err(_) => break,
                 };
                 let reject = coordinator_guard.handle_pane_failed(&peer_id, failed);
-                send_to_peer(
-                    &peers,
-                    &reject.peer_id,
-                    coordinator_envelope(
-                        &coordinator_peer_id,
-                        envelope::Body::LayoutReject(reject.reject),
-                    ),
-                );
+                // The machine that asked may be this one, and `peers` holds
+                // only the machines that connected *to* here — so its own id
+                // would find nothing and the answer would be dropped in
+                // silence. See `push_own_reject`.
+                deliver_reject(&peers, &coordinator_peer_id, &own_rejects, reject);
                 drop(coordinator_guard);
             }
             Some(envelope::Body::FleetInvite(invite)) => {
@@ -4992,6 +5050,62 @@ mod control_queue_tests {
     use super::*;
     use crate::protocol::{AgentRosterEntry, AgentRosterState};
     use tokio::sync::oneshot;
+
+    /// The coordinator is usually the machine you are sitting at, so this is
+    /// the common path and not an edge: it asks for a terminal on a droplet,
+    /// the droplet refuses, and the answer is addressed to the coordinator's
+    /// own peer id — which `peers` can never contain, because that map holds
+    /// the machines that connected *to* here.
+    ///
+    /// It used to be handed to `send_to_peer` anyway and dropped without a
+    /// word, so the refusal, the "that machine is asleep" and the "did not
+    /// answer in time" were all written for a screen none of them reached.
+    #[test]
+    fn a_rejection_for_the_coordinator_itself_is_kept_rather_than_sent_nowhere() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let queue = OwnRejectQueue::default();
+        let own = b"coordinator".to_vec();
+
+        deliver_reject(
+            &peers,
+            &own,
+            &queue,
+            targeted_reject(own.clone(), 7, LayoutRejectReason::TargetRefused),
+        );
+        let kept = queue.lock().expect("queue").clone();
+        assert_eq!(kept.len(), 1, "the coordinator keeps its own answer");
+        assert_eq!(kept[0].request_id, 7);
+        assert_eq!(kept[0].reason, LayoutRejectReason::TargetRefused as i32);
+
+        // Anyone else's goes out over their control stream, and there is none
+        // here, so the queue must not collect it: a member's rejection landing
+        // in the coordinator's own inbox would be a notice about somebody
+        // else's keypress.
+        deliver_reject(
+            &peers,
+            &own,
+            &queue,
+            targeted_reject(b"member".to_vec(), 8, LayoutRejectReason::TargetRefused),
+        );
+        assert_eq!(queue.lock().expect("queue").len(), 1);
+    }
+
+    /// A peer that never drains cannot make the coordinator hold rejections
+    /// without limit.
+    #[test]
+    fn the_kept_rejections_are_bounded() {
+        let queue = OwnRejectQueue::default();
+        for request_id in 0..64 {
+            push_own_reject(
+                &queue,
+                LayoutReject {
+                    request_id,
+                    reason: LayoutRejectReason::TargetRefused as i32,
+                },
+            );
+        }
+        assert_eq!(queue.lock().expect("queue").len(), 16);
+    }
 
     #[test]
     fn a_subscriber_hanging_up_mid_serve_is_not_a_service_error() {

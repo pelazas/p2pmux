@@ -748,15 +748,31 @@ impl SharedLayoutRuntime {
         // A pane this machine asked for on itself needs no permission from
         // itself. Everything else is a machine of yours asking, and the answer
         // is given here, by whoever owns this box.
+        crate::tui::debug_log::ui_debug_log(
+            "reservation_accepted",
+            format_args!(
+                "reservation={} request={} asked_here={asked_here} command={:?}",
+                reservation.reservation_id, pending.request_id, pending.command
+            ),
+        );
         if !asked_here {
-            match crate::pairing::load_or_empty().work_decision(&pending.command) {
+            let decision = crate::pairing::load_or_empty().work_decision(&pending.command);
+            crate::tui::debug_log::ui_debug_log(
+                "remote_work_decision",
+                format_args!("decision={decision:?} command={:?}", pending.command),
+            );
+            match decision {
                 crate::pairing::WorkDecision::Refuse => {
-                    let _ = self.control.try_failed(PaneFailed {
+                    let sent = self.control.try_failed(PaneFailed {
                         reservation_id: reservation.reservation_id,
                         request_id: pending.request_id,
                         base_revision: pending.base_revision,
                         refused: true,
                     });
+                    crate::tui::debug_log::ui_debug_log(
+                        "remote_work_refused",
+                        format_args!("sent={:?}", sent.as_ref().err()),
+                    );
                     self.status =
                         String::from("refused a remote terminal: not on this machine's allowlist");
                     return Ok(());
@@ -907,8 +923,22 @@ impl SharedLayoutRuntime {
 
     pub(in crate::tui) fn reject_request_with_reason(&mut self, request_id: u64, reason: i32) {
         let notice = self.rejection_notice(reason, request_id);
+        crate::tui::debug_log::ui_debug_log(
+            "layout_request_rejected",
+            format_args!("request={request_id} reason={reason} notice={notice:?}"),
+        );
         self.reject_request(request_id);
-        self.footer_notice = Some(notice);
+        self.footer_notice = Some(notice.clone());
+        // …and as status, which is the only one of the two that survives the
+        // trip to an attached client. The node is headless and forwards
+        // `status`; a notice that lived in `footer_notice` alone reached nobody
+        // running the client/node split, which is to say nobody at all.
+        //
+        // That is not a cosmetic loss. Ask for a terminal on a machine that
+        // refuses and the screen left Home, opened nothing, and said nothing —
+        // three sentences written for exactly this moment, none of them ever
+        // seen by a user.
+        self.status = notice;
     }
 
     pub(in crate::tui) fn reject_request(&mut self, request_id: u64) {
@@ -928,7 +958,12 @@ impl SharedLayoutRuntime {
         {
             let _ = pane.set_locked(previous);
         }
-        self.footer_notice = Some(format!("layout request {request_id} rejected"));
+        let notice = format!("layout request {request_id} rejected");
+        self.footer_notice = Some(notice.clone());
+        // Overwritten a moment later by `reject_request_with_reason` when there
+        // is a sentence to say instead. Set here too so that a rejection with
+        // no reason still reaches an attached client rather than vanishing.
+        self.status = notice;
     }
 
     pub(in crate::tui) fn next_id(&mut self) -> u64 {
