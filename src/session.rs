@@ -3603,9 +3603,19 @@ impl SharedLayoutHost {
             // pasted into a laptop somebody is sitting at should put a *machine*
             // in your fleet or nothing.
             if receipt.enrolled && receipt.identity.kind.declared_machine() {
+                // The *verified* machine id, never the one in the frame. A
+                // fleet record keys ownership on this, so writing an unproved
+                // one would let a token holder file itself under a machine it
+                // is not — and `owns_machine` would believe it ever after.
+                // Everywhere else gets this for free by going through a member
+                // list; this path does not, so it asks here.
+                let identity = receipt
+                    .identity
+                    .clone()
+                    .verified_for(&receipt.admitted_peer_id);
                 if let Err(error) = crate::pairing::enrol_machine(
                     &receipt.display_name,
-                    &crate::machine_id::to_hex(&receipt.identity.machine_id),
+                    &crate::machine_id::to_hex(&identity.machine_id),
                 ) {
                     eprintln!("p2pmux node: failed to record an enrolled machine: {error}");
                 }
