@@ -147,6 +147,10 @@ pub struct AgentOverlayRow {
     /// machine — a peer's node strips it before publishing, so a remote row's is
     /// always empty.
     pub message: String,
+    /// The p2pmux session this agent's pane belongs to, when it is not this
+    /// one. Empty for a pane of this session and for an agent genuinely under
+    /// no p2pmux at all.
+    pub session: String,
 }
 
 impl AgentOverlayRow {
@@ -168,6 +172,18 @@ impl AgentOverlayRow {
     /// rather than by jumping to a pane p2pmux already owns.
     pub(in crate::tui) fn outside_p2pmux(&self) -> bool {
         self.pane_id == 0
+    }
+
+    /// Whether this agent is in a p2pmux pane after all — one belonging to
+    /// another session on its machine.
+    ///
+    /// These are the rows that made the inbox look like it was hallucinating:
+    /// a fresh session on a machine with three detached ones lists their agents
+    /// and, having only ever compared against its own panes, calls every one of
+    /// them "running outside p2pmux". They are inside p2pmux. They are one
+    /// `attach` away, and this is what says so.
+    pub(in crate::tui) fn in_another_session(&self) -> bool {
+        self.outside_p2pmux() && !self.session.is_empty()
     }
 }
 

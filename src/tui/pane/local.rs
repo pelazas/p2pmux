@@ -305,6 +305,8 @@ impl SharedLocalPane {
             cwd: listed.agent.cwd,
             state: roster_state(listed.state) as i32,
             working_since_unix_ms: listed.working_since_unix_ms,
+            // A pane of this session, so there is no other session to name.
+            session_name: String::new(),
         })
     }
 

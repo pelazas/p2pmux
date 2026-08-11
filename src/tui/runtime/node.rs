@@ -384,6 +384,15 @@ impl SharedLayoutRuntime {
                     ),
                     state: crate::tui::pane::local::roster_state(agent.state) as i32,
                     working_since_unix_ms: agent.working_since_unix_ms,
+                    // Unlike the message, this does travel. Which session an
+                    // agent is in is a fact about the machine, not something
+                    // the agent said, and the peer looking at the row is the
+                    // one that has to be stopped from calling it "outside
+                    // p2pmux".
+                    session_name: truncate_bytes(
+                        sanitize_single_line(&agent.session),
+                        crate::protocol::MAX_SESSION_NAME_BYTES,
+                    ),
                 }),
         );
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
@@ -479,13 +488,20 @@ impl SharedLayoutRuntime {
                         // An agent nobody started in a pane. There is no tab,
                         // no pane and nobody holding it, and the row says so
                         // with dashes rather than inventing a location.
+                        let session = sanitize_single_line(&entry.session_name);
                         AgentOverlayRow {
                             pane_id: 0,
                             process_pid: entry.process_pid,
                             tab_ordinal: 0,
                             pane_ordinal: 0,
                             tab_label: String::from("—"),
-                            pane_label: String::from("not in p2pmux"),
+                            // A pane of another session is still a pane, and
+                            // this column used to swear otherwise.
+                            pane_label: if session.is_empty() {
+                                String::from("not in p2pmux")
+                            } else {
+                                format!("session {session}")
+                            },
                             kind: sanitize_single_line(&entry.agent_kind),
                             cwd: sanitize_single_line(&entry.cwd),
                             state: AgentRosterState::from_wire(entry.state),
@@ -508,6 +524,7 @@ impl SharedLayoutRuntime {
                                 })
                                 .map(|agent| agent.message.clone())
                                 .unwrap_or_default(),
+                            session,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -572,6 +589,9 @@ impl SharedLayoutRuntime {
                                 .and_then(crate::tui::SharedLocalPane::listed_agent)
                                 .map(|listed| listed.message)
                                 .unwrap_or_default(),
+                            // A pane of this session. There is no other
+                            // session to send the user to.
+                            session: String::new(),
                         })
                     })
                     .chain(loose)

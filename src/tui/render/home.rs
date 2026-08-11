@@ -415,7 +415,12 @@ pub(in crate::tui) fn format_home_card(
 /// and runs its chat command. The line says which of the two it is looking at,
 /// because the rest of the card cannot be told apart.
 fn home_location(row: &AgentOverlayRow, cwd_already_shown: bool) -> String {
-    let where_it_runs = if row.outside_p2pmux() {
+    let where_it_runs = if row.in_another_session() {
+        // In p2pmux the whole time, in a session this one had never been told
+        // to ask about. Enter goes there rather than starting anything, so the
+        // row promises the one thing that is actually true of it.
+        format!("p2pmux session {} · enter attaches it", row.session)
+    } else if row.outside_p2pmux() {
         // Which of the three things enter does, said on the row. An agent that
         // cannot join its own running conversation must not look like one that
         // can, and the moment to say so is before the keypress.

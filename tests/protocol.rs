@@ -459,6 +459,7 @@ fn agent_entry(pane_id: u64) -> AgentRosterEntry {
         cwd: String::from("/repo"),
         state: AgentRosterState::Working as i32,
         working_since_unix_ms: 1_725_000_000_123,
+        session_name: String::new(),
     }
 }
 

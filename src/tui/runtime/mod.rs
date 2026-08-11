@@ -10,7 +10,7 @@ mod node;
 mod run;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     io,
     time::{Duration, Instant},
@@ -83,6 +83,13 @@ pub struct SharedLayoutRuntime {
     /// Refreshed by the same process scan the panes use, because it is the same
     /// scan: the only difference is which processes it is asked about.
     pub(in crate::tui) loose_agents: Vec<crate::agent_detect::LooseAgent>,
+    /// Names for the p2pmux nodes on this machine, keyed by their pid.
+    ///
+    /// Cached because the scan runs on a redraw path and reading the session
+    /// store is file IO. Refreshed only when a loose agent turns up under a
+    /// node this map has never heard of, which happens when a session starts
+    /// and then not again.
+    pub(in crate::tui) session_names: HashMap<u32, String>,
     pub(in crate::tui) next_agent_roster_heartbeat: Instant,
     pub(in crate::tui) last_agent_overlay_animation: Instant,
     pub(in crate::tui) presence_generation: u64,
@@ -245,6 +252,7 @@ impl SharedLayoutRuntime {
             agent_roster_generation: 0,
             last_local_agent_entries: Vec::new(),
             loose_agents: Vec::new(),
+            session_names: HashMap::new(),
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
             presence_generation: 0,

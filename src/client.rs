@@ -1157,6 +1157,7 @@ fn apply_rosters(
                 host: row.host,
                 controller: row.controller,
                 message: row.message,
+                session: row.session,
             })
             .collect(),
     )
@@ -1519,6 +1520,7 @@ mod tests {
             working_since_unix_ms: 1,
             host: String::from("Host"),
             controller: String::from("free"),
+            session: String::new(),
         }
     }
 

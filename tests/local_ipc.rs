@@ -187,6 +187,7 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                 host: "host".into(),
                 controller: "controller".into(),
                 message: "running tests".into(),
+                session: String::new(),
             }],
         },
         NodeMessage::Focus {

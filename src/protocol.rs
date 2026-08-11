@@ -841,6 +841,20 @@ pub struct AgentRosterEntry {
     /// Zero for every pane-hosted agent, which is identified by its pane.
     #[prost(uint32, tag = "6")]
     pub process_pid: u32,
+    /// The p2pmux session this agent's pane belongs to, when that session is
+    /// not the one being reported to.
+    ///
+    /// Only ever set for a `pane_id == 0` entry, and only when the host machine
+    /// found a p2pmux node above the agent's process. It is the difference
+    /// between "there is another session on this machine called dakar, and this
+    /// agent is in it" and the flat, wrong "running outside p2pmux" — which is
+    /// what every one of these rows used to say, including on a machine whose
+    /// only agents were in p2pmux panes the whole time.
+    ///
+    /// Empty for an agent genuinely outside p2pmux, which is the shape this
+    /// field was added around and the one older peers will always send.
+    #[prost(string, tag = "7")]
+    pub session_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
@@ -1305,6 +1319,11 @@ fn validate_agent_roster(roster: &AgentRoster) -> Result<(), ProtocolError> {
             "agent_roster.entry.cwd",
             entry.cwd.len(),
             MAX_AGENT_CWD_BYTES,
+        )?;
+        validate_field_size(
+            "agent_roster.entry.session_name",
+            entry.session_name.len(),
+            MAX_SESSION_NAME_BYTES,
         )?;
         // `entry.state` is deliberately not checked against the known variants:
         // see `AgentRosterState::from_wire`. Readers fold an unknown state to

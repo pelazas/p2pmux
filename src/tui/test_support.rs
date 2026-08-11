@@ -91,6 +91,7 @@ pub(in crate::tui) fn agent_row(
         working_since_unix_ms: 1_725_000_000_123,
         host: String::from("Host"),
         controller: String::from("free"),
+        session: String::new(),
     }
 }
 

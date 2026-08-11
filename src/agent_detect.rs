@@ -287,6 +287,23 @@ fn is_program_path(argument: &str, name: &str) -> bool {
         .any(|component| component == name || component.strip_prefix(name) == Some(".js"))
 }
 
+/// The hidden subcommand every p2pmux node runs under. See `cli.rs`.
+const NODE_SUBCOMMAND: &str = "__node";
+
+/// Whether a process is a p2pmux node — the thing that hosts panes.
+///
+/// Both halves are required. The subcommand alone would match this repository's
+/// own `cargo test` and every `grep __node` a developer runs in it; the program
+/// name alone would match the client sitting in front of the user, which hosts
+/// nothing and is not what "the pane's owner" means.
+fn is_node_process(process: &ProcessSnapshot) -> bool {
+    (is_program_path(&process.exe_basename, "p2pmux") || process.name == "p2pmux")
+        && process
+            .cmdline
+            .iter()
+            .any(|argument| argument == NODE_SUBCOMMAND)
+}
+
 /// One process from a sampler snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessSnapshot {
@@ -445,6 +462,23 @@ pub struct LooseAgent {
     /// used to tell this agent from an older one that had the same pid — see
     /// [`crate::agent_status::read`].
     pub start_time: Option<u64>,
+    /// The p2pmux node this agent is running under, or `0` for one that is
+    /// running under no node at all.
+    ///
+    /// Non-zero means the agent is in a p2pmux pane — just not in the session
+    /// asking the question. Panes of *this* session never get here; they are
+    /// excluded by `pane_roots` before a loose agent is built. So a non-zero
+    /// value is always another session on this machine, and saying "running
+    /// outside p2pmux" about it is simply untrue.
+    ///
+    /// The pid rather than the session name, because a process table is what
+    /// this module reads and a session's name lives in the session store. The
+    /// caller that has both turns one into the other.
+    pub node_pid: u32,
+    /// The name of the session [`Self::node_pid`] is hosting, when the caller
+    /// has looked it up. Empty for an agent under no node, and for one whose
+    /// session left no record behind.
+    pub session: String,
     /// What its hooks last said, or [`AgentState::Unknown`] if nothing has.
     ///
     /// Filled in from [`crate::agent_status`] after the scan, not by it: which
@@ -594,6 +628,8 @@ impl<'a> AgentScan<'a> {
                 pid: process.pid,
                 cwd: process.cwd.clone().unwrap_or_default(),
                 start_time: process.start_time,
+                node_pid: self.enclosing_node(process.pid).unwrap_or_default(),
+                session: String::new(),
                 state: AgentState::Unknown,
                 message: String::new(),
                 working_since_unix_ms: 0,
@@ -604,6 +640,26 @@ impl<'a> AgentScan<'a> {
         // likes, and the inbox compares this list to decide it changed.
         found.sort_by_key(|agent| (agent.kind, agent.pid));
         found
+    }
+
+    /// The p2pmux node `pid` runs under, if it runs under one.
+    ///
+    /// A pane's shell is a child of the node hosting it, so every agent started
+    /// in a pane has one of these above it. That is what separates an agent in
+    /// *another* p2pmux session on this machine from one started in a bare
+    /// terminal — two things the inbox used to call by the same wrong name,
+    /// because it only ever asked about the panes of the session in front of
+    /// you and read "not one of mine" as "not p2pmux at all".
+    ///
+    /// The nearest node wins, which matters the day somebody attaches one
+    /// session from inside another's pane: the agent belongs to the session
+    /// whose pane it is actually in.
+    pub fn enclosing_node(&self, pid: u32) -> Option<u32> {
+        self.ancestors_of(pid).find(|ancestor| {
+            self.by_pid
+                .get(ancestor)
+                .is_some_and(|p| is_node_process(p))
+        })
     }
 
     /// Whether the snapshot this scan was built from saw `pid` at all.
@@ -1022,6 +1078,83 @@ mod tests {
                     && agent.working_since_unix_ms == 0)
         );
         assert_eq!(loose[0].start_time, Some(10));
+    }
+
+    /// The bug a fresh session on a busy machine walks straight into: three
+    /// detached p2pmux sessions, each with an agent in a pane, and every one of
+    /// them listed as "running outside p2pmux" because the new session only
+    /// ever compared against its own panes.
+    ///
+    /// They are still loose — this session cannot jump to a pane it does not
+    /// have — but each one now carries the node it belongs to, which is what
+    /// lets the row name a session instead of denying there is one.
+    #[test]
+    fn an_agent_in_another_sessions_pane_is_loose_but_not_outside_p2pmux() {
+        let mut node = process(50, Some(1), "p2pmux", Some(50));
+        node.cmdline = vec![
+            String::from("/opt/homebrew/bin/p2pmux"),
+            String::from("__node"),
+            String::from("--bootstrap"),
+            String::from("/tmp/p2pmux-503/abc.bootstrap"),
+        ];
+        // The client the user is looking at is a p2pmux too, and hosts nothing.
+        let mut client = process(60, Some(1), "p2pmux", Some(60));
+        client.cmdline = vec![String::from("p2pmux"), String::from("create")];
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            node,
+            process(51, Some(50), "zsh", Some(51)),
+            // The agent in the other session's pane.
+            process(52, Some(51), "claude", Some(52)),
+            client,
+            // …and one genuinely outside every p2pmux, in a bare terminal.
+            process(70, Some(1), "claude", Some(70)),
+            // This session's own pane, which is not loose at all.
+            process(80, Some(1), "zsh", Some(80)),
+            process(81, Some(80), "claude", Some(81)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        let loose = scan.loose_agents(&[80]);
+
+        assert_eq!(
+            loose
+                .iter()
+                .map(|agent| (agent.pid, agent.node_pid))
+                .collect::<Vec<_>>(),
+            vec![(52, 50), (70, 0)],
+            "the agent in another session's pane names that session's node; \
+             the one in a bare terminal names nothing"
+        );
+        // Nobody has looked a name up yet, which is the caller's job.
+        assert!(loose.iter().all(|agent| agent.session.is_empty()));
+    }
+
+    /// The client is a `p2pmux` process too, and a `cargo test` in this
+    /// repository has `__node` all over its command line. Neither hosts a pane,
+    /// and mistaking either for one would attribute an agent to a session that
+    /// does not exist.
+    #[test]
+    fn only_a_real_node_counts_as_the_session_an_agent_is_in() {
+        let mut client = process(10, Some(1), "p2pmux", Some(10));
+        client.cmdline = vec![
+            String::from("p2pmux"),
+            String::from("attach"),
+            String::from("dakar"),
+        ];
+        let mut grep = process(20, Some(1), "rg", Some(20));
+        grep.cmdline = vec![String::from("rg"), String::from("__node")];
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            client,
+            process(11, Some(10), "claude", Some(11)),
+            grep,
+            process(21, Some(20), "claude", Some(21)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        assert_eq!(scan.enclosing_node(11), None);
+        assert_eq!(scan.enclosing_node(21), None);
     }
 
     /// The list is compared against the previous scan's to decide the inbox

@@ -432,6 +432,7 @@ fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
             cwd: String::from("/forged"),
             state: AgentRosterState::Working as i32,
             working_since_unix_ms: 0,
+            session_name: String::new(),
         }],
     };
     assert_eq!(coordinator.accept_agent_roster(&host_b(), forged), None);
@@ -449,6 +450,7 @@ fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
                     cwd: String::from("/repo"),
                     state: AgentRosterState::Working as i32,
                     working_since_unix_ms: 0,
+                    session_name: String::new(),
                 }],
             },
         )

@@ -4,7 +4,7 @@
 //! state (PTYs, tickets, screens, and focus) belongs to the node process, never to disk.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, BufRead, Write},
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
@@ -309,6 +309,41 @@ impl SessionStore {
             ));
         }
         Ok(descriptor)
+    }
+
+    /// Every recorded session's node pid and name, read and nothing more.
+    ///
+    /// Deliberately not [`Self::list_live`], which probes every socket and
+    /// deletes the records that do not answer. That is right for a person
+    /// asking which sessions exist and wrong for anything on a redraw path:
+    /// the probe blocks, and under load a busy node misses its deadline — see
+    /// the tests around [`PROBE_ACK_TIMEOUT`]. A caller that already holds a
+    /// process snapshot has a better liveness test than a socket probe anyway,
+    /// and a name for a session that has since exited costs nothing.
+    ///
+    /// Unreadable and malformed records are skipped rather than swept, because
+    /// having no name for a session is a missing label and deleting its record
+    /// would strand it.
+    pub fn names_by_node_pid(&self) -> io::Result<HashMap<u32, String>> {
+        let entries = match fs::read_dir(&self.sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(error),
+        };
+        let mut names = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if let Ok(descriptor) = self.read(id) {
+                names.insert(descriptor.node_pid, descriptor.name);
+            }
+        }
+        Ok(names)
     }
 
     pub fn remove(&self, id: &str) -> io::Result<()> {

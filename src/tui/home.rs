@@ -450,6 +450,9 @@ impl MultiPaneTui {
         else {
             return Vec::new();
         };
+        if row.in_another_session() {
+            return self.attach_the_session_the_agent_is_in(&row);
+        }
         let Some(kind) = crate::agent_detect::AgentKind::from_wire(&row.kind) else {
             self.home_notice = Some(format!(
                 "p2pmux does not know how to open a chat with {}",
@@ -494,6 +497,48 @@ impl MultiPaneTui {
                 kind.display_label(),
                 row.host,
                 chat.access.describe()
+            ));
+        }
+        intents
+    }
+
+    /// Enter on an agent that turned out to be in another p2pmux session.
+    ///
+    /// Not a chat, and pointedly not a new one. The agent is in a pane already;
+    /// what stands between the user and it is that the pane belongs to a
+    /// session nobody is attached to here. So the pane this opens runs
+    /// `p2pmux attach <name>`, and one keypress later the user is looking at
+    /// the conversation itself rather than at a second one started next to it.
+    ///
+    /// The alternative — treating it as an agent outside p2pmux — is what
+    /// shipped, and it is the bug: a machine with three detached sessions
+    /// filled the inbox with rows claiming to be outside p2pmux, and Enter on
+    /// any of them started a fresh agent in an empty tab.
+    fn attach_the_session_the_agent_is_in(&mut self, row: &AgentOverlayRow) -> Vec<UiIntent> {
+        let command = vec![
+            String::from("p2pmux"),
+            String::from("attach"),
+            row.session.clone(),
+        ];
+        // A second Enter finds the attach pane the first one opened, on the
+        // same title match a second chat uses.
+        if let Some(existing) = self.chat_pane_for(&row.host, &command) {
+            return self.enter_pane_from_home(existing);
+        }
+        let Some(index) = machine_rows(self)
+            .iter()
+            .position(|machine| machine.name == row.host)
+        else {
+            self.home_notice = Some(format!("{} is not in this session", row.host));
+            return Vec::new();
+        };
+        self.home_machine = Some(index);
+        let intents = self.open_terminal_on_selected_machine(self.last_home_area, command);
+        self.home_machine = None;
+        if !intents.is_empty() {
+            self.home_notice = Some(format!(
+                "attaching p2pmux session {} on {}",
+                row.session, row.host
             ));
         }
         intents
@@ -1704,6 +1749,85 @@ mod tests {
                 [UiIntent::CreateTabOn { command, .. }] if command == &[String::from("claude")]
             ),
             "a local bot's chat command must reach the new pane, not be dropped: {intents:?}"
+        );
+    }
+
+    /// The rows that made the inbox look like it was inventing agents: they
+    /// were in p2pmux the whole time, in sessions this one had not been told to
+    /// ask about. Enter goes to the session rather than starting a rival agent
+    /// beside it.
+    #[test]
+    fn enter_on_an_agent_in_another_session_attaches_that_session() {
+        let mut tui = tui_with_a_bot_on_a_droplet("claude");
+        let mut rows = tui.agent_rows.clone();
+        for row in &mut rows {
+            if row.pane_id == 0 {
+                row.host = String::from("laptop");
+                row.session = String::from("dakar");
+            }
+        }
+        tui.set_agent_rows(rows);
+        select_the_bot(&mut tui);
+
+        let intents = tui.open_home_selection();
+
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [UiIntent::CreateTabOn { command, .. }]
+                    if command == &[
+                        String::from("p2pmux"),
+                        String::from("attach"),
+                        String::from("dakar"),
+                    ]
+            ),
+            "{intents:?}"
+        );
+        let notice = tui.home_notice.clone().expect("a notice");
+        assert!(
+            notice.contains("attaching p2pmux session dakar"),
+            "the row promised an attach and the notice has to say the same: {notice}"
+        );
+    }
+
+    /// Pressing Enter twice must not leave two attach panes against one
+    /// session, for the same reason it must not leave two chats.
+    #[test]
+    fn a_second_enter_finds_the_attach_pane_the_first_one_opened() {
+        let mut tui = tui_with_a_bot_on_a_droplet("claude");
+        let mut rows = tui.agent_rows.clone();
+        for row in &mut rows {
+            if row.pane_id == 0 {
+                row.session = String::from("dakar");
+            }
+        }
+        tui.set_agent_rows(rows);
+        tui.snapshot.panes.insert(
+            9,
+            crate::layout::Pane {
+                pane_id: 9,
+                host_peer_id: vec![0xca, 0xfe],
+                locked: false,
+                exited: false,
+                grid_rows: 2,
+                grid_cols: 8,
+                title: Some(chat_pane_title(&[
+                    String::from("p2pmux"),
+                    String::from("attach"),
+                    String::from("dakar"),
+                ])),
+            },
+        );
+        tui.snapshot.tabs.push(crate::layout::Tab {
+            tab_id: 9,
+            root: crate::layout::Node::Leaf { pane_id: 9 },
+            title: None,
+        });
+        select_the_bot(&mut tui);
+
+        assert_eq!(
+            tui.open_home_selection(),
+            vec![UiIntent::FocusPane { pane_id: 9 }]
         );
     }
 

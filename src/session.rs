@@ -5115,6 +5115,7 @@ mod control_queue_tests {
                     cwd: String::from("/repo"),
                     state: AgentRosterState::Working as i32,
                     working_since_unix_ms: 0,
+                    session_name: String::new(),
                 }],
             }),
         )

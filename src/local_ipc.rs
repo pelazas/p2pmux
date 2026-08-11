@@ -245,6 +245,10 @@ pub struct AgentOverlaySnapshotRow {
     /// hosted by another member: their node never sent it, and never should.
     #[serde(default)]
     pub message: String,
+    /// The p2pmux session an agent with no pane of ours is in, when the node
+    /// found one above its process. Empty for every pane row.
+    #[serde(default)]
+    pub session: String,
 }
 
 impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
@@ -259,6 +263,7 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
             host: row.host.clone(),
             controller: row.controller.clone(),
             message: row.message.clone(),
+            session: row.session.clone(),
         }
     }
 }

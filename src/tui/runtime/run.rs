@@ -503,6 +503,7 @@ impl SharedLayoutRuntime {
             // which is how both assistant agents are meant to run and the one
             // shape the inbox could not see.
             let mut loose = scan.loose_agents(&pane_roots);
+            self.name_their_sessions(&mut loose);
             // …and then what each of them is doing, which the scan cannot know
             // and their hooks have left on this machine for exactly this. An
             // agent with no hooks stays `Unknown` and the row still says so.
@@ -550,6 +551,34 @@ impl SharedLayoutRuntime {
         changed |= self.refresh_local_views();
         changed |= self.refresh_agent_rows();
         Ok(changed)
+    }
+
+    /// Name the p2pmux session each loose agent is sitting in, where there is
+    /// one.
+    ///
+    /// The scan can see that an agent's process descends from a node; only the
+    /// session store knows that node is called `dakar`. The map is cached and
+    /// re-read only when a node turns up that is not in it, because this runs
+    /// on a redraw path and the store is on disk — and never through
+    /// `list_live`, which probes every socket and deletes the records that miss
+    /// their deadline.
+    fn name_their_sessions(&mut self, loose: &mut [crate::agent_detect::LooseAgent]) {
+        let unknown = loose
+            .iter()
+            .any(|agent| agent.node_pid != 0 && !self.session_names.contains_key(&agent.node_pid));
+        if unknown
+            && let Ok(store) = crate::session_store::SessionStore::for_current_user()
+            && let Ok(names) = store.names_by_node_pid()
+        {
+            self.session_names = names;
+        }
+        for agent in loose {
+            agent.session = self
+                .session_names
+                .get(&agent.node_pid)
+                .cloned()
+                .unwrap_or_default();
+        }
     }
 
     pub(in crate::tui) fn spawn_remote_shutdown(&self, pane: GuestPane) {
