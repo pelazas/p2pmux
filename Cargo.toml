@@ -1,6 +1,6 @@
 [package]
 name = "p2pmux"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.85"
 description = "A peer-to-peer terminal multiplexer where every pane runs on its owner's machine"

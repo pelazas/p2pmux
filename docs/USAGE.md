@@ -58,6 +58,11 @@ stream the first time one arrives. v0.1.4 and v0.1.5 still share sessions with e
 neither can join a v0.1.6 one. v0.1.7 left the pin where v0.1.6 put it, so those two do share
 sessions.
 
+v0.1.8 moved it again, for the same reason: a machine now tells the session it has joined a fleet,
+and a joining machine can present an enrolment token, and a v0.1.7 peer handed either message
+drops its control stream rather than ignoring it. So v0.1.8 shares sessions with nothing older —
+update both machines together.
+
 To dogfood the shared layout on one machine:
 
 ```text
@@ -394,9 +399,18 @@ It records the session's ticket in `pairing.toml`, which is what makes bare `p2p
 both machines afterwards. It does not answer the accepts-work question — that is asked once, by
 `p2pmux pair`, and its answer is default-deny.
 
+`m` moves the cursor into the rail, and the arrow keys walk it from there; `m` again or `Esc`
+hands the cursor back to the agents. With it on a machine, `enter` and `n` both mean "a terminal
+*there*". One machine is one row however many p2pmux it has run, because a peer id belongs to a
+process and the row is about the box.
+
 The `inbox` badge in the tab bar carries the count of agents blocked on a human, in amber, so it
 stays visible while you are deep inside a terminal. It never shows a zero: absence is quieter and
-means the same thing.
+means the same thing. Going to an agent's pane answers its summons and drops it from the count —
+the badge means "somebody is waiting on you and you have not been", so standing in front of the
+question answers it. The next question from that pane counts again: answering one is not muting
+the pane. An agent that blocks in a pane you left focused and walked away from still counts, which
+is the case the badge exists for.
 
 Working directories are shared with every member as part of the existing trusted shared-shell
 model, so do not use a session with people who should not see repository paths. What the agent
@@ -540,13 +554,63 @@ No other machines paired yet. Run `p2pmux pair` to add one.
 
 `accepts work` is asked once, during pairing, and defaults to no. It means *accepts work from your
 other machines*, never *from anyone with the join code* — otherwise handing out a code would be
-handing out remote code execution. **Nothing acts on it yet**: it is recorded now so that starting
-a terminal on another machine can later be legal without widening the trust model. It reads `—`
-for a machine that has never answered the question, because the answer is given on the machine it
-is about and there is no channel back; printing `no` would show a refusal nobody made.
+handing out remote code execution. It reads `—` for a machine that has never answered the question,
+because the answer is given on the machine it is about and there is no channel back; printing `no`
+would show a refusal nobody made.
 
 Pairing is stored in `$XDG_CONFIG_HOME/p2pmux/pairing.toml`. It holds the shared session's ticket
 and the names of the paired machines, and no keys of its own.
+
+### Enrolling a machine nobody is sitting at
+
+`p2pmux pair` is a code one human types on one machine within ten minutes. That is right for two
+laptops and unusable from a provisioning script, so a VM gets a token instead:
+
+```text
+On a machine already in the fleet:   p2pmux enroll
+                                     → p2pmux enroll p2pmux-enrol-v1:… --name <name>
+                                     → and the cloud-init line to paste it into
+
+On the new machine:                  p2pmux enroll p2pmux-enrol-v1:… --name build-box --accept-work
+                                     → enrolled as build-box
+```
+
+Printing the token twice gives the same token, so an image built from last week's paste still
+works. `p2pmux enroll --revoke` withdraws it; machines already enrolled stay, and `p2pmux unpair`
+is how one leaves.
+
+It is a credential, and worth being plain about: anyone holding it can put a machine in your fleet
+until you revoke it. What that buys them is *membership*, which starts nothing on its own — see
+below. A machine that presents a withdrawn token can still **join the session**, because the ticket
+inside it is a session invitation and revoking an enrolment is not revoking that; `p2pmux machines`
+lists it under `IN THIS SESSION, NOT YOURS`, which is the difference the heading exists for.
+
+### What your machines may start here
+
+Two gates, both closed until you open them: this machine has to accept work at all, and the exact
+command has to be on its allowlist. `p2pmux work` prints where both stand.
+
+```text
+p2pmux work                 # what this machine allows, and what to run to change it
+p2pmux work allow           # a login shell — everything this user account can do
+p2pmux work allow claude    # one named command, matched in full
+p2pmux work deny claude
+p2pmux work confirm         # ask here before each remote pane; --off stops asking
+p2pmux work off             # refuse everything, keeping the list for later
+```
+
+Commands are matched whole, so `claude` and `claude --dangerously-skip-permissions` are separate
+decisions. There is no blocklist, because a blocklist on an interactive shell is a guardrail
+against accidents and not a boundary: allow a shell and you have allowed everything that user can
+do, and the allowlist says so in those words rather than pretending otherwise.
+
+Granting anything turns `accepts_work` on with it — an allowlist behind a closed gate is a list
+nothing reads. When a machine refuses a terminal, the machine that asked is told the command that
+lifts it and where to run it:
+
+```text
+droplet refused — run `p2pmux work allow` on droplet
+```
 
 ## Configuration
 
@@ -591,7 +655,7 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.8 is out — you have 0.1.7. Update with `brew update && brew upgrade p2pmux`
+p2pmux 0.1.9 is out — you have 0.1.8. Update with `brew update && brew upgrade p2pmux`
 ```
 
 `p2pmux doctor` asks the same question and answers it either way, which is the one to run when you

@@ -59,7 +59,7 @@ fn protocol_version_is_v10() {
     // v10 added the coordinator epoch to the welcome and to every ledger entry. A v9 peer
     // cannot tell which coordinator sealed what it is being handed, so it must not be let in
     // rather than be left guessing.
-    assert_eq!(PROTOCOL_VERSION, 11);
+    assert_eq!(PROTOCOL_VERSION, 12);
 }
 
 #[test]

@@ -3,7 +3,7 @@
 Send to **hello@console.dev**. Edit it so it sounds like you before sending — it is short
 on purpose, and the details are what matter, not the pitch.
 
-Eligibility checked 2026-08-02: Console only covers pre-1.0 / beta tools, so v0.1.7
+Eligibility checked 2026-08-02: Console only covers pre-1.0 / beta tools, so v0.1.8
 qualifies. Stable releases are explicitly *not* eligible, which means this window closes
 the day you tag 1.0.
 
@@ -14,7 +14,7 @@ the day you tag 1.0.
 Hi,
 
 I've been building p2pmux, a terminal multiplexer for people who work with coding agents
-on more than one machine. It's at v0.1.7, MIT, Rust.
+on more than one machine. It's at v0.1.8, MIT, Rust.
 
 The difference from tmux/tmate: there's no shared box. Every pane runs a PTY on the
 machine of whoever opened it, with that machine's PATH, env and subscriptions. You join a

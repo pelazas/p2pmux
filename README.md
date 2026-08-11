@@ -92,6 +92,10 @@ not an agent orchestration platform.
   *state unknown — no hooks* on its own row rather than being guessed about.
 - `p2pmux pair` associates two machines you own, once and permanently. After that, bare `p2pmux`
   rejoins on either with no code typed, and `p2pmux machines` says which of them are awake.
+  For a machine with nobody sitting at it, `p2pmux enroll` prints a revocable token to paste into
+  a provisioning script, and the VM joins your fleet unattended.
+- What your machines may start on one of them is written on that machine: `p2pmux work allow`,
+  matched in full, default closed. Being in your fleet grants nothing on its own.
 
 <p align="center">
   <a href="docs/assets/workflow.mp4">
@@ -109,7 +113,7 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.7 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.8 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. Bare `p2pmux` opens the inbox, two machines pair
 once and rejoin without a code, and two agents report their own state through hooks — Claude Code
 and OpenCode. A coordinator that dies no longer ends the session — a survivor takes the role over,
@@ -136,9 +140,22 @@ top or bottom scrolls it, and keeps scrolling for as long as you hold it there, 
 no longer limited to what fits on screen. And when a newer release exists the inbox says so, naming
 the one command that fits how your copy was installed.
 
-**v0.1.6 and v0.1.7 share sessions.** The wire protocol did not move, so a peer on either can join
-the other. v0.1.5 and older still cannot join either: that pin moved in v0.1.6, and a peer on the
-wrong side of it is refused with an unsupported-protocol error rather than half-joining.
+v0.1.8 is about the fleet, and about the inbox telling the truth. A machine you pair while a
+session is already open now stays in the fleet — it used to announce that it belonged to none for
+as long as that p2pmux ran, so nothing ever wrote it down and its row vanished with the session.
+One machine is one row, however many p2pmux it has run. `p2pmux enroll` puts a machine you own in
+your fleet from a provisioning script, with a revocable token instead of a code somebody types
+within ten minutes. `p2pmux work` is how a machine says what your other machines may start on it,
+which until now could only be written by hand into a file most people never found — and a refusal
+names the command that lifts it, on the machine to run it on. Agents in *another* p2pmux session on
+the same machine are named as such rather than called "running outside p2pmux", and enter attaches
+that session. The `inbox N` badge stops counting an agent once you have been to its pane. `m` moves
+the cursor into the fleet and the arrow keys walk it.
+
+**v0.1.8 does not share sessions with v0.1.7 or older.** The wire pin moved: a machine now tells
+the session it has joined a fleet, and a joining machine can present an enrolment token, and
+neither message exists on the old side. A peer on the wrong side of the pin is refused with an
+unsupported-protocol error rather than half-joining — update both machines together.
 
 ## Install
 

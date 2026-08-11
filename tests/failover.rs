@@ -269,5 +269,5 @@ fn the_wire_version_gates_peers_that_cannot_read_an_epoch() {
     // A v9 peer parses the new welcome and the new entries, and silently reads every epoch
     // as 0 -- which is exactly the confusion the epoch exists to prevent. The version bump
     // is what keeps it out.
-    assert_eq!(PROTOCOL_VERSION, 11);
+    assert_eq!(PROTOCOL_VERSION, 12);
 }
