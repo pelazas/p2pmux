@@ -913,17 +913,42 @@ const MACHINE_RAIL_MIN_HEIGHT: u16 = 6;
 /// collaborating on this session, and dropping them would be as wrong as the
 /// old behaviour of drawing them as fleet.
 pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
+    // One row per *machine*, not per member. A peer id is per process, so a
+    // machine that has run p2pmux twice — the pairing node and the one you are
+    // attached to, or a session left over from this morning — is several
+    // members, and the rail used to draw each of them as its own machine.
+    //
+    // The liveliest peer wins the row: `this_machine` and reachability are
+    // properties of the box, and the box is up if any of its processes is.
+    let mut seen_machines: Vec<Vec<u8>> = Vec::new();
     let mut rows = tui
         .snapshot
         .members
         .iter()
+        .filter(|member| {
+            let identity = if member.machine_id.is_empty() {
+                member.peer_id.clone()
+            } else {
+                member.machine_id.clone()
+            };
+            let first = !seen_machines.contains(&identity);
+            if first {
+                seen_machines.push(identity);
+            }
+            first
+        })
         .map(|member| {
             // Keyed on the member *label*, not the raw display name, because
             // that is what the agent rows carry and what the strip prints. Two
             // machines that chose the same name get disambiguated there, and
             // matching on the raw name would credit one's agents to the other.
             let name = crate::tui::member_label(&member.peer_id, &tui.snapshot.members);
-            let this_machine = tui.local_peer_id.as_deref() == Some(member.peer_id.as_slice());
+            // Any of this machine's peers being the local one makes the row the
+            // machine you are sitting at, whichever of them the rail kept.
+            let this_machine = tui.snapshot.members.iter().any(|candidate| {
+                crate::tui::member_label(&candidate.peer_id, &tui.snapshot.members) == name
+                    && tui.local_peer_id.as_deref() == Some(candidate.peer_id.as_slice())
+            });
             MachineRow {
                 accepts_work: tui
                     .paired_machines
@@ -1334,6 +1359,41 @@ mod tests {
         let layout = home_layout(AREA, &tui);
         assert_eq!(layout.machine_panel, MachinePanel::Rail);
         assert_eq!(layout.machines.height, AREA.height);
+    }
+
+    /// The rail drew one row per *member*, and a peer id is per process — so a
+    /// droplet that had run p2pmux twice appeared as two machines plus, once
+    /// its first node died, an `asleep` third. Pressing Enter on the wrong one
+    /// sends a request to a peer that is not there, and nothing comes back.
+    #[test]
+    fn one_machine_is_one_row_however_many_p2pmux_it_has_run() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        let droplet = vec![0xde, 0xad];
+        for peer in [vec![0xca, 0xfe], vec![0xbe, 0xef]] {
+            tui.snapshot.members.push(crate::layout::Member {
+                peer_id: peer,
+                endpoint_addr: vec![2],
+                display_name: String::from("droplet"),
+                kind: crate::layout::MemberKind::Machine,
+                machine_proof: Default::default(),
+                machine_id: droplet.clone(),
+            });
+        }
+
+        let machines = machine_rows(&tui);
+
+        assert_eq!(
+            machines
+                .iter()
+                .map(|machine| machine.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["laptop", "droplet"],
+            "two p2pmux processes on one droplet are one droplet"
+        );
+        assert!(machines[0].this_machine);
+        assert!(!machines[1].this_machine);
     }
 
     /// The rail is a column of the screen, so what it costs is width, and the

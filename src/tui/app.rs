@@ -548,11 +548,29 @@ pub(in crate::tui) fn member_label(peer_id: &[u8], members: &[crate::layout::Mem
     if member.display_name.is_empty() {
         return short_peer(peer_id);
     }
-    let duplicates = members
+    // A peer id is per *process*, so one machine that has run p2pmux twice is
+    // two members — and disambiguating on the display name alone printed it as
+    // two machines, `droplet · b3cf62f0` and `droplet · 8fe47d3f`, one of them
+    // usually a node whose process is already gone. Aiming a remote terminal at
+    // the wrong one of those is silence, not an error.
+    //
+    // So the suffix is for telling two *machines* apart, and the proved machine
+    // id is what says whether there are two. Members that could not prove one
+    // fall back to their peer id, which makes each of them its own machine —
+    // the honest answer when nothing links them.
+    let identity = |member: &crate::layout::Member| {
+        if member.machine_id.is_empty() {
+            member.peer_id.clone()
+        } else {
+            member.machine_id.clone()
+        }
+    };
+    let mine = identity(member);
+    let other_machines = members
         .iter()
         .filter(|candidate| candidate.display_name == member.display_name)
-        .count();
-    if duplicates > 1 {
+        .any(|candidate| identity(candidate) != mine);
+    if other_machines {
         format!("{} · {}", member.display_name, short_peer(peer_id))
     } else {
         member.display_name.clone()
@@ -634,6 +652,44 @@ mod tests {
             "sam · aabbccdd"
         );
         assert_eq!(member_label(&members[2].peer_id, &members), "pat");
+    }
+
+    /// One machine that has run p2pmux twice is two members, and it used to be
+    /// drawn as two machines — usually with one of them a node whose process
+    /// had already gone. Aiming a remote terminal at that one is silence.
+    #[test]
+    fn two_processes_on_one_machine_are_one_machine() {
+        let machine = vec![0xde, 0xad, 0xbe, 0xef];
+        let member = |peer: Vec<u8>, machine_id: Vec<u8>, name: &str| crate::layout::Member {
+            peer_id: peer,
+            endpoint_addr: vec![1],
+            display_name: name.into(),
+            kind: Default::default(),
+            machine_proof: Default::default(),
+            machine_id,
+        };
+        let members = vec![
+            member(vec![0xaa; 4], machine.clone(), "droplet"),
+            member(vec![0xbb; 4], machine.clone(), "droplet"),
+        ];
+
+        assert_eq!(member_label(&members[0].peer_id, &members), "droplet");
+        assert_eq!(
+            member_label(&members[1].peer_id, &members),
+            "droplet",
+            "the same box under both of its peer ids"
+        );
+
+        // Two boxes that chose the same name are still two, and still have to
+        // be told apart.
+        let two_boxes = vec![
+            member(vec![0xaa; 4], machine, "droplet"),
+            member(vec![0xbb; 4], vec![0x01, 0x02, 0x03, 0x04], "droplet"),
+        ];
+        assert_eq!(
+            member_label(&two_boxes[0].peer_id, &two_boxes),
+            "droplet · aaaaaaaa"
+        );
     }
 
     #[test]
