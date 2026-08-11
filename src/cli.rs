@@ -60,8 +60,8 @@ enum Command {
     Pair {
         /// The pairing code printed by `p2pmux pair` on your other machine.
         code: Option<String>,
-        /// Answer the accepts-work question without being asked. Only recorded;
-        /// nothing acts on it yet.
+        /// Answer the accepts-work question without being asked. The first of
+        /// two gates; `p2pmux work allow` here opens the second.
         #[arg(long = "accept-work")]
         accept_work: bool,
         /// Refuse the accepts-work question without being asked.
@@ -112,6 +112,15 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Say what your other machines may start on this one.
+    ///
+    /// Two gates gate a remote terminal, and both are closed until you open
+    /// them: this machine has to accept work at all, and the exact command has
+    /// to be on its allowlist. With no arguments this prints where both stand.
+    Work {
+        #[command(subcommand)]
+        action: Option<WorkCommand>,
     },
     /// Report agent status from an agent hook. Run inside a p2pmux pane; a
     /// no-op anywhere else, so it is safe to leave registered everywhere.
@@ -176,6 +185,39 @@ enum ConfigCommand {
     Set { key: String, value: String },
     Get { key: String },
     Init,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkCommand {
+    /// Let your other machines start this command here.
+    ///
+    /// Written and matched in full, so `claude` and
+    /// `claude --dangerously-skip-permissions` are separate decisions. With no
+    /// command it allows a login shell, which is everything this user account
+    /// can do — say `p2pmux work allow` only if you mean that.
+    ///
+    /// Granting anything is itself the consent to accept work, so this turns
+    /// that on too rather than leaving you with an allowlist nothing reads.
+    Allow {
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Stop letting them start it. With no command, a login shell.
+    Deny {
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Ask on this machine before each remote pane, even an allowed one.
+    Confirm {
+        /// Stop asking, and let allowed commands through unattended.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Refuse every remote pane, keeping the allowlist for when you turn it
+    /// back on.
+    Off,
+    /// Accept remote panes again, subject to the allowlist.
+    On,
 }
 
 #[derive(Debug, Subcommand)]
@@ -375,6 +417,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             _ => Err(CliError("config key must be name").into()),
         },
+        Some(Command::Work { action }) => run_work(action),
         Some(Command::Create { name, session_name }) => {
             {
                 let mut stdout = io::stdout().lock();
@@ -925,15 +968,90 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `p2pmux work …` — the only supported way to open the two gates a remote
+/// terminal has to pass.
+///
+/// They were openable before this existed only by hand-editing the pairing
+/// file, which meant the feature was reachable by people who had read the
+/// source. `p2pmux machines` says what a machine allows; this is how it comes
+/// to allow it.
+fn run_work(action: Option<WorkCommand>) -> Result<(), Box<dyn Error>> {
+    let mut pairing = crate::pairing::load()?;
+    let Some(action) = action else {
+        print!("{}", work_policy_summary(&pairing));
+        return Ok(());
+    };
+    match action {
+        WorkCommand::Allow { command } => {
+            let entry = crate::pairing::work_entry(&command);
+            let added = pairing.work.allow(&command);
+            // Granting a command is the consent; an allowlist behind a closed
+            // `accepts_work` is a list nothing reads, and leaving the user with
+            // one is how this feature looked broken.
+            let opened = !std::mem::replace(&mut pairing.accepts_work, true);
+            crate::pairing::save(&pairing)?;
+            if added {
+                println!("your machines may now start `{entry}` here");
+            } else {
+                println!("`{entry}` was already allowed here");
+            }
+            if opened {
+                println!("and this machine now accepts work — `p2pmux work off` undoes that");
+            }
+            if entry == crate::pairing::SHELL_ENTRY {
+                println!(
+                    "a login shell is everything this user account can do, on purpose and by name"
+                );
+            }
+        }
+        WorkCommand::Deny { command } => {
+            let entry = crate::pairing::work_entry(&command);
+            if pairing.work.deny(&command) {
+                crate::pairing::save(&pairing)?;
+                println!("your machines may no longer start `{entry}` here");
+            } else {
+                println!("`{entry}` was not allowed here anyway");
+            }
+        }
+        WorkCommand::Confirm { off } => {
+            pairing.work.confirm = !off;
+            crate::pairing::save(&pairing)?;
+            if off {
+                println!("allowed commands will start here without asking");
+            } else {
+                println!("every remote pane will wait for somebody here to say yes");
+            }
+        }
+        WorkCommand::Off => {
+            pairing.accepts_work = false;
+            crate::pairing::save(&pairing)?;
+            println!("this machine now refuses remote panes; its allowlist is kept");
+        }
+        WorkCommand::On => {
+            pairing.accepts_work = true;
+            crate::pairing::save(&pairing)?;
+            println!("this machine now accepts remote panes, subject to its allowlist");
+        }
+    }
+    println!();
+    print!("{}", work_policy_summary(&crate::pairing::load()?));
+    Ok(())
+}
+
 /// What this machine will let your other machines start on it, in words.
 fn work_policy_summary(pairing: &crate::pairing::Pairing) -> String {
     let mut summary = String::from("On this machine, your other machines may start:\n");
     if !pairing.accepts_work {
         summary.push_str("  nothing — this machine has not agreed to accept work\n");
+        summary.push_str("  `p2pmux work allow` here opens both gates, for a login shell\n");
         return summary;
     }
     if pairing.work.allow.is_empty() {
-        summary.push_str("  nothing yet — add commands to [work].allow in the pairing file\n");
+        // Naming the command matters more here than anywhere else in this
+        // output: this is the state a machine is in right after being paired
+        // with `--accept-work`, and it reads as the feature being broken.
+        summary.push_str("  nothing yet — `p2pmux work allow` here allows a login shell,\n");
+        summary.push_str("  or `p2pmux work allow claude` one named command\n");
         return summary;
     }
     for entry in &pairing.work.allow {

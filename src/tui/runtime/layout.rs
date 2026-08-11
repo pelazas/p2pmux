@@ -887,31 +887,22 @@ impl SharedLayoutRuntime {
     }
 
     /// What to tell the user when the coordinator refused a request.
-    ///
-    /// The three that can happen to a terminal asked for on another machine get
-    /// sentences, because each one has a different thing to do about it: wake
-    /// the machine, ask its owner, or wait. Everything else keeps the old line,
-    /// which is fine for failures the user did not cause and cannot act on.
     fn rejection_notice(&self, reason: i32, request_id: u64) -> String {
-        let machine = self
+        let pending = self
             .pending_create
             .as_ref()
-            .filter(|pending| pending.request_id == request_id)
-            .map(|pending| pending.target_name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| String::from("that machine"));
-        match LayoutRejectReason::try_from(reason) {
-            Ok(LayoutRejectReason::UnknownTarget) => {
-                format!("{machine} is not in this session — start p2pmux on it and it rejoins")
-            }
-            Ok(LayoutRejectReason::TargetRefused) => {
-                format!("{machine} refused: it does not accept work from your machines")
-            }
-            Ok(LayoutRejectReason::ReservationFailure) => {
-                format!("{machine} did not answer in time")
-            }
-            _ => format!("layout request {request_id} rejected"),
-        }
+            .filter(|pending| pending.request_id == request_id);
+        rejection_sentence(
+            reason,
+            request_id,
+            pending
+                .map(|pending| pending.target_name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("that machine"),
+            pending
+                .map(|pending| pending.command.as_slice())
+                .unwrap_or_default(),
+        )
     }
 
     pub(in crate::tui) fn reject_request_with_reason(&mut self, request_id: u64, reason: i32) {
@@ -944,5 +935,73 @@ impl SharedLayoutRuntime {
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1).max(1);
         id
+    }
+}
+
+/// The sentence a refused layout request gets.
+///
+/// The three that can happen to a terminal asked for on another machine get
+/// one each, because each has a different thing to do about it: wake the
+/// machine, open its gate, or wait. Everything else keeps the bare line, which
+/// is fine for failures the user did not cause and cannot act on.
+///
+/// Free of the runtime so the words can be tested without a session behind
+/// them — they are the whole value of the branch.
+fn rejection_sentence(reason: i32, request_id: u64, machine: &str, command: &[String]) -> String {
+    match LayoutRejectReason::try_from(reason) {
+        Ok(LayoutRejectReason::UnknownTarget) => {
+            format!("{machine} is not in this session — start p2pmux on it and it rejoins")
+        }
+        Ok(LayoutRejectReason::TargetRefused) => {
+            // The line the user needs is not that they were refused, which they
+            // can see, but the one command that stops it happening again — run
+            // *there*, because that is the machine whose answer it is.
+            let entry = crate::pairing::work_entry(command);
+            let argument = if entry == crate::pairing::SHELL_ENTRY {
+                String::new()
+            } else {
+                format!(" {entry}")
+            };
+            format!("{machine} refused — run `p2pmux work allow{argument}` on {machine}")
+        }
+        Ok(LayoutRejectReason::ReservationFailure) => {
+            format!("{machine} did not answer in time")
+        }
+        _ => format!("layout request {request_id} rejected"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rejection_sentence;
+    use crate::protocol::LayoutRejectReason;
+
+    /// A refusal the user cannot act on is a refusal that gets reported as a
+    /// bug. Both shapes name the command, and name the machine to run it on.
+    #[test]
+    fn a_refusal_names_the_command_that_lifts_it() {
+        assert_eq!(
+            rejection_sentence(LayoutRejectReason::TargetRefused as i32, 7, "droplet", &[]),
+            "droplet refused — run `p2pmux work allow` on droplet",
+            "a bare terminal is the shell entry, which is spelled by leaving it off"
+        );
+        assert_eq!(
+            rejection_sentence(
+                LayoutRejectReason::TargetRefused as i32,
+                7,
+                "droplet",
+                &[String::from("claude")],
+            ),
+            "droplet refused — run `p2pmux work allow claude` on droplet"
+        );
+        // The other two are about the machine, not about its policy.
+        assert!(
+            rejection_sentence(LayoutRejectReason::UnknownTarget as i32, 7, "droplet", &[])
+                .contains("not in this session")
+        );
+        assert_eq!(
+            rejection_sentence(99, 7, "droplet", &[]),
+            "layout request 7 rejected"
+        );
     }
 }

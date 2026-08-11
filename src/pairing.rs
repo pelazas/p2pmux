@@ -171,7 +171,46 @@ pub enum WorkDecision {
 /// The entry that means a login shell rather than a named program.
 pub const SHELL_ENTRY: &str = "shell";
 
+/// How a command is written in the allowlist and on a command line.
+///
+/// One function so the entry `p2pmux work allow` writes, the entry
+/// [`WorkPolicy::permits`] matches, and the entry a refusal tells you to add
+/// cannot drift apart — a policy you were told to add and that then does not
+/// match is worse than no policy at all.
+pub fn work_entry(command: &[String]) -> String {
+    if command.is_empty() {
+        return String::from(SHELL_ENTRY);
+    }
+    command.join(" ")
+}
+
 impl WorkPolicy {
+    /// Add an entry, and say whether it was not already there.
+    ///
+    /// Written through [`work_entry`] and compared the way [`Self::permits`]
+    /// compares, so `allow "claude  "` and `allow claude` are one entry.
+    pub fn allow(&mut self, command: &[String]) -> bool {
+        if self.permits(command) {
+            return false;
+        }
+        self.allow.push(work_entry(command));
+        true
+    }
+
+    /// Drop an entry, and say whether there was one.
+    pub fn deny(&mut self, command: &[String]) -> bool {
+        let before = self.allow.len();
+        let words = if command.is_empty() {
+            vec![String::from(SHELL_ENTRY)]
+        } else {
+            command.to_vec()
+        };
+        self.allow.retain(|entry| {
+            entry.split_whitespace().collect::<Vec<_>>() != words.iter().collect::<Vec<_>>()
+        });
+        before != self.allow.len()
+    }
+
     /// Whether this exact command may be launched here.
     ///
     /// Exact, because "starts with an allowed command" is not a permission
@@ -819,6 +858,51 @@ mod tests {
 
         pairing.work.allow.push(String::from("shell"));
         assert_eq!(pairing.work_decision(&[]), WorkDecision::Allow);
+    }
+
+    /// The entry `p2pmux work allow` writes has to be the entry
+    /// `work_decision` then reads. A grant that does not take is worse than no
+    /// grant: the user is told they opened the gate and the gate stays shut.
+    #[test]
+    fn what_allow_writes_is_what_the_decision_reads() {
+        let mut pairing = Pairing {
+            accepts_work: true,
+            ..Pairing::default()
+        };
+        let claude = vec![String::from("claude")];
+        let attach = vec![
+            String::from("p2pmux"),
+            String::from("attach"),
+            String::from("dakar"),
+        ];
+
+        assert!(pairing.work.allow(&[]));
+        assert!(pairing.work.allow(&claude));
+        assert!(pairing.work.allow(&attach));
+        assert!(
+            !pairing.work.allow(&claude),
+            "the same grant twice is one entry, not two"
+        );
+
+        assert_eq!(pairing.work_decision(&[]), WorkDecision::Allow);
+        assert_eq!(pairing.work_decision(&claude), WorkDecision::Allow);
+        assert_eq!(pairing.work_decision(&attach), WorkDecision::Allow);
+        assert_eq!(
+            pairing.work_decision(&[String::from("claude"), String::from("--dangerously")]),
+            WorkDecision::Refuse,
+            "matched in full: an allowed command cannot be extended with arguments"
+        );
+
+        // `deny` reaches the same entry whether the shell is spelled out or
+        // left implicit, because both spellings reach it on the way in.
+        assert!(pairing.work.deny(&[String::from("shell")]));
+        assert_eq!(pairing.work_decision(&[]), WorkDecision::Refuse);
+        assert!(!pairing.work.deny(&[]), "and denying twice is not an error");
+        assert_eq!(
+            pairing.work_decision(&claude),
+            WorkDecision::Allow,
+            "denying one entry leaves the rest alone"
+        );
     }
 
     #[test]
