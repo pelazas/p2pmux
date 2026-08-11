@@ -46,6 +46,22 @@ def check(label: str, passed: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if passed else 'FAIL'}] {label}" + (f" -- {detail}" if detail else ""), flush=True)
 
 
+def fleet_record(pairing_file: Path) -> str:
+    """The `[[machine]]` blocks of a pairing file, and nothing else.
+
+    `p2pmux machines` deliberately lists session members alongside the fleet —
+    a machine of yours that is in the session, and under its own heading anyone
+    else who is. So the listing is the wrong thing to assert ownership against:
+    a peer that joined and was *refused* the fleet still appears in it, which is
+    the whole point of printing them apart. This reads the record instead,
+    which is the only thing that decides.
+    """
+    text = pairing_file.read_text()
+    return "".join(
+        block for block in text.split("[[machine]]")[1:]
+    )
+
+
 def clean_env(**overrides: str) -> dict[str, str]:
     environment = {
         key: value
@@ -81,6 +97,26 @@ def main() -> int:
         # is what mints the home session; nobody types the code it prints.
         offered = mac("pair", "--no-accept-work")
         check("`p2pmux pair` mints a fleet to enrol into", "pairing code" in offered, offered.strip()[-160:])
+
+        # `pair` also opens the ten-minute window, and a droplet arriving inside
+        # it would be written into the fleet by the window rather than by the
+        # token — which would make this scenario pass without testing anything.
+        # Closing it is what the tenth minute would do, and this run has no ten
+        # minutes to spare.
+        pairing_file = harness.home / ".config" / "p2pmux" / "pairing.toml"
+        pairing_file.write_text(
+            "\n".join(
+                line
+                for line in pairing_file.read_text().splitlines()
+                if not line.startswith("pending_until")
+            )
+            + "\n"
+        )
+        check(
+            "the pairing window is shut, so only the token can let anything in",
+            "pending_until" not in pairing_file.read_text(),
+            "",
+        )
 
         printed = mac("enroll")
         match = TOKEN.search(printed)
@@ -128,45 +164,73 @@ def main() -> int:
             time.sleep(3.0)
         check("the fleet on the Mac lists it", "build-box" in listed, listed.strip()[-300:])
 
-        # The point of a fleet record: it outlives the session that introduced
-        # them. A row that only exists while both are in one session is a member
-        # list, which is the bug this scenario was written after.
-        for name in re.findall(r"^(\S+)\s", mac("ls"), re.MULTILINE):
-            if name not in ("NAME",):
-                mac("kill", name, "--yes")
+        # A fleet record outlives *membership*: the droplet stops being in the
+        # session and keeps its row, as `asleep`. A row that exists only while
+        # both are in one session is a member list, which is the bug this
+        # scenario was written after.
         droplet.reap()
-        time.sleep(4.0)
-        after = mac("machines")
+        time.sleep(6.0)
         check(
-            "and still lists it once every session is gone",
-            "build-box" in after,
-            after.strip()[-300:],
+            "it keeps its row once it leaves the session",
+            "build-box" in fleet_record(pairing_file),
+            pairing_file.read_text()[-200:],
         )
 
         # --- revocation -------------------------------------------------------
+        # Deliberately before the session is torn down: restarting one mints a
+        # new ticket, and a token refused because its session is gone would
+        # prove nothing about revocation.
         revoked = mac("enroll", "--revoke")
         check("`--revoke` withdraws the invitation", "revoked" in revoked, revoked.strip()[-160:])
-        mac("unpair", "build-box")
-        check(
-            "and unpairing takes the machine out of the fleet",
-            "build-box" not in mac("machines"),
-            "",
-        )
 
-        # A machine that presents the withdrawn token now enrols into nothing.
-        # It may still *join* — the ticket is a session invitation and revoking
-        # an enrolment is not revoking that — but it must not be written in.
+        # The same droplet, forgetting everything, coming back under a new name
+        # with the withdrawn token. Its machine id is unchanged, so an
+        # enrolment that wrongly succeeded would *rename* the row it already
+        # has — which makes the check sharper than an absence: the fleet must
+        # still say `build-box` and must never say `intruder`.
         droplet.reset_home()
-        droplet.cli(f"enroll {token} --name build-box --accept-work", timeout=180)
-        time.sleep(8.0)
+        try:
+            # It may well *join*: the ticket is a session invitation, and
+            # withdrawing an enrolment is not withdrawing that. Only the fleet
+            # write is refused, so whether this command succeeds is not the
+            # question — what the Mac's record says afterwards is.
+            droplet.cli(f"enroll {token} --name intruder --accept-work", timeout=180)
+        except RemoteError as error:
+            print(f"  (the refused enrolment exited non-zero: {error})", flush=True)
+        time.sleep(10.0)
         after_revoke = mac("machines")
         check(
             "the withdrawn token enrols nothing",
-            "build-box" not in after_revoke,
+            "intruder" not in fleet_record(pairing_file),
+            pairing_file.read_text()[-240:],
+        )
+        check(
+            "and cannot rename the machine it already enrolled",
+            "build-box" in fleet_record(pairing_file),
+            pairing_file.read_text()[-240:],
+        )
+        # It did *join*, and the fleet list says so in the one place that
+        # cannot be mistaken for ownership. This is the distinction the whole
+        # feature turns on: in your session is not in your fleet.
+        guests = after_revoke.split("IN THIS SESSION, NOT YOURS", 1)
+        check(
+            "and is listed as a guest of the session rather than as a machine",
+            len(guests) == 2 and "intruder" in guests[1],
             after_revoke.strip()[-300:],
         )
 
+        # …and the record survives the session that introduced them ending.
         droplet.reap()
+        for name in re.findall(r"^(\S+)\s", mac("ls"), re.MULTILINE):
+            if name != "NAME":
+                mac("kill", name, "--yes")
+        time.sleep(4.0)
+        after = mac("machines")
+        check(
+            "the fleet is still there once every session is gone",
+            "build-box" in after,
+            after.strip()[-300:],
+        )
 
     print()
     failed = [label for label, passed, _ in checks if not passed]
