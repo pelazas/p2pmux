@@ -374,10 +374,17 @@ impl MultiPaneTui {
             crate::tui::geometry::grid_for_pane(self.geometry(area).content);
         self.set_home_open(false, "new_remote_terminal");
         self.clear_zoom();
-        if machine.this_machine {
-            // Asking this machine for a terminal on this machine is a new tab.
-            // Routing it through the coordinator and back would work and would
-            // be slower for no reason.
+        if machine.this_machine && command.is_empty() {
+            // Asking this machine for a bare terminal on this machine is a new
+            // tab. Routing it through the coordinator and back would work and
+            // would be slower for no reason.
+            //
+            // A *command* is the exception, and it has to be: `CreateTab`
+            // carries no command, so taking this shortcut with one dropped it
+            // and left the user in an empty shell where a chat was promised.
+            // `CreateTabOn` addressed here costs nothing — the pane is still
+            // hosted locally — and it is the only intent that carries both the
+            // command and the title that lets a second Enter find this pane.
             return vec![UiIntent::CreateTab {
                 grid_rows,
                 grid_cols,
@@ -1671,6 +1678,32 @@ mod tests {
                         && name == "droplet"
             ),
             "{intents:?}"
+        );
+    }
+
+    /// The same promise, for the machine you are sitting at. A single-machine
+    /// session is the common case, and there the chat command must still run.
+    #[test]
+    fn enter_on_a_bot_on_this_machine_runs_its_chat_command_too() {
+        let mut tui = tui_with_a_bot_on_a_droplet("claude");
+        // Move the bot from the droplet onto the machine running the client.
+        let mut rows = tui.agent_rows.clone();
+        for row in &mut rows {
+            if row.pane_id == 0 {
+                row.host = String::from("laptop");
+            }
+        }
+        tui.set_agent_rows(rows);
+        select_the_bot(&mut tui);
+
+        let intents = tui.open_home_selection();
+
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [UiIntent::CreateTabOn { command, .. }] if command == &[String::from("claude")]
+            ),
+            "a local bot's chat command must reach the new pane, not be dropped: {intents:?}"
         );
     }
 
