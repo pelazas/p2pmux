@@ -180,6 +180,32 @@ impl SharedLayoutRuntime {
     ///
     /// Re-announced every time rather than once, because a machine that was
     /// asleep when a session started has to hear about it when it wakes. The
+    /// Say, at most once per process, that this box belongs to a fleet.
+    ///
+    /// The member kind is decided in `node::run_background` before anything
+    /// joins, from a pairing record that on this path did not exist yet. A box
+    /// paired afterwards announced `Unspecified` for the whole life of that
+    /// node, and `pairing::pin_into` refuses to write a peer into a fleet
+    /// unless it has said outright that it is a machine — so the machine you
+    /// just paired never made it into anybody's record, and its row lasted
+    /// exactly as long as the session did.
+    ///
+    /// Latched rather than repeated: the declaration is idempotent at both
+    /// ends, but a claim resent every membership tick is queue traffic for a
+    /// fact that cannot change back.
+    fn announce_fleet_membership(&mut self) {
+        if self.announced_fleet_membership {
+            return;
+        }
+        crate::session::set_local_member_kind(crate::layout::MemberKind::Machine);
+        if self
+            .control
+            .try_declare_kind(crate::layout::MemberKind::Machine)
+        {
+            self.announced_fleet_membership = true;
+        }
+    }
+
     /// receiving side makes that cheap: it already knows which sessions it is
     /// in, and an invitation to one of them does nothing.
     pub(crate) fn exchange_fleet_invites(&mut self) {
@@ -188,6 +214,12 @@ impl SharedLayoutRuntime {
         if !crate::pairing::load_or_empty().can_rejoin() {
             return;
         }
+        // Paired, so this box belongs to a fleet — which it may well have said
+        // the opposite of, because the claim is made once at node start and
+        // `p2pmux pair` while a session is open is the ordinary way to add a
+        // machine. Saying it again here is free once it is already recorded,
+        // and until it is said nobody may write this machine into a fleet.
+        self.announce_fleet_membership();
         for (from_peer_id, ticket) in self.control.take_fleet_invites() {
             self.consider_fleet_invite(&from_peer_id, &ticket);
         }

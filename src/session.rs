@@ -596,6 +596,29 @@ impl LayoutCoordinator {
         self.membership_change(peer_id, MembershipEvent::Joined, invalidated)
     }
 
+    /// Adopt what a member has just said it is.
+    ///
+    /// `Ok(None)` when nothing moved, which is the common answer: a member
+    /// re-announcing something it has already said must not cost a revision.
+    pub fn declare_member_kind(
+        &mut self,
+        authenticated_peer_id: &[u8],
+        kind: crate::layout::MemberKind,
+    ) -> Result<Option<MembershipChange>, CoordinatorError> {
+        let Some(invalidated) =
+            self.state
+                .update_member_kind(self.state.revision(), authenticated_peer_id, kind)?
+        else {
+            return Ok(None);
+        };
+        self.membership_change(
+            authenticated_peer_id.to_vec(),
+            MembershipEvent::EndpointChanged,
+            invalidated,
+        )
+        .map(Some)
+    }
+
     pub fn update_member_endpoint(
         &mut self,
         authenticated_peer_id: &[u8],
@@ -2619,6 +2642,8 @@ enum LayoutClientMessage {
     AgentRoster(AgentRoster),
     Presence(Presence),
     FleetInvite(crate::protocol::FleetInvite),
+    /// This member has learnt what it is. See `protocol::DeclareKind`.
+    DeclareKind(crate::protocol::DeclareKind),
 }
 
 const TARGETED_CONTROL_QUEUE_CAPACITY: usize = 16;
@@ -2880,6 +2905,21 @@ impl SharedLayoutMember {
                 crate::protocol::FleetInvite {
                     ticket,
                     from_peer_id: Vec::new(),
+                },
+            ))
+            .map_err(layout_queue_error)
+    }
+
+    /// Tell the coordinator this member has joined a fleet since it announced
+    /// itself. See [`crate::protocol::DeclareKind`].
+    pub fn try_declare_kind(
+        &self,
+        kind: crate::layout::MemberKind,
+    ) -> Result<(), LayoutControlQueueError> {
+        self.outbound
+            .try_send(LayoutClientMessage::DeclareKind(
+                crate::protocol::DeclareKind {
+                    kind: wire_member_kind(kind) as i32,
                 },
             ))
             .map_err(layout_queue_error)
@@ -3339,6 +3379,34 @@ impl SharedLayoutHost {
             .map_err(|_| SessionError::PeerTask)?;
         coordinator.set_locked(locked);
         Ok(coordinator.is_locked())
+    }
+
+    /// Record that this coordinator has joined a fleet since it opened the
+    /// session, and tell the members so.
+    ///
+    /// The counterpart of a member's `DeclareKind`, for the machine that has no
+    /// coordinator to send one to. Returns whether anything moved, so a caller
+    /// on a timer can say this every tick and cost nothing when it is already
+    /// true.
+    pub fn declare_local_kind(&self, kind: LayoutMemberKind) -> Result<bool, SessionError> {
+        let peer_id = self.host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let change = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .declare_member_kind(&peer_id, kind)
+            .map_err(|_| SessionError::InvalidPostWelcome)?;
+        let Some(change) = change else {
+            return Ok(false);
+        };
+        if let Some(state) = change.commit.state.as_ref() {
+            self.pane_server.replace_roster_from_layout(state)?;
+        }
+        self.broadcast_commit(change.commit);
+        if let Some(reject) = change.invalidated_reservation {
+            self.send_reject(reject);
+        }
+        Ok(true)
     }
 
     pub fn is_session_locked(&self) -> Result<bool, SessionError> {
@@ -4210,6 +4278,7 @@ async fn layout_member_writer_task(
             LayoutClientMessage::AgentRoster(roster) => envelope::Body::AgentRoster(roster),
             LayoutClientMessage::Presence(presence) => envelope::Body::Presence(presence),
             LayoutClientMessage::FleetInvite(invite) => envelope::Body::FleetInvite(invite),
+            LayoutClientMessage::DeclareKind(declared) => envelope::Body::DeclareKind(declared),
         };
         if writer
             .write_next(&coordinator_envelope(&peer_id, body))
@@ -4378,6 +4447,30 @@ async fn layout_host_reader_task(
                     &peer_id,
                     coordinator_envelope(&coordinator_peer_id, envelope::Body::FleetInvite(invite)),
                 );
+            }
+            Some(envelope::Body::DeclareKind(declared)) => {
+                // The peer QUIC proved, never the id in the frame.
+                let change = match coordinator.lock() {
+                    Ok(mut coordinator) => {
+                        coordinator.declare_member_kind(&peer_id, model_member_kind(declared.kind))
+                    }
+                    Err(_) => break,
+                };
+                if let Ok(Some(change)) = change {
+                    if let Some(state) = change.commit.state.as_ref() {
+                        let _ = pane_server.replace_roster_from_layout(state);
+                    }
+                    broadcast_envelope(
+                        &peers,
+                        coordinator_envelope(
+                            &coordinator_peer_id,
+                            envelope::Body::LayoutCommit(change.commit),
+                        ),
+                    );
+                    if let Some(reject) = change.invalidated_reservation {
+                        deliver_reject(&peers, &coordinator_peer_id, &own_rejects, reject);
+                    }
+                }
             }
             Some(envelope::Body::AgentRoster(roster)) => {
                 let accepted = match coordinator.lock() {

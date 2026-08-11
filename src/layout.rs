@@ -594,6 +594,43 @@ impl SessionState {
         Ok(self.invalidate_reservation())
     }
 
+    /// Adopt a member's newly declared kind, and say whether anything moved.
+    ///
+    /// Only ever a *strengthening*: `Unspecified` may become `Machine` or
+    /// `Person`, and neither of those may become anything else. A member that
+    /// has said what it is has said it, and letting the claim be taken back
+    /// would make "is this one of my machines" a question whose answer depends
+    /// on when you asked.
+    ///
+    /// This exists because the claim is made once, at node start, from a
+    /// pairing record that is very often written a minute later — `p2pmux pair`
+    /// while a session is already open is the ordinary way to add a machine.
+    /// Without a way to say so afterwards, a box that has just joined a fleet
+    /// goes on announcing that it belongs to none until it is restarted, and
+    /// `pin_peers` refuses to write it into anybody's fleet the whole time.
+    /// `Ok(None)` means the claim was refused or was already there and nothing
+    /// moved, which the caller must not turn into a commit: a revision bump per
+    /// re-announcement would be a burst of layout traffic caused by nothing.
+    pub fn update_member_kind(
+        &mut self,
+        base_revision: u64,
+        peer_id: &[u8],
+        kind: MemberKind,
+    ) -> Result<Option<Option<InvalidatedReservation>>, LayoutError> {
+        self.check_mutation(base_revision)?;
+        let member = self
+            .members
+            .iter_mut()
+            .find(|member| member.peer_id == peer_id)
+            .ok_or(LayoutError::NotMember)?;
+        if kind == MemberKind::Unspecified || member.kind != MemberKind::Unspecified {
+            return Ok(None);
+        }
+        member.kind = kind;
+        self.advance_revision();
+        Ok(Some(self.invalidate_reservation()))
+    }
+
     pub fn update_member_endpoint(
         &mut self,
         base_revision: u64,
@@ -1579,6 +1616,79 @@ mod tests {
         assert_eq!(
             normalize_title("line\nbreak"),
             Err(LayoutError::InvalidTitle)
+        );
+    }
+
+    /// A box paired while a session is already open — the ordinary way to add
+    /// a machine — announced `Unspecified` for the life of its node, and
+    /// `pin_peers` will not write a peer that has not said it is a machine into
+    /// any fleet. So the machine you just paired never made it into a record
+    /// and its row lasted exactly as long as the session did.
+    #[test]
+    fn a_member_may_say_what_it_is_once_and_never_take_it_back() {
+        let mut state = state();
+        state
+            .add_member(state.revision(), HOST_B.to_vec(), b"endpoint-b".to_vec())
+            .unwrap();
+        let member = |state: &SessionState| {
+            state
+                .members()
+                .iter()
+                .find(|member| member.peer_id == HOST_B)
+                .expect("member")
+                .kind
+        };
+        assert_eq!(member(&state), MemberKind::Unspecified);
+
+        let before = state.revision();
+        assert!(
+            state
+                .update_member_kind(state.revision(), HOST_B, MemberKind::Machine)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(member(&state), MemberKind::Machine);
+        assert!(state.revision() > before, "the fleet has to hear about it");
+
+        // Said twice is said once: a claim resent on a timer must not cost a
+        // revision, or a quiet session would commit forever.
+        let settled = state.revision();
+        assert!(
+            state
+                .update_member_kind(state.revision(), HOST_B, MemberKind::Machine)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.revision(), settled);
+
+        // And never taken back. "Is this one of my machines" must not have an
+        // answer that depends on when it was asked.
+        assert!(
+            state
+                .update_member_kind(state.revision(), HOST_B, MemberKind::Person)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(member(&state), MemberKind::Machine);
+        assert_eq!(state.revision(), settled);
+
+        // `Unspecified` is what a peer says when it is claiming nothing, so it
+        // is never a declaration.
+        state
+            .update_member_kind(state.revision(), HOST_A, MemberKind::Unspecified)
+            .unwrap();
+        assert_eq!(
+            state
+                .members()
+                .iter()
+                .find(|member| member.peer_id == HOST_A)
+                .expect("coordinator")
+                .kind,
+            MemberKind::Unspecified
+        );
+        assert_eq!(
+            state.update_member_kind(state.revision(), b"stranger", MemberKind::Machine),
+            Err(LayoutError::NotMember)
         );
     }
 

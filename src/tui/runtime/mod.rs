@@ -90,6 +90,9 @@ pub struct SharedLayoutRuntime {
     /// node this map has never heard of, which happens when a session starts
     /// and then not again.
     pub(in crate::tui) session_names: HashMap<u32, String>,
+    /// Whether this node has told the session it belongs to a fleet. See
+    /// `announce_fleet_membership`.
+    pub(in crate::tui) announced_fleet_membership: bool,
     pub(in crate::tui) next_agent_roster_heartbeat: Instant,
     pub(in crate::tui) last_agent_overlay_animation: Instant,
     pub(in crate::tui) presence_generation: u64,
@@ -253,6 +256,7 @@ impl SharedLayoutRuntime {
             last_local_agent_entries: Vec::new(),
             loose_agents: Vec::new(),
             session_names: HashMap::new(),
+            announced_fleet_membership: false,
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
             presence_generation: 0,

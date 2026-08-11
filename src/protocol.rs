@@ -180,6 +180,8 @@ pub mod envelope {
         PresenceRoster(super::PresenceRoster),
         #[prost(message, tag = "29")]
         FleetInvite(super::FleetInvite),
+        #[prost(message, tag = "30")]
+        DeclareKind(super::DeclareKind),
     }
 }
 
@@ -194,6 +196,25 @@ pub mod envelope {
 /// decides whether to accept it by asking its own pairing record whether the
 /// sender is one of its own — the sender's peer id is authenticated by the
 /// transport, so a guest in the session cannot pretend to be your laptop.
+/// A member telling the coordinator what it turned out to be.
+///
+/// The kind is decided at node start, from a pairing record that is very often
+/// written a minute later — `p2pmux pair` while a session is already open is
+/// the ordinary way to add a machine. Without this the box goes on announcing
+/// that it belongs to no fleet until it is restarted, and `pin_peers` refuses
+/// to write a machine that has not said it is one into anybody's fleet.
+///
+/// Not authority about *whose* fleet, exactly like the kind on a `Join`: it
+/// says only "I belong to some fleet", and every peer answers the ownership
+/// question against its own pairing record. The coordinator takes it only as a
+/// strengthening of `Unspecified` — see `LayoutState::update_member_kind` —
+/// so it cannot be used to disown a member or to relabel one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeclareKind {
+    #[prost(enumeration = "MemberKind", tag = "1")]
+    pub kind: i32,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FleetInvite {
     /// The session to join, as a printable ticket.
@@ -1275,6 +1296,10 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
                 return Err(ProtocolError::InvalidLayout("fleet_invite.ticket"));
             }
         }
+        // Nothing to bound: one enum field, and an unknown value is folded to
+        // `Unspecified` by the reader rather than tearing the connection down —
+        // the same rule agent states follow, and for the same reason.
+        envelope::Body::DeclareKind(_) => {}
     }
 
     Ok(())

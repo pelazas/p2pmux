@@ -89,6 +89,18 @@ impl SharedControl {
         }
     }
 
+    /// Say that this box has joined a fleet since it announced itself.
+    ///
+    /// A coordinator writes its own member entry; a member asks the
+    /// coordinator to. Both are no-ops once the claim is already recorded, so
+    /// this is safe to call on a timer.
+    pub(in crate::tui) fn try_declare_kind(&self, kind: crate::layout::MemberKind) -> bool {
+        match self {
+            Self::Host(host) => host.declare_local_kind(kind).unwrap_or(false),
+            Self::Member(member) => member.try_declare_kind(kind).is_ok(),
+        }
+    }
+
     /// Answers to this coordinator's own requests that a member refused.
     ///
     /// Empty on a member, which is sent its rejections down the control stream
