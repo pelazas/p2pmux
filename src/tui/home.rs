@@ -1190,21 +1190,23 @@ mod tests {
         );
     }
 
-    /// Pane 1 is where a fresh client's focus sits, so the fixtures below put
-    /// something unblocked there. Otherwise every count would be measuring the
-    /// answered-summons rule as well as whatever it meant to measure.
     #[test]
     fn the_header_count_only_counts_rows_a_hook_reported_as_blocked() {
         let tui = home_tui(&[
-            ("laptop", "codex", AgentRosterState::Working),
             ("laptop", "claude", AgentRosterState::Pending),
             ("droplet", "codex", AgentRosterState::Pending),
             // Detection knows this process is alive and nothing more. It must
             // never reach the count that a notification will one day carry.
             ("desktop", "cursor", AgentRosterState::Unknown),
+            ("laptop", "codex", AgentRosterState::Working),
         ]);
 
-        assert_eq!(tui.home_needs_you_count(), 2);
+        assert_eq!(
+            tui.home_needs_you_count(),
+            2,
+            "pane 1 holds a fresh client's focus and its agent is blocked, and \
+             a pane nobody has gone to since is still a summons"
+        );
         assert!(!tui.home_all_unwired());
     }
 
@@ -1215,15 +1217,14 @@ mod tests {
     #[test]
     fn going_to_a_blocked_agents_pane_answers_its_summons() {
         let mut tui = home_tui(&[
-            ("laptop", "codex", AgentRosterState::Working),
             ("laptop", "claude", AgentRosterState::Pending),
             ("droplet", "codex", AgentRosterState::Pending),
         ]);
         assert_eq!(tui.home_needs_you_count(), 2);
 
-        assert!(tui.select_pane(2, 2, "test"), "a repaint is owed");
+        assert!(tui.select_pane(1, 1, "test"), "a repaint is owed");
         assert_eq!(tui.home_needs_you_count(), 1);
-        tui.select_pane(3, 3, "test");
+        tui.select_pane(2, 2, "test");
         assert_eq!(tui.home_needs_you_count(), 0);
 
         // Leaving does not bring them back: the questions were seen, and a
@@ -1231,6 +1232,31 @@ mod tests {
         // answer.
         tui.select_pane(1, 1, "test");
         assert_eq!(tui.home_needs_you_count(), 0);
+    }
+
+    /// The case the badge exists for, and the one a "focused panes do not
+    /// count" rule would silently lose: the pane was left focused hours ago,
+    /// nobody is at the desk, and the agent has just blocked.
+    #[test]
+    fn an_agent_that_blocks_in_the_pane_you_left_focused_still_summons() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.select_pane(1, 1, "test");
+        assert_eq!(tui.home_needs_you_count(), 0);
+
+        tui.set_agent_rows(vec![crate::tui::AgentOverlayRow {
+            host: String::from("laptop"),
+            kind: String::from("claude"),
+            state: AgentRosterState::Pending,
+            ..crate::tui::test_support::agent_row(1, 1, 1)
+        }]);
+
+        assert_eq!(
+            tui.home_needs_you_count(),
+            1,
+            "a pane focused before the question was asked is not a human who saw it"
+        );
+        tui.select_pane(1, 1, "test");
+        assert_eq!(tui.home_needs_you_count(), 0, "going back answers it");
     }
 
     /// …but the *next* question does count. Answering one is not muting the

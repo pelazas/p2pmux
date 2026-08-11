@@ -61,16 +61,22 @@ impl MultiPaneTui {
         // Runs even when nothing changed: the agent that stopped needing a
         // human is the common case, and its answered mark has to be dropped so
         // the next question counts.
-        let answered = self.forget_answers_that_are_spent() | self.answer_focused_agent();
-        !unchanged || answered
+        let forgotten = self.forget_answers_that_are_spent();
+        !unchanged || forgotten
     }
 
     /// Mark the focused pane's agent as one whose question has been seen.
     ///
-    /// Only when it is actually asking. Marking a pane that is merely focused
-    /// would mute the question the user has not been asked yet — sit in a pane,
-    /// wait for the agent to block on a permission prompt, and the count would
-    /// never appear.
+    /// Called when focus *moves*, and deliberately not on every roster refresh.
+    /// A pane that merely happens to be focused is not a human: leave an agent
+    /// running in the pane you were last in, walk away, and it blocks — the
+    /// badge has to light up, because "somebody is waiting on you and you have
+    /// not been" is exactly true and is the whole thing the badge is for.
+    /// Suppressing it because a pane was focused an hour ago would lose the one
+    /// case the count exists to catch.
+    ///
+    /// So the summons is answered by *going* there, which is a thing a person
+    /// did.
     pub(in crate::tui) fn answer_focused_agent(&mut self) -> bool {
         let focused = self.focused_pane;
         // `0` is the pane id a row with no pane carries, and there is no
