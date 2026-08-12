@@ -412,53 +412,33 @@ fn run_socket_loop(
                             break;
                         }
                         Ok(Some(ClientMessage::Hello { cols, rows })) => {
-                            if let Ok(generation) = gate.attach() {
-                                node.resize(cols, rows)
-                                    .map_err(|error| io::Error::other(error.to_string()))?;
-                                let mut publish = AttachmentPublishState::default();
-                                match write_message(
-                                    reader.get_mut(),
-                                    &NodeMessage::AttachAccepted { generation },
-                                )
-                                .and_then(|()| {
-                                    write_snapshot(
-                                        reader.get_mut(),
-                                        descriptor,
-                                        node,
-                                        &mut publish,
-                                        Duration::ZERO,
-                                    )
-                                }) {
-                                    Ok(()) => {
-                                        reader
-                                            .get_mut()
-                                            .set_read_timeout(Some(Duration::from_millis(1)))?;
-                                        let writer =
-                                            AttachmentWriter::start(reader.get_mut().try_clone()?)?;
-                                        client = Some(AttachedClient {
-                                            reader,
-                                            generation,
-                                            publish,
-                                            writer,
-                                            close_after_ack: false,
-                                            shutdown_after_ack: false,
-                                        });
-                                        did_work = true;
-                                    }
-                                    Err(error) => {
-                                        eprintln!(
-                                            "p2pmux node: failed to write initial local snapshot: {error}"
-                                        );
-                                        let _ = gate.detach(generation);
-                                    }
-                                }
-                            } else {
+                            let Ok(generation) = gate.attach() else {
                                 let _ = write_message(
                                     reader.get_mut(),
                                     &NodeMessage::AttachRejected {
                                         reason: "already attached".into(),
                                     },
                                 );
+                                continue;
+                            };
+                            match attach_client(reader, generation, cols, rows, descriptor, node) {
+                                Ok(attached) => {
+                                    client = Some(attached);
+                                    did_work = true;
+                                }
+                                // Losing one client is not losing the session.
+                                // Everything this can fail on belongs to the
+                                // connection, not to the node: a peer that
+                                // hung up mid-handshake -- for which macOS
+                                // answers EINVAL to `setsockopt` rather than
+                                // anything about the peer -- or a descriptor
+                                // limit reached while duplicating its socket.
+                                // Ending the socket loop over any of them took
+                                // every pane down with it.
+                                Err(error) => {
+                                    eprintln!("p2pmux node: could not attach that client: {error}");
+                                    let _ = gate.detach(generation);
+                                }
                             }
                         }
                         Ok(None) => {}
@@ -482,7 +462,16 @@ fn run_socket_loop(
                 {
                     continue;
                 }
-                Err(error) => return Err(error),
+                // Stop accepting for this pass rather than ending the session.
+                // The realistic causes are a descriptor limit reached by
+                // something else on the machine, which passes; and a listener
+                // that is genuinely broken costs one line per pass and leaves
+                // the panes and the attached client alive, which is strictly
+                // better than taking them down.
+                Err(error) => {
+                    eprintln!("p2pmux node: could not accept a local connection: {error}");
+                    break;
+                }
             }
         }
         let drain_started = Instant::now();
@@ -865,6 +854,48 @@ struct AttachedClient {
     writer: AttachmentWriter,
     close_after_ack: bool,
     shutdown_after_ack: bool,
+}
+
+/// Take a client that said hello onto the single attachment.
+///
+/// Separate from the socket loop so that it can fail without the loop failing:
+/// every step here is about one connection, and the loop has a session's panes
+/// behind it. The connection is dropped on the way out of the error, which is
+/// what tells a client that is still there to stop waiting.
+fn attach_client(
+    mut reader: BufReader<UnixStream>,
+    generation: u64,
+    cols: u16,
+    rows: u16,
+    descriptor: &SessionDescriptor,
+    node: &mut SharedLayoutNode,
+) -> io::Result<AttachedClient> {
+    node.resize(cols, rows)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut publish = AttachmentPublishState::default();
+    write_message(
+        reader.get_mut(),
+        &NodeMessage::AttachAccepted { generation },
+    )?;
+    write_snapshot(
+        reader.get_mut(),
+        descriptor,
+        node,
+        &mut publish,
+        Duration::ZERO,
+    )?;
+    reader
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(1)))?;
+    let writer = AttachmentWriter::start(reader.get_mut().try_clone()?)?;
+    Ok(AttachedClient {
+        reader,
+        generation,
+        publish,
+        writer,
+        close_after_ack: false,
+        shutdown_after_ack: false,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1695,6 +1726,41 @@ mod tests {
         drop(live);
 
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The other half of the same rule, where the type system cannot state it.
+    ///
+    /// `configure_accepted` returns an `Option` precisely so that one dead
+    /// connection cannot be `?`-propagated into ending the session. The arms
+    /// that run *after* it — the ones that take a client onto the attachment —
+    /// are ordinary fallible calls, and the loop kept its own escape hatch: a
+    /// `?` on the socket options, on the descriptor duplicated for the writer,
+    /// and a `return Err` for anything `accept` answered that was not already
+    /// named. Each of those is about one connection and none of them is worth
+    /// a session, so the accept loop no longer has a way out.
+    #[test]
+    fn nothing_about_one_connection_leaves_the_accept_loop() {
+        let source = include_str!("node.rs");
+        let loop_body = source
+            .split_once("match listener.accept() {")
+            .expect("the accept loop")
+            .1
+            .split_once("let drain_started = Instant::now();")
+            .expect("the end of the accept loop")
+            .0;
+
+        assert!(
+            !loop_body.contains("?;"),
+            "a per-connection failure can end the socket loop again"
+        );
+        assert!(
+            !loop_body.contains("return Err("),
+            "an accept error can end the socket loop again"
+        );
+        assert!(
+            loop_body.contains("attach_client("),
+            "the hello arm should hand off to the fallible helper"
+        );
     }
 
     /// The shape of every agent hook: write one line, exit immediately.
