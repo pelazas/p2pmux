@@ -439,13 +439,19 @@ impl SessionStore {
     /// open is refused by a node whose backlog is full -- and unlinking a live session's socket
     /// leaves it running with no way in.
     ///
-    /// A socket nobody claims is still given a second chance a moment later. The directory is
-    /// shared by every p2pmux this user runs, so one of these may belong to a node that bound
-    /// its listener a millisecond ago and has not written its record yet.
+    /// A socket nobody claims is still given a second chance a moment later, and then asked
+    /// about of the process table. The directory is shared by every p2pmux this user runs,
+    /// whatever `HOME` each was started with -- so a store in a sandbox `HOME`, which is how
+    /// every test harness and probe script isolates itself, finds sockets it has no record of.
+    /// Some of them belong to the sessions somebody is working in. The last word therefore
+    /// belongs to the nodes themselves, which name the socket they own on their command line.
     fn sweep_dead_sockets(&self, held: &HashSet<PathBuf>) {
         let Ok(entries) = fs::read_dir(&self.socket_dir) else {
             return;
         };
+        // Only paid for by a sweep that has found something to delete, which is rare: one
+        // pass of the process table against a directory that is almost always all live.
+        let mut owned_elsewhere: Option<HashSet<PathBuf>> = None;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("sock") {
@@ -454,11 +460,16 @@ impl SessionStore {
             if held.contains(&path) {
                 continue;
             }
-            if UnixStream::connect(&path).is_err() {
-                std::thread::sleep(SWEEP_RETRY_DELAY);
-                if UnixStream::connect(&path).is_err() {
-                    let _ = fs::remove_file(&path);
-                }
+            if UnixStream::connect(&path).is_ok() {
+                continue;
+            }
+            std::thread::sleep(SWEEP_RETRY_DELAY);
+            if UnixStream::connect(&path).is_ok() {
+                continue;
+            }
+            let owned = owned_elsewhere.get_or_insert_with(crate::agent_detect::node_socket_paths);
+            if !owned.contains(&path) {
+                let _ = fs::remove_file(&path);
             }
         }
     }

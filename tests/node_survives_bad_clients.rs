@@ -22,7 +22,7 @@ use p2pmux::{
     client,
     local_ipc::{ClientMessage, NodeMessage},
     node::{NodeBootstrap, NodeBootstrapKind, write_bootstrap},
-    session_store::{SessionDescriptor, SessionRole, generate_id},
+    session_store::{SessionDescriptor, SessionRole, SessionStore, generate_id},
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,8 +52,8 @@ impl Fixture {
     /// The path stays short because a unix socket address has to: `sockaddr_un`
     /// is 104 bytes on macOS, and a temp directory under the target directory
     /// would not fit.
-    fn start() -> Self {
-        let root = PathBuf::from(format!("/tmp/p2pmux-bad-{}", std::process::id()));
+    fn start(name: &str) -> Self {
+        let root = PathBuf::from(format!("/tmp/p2pmux-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
         let socket = root.join("n.sock");
@@ -111,7 +111,7 @@ impl Fixture {
 
 #[test]
 fn a_session_outlives_every_kind_of_bad_local_client() {
-    let mut fixture = Fixture::start();
+    let mut fixture = Fixture::start("rude");
 
     // The client the user is sitting in front of.
     let (mut stream, mut reader, _) = attach(&fixture.socket);
@@ -177,6 +177,51 @@ fn a_session_outlives_every_kind_of_bad_local_client() {
     );
     receive_until_screens(&mut reader);
     assert!(fixture.running());
+}
+
+/// The shape that ends sessions on a developer's machine: a p2pmux started with
+/// a sandbox `HOME` -- every e2e scenario, every probe script -- sweeping the
+/// socket directory, which `HOME` does not move. It has no record of the
+/// session somebody is working in, and the socket refuses its connection
+/// because the node's backlog is full, so it used to unlink it and leave a
+/// running node nobody could reach.
+#[test]
+fn a_store_in_another_home_does_not_sweep_a_live_nodes_socket() {
+    let mut fixture = Fixture::start("sweep");
+    let (_stream, mut reader, _) = attach(&fixture.socket);
+    receive_until_snapshot(&mut reader);
+
+    // What the sweep falls back on for a socket that answers nothing and that no
+    // record it can see claims. Nothing else can tell it this socket belongs to a
+    // session somebody is working in: the record is in another `HOME`, and a node
+    // whose backlog is full refuses connections exactly as a dead one does.
+    // Asserted against a node that is genuinely running, since reading a live
+    // process's command line is the half a unit test cannot fake.
+    assert!(
+        p2pmux::agent_detect::node_socket_paths().contains(&fixture.socket),
+        "a running node's socket was not traced back to it"
+    );
+
+    // A store that has never heard of this session, pointed at the directory
+    // every p2pmux on the machine shares.
+    let elsewhere = SessionStore::at(
+        fixture.root.join("other-home"),
+        fixture
+            .socket
+            .parent()
+            .expect("socket directory")
+            .to_owned(),
+    );
+    assert!(
+        elsewhere.list_live().unwrap().is_empty(),
+        "the sandbox store should know of no sessions"
+    );
+
+    assert!(
+        fixture.socket.exists(),
+        "a live node's socket was swept by a store in another HOME"
+    );
+    assert!(fixture.running(), "and its node is still running");
 }
 
 fn attach(socket: &std::path::Path) -> (UnixStream, BufReader<UnixStream>, u64) {
