@@ -929,7 +929,10 @@ pub fn run_on(
             .and_then(|store| store.remove(&descriptor.id));
         println!("Killed {}", descriptor.name);
     } else if node_ended {
-        println!("p2pmux node ended");
+        match node_exit_reason(descriptor) {
+            Some(reason) => println!("p2pmux node ended: {reason}"),
+            None => println!("p2pmux node ended"),
+        }
     } else {
         println!(
             "Detached. Resume: p2pmux --resume  |  Attach: p2pmux attach {}  |  Kill: p2pmux kill {}",
@@ -937,6 +940,32 @@ pub fn run_on(
         );
     }
     Ok(())
+}
+
+/// What the node said on its way out, if it left anything.
+///
+/// Two places, because a node ends in two ways. One returns an error, which it
+/// writes beside its socket -- the same file `launch_background_node` reads
+/// while it is still waiting for a startup that never came. The other is a
+/// panic, which returns nothing and writes only to stderr; that is why the node
+/// is given a log rather than `/dev/null`, and why the last line of it is worth
+/// reading here.
+///
+/// A session that ends under someone working in it is the case this serves. All
+/// they had was `p2pmux node ended`, which names the event and nothing about it.
+fn node_exit_reason(descriptor: &SessionDescriptor) -> Option<String> {
+    let reported = descriptor.socket_path.with_extension("error");
+    if let Ok(message) = std::fs::read_to_string(&reported) {
+        let message = message.trim().to_owned();
+        if !message.is_empty() {
+            let _ = std::fs::remove_file(&reported);
+            return Some(message);
+        }
+    }
+    let log = descriptor.socket_path.with_extension("log");
+    let text = std::fs::read_to_string(&log).ok()?;
+    let last = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(format!("{}\n  its log: {}", last.trim(), log.display()))
 }
 
 fn refresh_tui_timers(
@@ -1994,6 +2023,50 @@ mod tests {
         assert!(tui.modal_open());
         assert!(!should_forward_paste(&tui, b"host"));
         assert!(!tui.scroll_mouse_pane(10, 2, area, 10, true));
+    }
+
+    /// What somebody dropped back to their shell mid-session gets to read.
+    #[test]
+    fn a_node_that_left_a_reason_is_quoted_rather_than_summarised() {
+        let root = std::path::PathBuf::from(format!("/tmp/p2pmux-why-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let socket = root.join("n.sock");
+        let descriptor = crate::session_store::SessionDescriptor::new(
+            crate::session_store::generate_id().expect("id"),
+            "lisbon".into(),
+            socket.clone(),
+            42,
+            crate::session_store::SessionRole::Coordinator,
+        );
+
+        // A node that ended on its own says nothing it was not asked to say.
+        assert_eq!(node_exit_reason(&descriptor), None);
+
+        // An error on the way out is reported verbatim, and consumed: it
+        // describes one death, and reading it twice would misattribute it.
+        std::fs::write(root.join("n.error"), "the coordinator refused this build\n")
+            .expect("error file");
+        assert_eq!(
+            node_exit_reason(&descriptor).as_deref(),
+            Some("the coordinator refused this build")
+        );
+        assert_eq!(node_exit_reason(&descriptor), None);
+
+        // A panic returns no error at all, and is only ever in the log.
+        std::fs::write(
+            root.join("n.log"),
+            "p2pmux node: slow drain\nthread 'main' panicked at src/node.rs:1: assertion failed\n",
+        )
+        .expect("log file");
+        let reason = node_exit_reason(&descriptor).expect("the log's last word");
+        assert!(reason.starts_with("thread 'main' panicked"), "{reason}");
+        assert!(
+            reason.contains("n.log"),
+            "the log is worth naming: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
