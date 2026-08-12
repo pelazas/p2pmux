@@ -225,6 +225,12 @@ impl SessionDescriptor {
 pub struct SessionStore {
     sessions_dir: PathBuf,
     socket_dir: PathBuf,
+    /// How this store asks whether a recorded node is still running.
+    ///
+    /// A field rather than a direct call so a test can describe a live node
+    /// without having to start one: the real answer comes from the process
+    /// table, which a test cannot fabricate.
+    node_alive: fn(u32) -> bool,
 }
 
 impl SessionStore {
@@ -252,6 +258,7 @@ impl SessionStore {
         Self {
             sessions_dir,
             socket_dir,
+            node_alive: crate::agent_detect::node_process_is_alive,
         }
     }
 
@@ -354,9 +361,17 @@ impl SessionStore {
         }
     }
 
-    /// Returns only connectable descriptors. A refused connection is the sole condition under
-    /// which a finder record is removed, avoiding accidental deletion of a node that is merely
-    /// starting -- or merely busy.
+    /// Returns the sessions that still have a node. A record is removed only when the socket
+    /// refuses a connection *and* the process that wrote the record is gone, avoiding accidental
+    /// deletion of a node that is merely starting -- or merely busy.
+    ///
+    /// The second half of that test is not belt and braces. A unix socket refuses connections
+    /// once its listener's backlog is full, exactly as it does when the listener has gone: on
+    /// macOS the 129th connection to a live, bound socket is answered `ECONNREFUSED`. A node
+    /// that is not accepting for a moment -- a long drain, a machine under a build -- therefore
+    /// looked dead to every `p2pmux ls`, `attach`, `ticket`, `kill` and `--resume` on the
+    /// machine, each of which would then delete the only record of a running session and unlink
+    /// the socket it was still listening on. The operating system knows the difference.
     ///
     /// A node that accepts the connection but does not answer within [`PROBE_ACK_TIMEOUT`] is
     /// still listed and, above all, still kept: it is alive and loaded, and deleting its record
@@ -383,6 +398,13 @@ impl SessionStore {
             match self.read(id) {
                 Ok(descriptor) => match probe(&descriptor.socket_path) {
                     Liveness::Acked | Liveness::Listening => sessions.push(descriptor),
+                    // Refused, which the process table gets the last word on.
+                    // Still listed when the node is alive: the session exists,
+                    // and the next connection -- once the backlog drains -- will
+                    // reach it.
+                    Liveness::Gone if (self.node_alive)(descriptor.node_pid) => {
+                        sessions.push(descriptor)
+                    }
                     Liveness::Gone => {
                         let _ = fs::remove_file(&descriptor.socket_path);
                         let _ = fs::remove_file(path);
@@ -393,7 +415,11 @@ impl SessionStore {
                 }
             }
         }
-        self.sweep_dead_sockets();
+        let held = sessions
+            .iter()
+            .map(|session| session.socket_path.clone())
+            .collect::<HashSet<_>>();
+        self.sweep_dead_sockets(&held);
         sessions.sort_by_key(|session| session.created_at);
         Ok(sessions)
     }
@@ -407,7 +433,16 @@ impl SessionStore {
     /// Failure to connect is the test, not absence of a descriptor: `run_background` binds
     /// the listener before it writes the record, so a session that is still starting up has
     /// a live socket and no record yet, and must not be swept.
-    fn sweep_dead_sockets(&self) {
+    ///
+    /// `held` names the sockets [`Self::list_live`] just accounted for, whose nodes are known
+    /// to be running. They are skipped rather than re-tested, because the connection this would
+    /// open is refused by a node whose backlog is full -- and unlinking a live session's socket
+    /// leaves it running with no way in.
+    ///
+    /// A socket nobody claims is still given a second chance a moment later. The directory is
+    /// shared by every p2pmux this user runs, so one of these may belong to a node that bound
+    /// its listener a millisecond ago and has not written its record yet.
+    fn sweep_dead_sockets(&self, held: &HashSet<PathBuf>) {
         let Ok(entries) = fs::read_dir(&self.socket_dir) else {
             return;
         };
@@ -416,8 +451,14 @@ impl SessionStore {
             if path.extension().and_then(|value| value.to_str()) != Some("sock") {
                 continue;
             }
+            if held.contains(&path) {
+                continue;
+            }
             if UnixStream::connect(&path).is_err() {
-                let _ = fs::remove_file(&path);
+                std::thread::sleep(SWEEP_RETRY_DELAY);
+                if UnixStream::connect(&path).is_err() {
+                    let _ = fs::remove_file(&path);
+                }
             }
         }
     }
@@ -536,11 +577,14 @@ fn now_secs() -> u64 {
 enum Liveness {
     /// The node answered the probe. Live, beyond doubt.
     Acked,
-    /// The connection was accepted but no ack arrived in time. A unix socket refuses
-    /// connections once its listener is gone, so something is still holding this one --
-    /// it is a busy node, not a dead one.
+    /// The connection was accepted but no ack arrived in time. Something is holding this
+    /// socket open -- it is a busy node, not a dead one.
     Listening,
-    /// Nobody is on the other end: the socket is missing, or connecting was refused.
+    /// The socket is missing, or connecting was refused.
+    ///
+    /// Refused is *not* the same as gone, whatever this name suggests: a listener whose
+    /// backlog is full refuses connections too. Callers settle it with the process table
+    /// rather than treating this as a verdict -- see [`SessionStore::list_live`].
     Gone,
 }
 
@@ -549,6 +593,13 @@ enum Liveness {
 /// Short on purpose: `p2pmux ls` waits this out once per session, and missing it is no
 /// longer expensive now that only [`Liveness::Gone`] deletes anything.
 const PROBE_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long an unclaimed socket is left alone before a second connection decides it.
+///
+/// Only ever paid for a socket about to be deleted, and only for one that no live record
+/// claims. It exists for the node that has bound its listener and not yet written its
+/// record: that gap is microseconds, and this is comfortably longer than it.
+const SWEEP_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 fn probe(path: &Path) -> Liveness {
     let Ok(mut stream) = UnixStream::connect(path) else {
@@ -769,6 +820,73 @@ mod tests {
             unrelated.exists(),
             "non-socket files are not ours to delete"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The bug this file's `list_live` doc describes, in one test: a node that
+    /// is alive but not accepting -- a full backlog answers `ECONNREFUSED`
+    /// exactly as a dead listener does -- must keep both its record and its
+    /// socket, or every `p2pmux ls` on the machine strands a running session.
+    #[test]
+    fn a_node_that_is_running_survives_a_refused_connection() {
+        let root = PathBuf::from(format!("/tmp/p2pmux-alive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut store = SessionStore::at(root.join("s"), root.join("k"));
+        store.node_alive = |_| true;
+
+        let id = generate_id().unwrap();
+        let socket = store.socket_path(&id).unwrap();
+        store
+            .write(&SessionDescriptor::new(
+                id.clone(),
+                "helsinki".into(),
+                socket.clone(),
+                4321,
+                SessionRole::Coordinator,
+            ))
+            .unwrap();
+        // Nothing is listening on it, which is what a refused connection looks
+        // like from the outside whether the node is gone or merely saturated.
+        fs::write(&socket, b"").unwrap();
+
+        let live = store.list_live().unwrap();
+
+        assert_eq!(
+            live.iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["helsinki"],
+            "a running node's session must still be listed"
+        );
+        assert!(store.read(&id).is_ok(), "its record must survive");
+        assert!(socket.exists(), "its socket must survive the sweep");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other half: once the node really is gone, the record goes with it.
+    #[test]
+    fn a_session_whose_node_is_gone_is_still_forgotten() {
+        let root = PathBuf::from(format!("/tmp/p2pmux-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut store = SessionStore::at(root.join("s"), root.join("k"));
+        store.node_alive = |_| false;
+
+        let id = generate_id().unwrap();
+        let socket = store.socket_path(&id).unwrap();
+        store
+            .write(&SessionDescriptor::new(
+                id.clone(),
+                "helsinki".into(),
+                socket.clone(),
+                4321,
+                SessionRole::Coordinator,
+            ))
+            .unwrap();
+        fs::write(&socket, b"").unwrap();
+
+        assert!(store.list_live().unwrap().is_empty());
+        assert!(store.read(&id).is_err(), "the record should be gone");
+        assert!(!socket.exists(), "the socket should have been swept");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -304,6 +304,26 @@ fn is_node_process(process: &ProcessSnapshot) -> bool {
             .any(|argument| argument == NODE_SUBCOMMAND)
 }
 
+/// Whether `pid` is a p2pmux node that is still running.
+///
+/// Asked of the operating system rather than of the node's socket, because a
+/// socket cannot tell the two apart: it answers "connection refused" both when
+/// its listener has gone and when the listener is merely not accepting fast
+/// enough to keep its backlog under the limit. `SessionStore::list_live` needs
+/// the difference before it deletes anything.
+///
+/// The command line is checked, not just the pid's existence, because pids are
+/// reused -- fast, on a machine building software -- and treating whatever now
+/// holds a dead node's pid as that node would keep a stale record forever.
+pub fn node_process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    refreshed(&mut system, pid).is_some_and(|process| is_node_process(&snapshot_of(process)))
+}
+
 /// One process from a sampler snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessSnapshot {
@@ -344,30 +364,35 @@ impl ProcessSampler for SysinfoSampler {
                 .with_cmd(UpdateKind::Always)
                 .with_cwd(UpdateKind::Always),
         );
-        self.system
-            .processes()
-            .values()
-            .map(|process| ProcessSnapshot {
-                pid: process.pid().as_u32(),
-                parent_pid: process.parent().map(|pid| pid.as_u32()),
-                exe_basename: process
-                    .exe()
-                    .and_then(|path| path.file_name())
-                    .unwrap_or(process.name())
-                    .to_string_lossy()
-                    .into_owned(),
-                name: process.name().to_string_lossy().into_owned(),
-                cmdline: process
-                    .cmd()
-                    .iter()
-                    .map(|argument| argument.to_string_lossy().into_owned())
-                    .collect(),
-                start_time: Some(process.start_time()),
-                cwd: process
-                    .cwd()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            })
-            .collect()
+        self.system.processes().values().map(snapshot_of).collect()
+    }
+}
+
+/// One `sysinfo` process in this module's own terms.
+///
+/// `cwd` is whatever the refresh that produced `process` asked for: a caller
+/// that did not ask gets `None`, which is the same thing a process that will
+/// not say gets.
+fn snapshot_of(process: &sysinfo::Process) -> ProcessSnapshot {
+    ProcessSnapshot {
+        pid: process.pid().as_u32(),
+        parent_pid: process.parent().map(|pid| pid.as_u32()),
+        exe_basename: process
+            .exe()
+            .and_then(|path| path.file_name())
+            .unwrap_or(process.name())
+            .to_string_lossy()
+            .into_owned(),
+        name: process.name().to_string_lossy().into_owned(),
+        cmdline: process
+            .cmd()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect(),
+        start_time: Some(process.start_time()),
+        cwd: process
+            .cwd()
+            .map(|path| path.to_string_lossy().into_owned()),
     }
 }
 
@@ -1128,6 +1153,16 @@ mod tests {
         );
         // Nobody has looked a name up yet, which is the caller's job.
         assert!(loose.iter().all(|agent| agent.session.is_empty()));
+    }
+
+    /// What the session store asks before deleting a session's only record.
+    /// Nothing here is a node: not pid 0, and not this test binary -- which is
+    /// the point, since it is a process in this repository with `__node` in
+    /// reach of its command line.
+    #[test]
+    fn nothing_that_is_not_a_node_is_reported_as_one() {
+        assert!(!node_process_is_alive(0));
+        assert!(!node_process_is_alive(std::process::id()));
     }
 
     /// The client is a `p2pmux` process too, and a `cargo test` in this
