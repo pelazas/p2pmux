@@ -304,6 +304,59 @@ fn is_node_process(process: &ProcessSnapshot) -> bool {
             .any(|argument| argument == NODE_SUBCOMMAND)
 }
 
+/// Whether `pid` is a p2pmux node that is still running.
+///
+/// Asked of the operating system rather than of the node's socket, because a
+/// socket cannot tell the two apart: it answers "connection refused" both when
+/// its listener has gone and when the listener is merely not accepting fast
+/// enough to keep its backlog under the limit. `SessionStore::list_live` needs
+/// the difference before it deletes anything.
+///
+/// The command line is checked, not just the pid's existence, because pids are
+/// reused -- fast, on a machine building software -- and treating whatever now
+/// holds a dead node's pid as that node would keep a stale record forever.
+pub fn node_process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    refreshed(&mut system, pid).is_some_and(|process| is_node_process(&snapshot_of(process)))
+}
+
+/// The socket every p2pmux node on this machine is listening on.
+///
+/// Read from the command lines rather than from any session store, because the
+/// store is the one thing that does not answer this question: the socket
+/// directory is shared by every p2pmux this user runs, whatever `HOME` each was
+/// started with, while the records are not. A test harness, a probe script, or
+/// anything else running in a sandbox `HOME` therefore finds sockets it has no
+/// record of -- and used to delete the live ones among them.
+///
+/// A node is launched as `p2pmux __node --bootstrap <id>.bootstrap`, beside the
+/// `<id>.sock` it binds, so its command line names the socket it owns for as
+/// long as it lives.
+pub fn node_socket_paths() -> HashSet<PathBuf> {
+    let mut sampler = SysinfoSampler::default();
+    node_sockets_in(&sample_global_snapshot(&mut sampler))
+}
+
+fn node_sockets_in(processes: &[ProcessSnapshot]) -> HashSet<PathBuf> {
+    processes
+        .iter()
+        .filter(|process| is_node_process(process))
+        .filter_map(|process| socket_of_node(&process.cmdline))
+        .collect()
+}
+
+fn socket_of_node(cmdline: &[String]) -> Option<PathBuf> {
+    let bootstrap = cmdline
+        .iter()
+        .skip_while(|argument| *argument != "--bootstrap")
+        .nth(1)?;
+    Some(PathBuf::from(bootstrap).with_extension("sock"))
+}
+
 /// One process from a sampler snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessSnapshot {
@@ -344,30 +397,35 @@ impl ProcessSampler for SysinfoSampler {
                 .with_cmd(UpdateKind::Always)
                 .with_cwd(UpdateKind::Always),
         );
-        self.system
-            .processes()
-            .values()
-            .map(|process| ProcessSnapshot {
-                pid: process.pid().as_u32(),
-                parent_pid: process.parent().map(|pid| pid.as_u32()),
-                exe_basename: process
-                    .exe()
-                    .and_then(|path| path.file_name())
-                    .unwrap_or(process.name())
-                    .to_string_lossy()
-                    .into_owned(),
-                name: process.name().to_string_lossy().into_owned(),
-                cmdline: process
-                    .cmd()
-                    .iter()
-                    .map(|argument| argument.to_string_lossy().into_owned())
-                    .collect(),
-                start_time: Some(process.start_time()),
-                cwd: process
-                    .cwd()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            })
-            .collect()
+        self.system.processes().values().map(snapshot_of).collect()
+    }
+}
+
+/// One `sysinfo` process in this module's own terms.
+///
+/// `cwd` is whatever the refresh that produced `process` asked for: a caller
+/// that did not ask gets `None`, which is the same thing a process that will
+/// not say gets.
+fn snapshot_of(process: &sysinfo::Process) -> ProcessSnapshot {
+    ProcessSnapshot {
+        pid: process.pid().as_u32(),
+        parent_pid: process.parent().map(|pid| pid.as_u32()),
+        exe_basename: process
+            .exe()
+            .and_then(|path| path.file_name())
+            .unwrap_or(process.name())
+            .to_string_lossy()
+            .into_owned(),
+        name: process.name().to_string_lossy().into_owned(),
+        cmdline: process
+            .cmd()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect(),
+        start_time: Some(process.start_time()),
+        cwd: process
+            .cwd()
+            .map(|path| path.to_string_lossy().into_owned()),
     }
 }
 
@@ -1128,6 +1186,53 @@ mod tests {
         );
         // Nobody has looked a name up yet, which is the caller's job.
         assert!(loose.iter().all(|agent| agent.session.is_empty()));
+    }
+
+    /// A node names the socket it owns on its command line, which is the only
+    /// place to read it from when the record belongs to another `HOME`.
+    #[test]
+    fn every_running_nodes_socket_is_found_whatever_home_recorded_it() {
+        let mut node = process(10, Some(1), "p2pmux", Some(10));
+        node.cmdline = vec![
+            String::from("/opt/homebrew/bin/p2pmux"),
+            String::from("__node"),
+            String::from("--bootstrap"),
+            String::from("/tmp/p2pmux-503/abc.bootstrap"),
+        ];
+        // Not a node: the client in front of the user, and this repository's
+        // own tooling with `__node` on its command line.
+        let mut client = process(20, Some(1), "p2pmux", Some(20));
+        client.cmdline = vec![String::from("p2pmux"), String::from("attach")];
+        let mut grep = process(30, Some(1), "rg", Some(30));
+        grep.cmdline = vec![String::from("rg"), String::from("--bootstrap")];
+
+        let sockets = node_sockets_in(&[node, client, grep]);
+
+        assert_eq!(
+            sockets,
+            HashSet::from([PathBuf::from("/tmp/p2pmux-503/abc.sock")])
+        );
+    }
+
+    /// A node with no `--bootstrap` at all is not a socket to protect, and must
+    /// not be read as one -- `nth(1)` off the end of a command line is `None`.
+    #[test]
+    fn a_node_without_a_bootstrap_argument_names_no_socket() {
+        assert_eq!(socket_of_node(&[String::from("p2pmux")]), None);
+        assert_eq!(
+            socket_of_node(&[String::from("p2pmux"), String::from("--bootstrap")]),
+            None
+        );
+    }
+
+    /// What the session store asks before deleting a session's only record.
+    /// Nothing here is a node: not pid 0, and not this test binary -- which is
+    /// the point, since it is a process in this repository with `__node` in
+    /// reach of its command line.
+    #[test]
+    fn nothing_that_is_not_a_node_is_reported_as_one() {
+        assert!(!node_process_is_alive(0));
+        assert!(!node_process_is_alive(std::process::id()));
     }
 
     /// The client is a `p2pmux` process too, and a `cargo test` in this

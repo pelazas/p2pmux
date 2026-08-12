@@ -404,15 +404,26 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         None => open_home().await,
         Some(Command::Node { bootstrap }) => {
-            // This process has no terminal and its stderr is /dev/null, so a startup
-            // failure would otherwise be invisible and the launcher could only report
-            // that the socket never appeared. Leave the reason where it can find it.
+            // This process has no terminal, so a failure would otherwise be invisible and
+            // the launcher could only report that the socket never appeared. Leave the
+            // reason where it can find it -- and where the client can, long after the
+            // launcher stopped waiting: a node that dies an hour into a session used to
+            // leave nothing at all behind, which made "p2pmux node ended" the whole of
+            // what anybody could know about it.
             let result = match crate::node::read_bootstrap(&bootstrap) {
                 Ok(parsed) => crate::node::run_background(parsed).await,
                 Err(error) => Err(error.into()),
             };
-            if let Err(error) = &result {
-                let _ = std::fs::write(bootstrap.with_extension("error"), error.to_string());
+            match &result {
+                Err(error) => {
+                    let _ = std::fs::write(bootstrap.with_extension("error"), error.to_string());
+                }
+                // Nothing went wrong, so the log is a temporary file nobody will
+                // ever read. A node that panicked runs neither arm and leaves its
+                // log where the client will look.
+                Ok(()) => {
+                    let _ = std::fs::remove_file(bootstrap.with_extension("log"));
+                }
             }
             result
         }
@@ -1476,8 +1487,22 @@ pub(crate) fn launch_background_node(
         .arg("--bootstrap")
         .arg(&bootstrap_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    // Whatever the node has to say about itself, kept for as long as the session
+    // lives and deleted with it. It goes beside the socket rather than into a log
+    // directory because it belongs to this session and to nothing else: the node's
+    // own warnings, and -- the reason this exists -- the panic message of a node
+    // that died under someone who was working in it. `/dev/null` here is what made
+    // a session that ended on its own impossible to explain afterwards.
+    let log_path = descriptor.socket_path.with_extension("log");
+    match std::fs::File::create(&log_path) {
+        Ok(log) => {
+            command.stderr(Stdio::from(log));
+        }
+        Err(_) => {
+            command.stderr(Stdio::null());
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1750,5 +1775,31 @@ mod tests {
             .0;
         assert!(create_arm.contains("launch_background_node("));
         assert!(create_arm.contains("crate::client::run(&descriptor)"));
+    }
+
+    /// The node has no terminal, so whatever it writes to stderr is the only
+    /// account of a session that ended by itself. Sending that to `/dev/null`
+    /// is what left `p2pmux node ended` as the whole of what anyone could know.
+    #[test]
+    fn the_background_node_keeps_a_log_rather_than_discarding_its_stderr() {
+        let source = include_str!("cli.rs");
+        let launcher = source
+            .split_once("pub(crate) fn launch_background_node(")
+            .expect("the launcher")
+            .1
+            .split_once("let deadline = Instant::now()")
+            .expect("the readiness wait")
+            .0;
+
+        assert!(launcher.contains("with_extension(\"log\")"));
+        assert!(launcher.contains("Stdio::from(log)"));
+
+        // And a session that ended the way it was asked to takes its log with
+        // it, so this does not leave a file per session behind.
+        let node_arm = source
+            .split_once("Some(Command::Node { bootstrap }) => {")
+            .expect("the node arm")
+            .1;
+        assert!(node_arm.contains("remove_file(bootstrap.with_extension(\"log\"))"));
     }
 }

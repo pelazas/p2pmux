@@ -142,6 +142,20 @@ Two consequences worth knowing before you need them:
 `P2PMUX_FAILOVER_GRACE_SECS` overrides the five-minute window for a session, which is mostly of
 interest to the end-to-end tests.
 
+### When the session itself ends
+
+A session that stops while you are in it drops you back to your shell with `p2pmux node ended`,
+followed by whatever the node had to say for itself. The node has no terminal of its own, so it
+keeps a log beside its socket — `/tmp/p2pmux-$(id -u)/<id>.log` on macOS, `$XDG_RUNTIME_DIR`
+otherwise — and that is where a longer story is. A session you end yourself takes the log with
+it; one that ended on its own leaves it for you.
+
+Nothing else on the machine can end a session for you. `p2pmux ls`, `attach`, `ticket` and
+`--resume` all read the socket directory, which every p2pmux this user runs shares whatever
+`HOME` started it, and a session that is busy enough to refuse a connection used to look dead to
+them. Liveness is settled with the process table now, so a test harness or a script running in a
+sandbox `HOME` cannot delete a running session's record or unlink its socket.
+
 ## Control
 
 Only one peer controls a pane while they are actively typing. After about thirty seconds without
