@@ -900,10 +900,16 @@ impl PaneAgentTracker {
 
     /// Apply a status pushed by a producer inside the pane.
     ///
-    /// A `Working` push carries its interval start forward from the previous
-    /// `Working` push, so the per-tool-call stream a hooked agent emits shows
-    /// one continuous interval rather than restarting the clock every few
-    /// seconds.
+    /// A push carries its interval start forward while the state is unchanged,
+    /// so the per-tool-call stream a hooked agent emits shows one continuous
+    /// interval rather than restarting the clock every few seconds. A state
+    /// that *has* changed dates from now: that is a new episode, and the
+    /// question the row answers is how long it has been in the state it is in.
+    ///
+    /// Every state gets a clock, not only `Working`. An inbox exists to say
+    /// which agent needs you, and the first thing worth knowing about one that
+    /// does is how long it has been waiting — a `needs you` row with no clock
+    /// cannot be told from one that only just stopped.
     ///
     /// An empty `message` leaves the stored one standing. Not every hook event
     /// carries text — a `PreToolUse` has nothing to say — and blanking the line
@@ -923,13 +929,14 @@ impl PaneAgentTracker {
             .as_ref()
             .filter(|pushed| pushed.kind == kind)
             .map(|pushed| (pushed.state, pushed.working_since_unix_ms, &pushed.message));
-        let working_since_unix_ms = match state {
-            AgentState::Working => previous
-                .filter(|(state, ..)| *state == AgentState::Working)
-                .map(|(_, since, _)| since)
-                .unwrap_or(unix_ms_now),
-            _ => 0,
-        };
+        let working_since_unix_ms = previous
+            .filter(|(previous_state, ..)| *previous_state == state)
+            .map(|(_, since, _)| since)
+            // A stored zero is a clock that never started — a `SystemTime` the
+            // producer could not read. Carrying it forward would leave the row
+            // with no clock for the whole episode, so start one now instead.
+            .filter(|since| *since != 0)
+            .unwrap_or(unix_ms_now);
         let message = if message.is_empty() {
             previous
                 .map(|(.., message)| message.clone())
@@ -1762,7 +1769,9 @@ mod tests {
             5_000
         );
 
-        // Finishing drops the interval; the next turn starts a fresh one.
+        // Finishing ends that interval and starts its own: "done 4s ago" is the
+        // useful reading of a row that has stopped, and the next turn dates
+        // from when that turn began rather than from this one.
         tracker.record_pushed_status(
             AgentKind::Codex,
             "/repo".into(),
@@ -1775,7 +1784,7 @@ mod tests {
             tracker
                 .listed_agent()
                 .map_or(0, |listed| listed.working_since_unix_ms),
-            0
+            9_000
         );
         tracker.record_pushed_status(
             AgentKind::Codex,
@@ -1790,6 +1799,72 @@ mod tests {
                 .listed_agent()
                 .map_or(0, |listed| listed.working_since_unix_ms),
             10_000
+        );
+    }
+
+    /// A question mid-turn is its own episode, and the row has to say how long
+    /// it has been asking. Before this the clock was zeroed for every state but
+    /// `Working`, so the one row an inbox exists to surface — the one waiting on
+    /// you — was the only row that could not tell you how long it had waited.
+    #[test]
+    fn a_pane_agent_waiting_on_you_counts_from_when_it_started_waiting() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Working,
+            String::new(),
+            now,
+            5_000,
+        );
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Pending,
+            "may I run this?".into(),
+            now + Duration::from_secs(2),
+            7_000,
+        );
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            7_000
+        );
+
+        // A second push in the same state does not restart the wait.
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Pending,
+            String::new(),
+            now + Duration::from_secs(9),
+            14_000,
+        );
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            7_000
+        );
+
+        // Answering it starts the new working stretch from the answer, not from
+        // the start of the turn the question interrupted.
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Working,
+            String::new(),
+            now + Duration::from_secs(10),
+            15_000,
+        );
+        assert_eq!(
+            tracker
+                .listed_agent()
+                .map_or(0, |listed| listed.working_since_unix_ms),
+            15_000
         );
     }
 

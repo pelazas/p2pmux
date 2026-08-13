@@ -156,7 +156,13 @@ impl MultiPaneTui {
         newly_unread
     }
 
-    /// Whether any row is spinning, so the draw loop knows to keep repainting.
+    /// Whether any row is spinning or counting, so the draw loop knows to keep
+    /// repainting.
+    ///
+    /// Both, not just the spinner: every state carries a clock now, and a row
+    /// that says how long it has needed you has to be repainted to keep saying
+    /// it. Gated on a clock actually running rather than on the state, so a row
+    /// whose producer never managed to stamp one costs nothing.
     ///
     /// Only while Home is on screen: a spinner nobody can see is a wake-up per
     /// frame for nothing.
@@ -165,7 +171,7 @@ impl MultiPaneTui {
             && self
                 .agent_rows
                 .iter()
-                .any(|row| row.state == AgentRosterState::Working)
+                .any(|row| row.state == AgentRosterState::Working || row.working_since_unix_ms != 0)
     }
 
     pub(crate) fn expire_home_toggle(&mut self, now: Instant) -> bool {
@@ -189,6 +195,33 @@ mod tests {
             test_support::{agent_row, layout},
         },
     };
+
+    /// A row counting how long it has needed you has to be repainted to keep
+    /// counting. Gating the repaint on `Working` alone froze that clock at the
+    /// second the agent stopped, which is the one second it is least useful at.
+    #[test]
+    fn a_row_waiting_on_you_keeps_the_inbox_repainting() {
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 8)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        tui.set_home_open(true, "test");
+
+        let mut pending = agent_row(1, 1, 1);
+        pending.state = crate::protocol::AgentRosterState::Pending;
+        tui.update_attached_agent_rows(vec![pending.clone()]);
+        assert!(tui.home_has_working_rows());
+
+        // A row whose producer never stamped a clock costs no wake-ups.
+        pending.working_since_unix_ms = 0;
+        tui.update_attached_agent_rows(vec![pending]);
+        assert!(!tui.home_has_working_rows());
+    }
 
     #[test]
     fn attached_agent_rows_mark_only_unfocused_arrivals_at_attention_unread() {

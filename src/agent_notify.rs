@@ -293,7 +293,7 @@ fn report_outside_a_pane(kind: AgentKind, update: HookUpdate) -> Option<()> {
 /// This hook's status, folded onto the one before it.
 ///
 /// The same two carries the pane path makes in `record_pushed_status`, for the
-/// same reasons: a stream of per-tool-call `working` pushes is one interval
+/// same reasons: a stream of per-tool-call pushes in one state is one interval
 /// rather than a clock that restarts every few seconds, and a hook with nothing
 /// to say leaves the last thing the agent said standing. Kept a pure function
 /// because that is the only part of writing a record worth asserting on.
@@ -308,15 +308,12 @@ fn merged_record(
     // before, and carrying its clock forward would date this agent's turn from
     // the last one's.
     let previous = previous.filter(|record| record.kind == kind.wire_value());
-    let working_since_unix_ms = match update.state {
-        AgentState::Working => previous
-            .as_ref()
-            .filter(|record| record.state == AgentState::Working.wire_value())
-            .map(|record| record.working_since_unix_ms)
-            .filter(|since| *since != 0)
-            .unwrap_or(unix_ms_now),
-        _ => 0,
-    };
+    let working_since_unix_ms = previous
+        .as_ref()
+        .filter(|record| record.state == update.state.wire_value())
+        .map(|record| record.working_since_unix_ms)
+        .filter(|since| *since != 0)
+        .unwrap_or(unix_ms_now);
     let message = if update.message.is_empty() {
         previous.map(|record| record.message).unwrap_or_default()
     } else {
@@ -538,7 +535,8 @@ mod tests {
         assert_eq!(second.working_since_unix_ms, 1_000);
         assert_eq!(second.message, "reading the tests");
 
-        // The turn ends: no clock, and the agent's closing words.
+        // The turn ends: a clock of its own — how long ago it finished — and
+        // the agent's closing words.
         let third = merged_record(
             Some(second),
             AgentKind::Claude,
@@ -546,7 +544,7 @@ mod tests {
             77,
             9_000,
         );
-        assert_eq!(third.working_since_unix_ms, 0);
+        assert_eq!(third.working_since_unix_ms, 9_000);
         assert_eq!(third.message, "all green");
         assert_eq!(third.state, "done");
 
