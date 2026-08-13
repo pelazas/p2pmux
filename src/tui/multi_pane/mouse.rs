@@ -494,6 +494,35 @@ impl MultiPaneTui {
         }
     }
 
+    /// Encodes a wheel notch for the child of the pane it was aimed at.
+    ///
+    /// The wheel is the one gesture addressed by where the pointer is rather
+    /// than by what has focus, so the question "does this child want the
+    /// wheel?" has to be asked of that pane and answered against that pane's
+    /// viewport. `None` means the notch stays with the mux, for local
+    /// scrollback.
+    pub fn wheel_bytes_for_pane(
+        &self,
+        mouse: crossterm::event::MouseEvent,
+        area: Rect,
+        protocol: PaneMouseProtocol,
+        pane_id: PaneId,
+    ) -> Option<Vec<u8>> {
+        // Shift is the standing escape hatch: it always scrolls, never forwards.
+        // A pane already held back in its history keeps the wheel too, or there
+        // would be no way to come back to the live edge.
+        if self.home_open()
+            || !protocol.reports_mouse()
+            || mouse.modifiers.contains(KeyModifiers::SHIFT)
+            || self.scrollback_offset(pane_id) != 0
+        {
+            return None;
+        }
+        let viewport = self.pane_screen_viewport(pane_id, area)?;
+        let cell = mouse_to_screen_cell(viewport, mouse.column, mouse.row)?;
+        encode_mouse(mouse.kind, mouse.modifiers, cell, protocol)
+    }
+
     /// Hands a mouse event to the focused pane's child when that child asked for
     /// mouse reports, so a click lands as a caret move instead of a mux selection.
     ///
@@ -880,6 +909,44 @@ mod tests {
         );
 
         assert_eq!(handling.forward_bytes, None);
+    }
+
+    #[test]
+    fn the_wheel_reaches_a_reporting_child_in_a_pane_that_does_not_have_focus() {
+        let tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        // Focus stays on pane 1 on the left; the pointer is over pane 2.
+        let viewport = tui.pane_screen_viewport(2, area).expect("pane 2 is drawn");
+
+        let bytes = tui.wheel_bytes_for_pane(
+            left_mouse(MouseEventKind::ScrollUp, viewport.x, viewport.y),
+            area,
+            reporting_child(),
+            2,
+        );
+
+        assert_eq!(tui.focused_pane(), 1);
+        assert_eq!(bytes, Some(b"\x1b[<64;1;1M".to_vec()));
+    }
+
+    #[test]
+    fn an_unfocused_pane_showing_history_keeps_its_own_wheel() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        let area = Rect::new(0, 0, 80, 24);
+        let viewport = tui.pane_screen_viewport(2, area).expect("pane 2 is drawn");
+        assert!(tui.set_pane_scrollback_offset(2, 3));
+
+        let bytes = tui.wheel_bytes_for_pane(
+            left_mouse(MouseEventKind::ScrollUp, viewport.x, viewport.y),
+            area,
+            reporting_child(),
+            2,
+        );
+
+        // Pane 1 has focus and is at the live edge, so reading the offset off
+        // focus instead of off the pointer would have forwarded this notch and
+        // stranded pane 2 in its history.
+        assert_eq!(bytes, None);
     }
 
     #[test]

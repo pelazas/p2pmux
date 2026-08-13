@@ -773,7 +773,7 @@ pub fn run_on(
                         let kitty_keyboard_active = screens
                             .get(&tui.focused_pane())
                             .is_some_and(GuestScreen::kitty_keyboard_active);
-                        if input_allowed(tui, &local_peer_id)
+                        if input_allowed(tui, &local_peer_id, tui.focused_pane())
                             && let Some(bytes) =
                                 client_key_bytes(key.code, key.modifiers, kitty_keyboard_active)
                         {
@@ -830,21 +830,19 @@ pub fn run_on(
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
                     // A child that reports mouse scrolls its own buffer; local
-                    // scrollback would otherwise hide the wheel from it.
-                    let protocol = focused_pane_mouse_protocol(tui, &screens, &local_peer_id);
-                    let forwarded = protocol
-                        .reports_mouse()
-                        .then(|| tui.handle_mouse(mouse, area, protocol))
-                        .and_then(|handling| handling.forward_bytes);
+                    // scrollback would otherwise hide the wheel from it. Which
+                    // child that is comes from the pointer, not from focus:
+                    // asking the focused pane sent a notch aimed at a
+                    // full-screen app next door into local scrollback, which
+                    // answered "unavailable" for a pane that scrolls perfectly
+                    // well the moment you focus it.
+                    let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
+                    let protocol = pane_mouse_protocol(tui, &screens, &local_peer_id, pane_id);
+                    let forwarded = tui.wheel_bytes_for_pane(mouse, area, protocol, pane_id);
                     if let Some(bytes) = forwarded {
                         let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
-                        write_message(
-                            &mut stream,
-                            &pane_input(tui.focused_pane(), bytes, perf_id),
-                        )?;
+                        write_message(&mut stream, &pane_input(pane_id, bytes, perf_id))?;
                     } else {
-                        let pane_id =
-                            tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
                         scroll_pane_toward(
                             &mut stream,
                             tui,
@@ -1003,20 +1001,30 @@ fn focused_pane_mouse_protocol(
     screens: &BTreeMap<u64, GuestScreen>,
     local_peer_id: &[u8],
 ) -> PaneMouseProtocol {
-    if !input_allowed(tui, local_peer_id) {
+    pane_mouse_protocol(tui, screens, local_peer_id, tui.focused_pane())
+}
+
+/// The mouse reporting one pane's child has turned on, if any.
+fn pane_mouse_protocol(
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+    local_peer_id: &[u8],
+    pane_id: u64,
+) -> PaneMouseProtocol {
+    if !input_allowed(tui, local_peer_id, pane_id) {
         return PaneMouseProtocol::default();
     }
     screens
-        .get(&tui.focused_pane())
+        .get(&pane_id)
         .and_then(GuestScreen::screen)
         .map(PaneMouseProtocol::from_screen)
         .unwrap_or_default()
 }
 
-fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
+fn input_allowed(tui: &MultiPaneTui, local_peer_id: &[u8], pane_id: u64) -> bool {
     tui.snapshot()
         .panes
-        .get(&tui.focused_pane())
+        .get(&pane_id)
         .is_none_or(|pane| !pane.exited && (!pane.locked || pane.host_peer_id == local_peer_id))
 }
 
@@ -1030,7 +1038,7 @@ fn next_perf_id_if_enabled(next: &mut u64) -> Option<u64> {
 }
 
 fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
-    !tui.home_open() && !tui.modal_open() && input_allowed(tui, local_peer_id)
+    !tui.home_open() && !tui.modal_open() && input_allowed(tui, local_peer_id, tui.focused_pane())
 }
 
 #[cfg(test)]
@@ -2075,9 +2083,9 @@ mod tests {
         layout.panes.get_mut(&1).expect("pane").locked = true;
         let tui = MultiPaneTui::new(layout).expect("layout");
 
-        assert!(!input_allowed(&tui, b"guest"));
+        assert!(!input_allowed(&tui, b"guest", tui.focused_pane()));
         assert!(!should_forward_paste(&tui, b"guest"));
-        assert!(input_allowed(&tui, b"host"));
+        assert!(input_allowed(&tui, b"host", tui.focused_pane()));
         assert!(should_forward_paste(&tui, b"host"));
     }
 
@@ -2087,9 +2095,9 @@ mod tests {
         layout.panes.get_mut(&1).expect("pane").exited = true;
         let tui = MultiPaneTui::new(layout).expect("layout");
 
-        assert!(!input_allowed(&tui, b"guest"));
+        assert!(!input_allowed(&tui, b"guest", tui.focused_pane()));
         assert!(!should_forward_paste(&tui, b"guest"));
-        assert!(!input_allowed(&tui, b"host"));
+        assert!(!input_allowed(&tui, b"host", tui.focused_pane()));
         assert!(!should_forward_paste(&tui, b"host"));
     }
 }
