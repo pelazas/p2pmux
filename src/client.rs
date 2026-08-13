@@ -1409,6 +1409,12 @@ fn client_key_bytes(
         KeyCode::Enter => Some(b"\r".to_vec()),
         KeyCode::Backspace => Some(b"\x7f".to_vec()),
         KeyCode::Tab => Some(b"\t".to_vec()),
+        // Shift+Tab, which crossterm reports as its own code rather than as a
+        // modified Tab. Matched whatever the modifiers say: terminals disagree
+        // about whether to set SHIFT on a key whose whole identity is the
+        // shift. Without this arm the key encoded to nothing and never left the
+        // client, so the mode switch it drives in a child never happened.
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Esc => Some(b"\x1b".to_vec()),
         KeyCode::Up => Some(b"\x1b[A".to_vec()),
         KeyCode::Down => Some(b"\x1b[B".to_vec()),
@@ -1490,11 +1496,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use crossterm::event::KeyEvent;
+
     use crate::{
         layout::{LayoutSnapshot, Member, Node, Pane, Tab},
         local_ipc::{AgentOverlaySnapshotRow, PaneScreenSnapshot},
         screen::HostScreen,
-        tui::{HOME_TOGGLE_WINDOW, UiIntent},
+        tui::{HOME_TOGGLE_WINDOW, KeyHandling, UiIntent},
     };
 
     use super::*;
@@ -1617,6 +1625,30 @@ mod tests {
             client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL, false),
             Some(vec![17])
         );
+    }
+
+    /// Claude Code cycles its mode on Shift+Tab, so a pane that never receives
+    /// the key is a pane whose mode cannot be changed at all.
+    #[test]
+    fn shift_tab_reaches_the_pane_as_a_back_tab() {
+        assert_eq!(
+            client_key_bytes(KeyCode::BackTab, KeyModifiers::SHIFT, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        // Some terminals report the key without naming the modifier.
+        assert_eq!(
+            client_key_bytes(KeyCode::BackTab, KeyModifiers::NONE, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        // And the mux does not claim it on the way past.
+        let mut tui = MultiPaneTui::new(layout(&[1])).expect("layout");
+        assert!(matches!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                Rect::new(0, 0, 80, 24)
+            ),
+            KeyHandling::Forward
+        ));
     }
 
     #[test]
