@@ -11,6 +11,8 @@ use ratatui::{
     widgets::Widget,
 };
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::{
     screen::SCROLLBACK_LINES,
     tui::{PaneTextSelection, ScreenCell},
@@ -78,7 +80,7 @@ impl Widget for VtScreen<'_> {
                 }
                 let target = &mut buf[(area.x + col, area.y + row)];
                 let contents = source.contents();
-                target.set_symbol(if contents.is_empty() { " " } else { contents });
+                target.set_symbol(&fitted_symbol(contents, source.is_wide()));
                 let style = if self.selection.is_some_and(|selection| {
                     selection.contains(ScreenCell { row, col }, self.scrollback)
                 }) {
@@ -93,6 +95,48 @@ impl Widget for VtScreen<'_> {
         }
     }
 }
+/// The cell's text, trimmed to measure exactly as many columns as the pane's
+/// grid reserved for it.
+///
+/// These two widths are allowed to disagree, and when they do the frame is
+/// corrupted well beyond the one cell. `✳\u{fe0f}` is the case that bites: the
+/// variation selector asks for emoji presentation, `vt100` still counts the
+/// cell as one column wide, and `unicode-width` reads the pair as two. Ratatui
+/// believes the symbol and skips the next cell in its diff, so a real character
+/// beside the emoji is never drawn; the terminal believes it too and advances
+/// the cursor twice, so the rest of that row lands a column early. Neither cell
+/// is ever repaired, because the buffer ratatui diffs against records what it
+/// *meant* to draw. The result is a row of stale glyphs with new output
+/// scattered between them — the same failure `clear_before_first_frame` guards
+/// against at startup, arriving mid-session instead.
+///
+/// Dropping the presentation selectors keeps the character and gives back the
+/// width the grid reserved. Anything still too wide falls back to its base
+/// character, and then to a space, because a cell that cannot be drawn at the
+/// right width is better blank than shifted.
+fn fitted_symbol(contents: &str, wide: bool) -> Cow<'_, str> {
+    let reserved = if wide { 2 } else { 1 };
+    if contents.is_empty() {
+        return Cow::Borrowed(" ");
+    }
+    if UnicodeWidthStr::width(contents) == reserved {
+        return Cow::Borrowed(contents);
+    }
+    let trimmed: String = contents
+        .chars()
+        .filter(|character| !matches!(character, '\u{fe0e}' | '\u{fe0f}'))
+        .collect();
+    if UnicodeWidthStr::width(trimmed.as_str()) == reserved {
+        return Cow::Owned(trimmed);
+    }
+    match trimmed.chars().next() {
+        Some(base) if UnicodeWidthChar::width(base) == Some(reserved) => {
+            Cow::Owned(base.to_string())
+        }
+        _ => Cow::Borrowed(" "),
+    }
+}
+
 fn vt_style(cell: &vt100::Cell) -> Style {
     let mut modifiers = Modifier::empty();
     if cell.bold() {
@@ -159,6 +203,7 @@ mod tests {
         backend::TestBackend,
         style::{Color, Modifier},
     };
+    use unicode_width::UnicodeWidthStr;
 
     use crate::{
         screen::{GuestScreen, HostScreen},
@@ -329,6 +374,82 @@ mod tests {
             terminal.backend().buffer()[(0, 0)].symbol(),
             history.cell(0, 0).expect("history cell").contents()
         );
+    }
+
+    /// An emoji-presentation sequence measures two columns while the pane's
+    /// grid gives it one. Handing that symbol to ratatui costs the cell beside
+    /// it — dropped from the diff, and overwritten on the terminal by the
+    /// glyph's second half — and every cell after it on the row is drawn a
+    /// column early.
+    #[test]
+    fn a_narrow_cell_never_carries_a_symbol_two_columns_wide() {
+        let mut parser = vt100::Parser::new(1, 6, 0);
+        parser.process("\u{2733}\u{fe0f}abcd".as_bytes());
+        assert!(
+            !parser.screen().cell(0, 0).expect("cell").is_wide(),
+            "the grid gives this cell one column"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(6, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(parser.screen()), frame.area()))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            UnicodeWidthStr::width(buffer[(0, 0)].symbol()),
+            1,
+            "symbol {:?} does not fit the column it was given",
+            buffer[(0, 0)].symbol()
+        );
+        // The character next door survives, which it does not when ratatui is
+        // told the emoji owns two columns.
+        assert_eq!(buffer[(1, 0)].symbol(), "a");
+    }
+
+    #[test]
+    fn a_wide_cell_keeps_the_two_columns_the_grid_gave_it() {
+        let mut parser = vt100::Parser::new(1, 6, 0);
+        parser.process("\u{4f60}\u{597d}".as_bytes());
+        let mut terminal = Terminal::new(TestBackend::new(6, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(parser.screen()), frame.area()))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "\u{4f60}");
+        assert_eq!(buffer[(2, 0)].symbol(), "\u{597d}");
+    }
+
+    #[test]
+    fn every_symbol_matches_the_columns_its_cell_reserved() {
+        // A row of what an agent pane actually prints.
+        let mut parser = vt100::Parser::new(1, 40, 0);
+        parser.process(
+            "\u{2733}\u{fe0f} \u{25cf} \u{23f5}\u{23f5} \u{2705} \u{2570} e\u{0301} \u{4f60}"
+                .as_bytes(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(parser.screen()), frame.area()))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        for col in 0..40_u16 {
+            let cell = parser.screen().cell(0, col).expect("cell");
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let reserved = if cell.is_wide() { 2 } else { 1 };
+            let symbol = buffer[(col, 0)].symbol();
+            assert_eq!(
+                UnicodeWidthStr::width(symbol),
+                reserved,
+                "column {col} symbol {symbol:?} does not fit the columns its cell reserved"
+            );
+        }
     }
 
     #[test]
