@@ -688,6 +688,12 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             crate::pairing::save(&pairing)?;
             println!("unpaired: {name}");
+            // The last one takes the fleet's session with it, so say so here
+            // rather than leaving the change to be discovered as a bare
+            // `p2pmux` that no longer waits for anybody.
+            if pairing.machines.is_empty() {
+                println!("nothing is paired with this machine now; `p2pmux` starts a session here");
+            }
             Ok(())
         }
         Some(Command::Ticket { session }) => print_join_ticket(session),

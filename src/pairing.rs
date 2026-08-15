@@ -370,10 +370,29 @@ impl Pairing {
                 .is_some_and(|token| token.secret == secret)
     }
 
+    /// Forget a paired machine — and, with the last of them, the fleet itself.
+    ///
+    /// Dropping the row is not the whole of an unpair. The ticket is what makes
+    /// this machine fleet at all: bare `p2pmux` dials it, the node declares
+    /// itself a machine on the strength of it, and [`pin_peers`] records
+    /// arrivals only while it is there. An unpair that left it behind left the
+    /// machine in a fleet of nobody — `p2pmux machines` printed "No other
+    /// machines paired yet" while every bare `p2pmux` still spent half a minute
+    /// dialling the session the last machine took with it.
+    ///
+    /// Only the last one does this. Unpairing one machine of three is leaving
+    /// that machine, and the fleet it leaves is still a fleet.
     pub fn forget(&mut self, name: &str) -> bool {
         let before = self.machines.len();
         self.machines.retain(|machine| machine.name != name);
-        before != self.machines.len()
+        if before == self.machines.len() {
+            return false;
+        }
+        if self.machines.is_empty() {
+            self.ticket = None;
+            self.pending_until = None;
+        }
+        true
     }
 }
 
@@ -639,6 +658,60 @@ mod tests {
         );
         assert!(pairing.forget("desktop"));
         assert!(!pairing.forget("desktop"));
+    }
+
+    #[test]
+    fn unpairing_the_last_machine_gives_up_the_session_it_took_with_it() {
+        // The ticket outliving the last machine is what made `p2pmux machines`
+        // and bare `p2pmux` disagree: nothing paired, half a minute of dialling.
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-ticket")),
+            ..Pairing::default()
+        };
+        pairing.open_pairing_window(1_000);
+        pairing.remember("desktop", Some(String::from("aa")), None);
+
+        assert!(pairing.forget("desktop"));
+
+        assert_eq!(pairing.ticket, None, "the fleet's session goes with it");
+        assert_eq!(
+            pairing.pending_until, None,
+            "and so does an open invitation"
+        );
+        assert!(!pairing.can_rejoin());
+    }
+
+    #[test]
+    fn unpairing_one_of_two_machines_keeps_the_session_the_other_rejoins() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-ticket")),
+            ..Pairing::default()
+        };
+        pairing.remember("desktop", Some(String::from("aa")), None);
+        pairing.remember("droplet", Some(String::from("bb")), None);
+
+        assert!(pairing.forget("desktop"));
+
+        assert_eq!(pairing.ticket.as_deref(), Some("p2pmux-ticket"));
+        assert!(pairing.can_rejoin(), "a fleet of one is still a fleet");
+    }
+
+    #[test]
+    fn forgetting_a_machine_that_was_never_paired_changes_nothing() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-ticket")),
+            ..Pairing::default()
+        };
+        pairing.remember("desktop", Some(String::from("aa")), None);
+
+        assert!(!pairing.forget("laptop"));
+
+        assert_eq!(
+            pairing.ticket.as_deref(),
+            Some("p2pmux-ticket"),
+            "a typo'd name is not an unpair, least of all of the whole fleet"
+        );
+        assert_eq!(pairing.machines.len(), 1);
     }
 
     #[test]
