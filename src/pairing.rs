@@ -111,6 +111,23 @@ pub struct Pairing {
     /// and resolved that by treating every peer as fleet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_until: Option<u64>,
+    /// Whether [`Self::ticket`] is a session this machine offered, rather than
+    /// one it was invited to.
+    ///
+    /// Both directions write a ticket before they know the pairing worked, and
+    /// they have to: the node needs the session in the file before a machine
+    /// can arrive through the window, and a join that connects and then drops
+    /// has still paired the machines. What differs is what an unanswered one
+    /// means. A ticket this machine was *given* addresses somebody else, who
+    /// may simply be asleep, and is worth dialling for as long as it takes. A
+    /// ticket this machine *handed out* addresses its own session — so with no
+    /// machine ever paired through it and its window shut, there is nobody at
+    /// the other end of it and there never was.
+    ///
+    /// Which is the whole reason this is written down. See
+    /// [`Pairing::rejoin_ticket`].
+    #[serde(default)]
+    pub offered_here: bool,
     /// Whether the user has already said no to installing the fleet agent.
     ///
     /// Pairing is where the offer belongs — it is the moment somebody decided
@@ -276,6 +293,34 @@ impl Pairing {
         self.ticket.is_some()
     }
 
+    /// The session bare `p2pmux` should go and look for, if there is one.
+    ///
+    /// Narrower than [`Self::can_rejoin`], which asks whether this machine
+    /// belongs to a fleet at all — the question the node answers when it says
+    /// what kind of member it is, and the one [`pin_peers`] asks before writing
+    /// anybody down. This asks the other thing: whether dialling is worth the
+    /// thirty seconds it costs when nobody answers.
+    ///
+    /// It is not, for an invitation nobody accepted. `p2pmux pair` and the
+    /// add-machine panel both record the session before any machine can arrive
+    /// through the window they opened, and when none ever does that ticket is
+    /// left addressing a session this machine hosted and nobody joined. Bare
+    /// `p2pmux` dialled it anyway — half a minute of "rejoining the session
+    /// this machine is paired with", on every run, on a machine whose own
+    /// `p2pmux machines` said nothing was paired. The only way out was to edit
+    /// the TOML by hand, because nothing in the product had ever said the
+    /// ticket was there.
+    ///
+    /// A ticket that came from somewhere else keeps its thirty seconds, window
+    /// or no window: an invited machine that has not answered yet is exactly
+    /// the machine that is asleep, and waiting for it is the feature.
+    pub fn rejoin_ticket(&self, now: u64) -> Option<&str> {
+        if self.offered_here && self.machines.is_empty() && !self.pairing_window_open(now) {
+            return None;
+        }
+        self.ticket.as_deref()
+    }
+
     /// Record a machine, or update the one already there.
     ///
     /// Pairing twice with the same machine is a re-pair, not a second machine:
@@ -391,6 +436,7 @@ impl Pairing {
         if self.machines.is_empty() {
             self.ticket = None;
             self.pending_until = None;
+            self.offered_here = false;
         }
         true
     }
@@ -488,6 +534,7 @@ fn offer_into(pairing: &mut Pairing, ticket: &str, now: u64) -> bool {
     }
     pairing.ticket = Some(ticket.to_owned());
     pairing.open_pairing_window(now);
+    pairing.offered_here = true;
     true
 }
 
@@ -651,6 +698,7 @@ mod tests {
             ticket: Some(String::from("p2pmux-ticket")),
             accepts_work: true,
             pending_until: None,
+            offered_here: false,
             daemon_declined: false,
             machines: Vec::new(),
             work: Default::default(),
@@ -707,6 +755,61 @@ mod tests {
             "the machine that answered the invitation is in the fleet"
         );
         assert!(!pairing.pairing_window_open(1_001), "and the window shuts");
+    }
+
+    #[test]
+    fn an_invitation_nobody_accepted_stops_being_dialled_when_its_window_shuts() {
+        let mut pairing = Pairing::default();
+        assert!(offer_into(&mut pairing, "p2pmux-ticket", 1_000));
+
+        assert_eq!(
+            pairing.rejoin_ticket(1_100),
+            Some("p2pmux-ticket"),
+            "while the window is open the machine may still be on its way"
+        );
+        assert_eq!(
+            pairing.rejoin_ticket(1_000 + PAIRING_WINDOW_SECONDS + 1),
+            None,
+            "after it, this is a session nobody else has ever been in"
+        );
+    }
+
+    #[test]
+    fn an_invitation_that_was_accepted_is_dialled_for_as_long_as_it_takes() {
+        let mut pairing = Pairing::default();
+        offer_into(&mut pairing, "p2pmux-ticket", 1_000);
+        pin_into(
+            &mut pairing,
+            &[SeenMachine {
+                name: String::from("desktop"),
+                machine_id: String::from("beef"),
+                kind: MemberKind::Machine,
+            }],
+            1_001,
+        );
+
+        assert_eq!(
+            pairing.rejoin_ticket(9_000_000),
+            Some("p2pmux-ticket"),
+            "a paired machine that is asleep is exactly what the wait is for"
+        );
+    }
+
+    #[test]
+    fn a_ticket_this_machine_was_given_is_dialled_before_anyone_answers_on_it() {
+        // `p2pmux pair <code>` and `p2pmux enroll` both write the ticket before
+        // a peer has been seen, and say so: "paired, but the other machine has
+        // not answered yet". The dial is how it ever does.
+        let pairing = Pairing {
+            ticket: Some(String::from("p2pmux-ticket")),
+            ..Pairing::default()
+        };
+
+        assert_eq!(
+            pairing.rejoin_ticket(9_000_000),
+            Some("p2pmux-ticket"),
+            "an invitation is not this machine's own session to write off"
+        );
     }
 
     #[test]

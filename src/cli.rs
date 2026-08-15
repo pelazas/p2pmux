@@ -834,6 +834,11 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket.clone());
     pairing.accepts_work = accepts_work;
+    // This machine's own session, offered to a machine that may never come for
+    // it. What that costs when nobody does is `Pairing::rejoin_ticket`'s
+    // subject, and it can only tell an offer from an invitation if the offer
+    // says so here.
+    pairing.offered_here = true;
     // This command returns as soon as it has printed a code, so the node is
     // what will be watching when the other machine arrives. The window is how
     // it knows that arrival was invited: without one, every peer of the session
@@ -890,6 +895,11 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket_text.clone());
     pairing.accepts_work = accepts_work;
+    // Somebody else's session, and the machine hosting it may be asleep rather
+    // than absent — so this ticket keeps its thirty seconds even before any
+    // machine has answered on it. An offer this machine made earlier does not
+    // get to speak for a pairing it has nothing to do with.
+    pairing.offered_here = false;
     crate::pairing::save(&pairing)?;
 
     let descriptor = rejoin_paired_session(&ticket_text).await?;
@@ -1173,6 +1183,10 @@ async fn enroll_with_token(
     }
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(invite.ticket.clone());
+    // The token names a session on the machine that minted it, which is the one
+    // case where nobody is sitting here to notice it did not answer. Dialling
+    // it on every boot until it does is the whole point of enrolling.
+    pairing.offered_here = false;
     pairing.enrol = Some(crate::pairing::EnrolToken {
         secret: invite.secret.clone(),
         created_at: crate::pairing::now_unix(),
@@ -1350,6 +1364,12 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
         {
             return result;
         }
+    }
+    // Which is a different question from whether there is a ticket at all: the
+    // session offered to a machine that never came for it is still worth
+    // attaching to while it is running here, and never worth dialling once it
+    // is not. See `Pairing::rejoin_ticket`.
+    if let Some(ticket) = pairing.rejoin_ticket(crate::pairing::now_unix()) {
         // Said before the dial, not after it. Reaching a machine that is not
         // answering costs iroh about thirty seconds, and this command spent
         // every one of them printing nothing at all: a bare `p2pmux` on a laptop
