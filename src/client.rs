@@ -509,6 +509,11 @@ pub fn run_on(
                             // No history to reach, so anything the burst queued behind this
                             // is unreachable too.
                             desired_scroll.remove(&pane_id);
+                            // Drop the cached session with it. The answer is also what a
+                            // node gives for a history id it no longer holds, and keeping
+                            // that dead id would put it on every later query -- one
+                            // evicted session and the pane could never be scrolled again.
+                            history.remove(&pane_id);
                             footer_notice = unavailable;
                             dirty = true;
                             continue;
