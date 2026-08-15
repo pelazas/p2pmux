@@ -118,6 +118,38 @@ impl MultiPaneTui {
         rows
     }
 
+    /// The rows the cursor is allowed to stop on, in the order they are drawn.
+    ///
+    /// Every agent is *drawn*; not every agent can be *opened*. One sitting in
+    /// another p2pmux session is on the list because it is the only record of
+    /// where it went, and off this list because Enter cannot reach it — see
+    /// [`AgentOverlayRow::reachable_from_here`]. Keeping the two lists apart
+    /// here is what stops a click from landing on a row that would then have to
+    /// refuse it.
+    fn home_stops(&self) -> Vec<HomeRowId> {
+        self.home_rows()
+            .into_iter()
+            .filter(|row| row.reachable_from_here())
+            .map(AgentOverlayRow::row_id)
+            .collect()
+    }
+
+    /// Where the cursor lands when it arrives at a page: the first row on it the
+    /// cursor may stop on, and nothing at all when the page holds none.
+    ///
+    /// `None` rather than a row on some other page. The cursor is what Enter
+    /// reads, and a cursor parked off-screen is how a keypress opens an agent
+    /// the user cannot see.
+    fn first_stop_on_page(&self, page: usize) -> Option<HomeRowId> {
+        let size = self.home_page_size.max(1);
+        self.home_rows()
+            .into_iter()
+            .skip(page.saturating_mul(size))
+            .take(size)
+            .find(|row| row.reachable_from_here())
+            .map(AgentOverlayRow::row_id)
+    }
+
     /// How many rows are blocked on a human *and* have not been visited. The
     /// header count, the tab-bar badge and the eventual notification all read
     /// this one number.
@@ -148,11 +180,10 @@ impl MultiPaneTui {
     /// Keeps the cursor on a row that still exists, and on the first row when
     /// it does not.
     pub(in crate::tui) fn repair_home_selection(&mut self) {
-        let rows = self
-            .home_rows()
-            .into_iter()
-            .map(AgentOverlayRow::row_id)
-            .collect::<Vec<_>>();
+        // Stops, not rows: an agent whose session detached under the cursor
+        // stops being openable, and leaving the cursor on it would leave one
+        // row that Enter refuses wearing the band that says it will not.
+        let rows = self.home_stops();
         if self
             .home_selected
             .as_ref()
@@ -195,10 +226,7 @@ impl MultiPaneTui {
         if self.home_page != previous {
             // The cursor follows the page. Leaving it behind on a page that is
             // no longer drawn means Enter opens an agent that is not on screen.
-            self.home_selected = self
-                .home_rows()
-                .get(self.home_page.saturating_mul(self.home_page_size.max(1)))
-                .map(|row| row.row_id());
+            self.home_selected = self.first_stop_on_page(self.home_page);
             return true;
         }
         false
@@ -219,10 +247,7 @@ impl MultiPaneTui {
         } else {
             (self.home_page + pages - 1) % pages
         };
-        self.home_selected = self
-            .home_rows()
-            .get(self.home_page_start())
-            .map(|row| row.row_id());
+        self.home_selected = self.first_stop_on_page(self.home_page);
         true
     }
 
@@ -277,6 +302,11 @@ impl MultiPaneTui {
         // is the one the pointer looks like it is on.
         self.home_rows()
             .get(self.home_page_start().saturating_add(line / card))
+            // A row the cursor cannot stop on cannot be clicked onto either.
+            // The pointer is the one input that can reach any card on screen,
+            // so without this the keyboard would be the only thing the refusal
+            // held for — and the click was where the whole complaint started.
+            .filter(|row| row.reachable_from_here())
             .map(|row| row.row_id())
     }
 
@@ -303,11 +333,7 @@ impl MultiPaneTui {
     }
 
     pub(in crate::tui) fn move_home_selection(&mut self, forward: bool) {
-        let rows = self
-            .home_rows()
-            .into_iter()
-            .map(AgentOverlayRow::row_id)
-            .collect::<Vec<_>>();
+        let rows = self.home_stops();
         if rows.is_empty() {
             self.home_selected = None;
             return;
@@ -457,6 +483,10 @@ impl MultiPaneTui {
     /// Three things have to be true before a pane is asked for, and each has
     /// its own sentence when it is not:
     ///
+    /// - the agent has to be one Enter can reach at all. An agent in another
+    ///   p2pmux session is not, and the cursor already refuses to stop on it;
+    ///   this is the same refusal for the paths that reach a row without the
+    ///   cursor's help.
     /// - p2pmux has to know how to talk to that agent at all. Some have no
     ///   client to run, and the row says so rather than doing nothing.
     /// - the machine has to be one of yours and in the session, which is
@@ -478,8 +508,8 @@ impl MultiPaneTui {
         else {
             return Vec::new();
         };
-        if row.in_another_session() {
-            return self.attach_the_session_the_agent_is_in(&row);
+        if !row.reachable_from_here() {
+            return Vec::new();
         }
         let Some(kind) = crate::agent_detect::AgentKind::from_wire(&row.kind) else {
             self.home_notice = Some(format!(
@@ -525,48 +555,6 @@ impl MultiPaneTui {
                 kind.display_label(),
                 row.host,
                 chat.access.describe()
-            ));
-        }
-        intents
-    }
-
-    /// Enter on an agent that turned out to be in another p2pmux session.
-    ///
-    /// Not a chat, and pointedly not a new one. The agent is in a pane already;
-    /// what stands between the user and it is that the pane belongs to a
-    /// session nobody is attached to here. So the pane this opens runs
-    /// `p2pmux attach <name>`, and one keypress later the user is looking at
-    /// the conversation itself rather than at a second one started next to it.
-    ///
-    /// The alternative — treating it as an agent outside p2pmux — is what
-    /// shipped, and it is the bug: a machine with three detached sessions
-    /// filled the inbox with rows claiming to be outside p2pmux, and Enter on
-    /// any of them started a fresh agent in an empty tab.
-    fn attach_the_session_the_agent_is_in(&mut self, row: &AgentOverlayRow) -> Vec<UiIntent> {
-        let command = vec![
-            String::from("p2pmux"),
-            String::from("attach"),
-            row.session.clone(),
-        ];
-        // A second Enter finds the attach pane the first one opened, on the
-        // same title match a second chat uses.
-        if let Some(existing) = self.chat_pane_for(&row.host, &command) {
-            return self.enter_pane_from_home(existing);
-        }
-        let Some(index) = machine_rows(self)
-            .iter()
-            .position(|machine| machine.name == row.host)
-        else {
-            self.home_notice = Some(format!("{} is not in this session", row.host));
-            return Vec::new();
-        };
-        self.home_machine = Some(index);
-        let intents = self.open_terminal_on_selected_machine(self.last_home_area, command);
-        self.home_machine = None;
-        if !intents.is_empty() {
-            self.home_notice = Some(format!(
-                "attaching p2pmux session {} on {}",
-                row.session, row.host
             ));
         }
         intents
@@ -1946,12 +1934,10 @@ mod tests {
         );
     }
 
-    /// The rows that made the inbox look like it was inventing agents: they
-    /// were in p2pmux the whole time, in sessions this one had not been told to
-    /// ask about. Enter goes to the session rather than starting a rival agent
-    /// beside it.
-    #[test]
-    fn enter_on_an_agent_in_another_session_attaches_that_session() {
+    /// The droplet inbox with its bot moved into a p2pmux session on the user's
+    /// own machine — one this client is not attached to. One openable row and
+    /// one that is not, which is the shape every test below needs.
+    fn a_bot_in_a_session_of_its_own() -> MultiPaneTui {
         let mut tui = tui_with_a_bot_on_a_droplet("claude");
         let mut rows = tui.agent_rows.clone();
         for row in &mut rows {
@@ -1961,68 +1947,102 @@ mod tests {
             }
         }
         tui.set_agent_rows(rows);
-        select_the_bot(&mut tui);
+        tui
+    }
 
-        let intents = tui.open_home_selection();
+    fn the_detached_agent(tui: &MultiPaneTui) -> crate::tui::HomeRowId {
+        tui.home_rows()
+            .iter()
+            .find(|row| row.pane_id == 0)
+            .map(|row| row.row_id())
+            .expect("the detached session's agent is on the list")
+    }
 
-        assert!(
-            matches!(
-                intents.as_slice(),
-                [UiIntent::CreateTabOn { command, .. }]
-                    if command == &[
-                        String::from("p2pmux"),
-                        String::from("attach"),
-                        String::from("dakar"),
-                    ]
-            ),
-            "{intents:?}"
+    /// The rows the whole complaint was about. They are in p2pmux, in a session
+    /// this client is not attached to, and the only way in is a `p2pmux attach`
+    /// nested inside a pane — which on a session that already has a terminal
+    /// ends at `already attached` and leaves an empty shell.
+    ///
+    /// So the cursor walks past them. They stay drawn, because they are the
+    /// only record of where those agents went.
+    #[test]
+    fn the_cursor_never_stops_on_an_agent_in_another_session() {
+        let mut tui = a_bot_in_a_session_of_its_own();
+        let detached = the_detached_agent(&tui);
+        assert_eq!(tui.home_rows().len(), 2, "both agents stay on the list");
+
+        assert_ne!(
+            tui.home_selected.as_ref(),
+            Some(&detached),
+            "the cursor does not open on it either"
         );
-        let notice = tui.home_notice.clone().expect("a notice");
+        for step in 0..6 {
+            tui.move_home_selection(step % 2 == 0);
+            assert_ne!(
+                tui.home_selected.as_ref(),
+                Some(&detached),
+                "the arrows walked onto a row Enter cannot open"
+            );
+        }
+    }
+
+    /// The pointer is the one input that can reach any card on screen, and the
+    /// click is where the complaint started: it opened a new tab with an empty
+    /// terminal in it.
+    #[test]
+    fn a_click_on_an_agent_in_another_session_is_not_a_click_at_all() {
+        let mut tui = a_bot_in_a_session_of_its_own();
+        tui.set_home_viewport_for(AREA);
+        let list = home_layout(tui.geometry(AREA).content, &tui).rows;
+        let card = home_card(list.height).lines() as u16;
+        let index = tui
+            .home_rows()
+            .iter()
+            .position(|row| row.pane_id == 0)
+            .expect("the detached session's agent is drawn") as u16;
+        let line = list.y + index * card;
+        let before = tui.home_selected.clone();
+
+        assert_eq!(tui.home_row_at(2, line, AREA), None);
         assert!(
-            notice.contains("attaching p2pmux session dakar"),
-            "the row promised an attach and the notice has to say the same: {notice}"
+            tui.handle_home_click(2, line, AREA).is_empty(),
+            "a click on it must open no tab and no pane"
+        );
+        assert_eq!(
+            tui.home_selected, before,
+            "and must not move the cursor off the row that was under it"
         );
     }
 
-    /// Pressing Enter twice must not leave two attach panes against one
-    /// session, for the same reason it must not leave two chats.
+    /// The same refusal for anything that reaches the row without the cursor's
+    /// help — a selection made before the agent's session detached, say.
     #[test]
-    fn a_second_enter_finds_the_attach_pane_the_first_one_opened() {
-        let mut tui = tui_with_a_bot_on_a_droplet("claude");
-        let mut rows = tui.agent_rows.clone();
-        for row in &mut rows {
-            if row.pane_id == 0 {
-                row.session = String::from("dakar");
-            }
-        }
-        tui.set_agent_rows(rows);
-        tui.snapshot.panes.insert(
-            9,
-            crate::layout::Pane {
-                pane_id: 9,
-                host_peer_id: vec![0xca, 0xfe],
-                locked: false,
-                exited: false,
-                grid_rows: 2,
-                grid_cols: 8,
-                title: Some(chat_pane_title(&[
-                    String::from("p2pmux"),
-                    String::from("attach"),
-                    String::from("dakar"),
-                ])),
-            },
-        );
-        tui.snapshot.tabs.push(crate::layout::Tab {
-            tab_id: 9,
-            root: crate::layout::Node::Leaf { pane_id: 9 },
-            title: None,
-        });
+    fn enter_on_an_agent_in_another_session_opens_nothing() {
+        let mut tui = a_bot_in_a_session_of_its_own();
         select_the_bot(&mut tui);
 
-        assert_eq!(
-            tui.open_home_selection(),
-            vec![UiIntent::FocusPane { pane_id: 9 }]
+        assert!(
+            tui.open_home_selection().is_empty(),
+            "no new tab, no new pane, and pointedly no second agent"
         );
+    }
+
+    /// An inbox holding nothing but other sessions' agents has no cursor at
+    /// all, rather than one parked on a row that refuses to open.
+    #[test]
+    fn an_inbox_of_only_other_sessions_has_nothing_to_press_enter_on() {
+        let mut tui = a_bot_in_a_session_of_its_own();
+        let rows = tui
+            .agent_rows
+            .iter()
+            .filter(|row| row.pane_id == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        tui.set_agent_rows(rows);
+
+        assert_eq!(tui.home_rows().len(), 1, "the row is still drawn");
+        assert_eq!(tui.home_selected, None);
+        assert!(tui.open_home_selection().is_empty());
     }
 
     /// The one genuinely bad outcome this feature could have.

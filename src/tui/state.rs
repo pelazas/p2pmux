@@ -180,10 +180,32 @@ impl AgentOverlayRow {
     /// These are the rows that made the inbox look like it was hallucinating:
     /// a fresh session on a machine with three detached ones lists their agents
     /// and, having only ever compared against its own panes, calls every one of
-    /// them "running outside p2pmux". They are inside p2pmux. They are one
-    /// `attach` away, and this is what says so.
+    /// them "running outside p2pmux". They are inside p2pmux, in a session this
+    /// client is not attached to, and that is a different thing from either of
+    /// the two the inbox knew how to say.
     pub(in crate::tui) fn in_another_session(&self) -> bool {
         self.outside_p2pmux() && !self.session.is_empty()
+    }
+
+    /// Whether Enter on this row can put the user in front of the conversation
+    /// that is already running.
+    ///
+    /// A pane of this session can, and so can a bot whose client genuinely
+    /// joins its running conversation. An agent in *another* p2pmux session
+    /// cannot, and that is the row this exists for: the only way in is
+    /// `p2pmux attach <name>`, which means a whole second p2pmux inside a pane
+    /// of this one. On a session that already has a terminal — the common case,
+    /// since a node serves one at a time — that attach ends at `already
+    /// attached` and leaves the empty shell that made the row look broken.
+    /// Even where it connects, a mux nested in a mux takes the prefix key from
+    /// the one around it.
+    ///
+    /// So the row stays on the list, because it is the only record of where
+    /// that agent went. What it stops doing is offering a keypress that cannot
+    /// deliver. See `crate::tui::render::home::home_location` for what it says
+    /// instead.
+    pub(in crate::tui) fn reachable_from_here(&self) -> bool {
+        !self.in_another_session()
     }
 }
 
