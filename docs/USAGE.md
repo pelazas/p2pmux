@@ -5,9 +5,15 @@ Everything the README does not need to say on first read. Start with
 
 ## Sessions
 
-`p2pmux` with no arguments needs none of what follows. It attaches the newest live session here,
-or rejoins the one your pairing recorded, or starts a fresh one — and lands you on the inbox
-either way. The commands below are for naming a specific session out loud.
+`p2pmux` with no arguments needs none of what follows: it puts this terminal in a session, always.
+On a machine you have paired it rejoins the session your pairing recorded, so every machine you
+own converges on one; on a machine with no fleet it starts a session and drops you straight into
+the shell. A session someone is already sitting in is passed over rather than fought over, so a
+second window on the same machine gets its own terminal instead of an error. The commands below
+are for naming a specific session out loud.
+
+`p2pmux attach` is the way back to a session already running here — with a name, or with none at
+all for the one started most recently.
 
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
 Ctrl+Q asks which leaving you meant: `d` detaches that client without stopping shells, Iroh, or
@@ -15,7 +21,7 @@ hosted panes, and `k` ends the session on this machine — its panes die with it
 nobody is left hosting a pane in is over. Enter is `d` and Esc backs out, so a reflex press never
 destroys work. Detaching prints the exact `--resume`, `attach`, and `kill` commands needed to
 return. Use `p2pmux --resume` for the
-live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <old> <new>` to
+live-session picker, `p2pmux attach [name]` to attach directly, `p2pmux rename <old> <new>` to
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
 for confirmation; use `--yes` for non-interactive scripts.
 

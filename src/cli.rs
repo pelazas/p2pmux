@@ -1122,7 +1122,7 @@ fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
     let Some(ticket) = pairing.ticket.clone() else {
         return Err(CliError(
             "this machine is not in a fleet yet — run `p2pmux pair` on it once, \
-             or start a session with `p2pmux create`, and try again",
+             or start a session with `p2pmux`, and try again",
         )
         .into());
     };
@@ -1456,7 +1456,7 @@ fn resume_picker(always_picker: bool) -> Result<(), Box<dyn Error>> {
         if always_picker {
             return Err(CliError("no live p2pmux sessions").into());
         }
-        return Err(CliError("no live session; run p2pmux create").into());
+        return Err(CliError("no live session here; `p2pmux` starts one").into());
     }
     let selected = pick_session(&sessions)?;
     crate::client::run(&selected)
@@ -1823,7 +1823,7 @@ fn sole_hosted_session(
         .collect();
     match hosted.len() {
         0 => Err(CliError(
-            "no session was created on this machine; run p2pmux create first",
+            "no session was created on this machine; `p2pmux` starts one",
         )),
         1 => Ok(hosted.remove(0)),
         _ => Err(CliError(
