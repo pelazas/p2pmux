@@ -85,16 +85,21 @@ enum Command {
         name: String,
     },
     /// List the live sessions on this machine.
-    Ls,
+    ///
+    /// `ls` is kept as an alias: it is what every release so far has answered
+    /// to, and it is written down in scripts and muscle memory this rename has
+    /// no business breaking.
+    #[command(alias = "ls")]
+    List,
     /// Print the full reusable join ticket for a session hosted on this machine.
     Ticket {
-        /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
+        /// The memorable session name, as listed by `p2pmux list`. Omit it when one session
         /// is hosted here.
         session: Option<String>,
     },
     /// Print the short join code for a session hosted on this machine.
     Code {
-        /// The memorable session name, as listed by `p2pmux ls`. Omit it when one session
+        /// The memorable session name, as listed by `p2pmux list`. Omit it when one session
         /// is hosted here.
         session: Option<String>,
     },
@@ -319,7 +324,7 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
             ),
         }),
         // Reading the finder records is a directory scan; it needs no runtime either.
-        Some(Command::Ls) => Some(print_sessions()),
+        Some(Command::List) => Some(print_sessions()),
         // Editing a settings file and reporting on it are both plain filesystem
         // work, and a user running them wants an answer, not a thread pool.
         Some(Command::Setup { agent }) => Some(match agent {
@@ -341,7 +346,7 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
 
 /// The live sessions on this machine, as `ticket`, `code`, `attach`, `kill` and `rename` name them.
 ///
-/// Those five commands all take a session name and every one of them documented `p2pmux ls` as
+/// Those five commands all take a session name and every one of them documented `p2pmux list` as
 /// where to read it, so this is the command that makes the rest addressable. It prints nothing
 /// but a header when there are none, rather than failing: "no sessions" is a legitimate answer
 /// to a listing, unlike to `p2pmux code`.
@@ -430,7 +435,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         // Already handled by the `run_without_runtime` call above; reaching
         // here would mean the two dispatches disagreed.
         Some(Command::Notify { .. })
-        | Some(Command::Ls)
+        | Some(Command::List)
         | Some(Command::Setup { .. })
         | Some(Command::Doctor) => Ok(()),
         Some(Command::Local) => crate::tui::run_local(),
@@ -1750,7 +1755,7 @@ fn sole_hosted_session(
         )),
         1 => Ok(hosted.remove(0)),
         _ => Err(CliError(
-            "several sessions are hosted on this machine; pass the session name, as listed by p2pmux ls",
+            "several sessions are hosted on this machine; pass the session name, as listed by p2pmux list",
         )),
     }
 }

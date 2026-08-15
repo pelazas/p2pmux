@@ -19,7 +19,7 @@ live-session picker, `p2pmux attach <name>` to attach directly, `p2pmux rename <
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
 for confirmation; use `--yes` for non-interactive scripts.
 
-`p2pmux ls` prints the live sessions on this machine — the names every one of those commands takes:
+`p2pmux list` prints the live sessions on this machine — the names every one of those commands takes:
 
 ```text
 NAME       ROLE         CODE         UP
@@ -93,7 +93,7 @@ It is also available from a shell, printed to stdout alone so `p2pmux code | pbc
 
 ```text
 p2pmux code              # the one session hosted on this machine
-p2pmux code <name>       # when several are; the name is the one p2pmux ls shows
+p2pmux code <name>       # when several are; the name is the one p2pmux list shows
 ```
 
 ### The ticket behind the code
@@ -150,7 +150,7 @@ keeps a log beside its socket — `/tmp/p2pmux-$(id -u)/<id>.log` on macOS, `$XD
 otherwise — and that is where a longer story is. A session you end yourself takes the log with
 it; one that ended on its own leaves it for you.
 
-Nothing else on the machine can end a session for you. `p2pmux ls`, `attach`, `ticket` and
+Nothing else on the machine can end a session for you. `p2pmux list`, `attach`, `ticket` and
 `--resume` all read the socket directory, which every p2pmux this user runs shares whatever
 `HOME` started it, and a session that is busy enough to refuse a connection used to look dead to
 them. Liveness is settled with the process table now, so a test harness or a script running in a
