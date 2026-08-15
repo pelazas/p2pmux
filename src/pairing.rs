@@ -461,11 +461,34 @@ pub fn save(pairing: &Pairing) -> Result<(), PairingError> {
 pub fn offer(ticket: &str) -> Result<(), PairingError> {
     let path = pairing_path()?;
     let mut pairing = load_from(&path)?;
-    if pairing.ticket.as_deref() == Some(ticket) {
+    if !offer_into(&mut pairing, ticket, now_unix()) {
         return Ok(());
     }
-    pairing.ticket = Some(ticket.to_owned());
     save_to(&path, &pairing)
+}
+
+/// What opening the add-machine panel does to the record. The pure half of
+/// [`offer`], and `false` when the file already says this.
+///
+/// The window is half of the offer, not a detail of the CLI that made one. This
+/// panel is older than [`Pairing::pending_until`], and when the window arrived
+/// only `p2pmux pair` learned to open it — so a machine invited from the inbox
+/// arrived to a fleet that admits nobody, was never written down by
+/// [`pin_into`], and left this machine holding a ticket for a pairing that
+/// could not complete. Bare `p2pmux` then dialled that ticket, for half a
+/// minute, on every run.
+///
+/// Each visit to the panel opens a window, exactly as each `p2pmux pair` does:
+/// the window admits one machine and closes, so a second machine is a second
+/// invitation. One already open is left to run out on its own schedule rather
+/// than extended by a redraw.
+fn offer_into(pairing: &mut Pairing, ticket: &str, now: u64) -> bool {
+    if pairing.ticket.as_deref() == Some(ticket) && pairing.pairing_window_open(now) {
+        return false;
+    }
+    pairing.ticket = Some(ticket.to_owned());
+    pairing.open_pairing_window(now);
+    true
 }
 
 /// Attach identities and current names to machines already in the fleet.
@@ -590,7 +613,7 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), PairingError> {
 mod tests {
     use super::{
         MemberKind, PAIRING_WINDOW_SECONDS, Pairing, SeenMachine, WorkDecision, load_from,
-        now_unix, pin_into, save_to,
+        now_unix, offer_into, pin_into, save_to,
     };
     use crate::tui::PairedMachine;
 
@@ -658,6 +681,52 @@ mod tests {
         );
         assert!(pairing.forget("desktop"));
         assert!(!pairing.forget("desktop"));
+    }
+
+    #[test]
+    fn a_machine_invited_from_the_inbox_is_admitted_like_one_invited_by_pair() {
+        // The panel is older than the window, and when the window arrived only
+        // `p2pmux pair` learned to open one. So the machine that accepted an
+        // invitation from the inbox was judged a guest and never written down.
+        let mut pairing = Pairing::default();
+        assert!(offer_into(&mut pairing, "p2pmux-ticket", 1_000));
+
+        pin_into(
+            &mut pairing,
+            &[SeenMachine {
+                name: String::from("desktop"),
+                machine_id: String::from("beef"),
+                kind: MemberKind::Machine,
+            }],
+            1_001,
+        );
+
+        assert_eq!(
+            pairing.machines.len(),
+            1,
+            "the machine that answered the invitation is in the fleet"
+        );
+        assert!(!pairing.pairing_window_open(1_001), "and the window shuts");
+    }
+
+    #[test]
+    fn opening_the_panel_again_is_a_second_invitation() {
+        let mut pairing = Pairing::default();
+        assert!(offer_into(&mut pairing, "p2pmux-ticket", 1_000));
+
+        assert!(
+            !offer_into(&mut pairing, "p2pmux-ticket", 1_100),
+            "a window still open is not re-opened by a redraw"
+        );
+        assert!(
+            offer_into(
+                &mut pairing,
+                "p2pmux-ticket",
+                1_000 + PAIRING_WINDOW_SECONDS + 1
+            ),
+            "an expired one is, because a second machine needs a second invitation"
+        );
+        assert!(pairing.pairing_window_open(1_000 + PAIRING_WINDOW_SECONDS + 2));
     }
 
     #[test]
