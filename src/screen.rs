@@ -349,7 +349,6 @@ pub struct HostScreen {
     previous: vt100::Parser,
     current: ScreenFrame,
     kitty_keyboard: KittyKeyboardTracker,
-    history_floor: u64,
     history_end: u64,
     /// Retained scrollback rows, tracked here because reading it from the screen means
     /// moving the scrollback offset, which needs `&mut` that `history_metadata` lacks.
@@ -380,7 +379,6 @@ impl HostScreen {
                 kitty_keyboard_active: false,
             },
             kitty_keyboard: KittyKeyboardTracker::default(),
-            history_floor: 0,
             history_end: 0,
             retained_scrollback: 0,
             hvp: HvpRewriter::default(),
@@ -445,8 +443,13 @@ impl HostScreen {
         self.previous = vt100::Parser::new(rows, cols, 0);
         self.previous
             .process(&self.parser.screen().state_formatted());
+        // The retained rows outlive the resize: `set_size` reflows the visible grid
+        // and leaves the scrollback deque alone, so history stays readable at its
+        // own width. Dropping it here is what made a pane unscrollable after every
+        // window resize, split, or zoom -- and permanently so for a full-frame
+        // agent UI, which repaints in place and never scrolls a fresh row in to
+        // rebuild what was thrown away.
         self.retained_scrollback = retained_scrollback_len(self.parser.screen_mut());
-        self.history_floor = self.history_end;
         let frame = ScreenFrame {
             sequence,
             base_sequence: 0,
@@ -491,10 +494,7 @@ impl HostScreen {
             return (0, 0);
         }
         let retained = self.retained_scrollback as u64;
-        let first = self
-            .history_end
-            .saturating_sub(retained)
-            .max(self.history_floor);
+        let first = self.history_end.saturating_sub(retained);
         (self.history_end.saturating_sub(first), self.history_end)
     }
 
@@ -1040,18 +1040,62 @@ mod tests {
     }
 
     #[test]
-    fn visual_scrollback_is_bounded_and_resets_on_resize_or_alternate_screen() {
+    fn visual_scrollback_is_bounded_and_survives_a_resize() {
         let mut screen = HostScreen::new(1, 3).unwrap();
         screen.process_pty(b"a\r\nb\r\nc").unwrap();
         let (total, rows) = screen.visual_scrollback(1, 1024);
         assert!(total >= 1);
         assert_eq!(rows.len(), 1);
 
+        // A resize used to raise the history floor to the live edge, which left a
+        // pane that stopped scrolling -- an agent UI repainting its own frame --
+        // with no reachable history at all.
         screen.resize(2, 3).unwrap();
-        assert_eq!(screen.visual_scrollback(10, 1024), (0, vec![]));
+        let (after, rows) = screen.visual_scrollback(10, 1024);
+        assert_eq!(after, total);
+        assert_eq!(rows.len(), total);
 
         screen.process_pty(b"\x1b[?1049h").unwrap();
         assert_eq!(screen.visual_scrollback(10, 1024), (0, vec![]));
+    }
+
+    /// The rows themselves have to come back, not just a non-zero count: the
+    /// window maps absolute positions onto the retained deque, and a resize is
+    /// exactly where that mapping used to be abandoned.
+    #[test]
+    fn history_rows_read_the_same_after_the_pane_is_resized() {
+        let mut screen = HostScreen::new(2, 12).unwrap();
+        for line in 0..8 {
+            screen
+                .process_pty(format!("row {line}\r\n").as_bytes())
+                .unwrap();
+        }
+        let (before_total, before) = screen.visual_scrollback(4, 4096);
+        assert!(before_total >= 4);
+
+        screen.resize(6, 12).unwrap();
+        let (after_total, after) = screen.visual_scrollback(4, 4096);
+        assert_eq!(after_total, before_total);
+        assert_eq!(after, before);
+    }
+
+    /// Retained rows keep the width they were written at, so a narrower pane reads
+    /// them through a shorter window than they hold. That has to clip, not panic,
+    /// and it has to leave the rows themselves reachable.
+    #[test]
+    fn history_survives_a_pane_that_gets_narrower() {
+        let mut screen = HostScreen::new(2, 24).unwrap();
+        for line in 0..8 {
+            screen
+                .process_pty(format!("{line} wide row of text\r\n").as_bytes())
+                .unwrap();
+        }
+        let (before_total, _) = screen.visual_scrollback(4, 4096);
+
+        screen.resize(2, 10).unwrap();
+        let (after_total, after) = screen.visual_scrollback(4, 4096);
+        assert_eq!(after_total, before_total);
+        assert_eq!(after.len(), 4);
     }
 
     #[test]
