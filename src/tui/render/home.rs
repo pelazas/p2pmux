@@ -377,14 +377,17 @@ pub(in crate::tui) fn format_home_card(
     theme: &UiTheme,
 ) -> Vec<Line<'static>> {
     if card == HomeCard::Row {
-        return vec![format_home_row(
+        return dim_unless_openable(
             row,
-            selected,
-            width,
-            now_unix_ms,
-            animation_phase,
-            theme,
-        )];
+            vec![format_home_row(
+                row,
+                selected,
+                width,
+                now_unix_ms,
+                animation_phase,
+                theme,
+            )],
+        );
     }
     let background = if selected {
         Style::default().bg(theme.agent_overlay_selected_background)
@@ -411,7 +414,29 @@ pub(in crate::tui) fn format_home_card(
     // The blank between two cards, tinted with the selection so the band reads
     // as one agent rather than as three lines that happen to be adjacent.
     lines.push(card_line("", Style::default(), width, background));
+    dim_unless_openable(row, lines)
+}
+
+/// A card the cursor cannot stop on is drawn dim.
+///
+/// The difference has to be legible *before* the click rather than explained
+/// after it, and dim is the one distinction that survives a themed terminal:
+/// every color on this screen is configurable, so a row that said "you cannot
+/// open this" by being grey would, on somebody's theme, be saying it in the
+/// same grey as the line under it. The card keeps its state color — that an
+/// agent is blocked is true wherever it is running, and the line below names
+/// the session and the command that reaches it.
+fn dim_unless_openable(row: &AgentOverlayRow, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if row.reachable_from_here() {
+        return lines;
+    }
     lines
+        .into_iter()
+        .map(|line| {
+            let dimmed = line.style.add_modifier(Modifier::DIM);
+            line.style(dimmed)
+        })
+        .collect()
 }
 
 /// `~/work/p2pmux · tab 2 · pane 1` — where the agent is, and where Enter goes.
@@ -421,12 +446,16 @@ pub(in crate::tui) fn format_home_card(
 /// and runs its chat command. The line says which of the two it is looking at,
 /// because the rest of the card cannot be told apart.
 fn home_location(row: &AgentOverlayRow, cwd_already_shown: bool) -> String {
-    let where_it_runs = if row.in_another_session() {
-        // In p2pmux the whole time, in a session this one had never been told
-        // to ask about. Enter goes there rather than starting anything, so the
-        // row promises the one thing that is actually true of it.
-        format!("p2pmux session {} · enter attaches it", row.session)
-    } else if row.outside_p2pmux() {
+    if row.in_another_session() {
+        // The row Enter refuses, and therefore the row that has to answer
+        // "where did that agent go" on its own. It names the session and the
+        // command that reaches it, and — alone among the three — is never
+        // prefixed with the directory: the command is the payload, and a
+        // narrow terminal truncates the tail, which would cut exactly the half
+        // worth reading.
+        return format!("another p2pmux session · p2pmux attach {}", row.session);
+    }
+    let where_it_runs = if row.outside_p2pmux() {
         // Which of the three things enter does, said on the row. An agent that
         // cannot join its own running conversation must not look like one that
         // can, and the moment to say so is before the keypress.
@@ -1486,6 +1515,64 @@ mod tests {
             "the fallback line already is the directory: {drawn}"
         );
         assert!(drawn.contains("tab 1 · pane 1"), "{drawn}");
+    }
+
+    /// The card the click used to send the user nowhere. It has to say — before
+    /// any keypress, and without needing one — which session that agent is in
+    /// and what reaches it, and it has to look unlike the rows Enter opens.
+    #[test]
+    fn an_agent_in_another_session_is_drawn_dim_and_names_the_way_in() {
+        use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        let mut rows = tui.agent_rows.clone();
+        rows.push(crate::tui::AgentOverlayRow {
+            // No pane of this session's, and a session name: an agent left
+            // behind in a p2pmux nobody here is attached to.
+            pane_id: 0,
+            process_pid: 985,
+            host: String::from("laptop"),
+            kind: String::from("claude"),
+            state: AgentRosterState::Pending,
+            session: String::from("dakar"),
+            ..agent_row(0, 0, 0)
+        });
+        tui.set_agent_rows(rows);
+        tui.set_home_open(true, "test");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| super::render_home(frame, &tui, 0))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let line_holding = |needle: &str| -> u16 {
+            (0..30u16)
+                .find(|row| {
+                    (0..120u16)
+                        .map(|column| buffer[(column, *row)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("nothing on screen holds {needle}"))
+        };
+
+        let detached = line_holding("another p2pmux session · p2pmux attach dakar");
+        assert!(
+            buffer[(2, detached)].modifier.contains(Modifier::DIM),
+            "the row Enter refuses has to look like one"
+        );
+        assert!(
+            buffer[(2, detached.saturating_sub(2))]
+                .modifier
+                .contains(Modifier::DIM),
+            "the whole card is dim, not only the line naming the session"
+        );
+        let openable = line_holding("tab 1 · pane 1");
+        assert!(
+            !buffer[(2, openable)].modifier.contains(Modifier::DIM),
+            "and the agent Enter does open must not be dimmed with it"
+        );
     }
 
     /// A terminal too short for cards keeps the one-line rows rather than
