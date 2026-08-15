@@ -44,7 +44,7 @@ halves are true at once, and [the trust model](#trust) says exactly what that me
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
 
-p2pmux create                # you host; Ctrl+S shows the line to send
+p2pmux                       # you host; Ctrl+S shows the line to send
 p2pmux join 4KP7Q-M2XRW      # them, on their own machine
 ```
 

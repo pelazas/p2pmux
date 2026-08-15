@@ -416,7 +416,7 @@ fn run_socket_loop(
                                 let _ = write_message(
                                     reader.get_mut(),
                                     &NodeMessage::AttachRejected {
-                                        reason: "already attached".into(),
+                                        reason: crate::local_ipc::ALREADY_ATTACHED.into(),
                                     },
                                 );
                                 continue;

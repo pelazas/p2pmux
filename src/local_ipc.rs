@@ -327,6 +327,15 @@ pub struct SessionSummary {
     pub coordinator_name: String,
 }
 
+/// Why [`AttachmentGate::attach`] refused, and what the node sends back as the
+/// rejection reason.
+///
+/// Named rather than written out at each end because a caller decides what to do
+/// next by reading it: bare `p2pmux` treats this one refusal as "that session is
+/// taken, open another" rather than as an error, and a typo here would turn that
+/// recovery back into the dead end it replaced.
+pub const ALREADY_ATTACHED: &str = "already attached";
+
 /// Single-client gate. A generation makes delayed disconnects harmless after a reattach.
 #[derive(Clone, Default)]
 pub struct AttachmentGate(Arc<Mutex<AttachmentState>>);
@@ -340,7 +349,7 @@ impl AttachmentGate {
     pub fn attach(&self) -> Result<u64, &'static str> {
         let mut state = self.0.lock().expect("attachment gate poisoned");
         if state.attached {
-            return Err("already attached");
+            return Err(ALREADY_ATTACHED);
         }
         state.generation = state.generation.saturating_add(1).max(1);
         state.attached = true;

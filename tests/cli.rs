@@ -106,6 +106,41 @@ fn help_lists_the_local_terminal_command() {
     assert!(stdout.contains("full reusable join ticket"));
 }
 
+/// The listing is spelled `list`, and `ls` still reaches it.
+///
+/// Renaming the command a user types every day is only worth doing if the old
+/// spelling keeps working: `ls` is in scripts, in shell history and in three
+/// releases' worth of documentation, and a rename that breaks those buys a
+/// nicer name at the price of every one of them.
+#[test]
+fn list_and_its_ls_alias_print_the_same_sessions() {
+    let session = FakeSession::hosted("lisbon");
+
+    let long = run_with_home(session.home(), &["list"]);
+    let short = run_with_home(session.home(), &["ls"]);
+
+    assert!(long.status.success());
+    assert!(short.status.success());
+    let listed = String::from_utf8(long.stdout).expect("stdout should be UTF-8");
+    assert!(listed.contains("lisbon"), "{listed}");
+    assert!(listed.contains("coordinator"), "{listed}");
+    assert_eq!(
+        listed,
+        String::from_utf8(short.stdout).expect("stdout should be UTF-8")
+    );
+}
+
+/// `list` is the one the help text teaches, so the rename reaches the place a
+/// user goes to find out what the commands are.
+#[test]
+fn help_names_the_listing_command_list() {
+    let output = run(&["--help"]);
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("list"), "{stdout}");
+    assert!(stdout.contains("List the live sessions"), "{stdout}");
+}
+
 #[test]
 fn ticket_prints_a_pasteable_ticket_that_join_would_accept() {
     let session = FakeSession::hosted("lisbon");

@@ -169,13 +169,19 @@ fn run_detach_resume_round_trip(
     );
 
     // A second live client is refused while the first holds the attachment gate.
+    //
+    // The reason is asserted word for word, not just the variant: bare `p2pmux`
+    // reads it to decide that this session is merely taken and it should open
+    // another, and a reword here would silently turn that recovery back into
+    // the `Error: already attached` dead end it exists to prevent.
     let mut refused = UnixStream::connect(socket_path).unwrap();
     send(&mut refused, &ClientMessage::Hello { cols: 80, rows: 24 });
     let mut refused_reader = BufReader::new(refused.try_clone().unwrap());
-    assert!(matches!(
-        receive(&mut refused_reader, "second client rejection"),
-        NodeMessage::AttachRejected { .. }
-    ));
+    let rejection = receive(&mut refused_reader, "second client rejection");
+    let NodeMessage::AttachRejected { reason } = &rejection else {
+        panic!("expected the second client to be refused, got {rejection:?}");
+    };
+    assert_eq!(reason, p2pmux::local_ipc::ALREADY_ATTACHED);
 
     send(
         &mut stream,
