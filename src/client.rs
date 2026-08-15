@@ -218,15 +218,49 @@ fn scroll_pane_toward(
 
 /// Which screen an attaching client lands on.
 ///
-/// Bare `p2pmux` opens the inbox: the question it answers is "which of my
-/// agents needs me", and answering it should not require picking a session
-/// first. Every other entry point named a session out loud — `create`, `join`,
-/// `attach` — so it lands in the terminal the user asked for.
+/// The inbox is for arriving somewhere that was already running: the question
+/// it answers is "which of my agents needs me", and a session with other
+/// machines in it has an answer worth reading before anything else. Bare
+/// `p2pmux` opens on it when it rejoins a fleet session for that reason.
+///
+/// Everything that *starts* a session lands in the terminal instead — `create`,
+/// `join`, `attach`, and bare `p2pmux` on a machine with no fleet. A session one
+/// second old has a single pane and no agents, so its inbox is an empty list,
+/// and opening on an empty list is indistinguishable from opening on nothing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StartScreen {
     #[default]
     Session,
     Home,
+}
+
+/// A node turning this client away at the door, carrying its reason verbatim.
+///
+/// Typed rather than folded into `io::Error` so a caller can tell the one
+/// refusal it can recover from — the session already has a terminal in it —
+/// from every other way attaching fails. Matching on the message text would
+/// have worked until somebody reworded it.
+#[derive(Debug)]
+pub struct AttachRejected(String);
+
+impl std::fmt::Display for AttachRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AttachRejected {}
+
+/// Whether this is a node refusing a second client, rather than a session that
+/// is genuinely broken.
+///
+/// A node serves one terminal at a time, so this is the ordinary state of every
+/// session a user already has open — not a fault, and not something to end a
+/// command over.
+pub fn is_already_attached(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<AttachRejected>()
+        .is_some_and(|rejected| rejected.0 == crate::local_ipc::ALREADY_ATTACHED)
 }
 
 pub fn run(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
@@ -258,7 +292,7 @@ pub fn run_on(
     )?;
     let generation = match read_message(&mut reader)? {
         Some(NodeMessage::AttachAccepted { generation }) => generation,
-        Some(NodeMessage::AttachRejected { reason }) => return Err(io::Error::other(reason).into()),
+        Some(NodeMessage::AttachRejected { reason }) => return Err(AttachRejected(reason).into()),
         _ => return Err(io::Error::other("node did not accept attachment").into()),
     };
     let (wake_tx, wakes) = mpsc::channel();
@@ -1506,6 +1540,29 @@ mod tests {
     };
 
     use super::*;
+
+    /// The one refusal a caller recovers from, told apart from every other.
+    ///
+    /// Bare `p2pmux` passes over a session that already has a terminal in it and
+    /// opens another; it must not do that for a session that is genuinely
+    /// broken, because then the fault disappears behind a working session and
+    /// nobody ever sees it.
+    #[test]
+    fn only_a_busy_session_reads_as_already_attached() {
+        let busy: Box<dyn std::error::Error> =
+            AttachRejected(crate::local_ipc::ALREADY_ATTACHED.into()).into();
+        assert!(is_already_attached(&*busy));
+
+        // A rejection with any other reason is the node saying something else.
+        let other: Box<dyn std::error::Error> =
+            AttachRejected("session is shutting down".into()).into();
+        assert!(!is_already_attached(&*other));
+
+        // And a plain I/O failure — a socket that has gone away, say — is not a
+        // rejection at all.
+        let broken: Box<dyn std::error::Error> = io::Error::other("connection reset").into();
+        assert!(!is_already_attached(&*broken));
+    }
 
     fn layout(pane_ids: &[u64]) -> LayoutSnapshot {
         let root = pane_ids

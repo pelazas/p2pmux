@@ -103,8 +103,16 @@ enum Command {
         /// is hosted here.
         session: Option<String>,
     },
-    /// Attach a live local session by memorable name.
-    Attach { name: String },
+    /// Go back to a session already running on this machine.
+    ///
+    /// Bare `p2pmux` starts somewhere new; this is how you return to somewhere
+    /// old. With no name it takes the session started most recently here, which
+    /// is what "put me back" means when only one is running.
+    Attach {
+        /// The memorable session name, as listed by `p2pmux list`. Omit it to
+        /// take the most recently started one.
+        name: Option<String>,
+    },
     /// Gracefully stop a live local session.
     Kill {
         name: String,
@@ -684,7 +692,15 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Some(Command::Ticket { session }) => print_join_ticket(session),
         Some(Command::Code { session }) => print_join_code(session),
-        Some(Command::Attach { name }) => crate::client::run(&find_live(&name)?),
+        Some(Command::Attach { name }) => crate::client::run(&match name {
+            Some(name) => find_live(&name)?,
+            None => {
+                newest_live(&crate::session_store::SessionStore::for_current_user()?.list_live()?)
+                    .ok_or(CliError(
+                    "no session is running on this machine; `p2pmux` starts one",
+                ))?
+            }
+        }),
         Some(Command::Kill { name, yes }) => {
             let descriptor = find_live(&name)?;
             if descriptor.role == crate::session_store::SessionRole::Coordinator && !yes {
@@ -1292,27 +1308,42 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
     Ok(rows)
 }
 
-/// What bare `p2pmux` does: open the inbox.
+/// What bare `p2pmux` does: put this terminal in a session, always.
 ///
-/// Not a session picker. The question the command answers is "which of my
-/// agents needs me", and making someone choose a session first is asking them
-/// to answer a question they did not have in order to be shown the one they
-/// did. `--resume` still reaches the picker for anyone who wants it.
+/// The command has to answer for a machine in a fleet and a machine on its own,
+/// and those two want opposite things from the same six keystrokes:
 ///
-/// Three cases, in order, and all of them end on Home:
+/// * **Paired** — rejoin the session the pairing recorded. Every machine you own
+///   converging on one session is the whole point of pairing once, and the line
+///   `p2pmux pair` prints promises exactly this. Creating a fresh session here
+///   instead would leave each machine hosting its own and the fleet never
+///   meeting.
+/// * **On its own** — create a session. Someone with no fleet who types the
+///   shortest command wants a terminal, and this is the command that gives them
+///   one.
 ///
-/// 1. A session is already live here — attach it.
-/// 2. This machine is paired — rejoin the session the pairing recorded, with
-///    no code typed. That is the whole point of pairing once.
-/// 3. Nothing yet — start a solo session, so a first run has a real terminal
-///    behind `n` rather than an empty screen and an error.
+/// What it may never do is end without a session. It used to attach the newest
+/// live one first, whoever was in it — and a node serves one terminal at a time,
+/// so the second window on a machine that already had p2pmux open got
+/// `Error: already attached` and nothing else. That is the state of every
+/// machine actually using this, which is why bare `p2pmux` read as broken. An
+/// occupied session is now a session to pass over, not a failure to report.
+///
+/// `--resume` still reaches the picker, and `p2pmux attach` still goes back to a
+/// session already running here.
 async fn open_home() -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
-    if let Some(descriptor) = newest_live(&store.list_live()?) {
-        return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
-    }
     let pairing = crate::pairing::load_or_empty();
     if let Some(ticket) = pairing.ticket.as_deref() {
+        // A node here is already in the fleet's session: use it rather than
+        // standing up a second one alongside it. Only while it is free — an
+        // occupied one falls through to a node of this terminal's own, which
+        // lands in the same shared session anyway.
+        if let Some(descriptor) = newest_live(&joined_to(&store.list_live()?, ticket))
+            && let Some(result) = attach_unless_busy(&descriptor, crate::client::StartScreen::Home)
+        {
+            return result;
+        }
         match rejoin_paired_session(ticket).await {
             Ok(descriptor) => {
                 return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
@@ -1328,7 +1359,48 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
         }
     }
     let descriptor = start_solo_session()?;
-    crate::client::run_on(&descriptor, crate::client::StartScreen::Home)
+    // The session screen, not the inbox. A session created a moment ago has one
+    // pane and no agents in it, so Home would open on an empty list — the blank
+    // screen a first run is least able to interpret. Rejoining a fleet session
+    // is the opposite case and keeps the inbox.
+    crate::client::run_on(&descriptor, crate::client::StartScreen::Session)
+}
+
+/// Attach `descriptor`, unless another terminal is already in it.
+///
+/// `None` means only that: the session is taken, and the caller should look
+/// elsewhere. Every other failure comes back as `Some(Err(..))` and stays the
+/// caller's problem to report — swallowing those would hide a broken session
+/// behind a brand-new one and make the fault impossible to see.
+fn attach_unless_busy(
+    descriptor: &crate::session_store::SessionDescriptor,
+    start: crate::client::StartScreen,
+) -> Option<Result<(), Box<dyn Error>>> {
+    match crate::client::run_on(descriptor, start) {
+        Err(error) if crate::client::is_already_attached(&*error) => None,
+        result => Some(result),
+    }
+}
+
+/// The live sessions here that are the one the pairing recorded.
+///
+/// Matched by ticket rather than taken as "the newest", because a machine in a
+/// fleet also starts sessions of its own: attaching one of those for a bare
+/// `p2pmux` would put the user somewhere their other machines are not, which is
+/// the one place this command must never leave them. The coordinator that
+/// minted the pairing ticket holds it as `ticket`; every machine that joined
+/// holds the same string as `joined_ticket`.
+fn joined_to(
+    live: &[crate::session_store::SessionDescriptor],
+    ticket: &str,
+) -> Vec<crate::session_store::SessionDescriptor> {
+    live.iter()
+        .filter(|descriptor| {
+            descriptor.joined_ticket.as_deref() == Some(ticket)
+                || descriptor.ticket.as_deref() == Some(ticket)
+        })
+        .cloned()
+        .collect()
 }
 
 /// The most recently created live session, which is the one a bare command
