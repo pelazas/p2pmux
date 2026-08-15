@@ -113,7 +113,7 @@ not an agent orchestration platform.
 
 ## Status
 
-**Early, but real.** v0.1.8 runs sessions between machines on different networks and different
+**Early, but real.** v0.1.9 runs sessions between machines on different networks and different
 continents. macOS and Linux, both architectures. Bare `p2pmux` opens the inbox, two machines pair
 once and rejoin without a code, and two agents report their own state through hooks — Claude Code
 and OpenCode. A coordinator that dies no longer ends the session — a survivor takes the role over,
@@ -155,10 +155,27 @@ not a way in. The `inbox N` badge stops counting an agent once you have been to 
 counts one you cannot get to from here. `m` moves the cursor into the fleet and the arrow keys walk
 it.
 
-**v0.1.8 does not share sessions with v0.1.7 or older.** The wire pin moved: a machine now tells
-the session it has joined a fleet, and a joining machine can present an enrolment token, and
-neither message exists on the old side. A peer on the wrong side of the pin is refused with an
-unsupported-protocol error rather than half-joining — update both machines together.
+v0.1.9 is about the first command and the rows you cannot act on. Bare `p2pmux` now always ends in
+a session: a session already serving a terminal is one to pass over rather than a failure to
+report, so a second window on a machine that already has p2pmux open rejoins the paired session, or
+creates one if this machine is on its own, instead of stopping at `Error: already attached`. When
+the rejoin has to dial a machine that is asleep it says so before spending the thirty seconds, not
+after. The listing is `p2pmux list`, with `ls` kept as an alias, and `p2pmux attach` takes the name
+optionally. In the inbox, an agent in *another* p2pmux session on the same machine is drawn dim and
+carries the command that reaches it: the cursor walks past it, a click on it opens nothing, and it
+is left out of the `inbox N` badge — the badge counts summonses somebody can answer from here. The
+elapsed clock now dates whichever state a row is in rather than only a working one, so `needs you`
+says how long it has been waiting and an interrupted turn stops restarting its clock. An emoji
+presentation glyph no longer eats the character beside it and shifts everything after it, Shift+Tab
+reaches the pane instead of being swallowed, and the wheel is aimed by the pointer rather than by
+focus. A refused local connection is no longer taken as proof the node is gone, one bad local
+connection cannot end a session, and a node that dies says what happened.
+
+**v0.1.8 and v0.1.9 share sessions.** The wire protocol did not move, so a peer on either can join
+the other. v0.1.7 and older still cannot join either: that pin moved in v0.1.8 — a machine now
+tells the session it has joined a fleet, and a joining machine can present an enrolment token —
+and a peer on the wrong side of it is refused with an unsupported-protocol error rather than
+half-joining.
 
 ## Install
 

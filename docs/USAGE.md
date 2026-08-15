@@ -67,7 +67,8 @@ sessions.
 v0.1.8 moved it again, for the same reason: a machine now tells the session it has joined a fleet,
 and a joining machine can present an enrolment token, and a v0.1.7 peer handed either message
 drops its control stream rather than ignoring it. So v0.1.8 shares sessions with nothing older —
-update both machines together.
+update both machines together. v0.1.9 left the pin where v0.1.8 put it, so those two do share
+sessions.
 
 To dogfood the shared layout on one machine:
 
@@ -699,7 +700,7 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.9 is out — you have 0.1.8. Update with `brew update && brew upgrade p2pmux`
+p2pmux 0.1.10 is out — you have 0.1.9. Update with `brew update && brew upgrade p2pmux`
 ```
 
 `p2pmux doctor` asks the same question and answers it either way, which is the one to run when you
