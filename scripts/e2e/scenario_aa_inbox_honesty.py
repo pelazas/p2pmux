@@ -350,17 +350,17 @@ def main() -> int:
         mac.send(CTRL_O)
         time.sleep(1.5)
         screen = wait_for_screen(
-            mac, lambda s: "p2pmux session other" in s, timeout=60
+            mac, lambda s: "p2pmux attach other" in s, timeout=60
         )
         check(
             "an agent in another p2pmux session names that session",
-            "p2pmux session other" in screen,
+            "p2pmux attach other" in screen,
             "\n".join(line for line in screen.split("\n") if "session" in line)[:300],
         )
         check(
             "and is no longer called an agent running outside p2pmux",
             "running outside p2pmux · enter starts" not in screen
-            or "p2pmux session other" in screen,
+            or "p2pmux attach other" in screen,
             screen[:400],
         )
 
