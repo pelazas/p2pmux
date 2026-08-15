@@ -1344,6 +1344,21 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
         {
             return result;
         }
+        // Said before the dial, not after it. Reaching a machine that is not
+        // answering costs iroh about thirty seconds, and this command spent
+        // every one of them printing nothing at all: a bare `p2pmux` on a laptop
+        // whose paired desktop is asleep looked exactly like a command that had
+        // hung. Thirty seconds of "waiting for my other machine" is a wait; the
+        // same thirty seconds in silence is what "p2pmux does nothing" was.
+        {
+            let mut stderr = io::stderr().lock();
+            writeln!(
+                stderr,
+                "rejoining the session this machine is paired with; this can take \
+                 up to half a minute if the other machine is asleep…"
+            )?;
+            stderr.flush()?;
+        }
         match rejoin_paired_session(ticket).await {
             Ok(descriptor) => {
                 return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
@@ -1852,6 +1867,42 @@ mod tests {
             .0;
         assert!(create_arm.contains("launch_background_node("));
         assert!(create_arm.contains("crate::client::run(&descriptor)"));
+    }
+
+    /// Bare `p2pmux` says it is dialling *before* it dials.
+    ///
+    /// Reaching a paired machine that is asleep costs iroh about thirty
+    /// seconds. Printing afterwards — which is all this did — meant those
+    /// thirty seconds were blank, and a blank terminal is indistinguishable
+    /// from a hung command. Measured on a droplet whose peer was unreachable,
+    /// the first byte arrived at t=31.6s.
+    ///
+    /// Pinned by order rather than by behaviour because the alternative is a
+    /// test that waits out a real dial to a machine that is deliberately not
+    /// answering, and a half-minute of CI per run is a worse trade than this.
+    #[test]
+    fn bare_p2pmux_announces_the_rejoin_before_it_waits_on_one() {
+        let source = include_str!("cli.rs");
+        let body = source
+            .split_once("async fn open_home()")
+            .expect("open_home")
+            .1
+            .split_once("\nasync fn ")
+            .map_or_else(
+                || source.split_once("async fn open_home()").unwrap().1,
+                |split| split.0,
+            );
+
+        let announcement = body
+            .find("rejoining the session this machine is paired with")
+            .expect("open_home should say it is rejoining");
+        let dial = body
+            .find("rejoin_paired_session(ticket)")
+            .expect("open_home should rejoin");
+        assert!(
+            announcement < dial,
+            "the notice must be printed before the dial it explains, not after it"
+        );
     }
 
     /// The node has no terminal, so whatever it writes to stderr is the only
