@@ -380,6 +380,30 @@ Left-clicking a card opens it. The mouse wheel turns the page. To retain readlin
 beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A to the focused
 PTY instead.
 
+### Agents in another session
+
+The inbox lists every agent on every machine in the session, not only the ones in panes this
+client is showing you. A `claude` started in iTerm is on the list, and so is one left behind in a
+p2pmux session you detached last Tuesday. The rows say which of the two each one is.
+
+An agent in another p2pmux session is drawn dim, and neither the cursor nor the pointer stops on
+it. Its last line carries the way in instead:
+
+```
+ ○ laptop     claude                  running
+   state unknown — no hooks
+   another p2pmux session · p2pmux attach dakar
+```
+
+Run that from a terminal, not from a pane in here. Reaching it from inside would mean a whole
+second p2pmux nested in a pane of this one — which takes the prefix key from the mux around it
+and, on a session that already has a terminal, ends at `already attached` and leaves an empty
+shell. The row stays on the list because it is the only record of where that agent went.
+
+It does not feed the `inbox N` badge either. Going to an agent is what answers its summons, and
+there is no going to that one from here, so a count including it could only ever rise. The row
+still says `needs you` in its own state column, where it is true.
+
 ### The machines rail
 
 Every machine you have paired with is listed down the right-hand side for as long as the inbox is

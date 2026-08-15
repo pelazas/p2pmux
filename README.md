@@ -148,9 +148,12 @@ your fleet from a provisioning script, with a revocable token instead of a code 
 within ten minutes. `p2pmux work` is how a machine says what your other machines may start on it,
 which until now could only be written by hand into a file most people never found — and a refusal
 names the command that lifts it, on the machine to run it on. Agents in *another* p2pmux session on
-the same machine are named as such rather than called "running outside p2pmux", and enter attaches
-that session. The `inbox N` badge stops counting an agent once you have been to its pane. `m` moves
-the cursor into the fleet and the arrow keys walk it.
+the same machine are named as such rather than called "running outside p2pmux": the row is drawn
+dim, the cursor and the pointer both pass over it, and it carries the command that reaches that
+agent — `p2pmux attach <name>`, from a terminal, since a p2pmux nested in a pane of another one is
+not a way in. The `inbox N` badge stops counting an agent once you have been to its pane, and never
+counts one you cannot get to from here. `m` moves the cursor into the fleet and the arrow keys walk
+it.
 
 **v0.1.8 does not share sessions with v0.1.7 or older.** The wire pin moved: a machine now tells
 the session it has joined a fleet, and a joining machine can present an enrolment token, and
