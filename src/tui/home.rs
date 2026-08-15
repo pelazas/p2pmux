@@ -159,10 +159,21 @@ impl MultiPaneTui {
     /// you answers it — leaving `inbox 1` up while the user reads the question
     /// it refers to makes the badge mean "there is an agent" rather than "you
     /// are needed". See `answered_agent_panes`.
+    ///
+    /// Which is also why an agent in another p2pmux session is left out. Going
+    /// to it is the only thing that answers a summons, and there is no going to
+    /// it from here — so its count could only ever go up. A blocked agent in a
+    /// session detached last Tuesday would put a number on the badge that no
+    /// action taken in this session could ever clear, on every session, for as
+    /// long as that agent stayed blocked. A badge that cannot be cleared stops
+    /// being read, and takes the answerable ones down with it. The row still
+    /// says `needs you` in its own state column, where it is true and costs
+    /// nobody a glance at the tab bar.
     pub fn home_needs_you_count(&self) -> usize {
         self.agent_rows
             .iter()
             .filter(|row| row.state.needs_you())
+            .filter(|row| row.reachable_from_here())
             .filter(|row| !self.answered_agent_panes.contains(&row.pane_id))
             .count()
     }
@@ -2025,6 +2036,37 @@ mod tests {
             tui.open_home_selection().is_empty(),
             "no new tab, no new pane, and pointedly no second agent"
         );
+    }
+
+    /// The badge counts summonses a person can answer. A blocked agent in a
+    /// session detached last Tuesday is not one: nothing done here reaches it,
+    /// so its number could only ever go up, on every session, for as long as it
+    /// stayed blocked.
+    #[test]
+    fn an_agent_in_another_session_never_puts_a_number_on_the_badge() {
+        let mut tui = a_bot_in_a_session_of_its_own();
+        let mut rows = tui.agent_rows.clone();
+        for row in &mut rows {
+            row.state = AgentRosterState::Pending;
+        }
+        tui.set_agent_rows(rows.clone());
+        assert_eq!(
+            tui.home_needs_you_count(),
+            1,
+            "both are blocked; only the one Enter reaches is a summons"
+        );
+
+        // The row still says it, where it is true and costs nobody a glance at
+        // the tab bar.
+        assert!(
+            tui.home_rows()
+                .iter()
+                .any(|row| row.pane_id == 0 && row.state.needs_you())
+        );
+
+        // And with only the unreachable one left, the badge is clear.
+        tui.set_agent_rows(rows.into_iter().filter(|row| row.pane_id == 0).collect());
+        assert_eq!(tui.home_needs_you_count(), 0);
     }
 
     /// An inbox holding nothing but other sessions' agents has no cursor at
