@@ -26,6 +26,32 @@ means ship the inbox and widen to ~10 hand-picked users, > 5 means build hard.**
 | Date | Downloads | Stranger issues | Visitors 14d | Escalations | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 2026-08-02 | 23 | **0** | 4 | 0 | Baseline. See caveats below. |
+| 2026-08-16 | 57 | **0** | 10 | 0 | First distribution went out the same day, too late to show here. |
+
+### 2026-08-16 — two weeks on, and the funnel is still empty
+
+Eight releases shipped in the fortnight (`v0.1.3` through `v0.1.10`), which is most of what moved
+downloads. Nothing had been posted anywhere until today, so read this as the *pre-distribution*
+reading rather than as a result.
+
+- **10 unique visitors in 14 days**, up from 4. Against 157 views. Still nobody, and still the number
+  every other one is downstream of. The referrers are `github.com` (6 uniques), Google (2) and
+  crates.io (2) — no external site sends anyone here, because no external site mentions it.
+- **Downloads 23 → 57.** Eight releases in the window and a chunk of the count is our own install
+  verification, so the honest figure for *distinct humans who tried it* is still close to zero.
+- **crates.io says 142 downloads, 133 of them recent. Do not report that number to anyone.** The
+  daily series is 14, 14, 16, 2, 12, 12, 9 — flat, every day, uncorrelated with releases and
+  uncorrelated with the days that had visitors. A real audience is spiky and follows posting. This
+  is mirrors and scanners, exactly like the clone count this page already refuses to quote.
+- **Stranger-opened issues: still zero.** Unchanged, and the only number that would prove use.
+
+**On the 200-download decision rule.** It has not triggered and is further away than it looks: the
+rule counts release assets, so we are at 57 of 200, and the fraction of that 57 which is a person is
+small. Do not invoke the rule early on the crates.io figure — that is the mistake this page's whole
+tone exists to prevent.
+
+The three list PRs and the iroh discussion all went out on 2026-08-16, after this snapshot. The next
+row is the first one that can say anything about whether distribution works.
 
 ### 2026-08-02 — baseline
 
