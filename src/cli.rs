@@ -1027,6 +1027,7 @@ async fn wait_for_peers(
 /// line under the fleet rather than instead of it.
 fn print_machines() -> Result<(), Box<dyn Error>> {
     let rows = machine_rows()?;
+    let pairing = crate::pairing::load()?;
     let (fleet, guests): (Vec<_>, Vec<_>) = rows.iter().partition(|row| row.owned);
     println!(
         "{:<12} {:<8} {:<14} RUNNING",
@@ -1048,13 +1049,28 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
     }
     if fleet.len() < 2 {
         println!();
-        println!("No other machines paired yet. Run `p2pmux pair` to add one.");
+        // An open invitation is not the same state as no invitation, and this
+        // line used to call them the same thing. The machine that accepts a
+        // code is written down by the node, on its own two-second scan, and not
+        // at the instant the code is typed -- so asking straight after pairing
+        // reads `No other machines paired yet` about a pairing that is working.
+        // That gap was reported as a pairing that never happened (#92), and the
+        // right answer to it is a sentence, not a faster timer.
+        if pairing.pairing_window_open(crate::pairing::now_unix()) {
+            println!(
+                "An invitation is open and no machine has come through it yet.\n\
+                 One that accepts the code lands here a few seconds later, not the\n\
+                 moment it is typed — so if you have just paired, ask again."
+            );
+        } else {
+            println!("No other machines paired yet. Run `p2pmux pair` to add one.");
+        }
     }
     // Only about this machine, because this machine's own file is the only
     // policy it can honestly report. Every other row's `ACCEPTS WORK` column
     // already says `—` for the same reason.
     println!();
-    print!("{}", work_policy_summary(&crate::pairing::load()?));
+    print!("{}", work_policy_summary(&pairing));
     Ok(())
 }
 

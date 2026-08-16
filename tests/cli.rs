@@ -313,6 +313,60 @@ fn notify_is_a_silent_no_op_outside_a_pane() {
     fs::remove_dir_all(&directory).expect("temporary directory should remove");
 }
 
+/// Write a pairing record into a sandbox HOME, optionally with an open window.
+fn write_pairing(home: &Path, window_open: bool) {
+    let directory = home.join(".config").join("p2pmux");
+    fs::create_dir_all(&directory).expect("config directory");
+    let mut record = String::from("ticket = \"p2pmux-v3:abc\"\naccepts_work = false\n");
+    if window_open {
+        let until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_secs()
+            + 600;
+        record.push_str(&format!("pending_until = {until}\n"));
+    }
+    fs::write(directory.join("pairing.toml"), record).expect("pairing record should write");
+}
+
+/// An invitation nobody has accepted *yet* is not the same state as no
+/// invitation, and `machines` used to print one sentence for both.
+///
+/// The node writes an arriving machine down on its own two-second scan rather
+/// than at the moment the code is typed, so asking straight after pairing —
+/// which is exactly when somebody asks — read as a pairing that never happened.
+/// That is #92.
+#[test]
+fn machines_says_an_open_invitation_is_still_open_rather_than_that_nobody_paired() {
+    let session = FakeSession::hosted("lisbon");
+    write_pairing(session.home(), true);
+
+    let output = run_with_home(session.home(), &["machines"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("An invitation is open"), "{stdout}");
+    assert!(stdout.contains("ask again"), "{stdout}");
+    assert!(
+        !stdout.contains("No other machines paired yet"),
+        "an open invitation is not nobody having paired: {stdout}"
+    );
+}
+
+/// And with no invitation out, the original line is still the right one.
+#[test]
+fn machines_still_says_nobody_is_paired_when_no_invitation_is_open() {
+    let session = FakeSession::hosted("lisbon");
+    write_pairing(session.home(), false);
+
+    let output = run_with_home(session.home(), &["machines"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("No other machines paired yet"), "{stdout}");
+    assert!(!stdout.contains("An invitation is open"), "{stdout}");
+}
+
 /// A fleet is something a pairing makes, and the error has to say so.
 ///
 /// It used to offer "or start a session with `p2pmux`" as an alternative, which
