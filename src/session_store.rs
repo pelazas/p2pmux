@@ -760,7 +760,22 @@ fn socket_dir(runtime_dir: Option<std::ffi::OsString>, uid: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp").join(format!("p2pmux-{uid}")))
 }
 
+/// This user's numeric id, asked of the system once per process.
+///
+/// It cannot change while a process runs, and asking costs a fork and an exec.
+/// That was invisible while this was on the path of `p2pmux ls`, and became a
+/// subprocess every couple of seconds once a node started reading its own
+/// session store on a timer.
 fn current_uid() -> io::Result<String> {
+    static UID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(uid) = UID.get() {
+        return Ok(uid.clone());
+    }
+    let uid = read_current_uid()?;
+    Ok(UID.get_or_init(|| uid).clone())
+}
+
+fn read_current_uid() -> io::Result<String> {
     let output = std::process::Command::new("id").arg("-u").output()?;
     if !output.status.success() {
         return Err(io::Error::other("could not determine current uid"));
