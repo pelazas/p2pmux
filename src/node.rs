@@ -167,7 +167,16 @@ pub fn read_bootstrap(path: &std::path::Path) -> io::Result<NodeBootstrap> {
 /// would be a worse message, not a better one.
 fn describe_join_failure(error: crate::session::SessionError) -> Box<dyn Error> {
     use crate::session::SessionError;
+    use crate::{protocol::ProtocolError, transport::TransportError};
     match error {
+        // A peer that answered in a protocol this one does not speak is not a
+        // peer that could not be reached, and saying so sent somebody looking at
+        // their network for an hour. This is the one transport failure that has
+        // a diagnosis: the two machines are on different versions of p2pmux, and
+        // the older one is the one to upgrade.
+        SessionError::Transport(TransportError::Protocol(ProtocolError::UnsupportedVersion(
+            theirs,
+        ))) => io::Error::other(unsupported_protocol_message(theirs)).into(),
         SessionError::Transport(_) | SessionError::TimedOut(_) => io::Error::other(
             "could not reach the session host: they may be offline or on a different network, \
              or the invite may be out of date. Ask for a fresh join code.",
@@ -175,6 +184,28 @@ fn describe_join_failure(error: crate::session::SessionError) -> Box<dyn Error> 
         .into(),
         other => Box::<dyn Error>::from(other.to_string()),
     }
+}
+
+/// What to tell somebody whose p2pmux and the session's do not speak the same
+/// protocol, in the terms they can act on: which end is old, and how to fix it.
+///
+/// The version numbers are what the wire carries, and nobody installs a protocol
+/// number — so they are named as the evidence and the instruction is about
+/// p2pmux itself. Which end to upgrade follows from which number is lower.
+pub(crate) fn unsupported_protocol_message(theirs: u32) -> String {
+    let ours = crate::protocol::PROTOCOL_VERSION;
+    let older = if theirs < ours {
+        "The machine hosting that session is running an older p2pmux than this one — \
+         upgrade it, not this machine."
+    } else {
+        "This machine is running an older p2pmux than the session's — upgrade this one."
+    };
+    format!(
+        "that session speaks p2pmux protocol {theirs} and this p2pmux speaks {ours}, \
+         so they cannot share a session. {older} \
+         Upgrade with `curl -fsSL https://p2pmux.com/install.sh | sh`, or \
+         `brew upgrade p2pmux` if you installed it that way, then try again."
+    )
 }
 
 /// Private child entrypoint. It owns the descriptor, socket and every PTY.
@@ -2267,6 +2298,52 @@ mod tests {
         assert_eq!(node.input(None, b"x".to_vec()).unwrap(), Some(2));
 
         tokio::task::block_in_place(|| node.shutdown());
+    }
+
+    /// The failure that reads as a network problem and is not one.
+    ///
+    /// A droplet on an older p2pmux, dialling a session on a newer one, was told
+    /// "could not reach the session host: they may be offline or on a different
+    /// network" — while both machines were up, on the same network, and reaching
+    /// each other fine. The peer answered; it answered in a protocol this one
+    /// does not speak, and that is a diagnosis, not a reachability failure.
+    #[test]
+    fn a_version_mismatch_is_not_reported_as_an_unreachable_host() {
+        use crate::{protocol::ProtocolError, transport::TransportError};
+
+        let older = describe_join_failure(crate::session::SessionError::Transport(
+            TransportError::Protocol(ProtocolError::UnsupportedVersion(
+                crate::protocol::PROTOCOL_VERSION - 1,
+            )),
+        ))
+        .to_string();
+        assert!(
+            !older.contains("could not reach"),
+            "a version mismatch must not be dressed up as a network failure: {older}"
+        );
+        assert!(older.contains("p2pmux.com/install.sh"), "{older}");
+        assert!(
+            older.contains("upgrade it, not this machine"),
+            "the older end is the one to upgrade, and it is the other one here: {older}"
+        );
+
+        let newer = describe_join_failure(crate::session::SessionError::Transport(
+            TransportError::Protocol(ProtocolError::UnsupportedVersion(
+                crate::protocol::PROTOCOL_VERSION + 1,
+            )),
+        ))
+        .to_string();
+        assert!(
+            newer.contains("upgrade this one"),
+            "here it is this machine that is behind: {newer}"
+        );
+
+        // Everything else about a transport is still a reachability question,
+        // and burying a genuine one under a version story would be the same
+        // mistake pointing the other way.
+        let unreachable =
+            describe_join_failure(crate::session::SessionError::TimedOut("join")).to_string();
+        assert!(unreachable.contains("could not reach"), "{unreachable}");
     }
 
     /// A machine that followed a fleet invitation runs a node nobody has ever
