@@ -930,9 +930,15 @@ pub fn run_on(
                 viewport = (cols, rows);
                 if !tui.modal_open() {
                     tui.set_home_viewport_for(Rect::new(0, 0, cols, rows));
+                    // The cached viewports were built against the old grid, so
+                    // they go — and with them the only rows a scrolled-back pane
+                    // had to show. What it falls back to is its live screen, so
+                    // the offsets have to come back to the live edge too, or the
+                    // pane reads as scrolled while showing the newest output.
                     history.clear();
                     pending_scroll.clear();
                     desired_scroll.clear();
+                    tui.reset_all_scrollback();
                     write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
                     node_viewport = (cols, rows);
                 }
