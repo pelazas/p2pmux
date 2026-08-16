@@ -1161,7 +1161,20 @@ mod tests {
         assert!(socket.exists(), "and so must its socket");
 
         // Once the listener is gone the connection is refused, and only then is it swept.
+        //
+        // Waited for rather than asserted on the next line. Closing a listening
+        // socket and the kernel refusing the next connection to it are not the
+        // same instant: connections already queued on the backlog are still
+        // completed for a moment afterwards, and on a machine running the rest
+        // of this suite in parallel that moment is long enough to lose a race.
+        // The claim under test is that the sweep follows the listener, not that
+        // it follows it within one scheduling quantum -- and asserting the
+        // second reddened CI at random.
         drop(listener);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while probe(&socket) != Liveness::Gone && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(probe(&socket), Liveness::Gone);
         assert!(store.list_live().unwrap().is_empty());
         assert!(store.read(&id).is_err());
