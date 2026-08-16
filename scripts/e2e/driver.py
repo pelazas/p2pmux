@@ -114,6 +114,25 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
+# What a p2pmux pane puts in its children's environment, and what a hook reads to
+# decide it is running in one.
+PANE_ENV = ("P2PMUX_PANE_ID", "P2PMUX_SOCK")
+
+
+def sandbox_environ() -> dict[str, str]:
+    """This process's environment with any live pane's markers taken out.
+
+    The suite is routinely run from a terminal inside p2pmux -- that is what
+    dogfooding is -- and every process it starts inherited that pane's id and
+    socket. A hook fired by a scenario's "loose" agent therefore reported to the
+    developer's own session instead of writing the machine-local record the
+    scenario was about, and two checks in scenario Y failed on a developer's
+    machine while passing in a bare shell. Scenarios that want these set pass
+    them explicitly.
+    """
+    return {key: value for key, value in os.environ.items() if key not in PANE_ENV}
+
+
 @dataclass
 class Peer:
     """One p2pmux process on its own PTY, with a live pyte-rendered screen."""
@@ -169,7 +188,7 @@ class Peer:
             stdout=slave_fd,
             stderr=slave_fd,
             preexec_fn=_become_session_leader,
-            env={**os.environ, **self.env},
+            env={**sandbox_environ(), **self.env},
             cwd=str(self.cwd) if self.cwd else None,
             close_fds=True,
         )

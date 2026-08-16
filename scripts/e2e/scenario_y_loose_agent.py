@@ -33,6 +33,7 @@ from driver import (  # noqa: E402
     Harness,
     orphans_after,
     p2pmux_pids,
+    sandbox_environ,
 )
 
 CTRL_O = b"\x0f"
@@ -82,6 +83,11 @@ def start_loose_agent(root: Path, name: str, body: str) -> int:
             f"</dev/null >/dev/null 2>&1",
         ],
         check=True,
+        # Without a pane's markers, which this process inherits whenever the
+        # suite is run from a terminal inside p2pmux. An agent that has them is
+        # not a loose agent: its hook reports to that pane, correctly, and the
+        # machine-local record this scenario is about is never written.
+        env=sandbox_environ(),
     )
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -116,6 +122,11 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
 
             peer = harness.spawn("home", [], env=env)
             peer.wait_ready(timeout=30)
+            # A first run lands in the session it just created, not on the
+            # inbox -- see `13124c2`. The inbox, which is what this scenario is
+            # about, is one keystroke from there.
+            peer.wait_for(r"Pane #1", timeout=20)
+            peer.send(CTRL_O)
             peer.wait_for(r"Agents", timeout=20)
 
             # The scan runs every five seconds and the agent reports `pending`
