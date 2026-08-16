@@ -57,18 +57,11 @@ it, and remembers a no. Local IPC is intentionally versioned as an implementatio
 session after upgrading when attach protocol changes are present.
 
 Everyone in a session runs the same wire protocol. It is pinned per release and never negotiated
-down, so a peer on a different one fails its join — reported as an unsupported protocol version —
-rather than entering a session it only half understands. v0.1.6 moved that pin: it added a message
-older peers cannot decode, so a v0.1.5 peer is refused at the door rather than dropping its control
-stream the first time one arrives. v0.1.4 and v0.1.5 still share sessions with each other, and
-neither can join a v0.1.6 one. v0.1.7 left the pin where v0.1.6 put it, so those two do share
-sessions.
-
-v0.1.8 moved it again, for the same reason: a machine now tells the session it has joined a fleet,
-and a joining machine can present an enrolment token, and a v0.1.7 peer handed either message
-drops its control stream rather than ignoring it. So v0.1.8 shares sessions with nothing older —
-update both machines together. v0.1.9 left the pin where v0.1.8 put it, so those two do share
-sessions.
+down, so a peer on a different one fails its join — reported as an unsupported protocol version,
+naming both numbers and saying which machine is the old one — rather than entering a session it
+only half understands. Which releases share a pin, and where it last moved, is in
+[CHANGELOG.md](../CHANGELOG.md#compatibility). When two of your own machines will not talk to each
+other, `p2pmux --version` on both is the first thing to check.
 
 To dogfood the shared layout on one machine:
 
@@ -578,6 +571,11 @@ On your laptop:       p2pmux pair 4KP7Q-M2XRW
                       → paired: desktop
 ```
 
+Both machines need a p2pmux that shares a protocol pin — `p2pmux --version` on each, and
+[CHANGELOG.md](../CHANGELOG.md#compatibility) for which releases go together. The code is good for
+ten minutes, and it admits exactly one machine: the window closes on the first arrival and expires
+on its own, so a second machine needs a second `p2pmux pair`.
+
 `p2pmux machines` lists the fleet and whether each part of it is answering:
 
 ```text
@@ -609,10 +607,32 @@ would show a refusal nobody made.
 Pairing is stored in `$XDG_CONFIG_HOME/p2pmux/pairing.toml`. It holds the shared session's ticket
 and the names of the paired machines, and no keys of its own.
 
+### When a machine will not join
+
+In the order they actually happen:
+
+- **`could not reach the session host`, but both machines are up and on the network.** Check
+  `p2pmux --version` on each. Two p2pmux on different sides of a protocol pin cannot share a
+  session; a recent one says so outright, an older one reports it as a reachability failure
+  because the refusal arrives in a protocol it cannot read.
+- **The code was typed more than ten minutes after it was printed**, or another machine used it
+  first. Print a fresh one with `p2pmux pair` and type it within the window.
+- **`p2pmux enroll` says this machine is not in a fleet.** A token is an invitation to a fleet that
+  already exists, and a fleet begins with one human pairing two machines. Run `p2pmux pair` between
+  two of yours first; enrol the third and every one after it.
+- **A machine that paired is `asleep` in `p2pmux machines`.** It is paired but nothing is running
+  on it. A box with somebody at it rejoins with bare `p2pmux`; one without needs the fleet agent —
+  `p2pmux daemon install` on that machine, once.
+- **A machine of yours keeps dragging you somewhere unexpected.** Your machines invite each other
+  into every session they are coordinating, and a session left running on a box nobody looks at
+  goes on inviting for as long as it is up. `p2pmux list` on that machine says what it is running,
+  and `p2pmux kill <name>` ends it.
+
 ### Enrolling a machine nobody is sitting at
 
 `p2pmux pair` is a code one human types on one machine within ten minutes. That is right for two
-laptops and unusable from a provisioning script, so a VM gets a token instead:
+laptops and unusable from a provisioning script, so a VM gets a token instead. It needs a fleet to
+invite the machine *into*, so pair two machines by hand first — a token cannot create one.
 
 ```text
 On a machine already in the fleet:   p2pmux enroll
@@ -626,6 +646,18 @@ On the new machine:                  p2pmux enroll p2pmux-enrol-v1:… --name bu
 Printing the token twice gives the same token, so an image built from last week's paste still
 works. `p2pmux enroll --revoke` withdraws it; machines already enrolled stay, and `p2pmux unpair`
 is how one leaves.
+
+Enrolling puts the machine in the fleet for as long as it stays up. Surviving its next reboot is a
+second step, and on a box nobody logs into it is the one that matters:
+
+```text
+On the new machine:   p2pmux daemon install
+                      → fleet agent installed: …
+```
+
+That writes a launchd agent or a systemd user unit which rejoins the home session at boot, so the
+machine is there to be invited into sessions you start later. `p2pmux daemon status` says whether
+it is installed, and `p2pmux daemon uninstall` removes it.
 
 It is a credential, and worth being plain about: anyone holding it can put a machine in your fleet
 until you revoke it. What that buys them is *membership*, which starts nothing on its own — see
