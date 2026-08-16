@@ -628,9 +628,14 @@ pub(in crate::tui) fn render_shared_multi_pane(
                 viewport,
             );
             let (row, col) = screen.cursor_position();
+            // `scrollback`, not the screen's own offset: a client keeps no
+            // scrollback of its own and renders history by swapping in a
+            // viewport the node built, whose retained-row count -- and so whose
+            // offset -- is always zero. Asking the screen left the caret parked
+            // on a row of history, at a position that belonged to the live edge.
             if focused
                 && view.ready
-                && screen.scrollback() == 0
+                && scrollback == 0
                 && !screen.hide_cursor()
                 && !pane.exited
                 && row < viewport.height
@@ -1354,6 +1359,92 @@ mod tests {
 
             assert!(!terminal.backend().cursor_visible());
         }
+    }
+
+    /// A pane scrolled back is not showing where its program's cursor is, so the
+    /// caret must not blink on a row of history.
+    ///
+    /// Both ways a pane can be scrolled are covered, because they disagree about
+    /// where the offset lives. A local pane scrolls its own screen; a client
+    /// keeps no scrollback at all and swaps in a viewport the node built, whose
+    /// retained-row count -- and so whose own offset -- is always zero. Reading
+    /// the offset off the screen was right for the first and silently wrong for
+    /// the second, which is every pane in a `create` session.
+    #[test]
+    fn a_scrolled_back_pane_keeps_no_caret_whichever_screen_it_is_showing() {
+        let mut own_history = vt100::Parser::new(2, 9, 100);
+        own_history.process(b"one\r\ntwo\r\nthree\r\nfour");
+        // What the node hands a client for the same offset: the history rows,
+        // parsed fresh, with no retained rows behind them.
+        let mut node_viewport = vt100::Parser::new(2, 9, 0);
+        node_viewport.process(b"one\r\ntwo");
+
+        for parser in [&own_history, &node_viewport] {
+            let mut tui = MultiPaneTui::new(layout(
+                vec![Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+
+                    title: None,
+                }],
+                &[(1, 2, 9)],
+            ))
+            .expect("valid layout");
+            tui.set_pane_view(
+                1,
+                PaneViewState {
+                    ready: true,
+                    controller_peer_id: None,
+                    controller_active: false,
+                    scrollback: 0,
+                },
+            );
+            assert!(tui.set_pane_scrollback_offset(1, 2));
+            let screens = BTreeMap::from([(1, parser.screen())]);
+            let mut terminal = Terminal::new(TestBackend::new(11, 8)).expect("test terminal");
+
+            terminal
+                .draw(|frame| render_multi_pane(frame, &tui, &screens))
+                .expect("render");
+
+            assert!(!terminal.backend().cursor_visible());
+        }
+    }
+
+    /// Returning to the live edge gives the caret back.
+    #[test]
+    fn a_pane_back_at_the_live_edge_shows_its_caret_again() {
+        let mut parser = vt100::Parser::new(2, 9, 100);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 2, 9)],
+        ))
+        .expect("valid layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState {
+                ready: true,
+                controller_peer_id: None,
+                controller_active: false,
+                scrollback: 0,
+            },
+        );
+        assert!(tui.set_pane_scrollback_offset(1, 2));
+        assert!(tui.set_pane_scrollback_offset(1, 0));
+        let screens = BTreeMap::from([(1, parser.screen())]);
+        let mut terminal = Terminal::new(TestBackend::new(11, 8)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &screens))
+            .expect("render");
+
+        assert!(terminal.backend().cursor_visible());
     }
 
     #[test]
