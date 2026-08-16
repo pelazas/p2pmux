@@ -434,6 +434,9 @@ fn run_socket_loop(
                             match attach_client(reader, generation, cols, rows, descriptor, node) {
                                 Ok(attached) => {
                                     client = Some(attached);
+                                    // Only now is anybody looking. Until this,
+                                    // this node had no location to broadcast.
+                                    node.runtime.set_client_attached(true);
                                     did_work = true;
                                 }
                                 // Losing one client is not losing the session.
@@ -785,6 +788,10 @@ fn run_socket_loop(
             let _ = client.reader.get_ref().shutdown(Shutdown::Both);
             client.writer.close();
             let _ = gate.detach(client.generation);
+            // The panes stay up and keep taking input; the person watching them
+            // does not. Presence has to say the second without touching the
+            // first, or a detached session leaves a dot on a pane forever.
+            node.runtime.set_client_attached(false);
             node.release_all_local_control()
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
@@ -1625,6 +1632,12 @@ impl SharedLayoutNode {
         self.runtime.local_focus()
     }
 
+    /// What this node last told the session about where it is looking.
+    #[cfg(test)]
+    pub(crate) fn local_presence(&self) -> Option<crate::protocol::Presence> {
+        self.runtime.local_presence().cloned()
+    }
+
     /// Where the other members are looking, for the attached client to draw.
     pub fn presence_rows(&self) -> Vec<PresenceRow> {
         self.runtime.presence_rows()
@@ -2252,6 +2265,84 @@ mod tests {
         );
         // A client too old to name a pane still gets the node's focus.
         assert_eq!(node.input(None, b"x".to_vec()).unwrap(), Some(2));
+
+        tokio::task::block_in_place(|| node.shutdown());
+    }
+
+    /// A machine that followed a fleet invitation runs a node nobody has ever
+    /// attached to. It used to announce that it was watching whatever pane its
+    /// layout started on — so a droplet that joined on its own put a member dot
+    /// on the tab bar and lit a pane border as watched, on a laptop, for a
+    /// session no human had opened there. Presence has to be about a terminal
+    /// somebody is sitting at, and this is where that is decided.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_with_no_terminal_on_it_is_looking_at_nothing() {
+        let host = SharedLayoutHost::new(HostSession::create().await.unwrap(), 2, 8).unwrap();
+        let panes = host.pane_server();
+        let host_peer_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_peer_id.clone()).unwrap();
+        panes
+            .register_local_pane(
+                crate::protocol::PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id,
+                    grid_rows: 2,
+                    grid_cols: 8,
+                    title: None,
+                    locked: false,
+                    exited: false,
+                },
+                initial.channels(),
+            )
+            .unwrap();
+        let state = host.session_snapshot().unwrap().state.unwrap();
+        let snapshot = layout_snapshot_from_state(&state).unwrap();
+        let mut node = SharedLayoutNode::new(
+            SharedLayoutRuntime::host(
+                host,
+                panes,
+                snapshot,
+                initial,
+                String::from("TESTCODE"),
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+
+        // Focus moving is what publishes presence, and on an unattended node it
+        // moves for reasons that have nothing to do with a person: a pane
+        // opening, a layout arriving from the coordinator.
+        node.focus(1, 1).unwrap();
+        let unattended = node.local_presence();
+        assert!(
+            unattended
+                .as_ref()
+                .is_none_or(|presence| !presence.attached),
+            "a node nobody attached to claimed to be attached: {unattended:?}"
+        );
+        assert!(
+            unattended
+                .as_ref()
+                .is_none_or(|presence| presence.pane_id == 0 && presence.tab_id == 0),
+            "a node nobody attached to claimed a location: {unattended:?}"
+        );
+
+        // Somebody opens it. Now there is a person, and a pane they are on.
+        node.runtime.set_client_attached(true);
+        let attached = node.local_presence().expect("attaching publishes presence");
+        assert!(attached.attached, "{attached:?}");
+        assert_eq!((attached.tab_id, attached.pane_id), (1, 1), "{attached:?}");
+
+        // And when they detach, the panes stay up but the dot goes away.
+        node.runtime.set_client_attached(false);
+        let detached = node.local_presence().expect("detaching publishes presence");
+        assert!(!detached.attached, "{detached:?}");
+        assert_eq!((detached.tab_id, detached.pane_id), (0, 0), "{detached:?}");
+        assert!(
+            detached.generation > attached.generation,
+            "a later presence must supersede the one before it: {detached:?}"
+        );
 
         tokio::task::block_in_place(|| node.shutdown());
     }

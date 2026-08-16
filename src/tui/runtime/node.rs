@@ -455,24 +455,57 @@ impl SharedLayoutRuntime {
         self.tui.set_agent_rows(self.agent_overlay_rows())
     }
 
+    /// What this node last told the session about where it is looking.
+    ///
+    /// `None` before it has said anything at all, which is a node that has
+    /// neither been attached to nor moved.
+    #[cfg(test)]
+    pub(crate) fn local_presence(&self) -> Option<&Presence> {
+        self.last_local_presence.as_ref()
+    }
+
+    /// Say whether a terminal is attached to this node, and tell the session.
+    ///
+    /// The node calls this on both edges. Attaching is what gives this member a
+    /// location at all; detaching takes it away again, and the roster has to
+    /// hear about the second as reliably as the first or the dot stays where
+    /// somebody left it.
+    pub fn set_client_attached(&mut self, attached: bool) -> bool {
+        if self.client_attached == attached {
+            return false;
+        }
+        self.client_attached = attached;
+        self.maybe_publish_presence()
+    }
+
     /// Tell the session where this member is now looking, if it moved.
     ///
     /// Called after anything that can change focus. There is no heartbeat and no timer:
     /// a human moving is the only thing that produces traffic here, so an idle session
     /// costs nothing.
+    ///
+    /// A node with no terminal on it is looking at nothing, and says so. That is
+    /// not a corner case: a machine that followed a fleet invitation runs a node
+    /// nobody has ever attached to, and every one of them used to claim the
+    /// focus its layout happened to start with — putting a member's dot on a
+    /// pane on somebody else's laptop, and painting that pane as watched, for a
+    /// machine where nobody had opened the session at all.
     pub(in crate::tui) fn maybe_publish_presence(&mut self) -> bool {
+        let attached = self.client_attached;
         let presence = Presence {
             peer_id: self.control.peer_id(),
             generation: self.presence_generation.saturating_add(1),
-            tab_id: self.tui.current_tab(),
-            pane_id: self.tui.focused_pane(),
-            attached: true,
+            // Normalized here as well as at the coordinator, so what this node
+            // remembers sending matches what every other node will hold.
+            tab_id: if attached { self.tui.current_tab() } else { 0 },
+            pane_id: if attached { self.tui.focused_pane() } else { 0 },
+            attached,
         };
-        if self
-            .last_local_presence
-            .as_ref()
-            .is_some_and(|last| last.tab_id == presence.tab_id && last.pane_id == presence.pane_id)
-        {
+        if self.last_local_presence.as_ref().is_some_and(|last| {
+            last.tab_id == presence.tab_id
+                && last.pane_id == presence.pane_id
+                && last.attached == presence.attached
+        }) {
             return false;
         }
         match self.control.try_presence(presence.clone()) {

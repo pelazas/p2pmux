@@ -194,6 +194,14 @@ Separately, on the droplet's real systemd: the unit was installed, the daemon
 killed at PID 443008, and systemd brought it back at 443085 with
 `NRestarts=1` — #73's restart-on-crash criterion. The unit was then removed.
 
+`scripts/e2e/scenario_af_unattended_presence.py` is the second two-machine
+check, for the claim presence makes: a member is drawn as watching a pane only
+while somebody is at it. The droplet joins with its terminal open and appears on
+the Mac's tab bar; it then closes that terminal, leaving its node and its panes
+running, and stops appearing. Pointed at a build from before the fix — with
+`P2PMUX_AF_REMOTE_BINARY` — the second half fails and prints the tab bar with
+the stale dot still on it, which is how the check is known to be able to fail.
+
 ## What the second machine found that the test suite could not
 
 Six bugs, every one of them invisible to a green `cargo test`. They are the

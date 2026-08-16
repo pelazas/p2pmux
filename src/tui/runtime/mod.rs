@@ -107,6 +107,15 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) last_agent_overlay_animation: Instant,
     pub(in crate::tui) presence_generation: u64,
     pub(in crate::tui) last_local_presence: Option<Presence>,
+    /// Whether a terminal is attached to this node right now.
+    ///
+    /// The one thing presence is about, and the one thing the node used to
+    /// assert without checking. A machine that followed a fleet invitation has
+    /// no terminal on it at all — nobody has ever looked at that session there
+    /// — and claiming otherwise put its dot on somebody else's pane and lit
+    /// that pane's border as watched. False until a client says hello, and
+    /// false again the moment one leaves.
+    pub(in crate::tui) client_attached: bool,
     pub(in crate::tui) seen_presence_epoch: u64,
     /// Highest roster generation this renderer has already applied, per host. Only the
     /// coordinator advances it: a member is handed rosters by the broadcast instead.
@@ -272,6 +281,9 @@ impl SharedLayoutRuntime {
             last_agent_overlay_animation: Instant::now(),
             presence_generation: 0,
             last_local_presence: None,
+            // A node exists before any terminal does, including on a machine
+            // where none ever will.
+            client_attached: false,
             seen_presence_epoch: 0,
             seen_agent_generations: BTreeMap::new(),
             presence: Vec::new(),
