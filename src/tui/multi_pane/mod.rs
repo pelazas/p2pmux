@@ -496,27 +496,78 @@ impl MultiPaneTui {
             .saturating_add(text_width(TOP_BAR_BRAND_SEPARATOR))
             .saturating_add(inbox_segment_width(self.home_needs_you_count()));
         let right = tab_bar.x.saturating_add(tab_bar.width);
-        self.snapshot
+        let separator = text_width(TAB_BAR_SEPARATOR);
+        let widths = self
+            .snapshot
             .tabs
             .iter()
             .enumerate()
             .map(|(index, tab)| {
-                if index > 0 {
-                    x = x.saturating_add(text_width(TAB_BAR_SEPARATOR));
-                }
-                let label_width = text_width(&tab_label(
+                text_width(&tab_label(
                     tab.title.as_deref(),
                     index + 1,
                     self.is_active_tab(tab.tab_id),
                     self.tab_has_unread_agent_pane(tab),
                 ))
-                .saturating_add(tab_presence_width(self.tab_watchers(tab.tab_id).len()));
+                .saturating_add(tab_presence_width(self.tab_watchers(tab.tab_id).len()))
+            })
+            .collect::<Vec<_>>();
+        let first = self.first_visible_tab(&widths, x, right, separator);
+        self.snapshot
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                // Scrolled past. Zero width is what the renderer and the click
+                // map both already read as "not on screen".
+                if index < first {
+                    return (tab.tab_id, Rect::new(x, tab_bar.y, 0, tab_bar.height));
+                }
+                if index > first {
+                    x = x.saturating_add(separator);
+                }
+                let label_width = widths[index];
                 let width = right.saturating_sub(x).min(label_width);
                 let rect = Rect::new(x, tab_bar.y, width, tab_bar.height);
                 x = x.saturating_add(label_width);
                 (tab.tab_id, rect)
             })
             .collect()
+    }
+
+    /// The first tab to draw, so that the tab you are on is one of them.
+    ///
+    /// The bar used to start at tab one and run off the right edge, which on a
+    /// hundred-column terminal with nine tabs meant the active tab -- the one
+    /// whose panes fill the screen below -- was not drawn at all. Nothing on
+    /// screen said which tab you were on, and the highlight that answers that
+    /// question was off the end of the row.
+    ///
+    /// So the strip scrolls, by the least it can: tabs are dropped from the
+    /// left only until the active one fits. Numbered labels make that legible
+    /// on their own -- a bar starting at `Tab #4` says what is missing.
+    fn first_visible_tab(&self, widths: &[u16], start_x: u16, right: u16, separator: u16) -> usize {
+        let Some(active) = self
+            .snapshot
+            .tabs
+            .iter()
+            .position(|tab| self.is_active_tab(tab.tab_id))
+        else {
+            return 0;
+        };
+        let mut first = 0;
+        while first < active {
+            let gaps = u16::try_from(active - first).unwrap_or(u16::MAX);
+            let needed = widths[first..=active]
+                .iter()
+                .fold(0u16, |total, width| total.saturating_add(*width))
+                .saturating_add(separator.saturating_mul(gaps));
+            if start_x.saturating_add(needed) <= right {
+                break;
+            }
+            first += 1;
+        }
+        first
     }
 
     pub(in crate::tui) fn tab_has_unread_agent_pane(&self, tab: &crate::layout::Tab) -> bool {
@@ -665,6 +716,47 @@ mod tests {
             test_support::{layout, split_layout},
         },
     };
+
+    /// The tab you are on is drawn, whatever the terminal is wide enough for.
+    ///
+    /// The strip used to start at tab one and run off the right edge. With nine
+    /// tabs on a hundred-column terminal that left the active tab -- the one
+    /// whose panes fill the screen below it -- undrawn, so nothing on screen
+    /// said where you were.
+    #[test]
+    fn the_tab_bar_scrolls_to_keep_the_active_tab_on_screen() {
+        let tabs = (1..=9)
+            .map(|id| Tab {
+                tab_id: id,
+                root: Node::Leaf { pane_id: id },
+                title: None,
+            })
+            .collect::<Vec<_>>();
+        let panes = (1..=9u64).map(|id| (id, 2, 8)).collect::<Vec<_>>();
+        let mut tui = MultiPaneTui::new(layout(tabs, &panes)).expect("valid layout");
+        tui.set_focus(9, 9).expect("focus the last tab");
+
+        for width in [140u16, 120, 100, 80, 70, 60] {
+            let area = Rect::new(0, 0, width, 6);
+            let rects = tui.tab_label_rects(tui.geometry(area).tab_bar);
+            let active = rects[&9];
+            assert!(
+                active.width > 0,
+                "at {width} columns the active tab was not drawn at all"
+            );
+            assert!(
+                active.right() <= width,
+                "at {width} columns it was drawn off the edge: {active:?}"
+            );
+        }
+
+        // Wide enough for all nine, and nothing is scrolled away.
+        let rects = tui.tab_label_rects(tui.geometry(Rect::new(0, 0, 140, 6)).tab_bar);
+        assert!(
+            rects[&1].width > 0,
+            "a bar with room for every tab hides none of them"
+        );
+    }
 
     #[test]
     fn pane_view_activity_transition_reports_a_redraw() {

@@ -362,8 +362,16 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     .bg(theme.footer_background),
             )
             .0;
+        let mut drawn_a_tab = false;
         for (index, tab) in tui.snapshot.tabs.iter().enumerate() {
-            if index > 0 {
+            // A tab with no room is not drawn, and neither is the separator
+            // that would have introduced it. Drawing it anyway left a dangling
+            // `·` at the end of a full bar, and -- once the strip scrolls --
+            // would have opened it with one.
+            if geometry.tab_labels[&tab.tab_id].width == 0 {
+                continue;
+            }
+            if drawn_a_tab {
                 x = buffer
                     .set_stringn(
                         x,
@@ -376,6 +384,7 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     )
                     .0;
             }
+            drawn_a_tab = true;
             let active = tui.is_active_tab(tab.tab_id);
             let style = if active {
                 Style::default()
