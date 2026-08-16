@@ -283,12 +283,15 @@ prompt does not report mouse, so nothing changes there.
 
 For locally hosted panes, mouse-wheel scrollback is loaded from the host on demand when you first
 scroll up, then cached while you browse it. Starting a scroll freezes a host-authored viewport for
-that browse session, so output can continue at the live edge without changing what is being read;
-resize, alternate-screen changes, and reconnects discard that frozen history.
+that browse session, so output can continue at the live edge without changing what is being read.
 
-Alternate-screen applications have no attach scrollback, and a resize establishes the existing
-history floor (so pre-attach history can be empty after the attach-triggered resize). Remote-hosted
-panes return an empty scrollback window in this v1 implementation.
+A resize, a split, a zoom or a reconnect ends that browse session — a reflow rewrites the grid the
+frozen window was taken against — but it does not touch the pane's history. The next notch of the
+wheel starts a fresh browse session over the rows that were always there. Retained rows keep the
+width they were written at, so a pane that got narrower clips them rather than losing them.
+
+Alternate-screen applications have no scrollback to browse at all, and remote-hosted panes return
+an empty scrollback window in this v1 implementation.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any
