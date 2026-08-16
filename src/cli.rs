@@ -360,6 +360,14 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
 /// to a listing, unlike to `p2pmux code`.
 fn print_sessions() -> Result<(), Box<dyn Error>> {
     let sessions = crate::session_store::SessionStore::for_current_user()?.list_live()?;
+    // A header with nothing under it is the one answer this command can give
+    // that a person cannot act on: it looks the same as a listing that failed.
+    // Every other empty list in p2pmux says what it means and what starts one,
+    // and so does this.
+    if sessions.is_empty() {
+        println!("No sessions running on this machine. `p2pmux` starts one.");
+        return Ok(());
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

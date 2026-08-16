@@ -134,6 +134,32 @@ fn list_and_its_ls_alias_print_the_same_sessions() {
     );
 }
 
+/// An empty listing says so, rather than printing a header over nothing.
+///
+/// On a machine with no sessions -- a box you have just installed p2pmux on,
+/// which is exactly when somebody runs this to see what it does -- the output
+/// was a column header and one blank line. That is indistinguishable from a
+/// listing that went wrong, and it is the only answer this command gives that
+/// a person cannot act on.
+#[test]
+fn an_empty_listing_says_what_starts_a_session() {
+    let session = FakeSession::empty();
+
+    let output = run_with_home(session.home(), &["list"]);
+
+    assert!(output.status.success());
+    let listed = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(listed.contains("No sessions running"), "{listed}");
+    assert!(
+        listed.contains("`p2pmux` starts one"),
+        "and what to do about it: {listed}"
+    );
+    assert!(
+        !listed.contains("NAME"),
+        "a header over nothing is what this replaces: {listed}"
+    );
+}
+
 /// `list` is the one the help text teaches, so the rename reaches the place a
 /// user goes to find out what the commands are.
 #[test]
