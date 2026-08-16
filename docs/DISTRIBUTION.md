@@ -13,7 +13,20 @@ has a real shell as you* are both true, and they go in the same breath every tim
 | --- | --- | --- | --- |
 | 2026-08-16 | [n0-computer/awesome-iroh](https://github.com/n0-computer/awesome-iroh/pull/61) | List entry, Collaboration and Productivity | PR open |
 | 2026-08-16 | [rothgar/awesome-tuis](https://github.com/rothgar/awesome-tuis/pull/833) | List entry, Productivity | PR open |
+| 2026-08-16 | [ratatui/awesome-ratatui](https://github.com/ratatui/awesome-ratatui/pull/407) | List entry, Development Tools | PR open |
 | 2026-08-16 | [iroh Show and tell](https://github.com/n0-computer/iroh/discussions/4474) | Discussion post | Posted |
+| 2026-08-16 | GitHub topics | Added `claude-code`, `iroh`, `ratatui`, `ai-agents`, `peer-to-peer`, `remote-pairing`, `cli` | Live |
+
+## What the lists told us about positioning
+
+Worth more than the three PRs. awesome-ratatui's **Development Tools** section is full of tools
+that supervise coding agents — `bosun`, `claudectl`, `crmux`, `iris`, `thurbox`, `trex`, `ilmari`,
+`amtr` — and every one of them watches agents **in tmux, on one box**. That is a crowded, active
+category with people browsing it, and p2pmux's inbox is the only entry in it that spans machines.
+
+The pair-programming framing puts us next to tmate, where the demand is falling and the field is
+commoditized. The agent-supervision framing puts us next to a category that is being actively
+shopped, as the one thing in it that is not single-box. Lead with the inbox.
 
 ## Blocked on an account
 
@@ -107,13 +120,38 @@ and link the discussion rather than repeating it.
 > work item. Wrote it up here: https://github.com/n0-computer/iroh/discussions/4474 — repo is
 > https://github.com/pelazas/p2pmux (MIT, macOS + Linux).
 
-### 4. console.dev
+### 4. awesome-claude-code — the biggest surface available
+
+[hesreallyhim/awesome-claude-code](https://github.com/hesreallyhim/awesome-claude-code), **52,000
+stars**, updated daily. We qualify: the bar is 14 days old with continued commits, or 100 stars, and
+p2pmux is 23 days old and committed to daily.
+
+**It has to be you, in a browser.** The CONTRIBUTING file says submissions must go through the web
+UI issue form and warns that using `gh` risks being blocked from the repo:
+[submit form](https://github.com/hesreallyhim/awesome-claude-code/issues/new?template=recommend-resource.yml).
+One resource per submission.
+
+Pitch it as the agent tool, not the multiplexer — the list is explicitly for things that use Claude
+Code's own features, and the hook integration is exactly that:
+
+> p2pmux gives you one inbox listing every Claude Code session running across every machine you
+> own — laptop, desktop, droplets — sorted by which one is blocking you. Press Enter on a row and
+> you are typing in that session's terminal. State comes from Claude Code's own hooks, installed by
+> `p2pmux setup`, so `needs you` means the agent said so rather than an inference from output
+> timing; an agent with no hooks says *state unknown* instead of being guessed about. Underneath it
+> is a peer-to-peer terminal multiplexer where each pane is a PTY on its owner's machine, so the
+> sessions keep running on the machines that own them and their credentials never move.
+
+Read the maintainer's note first — they are blunt that getting listed is not a growth strategy and
+that they prefer projects that already have users. Submit it, but do not wait on it.
+
+### 5. console.dev
 
 Send [console-dev-submission.md](./console-dev-submission.md) to hello@console.dev. It is a beta
 tools newsletter, so **this window closes the day 1.0 is tagged** — stable releases are explicitly
 ineligible.
 
-### 5. Terminal Trove
+### 6. Terminal Trove
 
 <https://terminaltrove.com/submit/> — a web form, so it cannot be automated. A durable listing on a
 site people browse specifically to find terminal tools; worth the five minutes.
@@ -131,6 +169,37 @@ worse than no PR.
 Two more lists were checked and rejected as dead rather than ineligible:
 `alebcay/awesome-shell` (last commit 2025-08, 185 open PRs) and `k4m4/terminals-are-sexy`
 (last commit 2024-07, 147 open PRs). A merge there is not coming.
+
+## Distribution that is not posting
+
+Posting is the obvious half and the smaller one. These are worth more per hour.
+
+**The invite is the growth loop, and it was leaking.** Every session invites up to seven people, and
+each one is handed `p2pmux join <code>` — on a machine that has never had p2pmux, that is
+`command not found` and the trail ends there. Fixed: the panel and the clipboard now both carry the
+install line. This is the only channel that compounds, because it is fed by use rather than by
+posting, so anything that widens it beats another list.
+
+Still open in the same vein, in order of how much they are worth:
+
+1. **AUR.** Arch's user repository has no notability gate at all, unlike Homebrew core (75 stars)
+   and nixpkgs. People browse and search it specifically to find tools. Needs an AUR account and an
+   SSH key — an hour, once, and then it is a permanent shelf we are on.
+2. **asciinema.** Host the three-machine cast on asciinema.org and embed it. A real cast beats a GIF
+   for a terminal tool: it is selectable text, it is a third of the bytes, and asciinema's own
+   browse page is a discovery surface the GIF in the README will never be.
+3. **AlternativeTo.** Nobody searches "p2pmux". They search *tmate alternative*. Listing against
+   tmate, tmux and Zellij puts us in front of demand that already exists and is already qualified.
+4. **`p2pmux --version` and the installer are touchpoints too.** Anywhere the binary already talks
+   to a new machine is a place the repo can be named for free.
+
+## Judgement call, not yet made
+
+Zellij and tmate both have long-running threads from people asking for exactly what p2pmux does.
+That is pre-qualified demand sitting in one place. It is also someone else's issue tracker, and
+"I built the thing you are asking for" lands as help or as spam depending entirely on the thread and
+on how it is written. Worth doing in at most one or two threads, in your own words, only where
+somebody is actually asking. Not something to automate, and not something to do at volume.
 
 ## Hacker News
 
