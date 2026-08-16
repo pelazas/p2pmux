@@ -187,11 +187,13 @@ def main() -> int:
         assert "hermes" in screen.lower(), screen
 
         section("a terminal on the droplet (#72)")
-        # `m` walks the fleet; this Mac is first, the droplet second.
+        # `m` moves the cursor into the fleet and the arrows walk it -- pressing
+        # it twice moves back out, which is how this check used to end up with
+        # the cursor on an agent row and Enter trying to start `claude` here.
         inbox.send("m")
-        time.sleep(0.3)
-        inbox.send("m")
-        time.sleep(0.3)
+        time.sleep(0.5)
+        inbox.key("down")
+        time.sleep(0.5)
         inbox.key("enter")
         inbox.wait_for(r"host: mybotvm|mybotvm", timeout=90.0)
         step("a pane opened, hosted by the droplet")
