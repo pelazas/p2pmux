@@ -409,10 +409,23 @@ pub(in crate::tui) fn render_shared_multi_pane(
                 ),
                 usize::from(name_width),
             );
+            // The active tab's label is wrapped in spaces, which is what gives the
+            // highlight its padding -- and the dots below add a separator space of
+            // their own. Drawn in that order the selected tab gets both, so its dot
+            // sits two cells out with a highlighted gap in front of it, while every
+            // other tab's sits one. The label's own trailing pad is therefore held
+            // back and drawn *after* the dots, closing the highlight around them:
+            // same cells, same click target, one space either way.
+            let padded = presence_width > 0 && label.ends_with(' ');
+            let name = if padded {
+                &label[..label.len() - 1]
+            } else {
+                &label[..]
+            };
             let (mut cursor, _) = buffer.set_stringn(
                 label_rect.x,
                 label_rect.y,
-                &label,
+                name,
                 usize::from(name_width),
                 style,
             );
@@ -427,6 +440,9 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     cursor = buffer
                         .set_stringn(cursor, label_rect.y, PRESENCE_WATCHING, 1, style.fg(color))
                         .0;
+                }
+                if padded {
+                    buffer.set_stringn(cursor, label_rect.y, " ", 1, style);
                 }
             }
             x = x
@@ -1616,6 +1632,51 @@ mod tests {
             "a member's dot uses their own slot color"
         );
     }
+    /// The dot sits the same distance from its label whichever tab you are on.
+    ///
+    /// The selected tab's label is wrapped in spaces to give the highlight its
+    /// padding, and the dots add a separator space of their own. Drawn in that
+    /// order the selected tab got both -- a two-cell gap with a highlighted
+    /// blank in it, which reads as the dot having drifted right, or as a second
+    /// dot painted in the tab's own background colour.
+    #[test]
+    fn a_selected_tab_does_not_hold_its_dot_a_cell_further_out() {
+        // The watcher is on tab two, which this fixture opens *not* selected --
+        // so the same tab can be measured either way with one keypress between.
+        let mut tui = two_tab_presence_tui();
+        assert!(tui.set_presence(vec![crate::local_ipc::PresenceRow {
+            peer_id: b"tis".to_vec(),
+            tab_id: 20,
+            pane_id: 2,
+        }]));
+
+        let gap = |tui: &MultiPaneTui| {
+            let mut terminal = Terminal::new(TestBackend::new(52, 4)).expect("test terminal");
+            terminal
+                .draw(|frame| render_multi_pane(frame, tui, &BTreeMap::new()))
+                .expect("render");
+            let buffer = terminal.backend().buffer();
+            let row = (0..52).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+            let dot = row.find(PRESENCE_WATCHING).expect("a watcher draws a dot");
+            let name_end = row[..dot].trim_end().len();
+            (dot - name_end, row)
+        };
+
+        let (unselected, unselected_row) = gap(&tui);
+        tui.set_focus(20, 2)
+            .expect("select the tab the watcher is on");
+        let (selected, selected_row) = gap(&tui);
+
+        assert_eq!(
+            unselected, 1,
+            "an unselected tab has one space before its dot: {unselected_row:?}"
+        );
+        assert_eq!(
+            selected, unselected,
+            "selecting a tab must not move its dot: {selected_row:?} vs {unselected_row:?}"
+        );
+    }
+
     #[test]
     fn presence_dots_stay_inside_the_tabs_click_target() {
         // The tab bar measures click targets from tab_label_rects and draws from the
