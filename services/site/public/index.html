@@ -545,7 +545,7 @@ footer .spacer { margin-left: auto; }
         <div class="term">
           <div class="term-bar">
             <span class="lamps"><i></i><i></i><i></i></span>
-            <span class="title"><b>userA@mac</b> — p2pmux create</span>
+            <span class="title"><b>userA@mac</b> — p2pmux</span>
           </div>
           <div class="term-body">
             <img src="/demo.gif" width="900" height="616" alt="userB joins a p2pmux session with a ten-character code, opens a pane on their own machine, then takes control of userA's pane and runs a command in it" loading="eager" decoding="async">
@@ -575,7 +575,7 @@ footer .spacer { margin-left: auto; }
         </p>
       </div>
       <div class="install-block">
-        <pre><span class="prompt">$ </span>p2pmux create             <span class="cmt"># you host</span>
+        <pre><span class="prompt">$ </span>p2pmux                    <span class="cmt"># you host; Ctrl+S shows the line to send</span>
 <span class="prompt">$ </span>p2pmux join 4KP7Q-M2XRW   <span class="cmt"># them, on their own machine</span></pre>
       </div>
     </div>
@@ -849,9 +849,9 @@ footer .spacer { margin-left: auto; }
 
         <div class="install-block">
           <h3>Then</h3>
-          <pre><span class="prompt">$ </span>p2pmux                       <span class="cmt"># the inbox</span>
+          <pre><span class="prompt">$ </span>p2pmux                       <span class="cmt"># the inbox, and a session</span>
 <span class="prompt">$ </span>p2pmux setup                 <span class="cmt"># wire up agent hooks, once</span>
-<span class="prompt">$ </span>p2pmux create                <span class="cmt"># host a session; Ctrl+S to invite</span></pre>
+<span class="prompt">$ </span>p2pmux join 4KP7Q-M2XRW      <span class="cmt"># one somebody sent you</span></pre>
           <p class="note">
             <code>p2pmux --version</code> says what you are running. Sessions already running keep
             the binary they started with, so <code>p2pmux kill &lt;name&gt;</code> and start again
