@@ -115,19 +115,28 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         seed_update_check(harness.home, NEWER_VERSION)
 
         # No arguments at all. A fresh HOME has no session and no pairing, so
-        # this exercises the whole first-run path: start a session, land on Home.
+        # this exercises the whole first-run path.
         peer = harness.spawn("home", [], env=env)
         peer.wait_ready(timeout=30)
 
+        # Since `13124c2` that path ends *in the session*, not on the inbox: a
+        # session created a moment ago has one pane and no agents in it, so Home
+        # would open on an empty list -- the emptiest screen there is, in front
+        # of the reader least able to interpret it. The inbox is one keystroke
+        # away, and everything below is about the inbox.
+        try:
+            peer.wait_for(r"Pane #1", timeout=20)
+            check("bare `p2pmux` lands in a session", True)
+        except DeadlineExceeded as error:
+            check("bare `p2pmux` lands in a session", False, str(error)[:300])
+
+        peer.send(CTRL_O)
+        time.sleep(1.0)
         try:
             peer.wait_for(r"Agents", timeout=20)
-            check("bare `p2pmux` opens Home, not a session picker", True)
+            check("Ctrl+O opens the inbox from there", True)
         except DeadlineExceeded as error:
-            check(
-                "bare `p2pmux` opens Home, not a session picker",
-                False,
-                str(error)[:300],
-            )
+            check("Ctrl+O opens the inbox from there", False, str(error)[:300])
 
         screen = peer.snapshot()
         # Since 0.1.6 the inbox lists every agent on the machine, not only the

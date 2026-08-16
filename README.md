@@ -84,8 +84,9 @@ not an agent orchestration platform.
   says which you got: `direct 55ms` or `relayed 120ms`.
 - One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
   that contacts no service at all, for when our rendezvous is down.
-- An inbox — the screen bare `p2pmux` opens — listing every Claude Code, Codex, Cursor, Pi and
-  OpenCode agent running on every machine in the session, sorted by which one is blocking you.
+- An inbox — `Ctrl+O` from anywhere, and where bare `p2pmux` lands when it rejoins a session you
+  already have — listing every Claude Code, Codex, Cursor, Pi and OpenCode agent running on every
+  machine in the session, sorted by which one is blocking you.
   Press Enter on a row and you are typing in that terminal; `Ctrl+O` brings you back. `needs you`
   comes only from the agent's own hooks, never from guessing at output timing: run
   `p2pmux setup` once, and `p2pmux doctor` to check. An agent with no hooks says
@@ -171,9 +172,11 @@ out of shared panes.
 
 ## Using it
 
-Run `p2pmux` with no arguments and you land on the inbox. `Ctrl+O` returns to it from anywhere,
-including from inside a live terminal; `Ctrl+A` does the same, for the muscle memory the old
-agents overlay built. `Ctrl+S` shares, `Ctrl+P` is pane mode, `Ctrl+T` is tab mode, and `Ctrl+Q`
+Run `p2pmux` with no arguments and you end up in a session: a new one on a machine that has none,
+or the one your machines share once you have paired. A brand-new session opens on its own terminal
+rather than the inbox, because a session a moment old has one pane and no agents to list. `Ctrl+O`
+opens the inbox from anywhere, including from inside a live terminal; `Ctrl+A` does the same, for
+the muscle memory the old agents overlay built. `Ctrl+S` shares, `Ctrl+P` is pane mode, `Ctrl+T` is tab mode, and `Ctrl+Q`
 asks whether to detach — leaving the session running — or to end it. `p2pmux --resume` brings back
 a specific session by name.
 
