@@ -14,7 +14,7 @@ use crate::{
     tui::{
         RenamePrompt, RenameTarget, ShareView,
         render::footer::{add_machine_help, render_footer_segments, share_help},
-        share::{join_command, pair_command},
+        share::{INSTALL_COMMAND, join_command, pair_command},
         text::{truncate_trailing, wrap_fixed},
     },
 };
@@ -39,62 +39,82 @@ pub(in crate::tui) fn render_share_modal(
 
     let width = area.width.saturating_sub(4).clamp(28, 72).min(area.width);
     let content_width = usize::from(width.saturating_sub(4)).max(1);
-    let mut lines: Vec<Line> = Vec::new();
-    match (share.ticket, share.code) {
-        (Some(_), Some(code)) => {
-            lines.push(Line::styled("Have them run:", label));
+    let build = |with_install_hint: bool| {
+        let mut lines: Vec<Line> = Vec::new();
+        match (share.ticket, share.code) {
+            (Some(_), Some(code)) => {
+                lines.push(Line::styled("Have them run:", label));
+                lines.push(Line::raw(""));
+                lines.extend(
+                    wrap_fixed(&join_command(code), content_width)
+                        .into_iter()
+                        .map(|chunk| Line::styled(chunk, value)),
+                );
+                if with_install_hint {
+                    lines.push(Line::raw(""));
+                    lines.extend(install_hint_lines(theme, content_width));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Expires in 6h.", label));
+                lines.push(Line::styled(
+                    "Anyone who runs it gets a full shell here.",
+                    Style::default().fg(theme.agent_overlay_warm),
+                ));
+            }
+            // No code means the rendezvous was unreachable when the session started. The ticket
+            // is then the only invite, so it earns the space the code would have had.
+            (Some(ticket), None) => {
+                lines.push(Line::styled(
+                    "No short code — rendezvous unreachable.",
+                    Style::default().fg(theme.agent_overlay_warm),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Have them run:", label));
+                lines.push(Line::raw(""));
+                lines.extend(
+                    wrap_fixed(&join_command(ticket), content_width)
+                        .into_iter()
+                        .map(|chunk| Line::styled(chunk, value)),
+                );
+                if with_install_hint {
+                    lines.push(Line::raw(""));
+                    lines.extend(install_hint_lines(theme, content_width));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Never expires.", label));
+                lines.push(Line::styled(
+                    "Anyone who runs it gets a full shell here.",
+                    Style::default().fg(theme.agent_overlay_warm),
+                ));
+            }
+            (None, _) => lines.push(Line::styled(
+                "Only the host can share this session.",
+                Style::default().fg(theme.agent_overlay_muted),
+            )),
+        }
+        if let Some(notice) = share.notice {
             lines.push(Line::raw(""));
-            lines.extend(
-                wrap_fixed(&join_command(code), content_width)
-                    .into_iter()
-                    .map(|chunk| Line::styled(chunk, value)),
-            );
-            lines.push(Line::raw(""));
-            lines.push(Line::styled("Expires in 6h.", label));
             lines.push(Line::styled(
-                "Anyone who runs it gets a full shell here.",
-                Style::default().fg(theme.agent_overlay_warm),
+                notice.to_owned(),
+                Style::default().fg(theme.copy_feedback_accent),
             ));
         }
-        // No code means the rendezvous was unreachable when the session started. The ticket
-        // is then the only invite, so it earns the space the code would have had.
-        (Some(ticket), None) => {
-            lines.push(Line::styled(
-                "No short code — rendezvous unreachable.",
-                Style::default().fg(theme.agent_overlay_warm),
-            ));
-            lines.push(Line::raw(""));
-            lines.push(Line::styled("Have them run:", label));
-            lines.push(Line::raw(""));
-            lines.extend(
-                wrap_fixed(&join_command(ticket), content_width)
-                    .into_iter()
-                    .map(|chunk| Line::styled(chunk, value)),
-            );
-            lines.push(Line::raw(""));
-            lines.push(Line::styled("Never expires.", label));
-            lines.push(Line::styled(
-                "Anyone who runs it gets a full shell here.",
-                Style::default().fg(theme.agent_overlay_warm),
-            ));
-        }
-        (None, _) => lines.push(Line::styled(
-            "Only the host can share this session.",
-            Style::default().fg(theme.agent_overlay_muted),
-        )),
-    }
-    if let Some(notice) = share.notice {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            notice.to_owned(),
-            Style::default().fg(theme.copy_feedback_accent),
-        ));
-    }
+        lines
+    };
 
     // Two border rows, a leading blank, the body, a blank, then the help row.
-    let height = u16::try_from(lines.len().saturating_add(5))
-        .unwrap_or(u16::MAX)
-        .min(area.height);
+    let panel_height =
+        |lines: &[Line]| u16::try_from(lines.len().saturating_add(5)).unwrap_or(u16::MAX);
+    // Where to get p2pmux is the one line here that a short terminal may go
+    // without: the panel truncates from the bottom, and everything below the
+    // hint — how long the invite lasts, and that it hands over a real shell —
+    // is something the host must not be quietly denied. So the hint is dropped
+    // whole rather than allowed to push the warning off the screen.
+    let mut lines = build(true);
+    if panel_height(&lines) > area.height {
+        lines = build(false);
+    }
+    let height = panel_height(&lines).min(area.height);
     let panel = Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
         area.y
@@ -151,12 +171,25 @@ pub(in crate::tui) fn render_share_modal(
         ),
     );
 }
-/// The install line for a machine that has never had p2pmux on it.
+/// The "first run this" half of an invite, wrapped to the panel.
 ///
-/// The case the CLI flow never covered: `p2pmux pair <code>` is useless advice
-/// on a machine with no p2pmux, and "add a machine" means a new one far more
-/// often than it means one already set up.
-const INSTALL_COMMAND: &str = "curl -fsSL https://p2pmux.com/install.sh | sh";
+/// The case the CLI flow never covered: `p2pmux join <code>` and
+/// `p2pmux pair <code>` are both useless advice on a machine with no p2pmux, and
+/// an invite goes to a machine that has never had it far more often than it goes
+/// to one already set up. Shared by both panels so the two invites cannot drift
+/// into telling people different things.
+fn install_hint_lines<'a>(theme: &UiTheme, content_width: usize) -> Vec<Line<'a>> {
+    let mut lines = vec![Line::styled(
+        "Not installed there yet? First run:",
+        Style::default().fg(theme.agent_overlay_muted),
+    )];
+    lines.extend(
+        wrap_fixed(INSTALL_COMMAND, content_width)
+            .into_iter()
+            .map(|chunk| Line::styled(chunk, Style::default().fg(theme.agent_overlay_secondary))),
+    );
+    lines
+}
 
 /// The panel behind `a` on the inbox: the one line to run on the machine being
 /// added, and then the machine arriving.
@@ -193,14 +226,7 @@ pub(in crate::tui) fn render_add_machine_modal(
                     .map(|chunk| Line::styled(chunk, value)),
             );
             lines.push(Line::raw(""));
-            lines.push(Line::styled("Not installed there yet? First run:", label));
-            lines.extend(
-                wrap_fixed(INSTALL_COMMAND, content_width)
-                    .into_iter()
-                    .map(|chunk| {
-                        Line::styled(chunk, Style::default().fg(theme.agent_overlay_secondary))
-                    }),
-            );
+            lines.extend(install_hint_lines(theme, content_width));
             lines.push(Line::raw(""));
             lines.push(match joined {
                 Some(name) => Line::styled(
@@ -555,6 +581,66 @@ mod tests {
         assert!(!rendered.contains("p2pmux-v3:TICKETVALUE"));
         assert!(rendered.contains("✓ copied join command"));
         assert!(rendered.contains("TICKET, WORKS OFFLINE"));
+        // The person this line is pasted to does not have p2pmux yet — that is
+        // what being invited means — so the panel says where to get it.
+        assert!(rendered.contains("curl -fsSL https://p2pmux.com/install.sh | sh"));
+    }
+
+    /// The panel truncates from the bottom, so on a terminal too short for all
+    /// of it something has to go. It must not be the line saying the invite
+    /// hands over a real shell.
+    #[test]
+    fn a_short_share_panel_drops_the_install_hint_and_never_the_warning() {
+        let render_at = |width: u16, height: u16| {
+            let snapshot = layout(
+                vec![Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                }],
+                &[(1, 1, 1)],
+            );
+            let mut tui = MultiPaneTui::new(snapshot).expect("layout");
+            tui.modal = ModalState::Share;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    render_multi_pane_with_copy_feedback(
+                        frame,
+                        &tui,
+                        &BTreeMap::new(),
+                        None,
+                        None,
+                        ShareView {
+                            code: Some("4KP7Q-M2XRW"),
+                            ticket: Some("p2pmux-v3:TICKETVALUE"),
+                            notice: None,
+                        },
+                        None,
+                        None,
+                    );
+                })
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let roomy = render_at(160, 24);
+        assert!(roomy.contains("install.sh"));
+        assert!(roomy.contains("Anyone who runs it gets a full shell here."));
+
+        // Twelve rows fits the invite and the warning but not the hint as well.
+        // Adding the hint is what made this size worth pinning: before it, the
+        // panel fit; the hint has to yield rather than shove the warning off.
+        let cramped = render_at(60, 12);
+        assert!(cramped.contains("p2pmux join 4KP7Q-M2XRW"));
+        assert!(cramped.contains("Anyone who runs it gets a full shell here."));
+        assert!(!cramped.contains("install.sh"));
     }
 
     #[test]
