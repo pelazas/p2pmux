@@ -219,6 +219,48 @@ impl SessionDescriptor {
         }
         Ok(())
     }
+
+    /// What another process on this machine needs to know about this record:
+    /// what to call it, and which shared session it is in.
+    fn local_session(&self) -> LocalSession {
+        LocalSession {
+            name: self.name.clone(),
+            tickets: [self.ticket.clone(), self.joined_ticket.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        }
+    }
+}
+
+/// A p2pmux node on this machine, as its own session record describes it.
+///
+/// One machine runs several of these — a second window that rejoined on a
+/// ticket it still had is a second node — and the interesting question about
+/// any two of them is whether they are in the *same* session, which is not
+/// answered by the name: the record a member writes for a session it joined
+/// takes a name of its own.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocalSession {
+    pub name: String,
+    /// Every ticket this record names: the session's own, for a coordinator,
+    /// and the one it joined on, for a member. Both, for a member a failover
+    /// promoted — which is why this is a set to overlap rather than one field
+    /// to compare.
+    pub tickets: Vec<String>,
+}
+
+impl LocalSession {
+    /// Whether these two records are two p2pmux in one shared session.
+    ///
+    /// Empty on either side is `false`: a record whose node has not published
+    /// a ticket yet says nothing about which session it is in, and guessing
+    /// "the same one" there would hide a session that is genuinely elsewhere.
+    pub fn shares_session_with(&self, other: &Self) -> bool {
+        self.tickets
+            .iter()
+            .any(|ticket| other.tickets.iter().any(|theirs| theirs == ticket))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -318,7 +360,8 @@ impl SessionStore {
         Ok(descriptor)
     }
 
-    /// Every recorded session's node pid and name, read and nothing more.
+    /// Every recorded session's node pid, name, and which shared session it is
+    /// part of. Read and nothing more.
     ///
     /// Deliberately not [`Self::list_live`], which probes every socket and
     /// deletes the records that do not answer. That is right for a person
@@ -331,13 +374,13 @@ impl SessionStore {
     /// Unreadable and malformed records are skipped rather than swept, because
     /// having no name for a session is a missing label and deleting its record
     /// would strand it.
-    pub fn names_by_node_pid(&self) -> io::Result<HashMap<u32, String>> {
+    pub fn sessions_by_node_pid(&self) -> io::Result<HashMap<u32, LocalSession>> {
         let entries = match fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(error) => return Err(error),
         };
-        let mut names = HashMap::new();
+        let mut sessions = HashMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -347,10 +390,10 @@ impl SessionStore {
                 continue;
             };
             if let Ok(descriptor) = self.read(id) {
-                names.insert(descriptor.node_pid, descriptor.name);
+                sessions.insert(descriptor.node_pid, descriptor.local_session());
             }
         }
-        Ok(names)
+        Ok(sessions)
     }
 
     pub fn remove(&self, id: &str) -> io::Result<()> {
@@ -785,6 +828,91 @@ mod tests {
             0o600
         );
         assert!(!valid_name("Nope") && !valid_name("-nope") && valid_name("good-name-2"));
+    }
+
+    /// Two p2pmux on one machine in one session, read out of the records they
+    /// each wrote. The name does not answer it — a member writes its own — so
+    /// the tickets have to.
+    #[test]
+    fn two_records_for_one_shared_session_recognize_each_other() {
+        let store = store();
+        let ticket = String::from("p2pmux-v3:shared");
+        let first = generate_id().unwrap();
+        let mut coordinator = SessionDescriptor::new(
+            first.clone(),
+            "calgary".into(),
+            store.socket_path(&first).unwrap(),
+            11,
+            SessionRole::Coordinator,
+        );
+        coordinator.ticket = Some(ticket.clone());
+        let second = generate_id().unwrap();
+        let mut member = SessionDescriptor::new(
+            second.clone(),
+            "calgary-2".into(),
+            store.socket_path(&second).unwrap(),
+            22,
+            SessionRole::Member,
+        );
+        member.joined_ticket = Some(ticket);
+        let third = generate_id().unwrap();
+        let mut elsewhere = SessionDescriptor::new(
+            third.clone(),
+            "dakar".into(),
+            store.socket_path(&third).unwrap(),
+            33,
+            SessionRole::Coordinator,
+        );
+        elsewhere.ticket = Some(String::from("p2pmux-v3:other"));
+
+        let (here, there, other) = (
+            coordinator.local_session(),
+            member.local_session(),
+            elsewhere.local_session(),
+        );
+        assert!(here.shares_session_with(&there));
+        assert!(there.shares_session_with(&here));
+        assert!(!here.shares_session_with(&other));
+        assert!(!other.shares_session_with(&there));
+        assert_ne!(here.name, there.name, "the names never had to agree");
+    }
+
+    /// A node that has not published a ticket yet says nothing about which
+    /// session it is in, and "nothing" must not read as "the same one".
+    #[test]
+    fn a_record_with_no_ticket_shares_a_session_with_nobody() {
+        let store = store();
+        let id = generate_id().unwrap();
+        let quiet = SessionDescriptor::new(
+            id.clone(),
+            "lisbon".into(),
+            store.socket_path(&id).unwrap(),
+            44,
+            SessionRole::Coordinator,
+        )
+        .local_session();
+
+        assert!(!quiet.shares_session_with(&quiet.clone()));
+    }
+
+    #[test]
+    fn sessions_by_node_pid_reads_names_and_tickets_back() {
+        let store = store();
+        let id = generate_id().unwrap();
+        let mut descriptor = SessionDescriptor::new(
+            id.clone(),
+            "calgary".into(),
+            store.socket_path(&id).unwrap(),
+            4242,
+            SessionRole::Coordinator,
+        );
+        descriptor.ticket = Some(String::from("p2pmux-v3:shared"));
+        store.write(&descriptor).unwrap();
+
+        let sessions = store.sessions_by_node_pid().unwrap();
+        let session = sessions.get(&4242).expect("the record's node pid");
+        assert_eq!(session.name, "calgary");
+        assert_eq!(session.tickets, vec![String::from("p2pmux-v3:shared")]);
     }
 
     #[test]

@@ -560,8 +560,8 @@ impl SharedLayoutRuntime {
         Ok(changed)
     }
 
-    /// Name the p2pmux session each loose agent is sitting in, where there is
-    /// one.
+    /// Name the p2pmux session each loose agent is sitting in, and drop the
+    /// ones that are not in another session at all.
     ///
     /// The scan can see that an agent's process descends from a node; only the
     /// session store knows that node is called `dakar`. The map is cached and
@@ -569,21 +569,45 @@ impl SharedLayoutRuntime {
     /// on a redraw path and the store is on disk — and never through
     /// `list_live`, which probes every socket and deletes the records that miss
     /// their deadline.
-    fn name_their_sessions(&mut self, loose: &mut [crate::agent_detect::LooseAgent]) {
-        let unknown = loose
-            .iter()
-            .any(|agent| agent.node_pid != 0 && !self.session_names.contains_key(&agent.node_pid));
+    ///
+    /// The dropping is the other half, and it is what keeps one agent from
+    /// being two rows. This scan asks "which agents on this machine are in none
+    /// of *my* panes", and a second p2pmux in the same session — a window that
+    /// rejoined on a ticket it still had — hosts panes that answer yes. Its
+    /// agents are already on the inbox as panes of this session, put there by
+    /// the node hosting them, so publishing them again listed the same process
+    /// twice: once where Enter reaches it, and once as an unreachable row whose
+    /// way in was `p2pmux attach` naming the session already on screen.
+    fn name_their_sessions(&mut self, loose: &mut Vec<crate::agent_detect::LooseAgent>) {
+        let unknown = loose.iter().any(|agent| {
+            agent.node_pid != 0 && !self.session_records.contains_key(&agent.node_pid)
+        });
         if unknown
             && let Ok(store) = crate::session_store::SessionStore::for_current_user()
-            && let Ok(names) = store.names_by_node_pid()
+            && let Ok(sessions) = store.sessions_by_node_pid()
         {
-            self.session_names = names;
+            self.session_records = sessions;
         }
+        let ours = std::process::id();
+        // Cloned rather than borrowed: the retain below reads the same map, and
+        // there is one of these per node on this machine.
+        let here = self.session_records.get(&ours).cloned();
+        loose.retain(|agent| {
+            if agent.node_pid == ours {
+                return false;
+            }
+            let (Some(here), Some(theirs)) =
+                (here.as_ref(), self.session_records.get(&agent.node_pid))
+            else {
+                return true;
+            };
+            !theirs.shares_session_with(here)
+        });
         for agent in loose {
             agent.session = self
-                .session_names
+                .session_records
                 .get(&agent.node_pid)
-                .cloned()
+                .map(|session| session.name.clone())
                 .unwrap_or_default();
         }
     }
