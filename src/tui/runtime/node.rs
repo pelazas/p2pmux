@@ -2,7 +2,7 @@
 //! intents, and the agent roster.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     io,
     time::{Duration, Instant},
@@ -534,6 +534,42 @@ impl SharedLayoutRuntime {
             .collect()
     }
 
+    /// Which machine a member is on, and what that machine is called here.
+    ///
+    /// A machine can be several members: a second window that rejoined is a
+    /// second node with its own peer id, and both announce the machine they are
+    /// on. The machines rail already collapses those into one row and labels it
+    /// after the first of them — so anything else that names a machine has to
+    /// agree, or the inbox attributes an agent to a member with no row in the
+    /// rail beside it.
+    fn machine_identity(&self, peer_id: &[u8]) -> Vec<u8> {
+        self.tui
+            .snapshot()
+            .members
+            .iter()
+            .find(|member| member.peer_id == peer_id)
+            .map(|member| {
+                if member.machine_id.is_empty() {
+                    member.peer_id.clone()
+                } else {
+                    member.machine_id.clone()
+                }
+            })
+            .unwrap_or_else(|| peer_id.to_vec())
+    }
+
+    /// The label the machines rail uses for whichever machine this peer is on.
+    fn machine_label(&self, peer_id: &[u8]) -> String {
+        let identity = self.machine_identity(peer_id);
+        let members = &self.tui.snapshot().members;
+        let canonical = members
+            .iter()
+            .find(|member| self.machine_identity(&member.peer_id) == identity)
+            .map(|member| member.peer_id.clone())
+            .unwrap_or_else(|| peer_id.to_vec());
+        sanitize_single_line(&member_label(&canonical, members))
+    }
+
     pub fn agent_overlay_rows(&self) -> Vec<AgentOverlayRow> {
         let pane_locations =
             self.tui
@@ -547,7 +583,8 @@ impl SharedLayoutRuntime {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-        self.agent_rosters
+        let mut rows = self
+            .agent_rosters
             .iter()
             .flat_map(|(host_peer_id, roster)| {
                 let loose = roster
@@ -576,10 +613,10 @@ impl SharedLayoutRuntime {
                             cwd: sanitize_single_line(&entry.cwd),
                             state: AgentRosterState::from_wire(entry.state),
                             working_since_unix_ms: entry.working_since_unix_ms,
-                            host: sanitize_single_line(&member_label(
-                                host_peer_id,
-                                &self.tui.snapshot().members,
-                            )),
+                            // The machine, not the node that reported it. An
+                            // agent outside p2pmux belongs to the box, and the
+                            // box may have several nodes in this session.
+                            host: self.machine_label(host_peer_id),
                             controller: String::from("—"),
                             // Read from this node's own scan rather than the
                             // roster entry, so it is only ever present for an
@@ -667,6 +704,18 @@ impl SharedLayoutRuntime {
                     .chain(loose)
                     .collect::<Vec<_>>()
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // One process on one machine is one row, however many of that machine's
+        // nodes are in this session to report it.
+        //
+        // An agent outside p2pmux is found by scanning the machine, and every
+        // node on that machine scans the same machine. Two of them -- a session
+        // you have open and a second window that rejoined it, which is the
+        // ordinary way to end up with two -- therefore listed every bot on that
+        // box twice, under two member names, only one of which the machines
+        // rail had a row for.
+        let mut seen = BTreeSet::new();
+        rows.retain(|row| row.pane_id != 0 || seen.insert((row.host.clone(), row.process_pid)));
+        rows
     }
 }

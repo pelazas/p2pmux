@@ -468,6 +468,118 @@ mod tests {
         Transport::from_endpoint(endpoint)
     }
 
+    /// One bot on one machine is one row, however many p2pmux that machine has
+    /// in this session.
+    ///
+    /// An agent outside p2pmux is found by scanning the machine, and every node
+    /// on that machine scans the same machine. A laptop with a session open and
+    /// a second window that rejoined it -- the ordinary way to end up with two
+    /// -- therefore reported every bot on it twice, under two member names,
+    /// only one of which the machines rail had a row for. The list said four
+    /// agents and the rail beside it said two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_nodes_on_one_machine_do_not_list_its_bots_twice() {
+        use crate::protocol::{AgentRoster, AgentRosterEntry};
+
+        let host = SharedLayoutHost::new(
+            HostSession::from_transport(loopback_transport().await).expect("host session"),
+            2,
+            8,
+        )
+        .expect("shared host");
+        let pane_server = host.pane_server();
+        let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_id.clone()).expect("initial pty");
+        pane_server
+            .register_local_pane(
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_id.clone(),
+                    grid_rows: 2,
+                    grid_cols: 8,
+                    title: None,
+                    locked: false,
+                    exited: false,
+                },
+                initial.channels(),
+            )
+            .expect("initial pane registered");
+        let state = host
+            .session_snapshot()
+            .expect("snapshot")
+            .state
+            .expect("layout state");
+        let snapshot = layout_snapshot_from_state(&state).expect("render layout");
+        let mut runtime = SharedLayoutRuntime::host(
+            host,
+            pane_server,
+            snapshot,
+            initial,
+            String::from("TESTCODE"),
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("runtime");
+
+        // Two members, two peer ids, one machine — the shape a second window
+        // rejoining produces.
+        let second_id = b"second-node-on-this-machine".to_vec();
+        let mut snapshot = runtime.tui.snapshot().clone();
+        snapshot.revision += 1;
+        let endpoint_addr = snapshot.members[0].endpoint_addr.clone();
+        for member in snapshot.members.iter_mut() {
+            member.display_name = String::from("laptop");
+            member.machine_id = b"one-machine".to_vec();
+            member.kind = crate::layout::MemberKind::Machine;
+        }
+        snapshot.members.push(crate::layout::Member {
+            peer_id: second_id.clone(),
+            endpoint_addr,
+            display_name: String::from("laptop"),
+            kind: crate::layout::MemberKind::Machine,
+            machine_proof: Default::default(),
+            machine_id: b"one-machine".to_vec(),
+        });
+        runtime
+            .tui
+            .apply_snapshot(snapshot)
+            .expect("two members on one machine");
+
+        // Both of them scan the same box and find the same bot.
+        let bot = |pid| AgentRosterEntry {
+            pane_id: 0,
+            process_pid: pid,
+            agent_kind: String::from("hermes"),
+            state: 0,
+            cwd: String::from("/home/pelazas"),
+            working_since_unix_ms: 0,
+            session_name: String::new(),
+        };
+        for (generation, peer) in [&host_id, &second_id].into_iter().enumerate() {
+            runtime.agent_rosters.insert(
+                peer.clone(),
+                AgentRoster {
+                    host_peer_id: peer.clone(),
+                    generation: generation as u64 + 1,
+                    entries: vec![bot(4242)],
+                },
+            );
+        }
+
+        let rows = runtime.agent_overlay_rows();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one process on one machine is one row: {rows:#?}"
+        );
+        assert_eq!(rows[0].process_pid, 4242);
+        assert_eq!(
+            rows[0].host, "laptop",
+            "and it is attributed to the machine the rail draws, not to whichever \
+             node happened to report it: {rows:#?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pushed_agent_status_is_confined_to_panes_this_node_hosts() {
         use crate::agent_detect::{AgentKind, AgentState};
