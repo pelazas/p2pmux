@@ -226,7 +226,12 @@ impl SharedLayoutRuntime {
         let Ok(store) = crate::session_store::SessionStore::for_current_user() else {
             return;
         };
-        let Ok(live) = store.list_live() else {
+        // Recorded, not probed: this is the node's own drain loop, the one a
+        // keystroke is echoed by, and `list_live` blocks on a socket per
+        // session. A session whose node has died since is announced one last
+        // time and refused by whoever follows it, which is cheaper than every
+        // other tick of this loop paying for the certainty.
+        let Ok(live) = store.list_recorded() else {
             return;
         };
         for session in live {

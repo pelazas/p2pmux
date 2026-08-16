@@ -111,7 +111,13 @@ pub fn follow_fleet_invite(ticket: &str) -> Result<bool, Box<dyn Error>> {
     // Both sides of the same question: the session this machine coordinates,
     // and any it has already been invited into. Without the first, a machine
     // would follow its own invitation back into the session it just started.
-    if store.list_live()?.iter().any(|session| {
+    //
+    // Read without probing. This runs on the node's own loop, every time a
+    // machine of yours re-announces a session — which is every couple of
+    // seconds, for as long as both are up — and `list_live` would spend a
+    // quarter of a second there waiting for this very node to answer a probe it
+    // cannot answer while it is blocked sending it.
+    if store.list_recorded()?.iter().any(|session| {
         session.ticket.as_deref() == Some(ticket.as_str())
             || session.joined_ticket.as_deref() == Some(ticket.as_str())
     }) {
@@ -274,8 +280,12 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
                     );
                 }
             };
+            // Recorded, not probed, for the same reason naming a session never
+            // probes: this node is mid-join and its own record is already on
+            // disk, so `list_live` would spend the ack timeout waiting for a
+            // socket this very thread is the one that would answer on.
             let live_names = SessionStore::for_current_user()?
-                .list_live()?
+                .list_recorded()?
                 .into_iter()
                 .map(|session| session.name)
                 .collect();

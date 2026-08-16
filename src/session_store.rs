@@ -421,6 +421,44 @@ impl SessionStore {
     /// would strand a running session with no way to `attach` or `kill` it by name. Load spikes
     /// long enough to blow that deadline are ordinary on a machine building software, which is
     /// exactly when a shared session is most likely to be open.
+    /// Every session recorded on this machine, read and nothing more.
+    ///
+    /// The same records [`Self::list_live`] returns, without the socket probe
+    /// that makes that one cost a quarter of a second per session and without
+    /// the sweep that makes it delete things. Both of those are why it exists:
+    /// a node asking about its own machine cannot use `list_live`, because the
+    /// probe it would send to its own socket is answered by the very loop that
+    /// is blocked sending it. It waits out the whole timeout, every time,
+    /// against itself.
+    ///
+    /// The cost of the difference is a record whose node has already died and
+    /// has not been swept yet. For the two questions asked on a hot path —
+    /// which session am I already in, and which name is free — that is a stale
+    /// answer nobody notices, and it is the correct trade against blocking the
+    /// loop that echoes keystrokes.
+    pub fn list_recorded(&self) -> io::Result<Vec<SessionDescriptor>> {
+        let entries = match fs::read_dir(&self.sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if let Ok(descriptor) = self.read(id) {
+                sessions.push(descriptor);
+            }
+        }
+        sessions.sort_by_key(|session| session.created_at);
+        Ok(sessions)
+    }
+
     pub fn list_live(&self) -> io::Result<Vec<SessionDescriptor>> {
         let entries = match fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
@@ -551,8 +589,12 @@ pub fn generate_name() -> io::Result<String> {
 }
 
 fn generate_name_from_store(store: &SessionStore) -> io::Result<String> {
+    // Recorded rather than live: naming a session is not worth a socket probe
+    // per session, and this runs on paths a node takes while a person is typing
+    // into it. A name held by a record whose node has gone is skipped over
+    // rather than reused, which costs one city out of hundreds.
     let live_names = store
-        .list_live()?
+        .list_recorded()?
         .into_iter()
         .map(|session| session.name)
         .collect();
@@ -1108,6 +1150,58 @@ mod tests {
         assert_eq!(probe(&socket), Liveness::Gone);
         assert!(store.list_live().unwrap().is_empty());
         assert!(store.read(&id).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The reason [`SessionStore::list_recorded`] exists, measured.
+    ///
+    /// A node reading its own machine's sessions is the caller that cannot use
+    /// `list_live`: the socket it would probe is its own, answered by the very
+    /// loop that is blocked waiting — so it waits out the whole ack deadline
+    /// against itself, and every keystroke behind that loop waits with it. This
+    /// ran every two seconds on any machine in a fleet.
+    #[test]
+    fn reading_recorded_sessions_never_waits_for_a_socket() {
+        let root = PathBuf::from(format!("/tmp/p2pmux-unprobed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = SessionStore::at(root.join("s"), root.join("k"));
+        let id = generate_id().unwrap();
+        fs::create_dir_all(root.join("k")).unwrap();
+        let socket = root.join("k").join(format!("{}.s", &id[..8]));
+        // Bound and never accepted from: a node whose one thread is busy
+        // elsewhere, which is what a node asking this question always is.
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        store
+            .write(&SessionDescriptor::new(
+                id.clone(),
+                "lisbon".into(),
+                socket.clone(),
+                42,
+                SessionRole::Coordinator,
+            ))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let probed = store.list_live().unwrap();
+        let probing = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let recorded = store.list_recorded().unwrap();
+        let reading = started.elapsed();
+
+        assert_eq!(
+            probed.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            recorded.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            "the cheap read must answer the same question"
+        );
+        assert!(
+            probing >= PROBE_ACK_TIMEOUT,
+            "this test is pointless unless the probe really does block: {probing:?}"
+        );
+        assert!(
+            reading < PROBE_ACK_TIMEOUT / 5,
+            "reading records waited on a socket: {reading:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
