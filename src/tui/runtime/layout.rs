@@ -1,6 +1,12 @@
 //! Applying layout state and turning UI intents into coordinator requests.
 
-use std::{collections::BTreeSet, error::Error, io, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use crossterm::terminal;
 use ratatui::layout::Rect;
@@ -27,6 +33,14 @@ use crate::{
 };
 
 use super::SharedLayoutRuntime;
+
+/// How long a machine waits before acting on the same invitation twice.
+///
+/// Long enough that a repeated announcement costs nothing, short enough that a
+/// session which becomes joinable — a coordinator that was still starting, a
+/// network that came back — is joined while the person who started it is still
+/// waiting for it.
+const FLEET_INVITE_RETRY: Duration = Duration::from_secs(60);
 
 impl SharedLayoutRuntime {
     pub(in crate::tui) fn handle_control_event(
@@ -71,7 +85,30 @@ impl SharedLayoutRuntime {
     /// droplet anywhere. And am I already there — because a session announces
     /// itself on a timer, and joining twice would leave two nodes of the same
     /// machine in one member list.
+    ///
+    /// Asked at most once a minute per invitation, and that rate limit is the
+    /// difference between a re-announcement and a decision. The sender repeats
+    /// itself every couple of seconds on purpose; this end used to answer every
+    /// repetition from scratch — a pairing file read, a walk of the session
+    /// store, and for anything it could not join, a node spawned to fail again.
+    /// A machine left coordinating a session nobody wants, which is what a
+    /// forgotten `p2pmux` on a droplet is, therefore cost its whole fleet a
+    /// stall every two seconds for as long as it stayed up.
     pub(in crate::tui) fn consider_fleet_invite(&mut self, from_peer_id: &[u8], ticket: &str) {
+        if self
+            .considered_fleet_invites
+            .get(ticket)
+            .is_some_and(|last| last.elapsed() < FLEET_INVITE_RETRY)
+        {
+            return;
+        }
+        // Bounded by the invitations actually seen, and those are bounded by the
+        // sessions your own machines are running. Dropped once an invitation has
+        // gone quiet for long enough that acting on it again would be free.
+        self.considered_fleet_invites
+            .retain(|_, last| last.elapsed() < FLEET_INVITE_RETRY * 10);
+        self.considered_fleet_invites
+            .insert(ticket.to_owned(), Instant::now());
         let name = crate::tui::member_label(from_peer_id, &self.tui.snapshot().members);
         let member = self
             .tui
@@ -110,7 +147,15 @@ impl SharedLayoutRuntime {
         match followed {
             Ok(true) => self.status = format!("joined the session {name} started"),
             Ok(false) => {}
-            Err(error) => self.status = format!("could not follow {name}: {error}"),
+            Err(error) => {
+                self.status = format!("could not follow {name}: {error}");
+                // And in the session log, which outlives the status line and is
+                // readable on a machine nobody is sitting at. A fleet that
+                // cannot follow one of its own left no trace anywhere: the
+                // status line is drawn for whoever is attached, and the machine
+                // this happens on is by definition often nobody.
+                eprintln!("p2pmux node: could not follow {name} into a session: {error}");
+            }
         }
     }
 

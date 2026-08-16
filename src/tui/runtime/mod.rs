@@ -94,6 +94,15 @@ pub struct SharedLayoutRuntime {
     /// Whether this node has told the session it belongs to a fleet. See
     /// `announce_fleet_membership`.
     pub(in crate::tui) announced_fleet_membership: bool,
+    /// When this node last acted on each invitation it was sent.
+    ///
+    /// Invitations are re-announced for as long as both machines are up, which
+    /// is what lets a machine that was asleep hear about a session started
+    /// while it was. Acting on every announcement is a different thing: an
+    /// invitation this machine cannot follow — a session whose coordinator has
+    /// gone, one it is refused by — was retried every couple of seconds
+    /// forever. See `consider_fleet_invite`.
+    pub(in crate::tui) considered_fleet_invites: HashMap<String, Instant>,
     pub(in crate::tui) next_agent_roster_heartbeat: Instant,
     pub(in crate::tui) last_agent_overlay_animation: Instant,
     pub(in crate::tui) presence_generation: u64,
@@ -258,6 +267,7 @@ impl SharedLayoutRuntime {
             loose_agents: Vec::new(),
             session_records: HashMap::new(),
             announced_fleet_membership: false,
+            considered_fleet_invites: HashMap::new(),
             next_agent_roster_heartbeat: Instant::now(),
             last_agent_overlay_animation: Instant::now(),
             presence_generation: 0,
