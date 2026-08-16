@@ -66,6 +66,22 @@ impl MultiPaneTui {
         true
     }
 
+    /// Put every pane back at its live edge.
+    ///
+    /// For the client, which keeps no scrollback and holds only the viewports
+    /// the node built for it: the moment those are thrown away — a resize
+    /// reflows every retained row, so they are — the panes are showing live
+    /// output again, and an offset left behind says otherwise. It hid the caret
+    /// on a pane that was at its live edge, and made the next several notches of
+    /// wheel-down walk back through rows that were no longer on screen.
+    pub(crate) fn reset_all_scrollback(&mut self) -> bool {
+        let mut moved = false;
+        for view in self.pane_views.values_mut() {
+            moved |= std::mem::take(&mut view.scrollback) != 0;
+        }
+        moved
+    }
+
     pub(in crate::tui) fn reset_scrollback(&mut self, pane_id: PaneId) -> bool {
         let Some(view) = self.pane_views.get_mut(&pane_id) else {
             return false;
@@ -126,6 +142,25 @@ mod tests {
         assert!(tui.scroll_pane(pane_id, 4, false));
         assert!(!tui.scroll_pane(pane_id, 4, false));
         assert_eq!(tui.pane_view(pane_id).expect("pane view").scrollback, 0);
+    }
+
+    /// A resize throws away every viewport the node built, so every pane is
+    /// back at its live edge whether or not it was the one being scrolled.
+    #[test]
+    fn dropping_the_fetched_history_returns_every_pane_to_the_live_edge() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        assert!(tui.scroll_pane(1, 40, true));
+        assert!(tui.scroll_pane(3, 40, true));
+        assert!(tui.scroll_pane(3, 40, true));
+
+        assert!(tui.reset_all_scrollback());
+
+        assert_eq!(tui.pane_view(1).expect("pane view").scrollback, 0);
+        assert_eq!(tui.pane_view(3).expect("pane view").scrollback, 0);
+        assert!(
+            !tui.reset_all_scrollback(),
+            "nothing moved, so nothing to redraw"
+        );
     }
 
     #[test]

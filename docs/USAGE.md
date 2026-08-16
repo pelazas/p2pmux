@@ -286,6 +286,11 @@ width they were written at, so a pane that got narrower clips them rather than l
 Alternate-screen applications have no scrollback to browse at all, and remote-hosted panes return
 an empty scrollback window in this v1 implementation.
 
+A pane being browsed shows no cursor: it is not displaying where its program's cursor is, and a
+caret left blinking on a row of history says otherwise. Typing returns the pane to its live edge
+and the cursor with it, and so does anything that ends the browse session — a resize, or a node
+answering that the rows are gone.
+
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
 outer terminal reflows locally hosted panes: the host resizes its PTY and VT screen and commits any
 changed host-owned grids. Guests only receive the resulting commit and screen snapshot.

@@ -119,6 +119,28 @@ fn take_matching_pending(
     pending.remove(&pane_id)
 }
 
+/// Give up on a pane's history and put it back at its live edge.
+///
+/// The node answers "unavailable" for a pane it does not host, for one on the
+/// alternate screen, and for a frozen session it has since evicted — and the
+/// last of those can arrive for a pane that is *already* parked in history.
+/// Everything cached for it goes, so what the pane falls back to is its live
+/// screen; leaving the offset behind would leave it reading as scrolled while
+/// showing the newest output, which costs it its caret and swallows the next
+/// several notches of wheel-down.
+fn abandon_history(
+    tui: Option<&mut MultiPaneTui>,
+    history: &mut BTreeMap<u64, HistoryCache>,
+    desired_scroll: &mut BTreeMap<u64, usize>,
+    pane_id: u64,
+) {
+    desired_scroll.remove(&pane_id);
+    history.remove(&pane_id);
+    if let Some(tui) = tui {
+        tui.set_pane_scrollback_offset(pane_id, 0);
+    }
+}
+
 const PANE_SCROLL_WHEEL_STEP: usize = 3;
 
 /// Rows pulled in per step by a selection dragged past a pane's edge.
@@ -513,14 +535,18 @@ pub fn run_on(
                             continue;
                         };
                         let Some(snapshot) = snapshot else {
-                            // No history to reach, so anything the burst queued behind this
-                            // is unreachable too.
-                            desired_scroll.remove(&pane_id);
-                            // Drop the cached session with it. The answer is also what a
-                            // node gives for a history id it no longer holds, and keeping
-                            // that dead id would put it on every later query -- one
-                            // evicted session and the pane could never be scrolled again.
-                            history.remove(&pane_id);
+                            // No history to reach: anything the burst queued behind this is
+                            // unreachable too, and the cached session goes with it. That
+                            // answer is also what a node gives for a history id it no
+                            // longer holds, and keeping that dead id would put it on every
+                            // later query -- one evicted session and the pane could never
+                            // be scrolled again.
+                            abandon_history(
+                                tui.as_mut(),
+                                &mut history,
+                                &mut desired_scroll,
+                                pane_id,
+                            );
                             footer_notice = unavailable;
                             dirty = true;
                             continue;
@@ -930,9 +956,15 @@ pub fn run_on(
                 viewport = (cols, rows);
                 if !tui.modal_open() {
                     tui.set_home_viewport_for(Rect::new(0, 0, cols, rows));
+                    // The cached viewports were built against the old grid, so
+                    // they go — and with them the only rows a scrolled-back pane
+                    // had to show. What it falls back to is its live screen, so
+                    // the offsets have to come back to the live edge too, or the
+                    // pane reads as scrolled while showing the newest output.
                     history.clear();
                     pending_scroll.clear();
                     desired_scroll.clear();
+                    tui.reset_all_scrollback();
                     write_message(&mut stream, &ClientMessage::Resize { cols, rows })?;
                     node_viewport = (cols, rows);
                 }
@@ -1840,6 +1872,60 @@ mod tests {
                 .unwrap()
                 .contents()
                 .contains("one")
+        );
+    }
+
+    /// The node says "unavailable" for a pane it does not host, for one on the
+    /// alternate screen, and for a frozen session it has since evicted. Only the
+    /// last of those can reach a pane that is already parked in history -- and
+    /// when it does, everything that pane had to show is gone, so it is back at
+    /// its live edge whether or not its offset admits it.
+    #[test]
+    fn losing_a_panes_history_returns_it_to_the_live_edge() {
+        let host = HostScreen::new(2, 8).unwrap();
+        let mut tui = None;
+        let mut screens = BTreeMap::new();
+        let mut history = BTreeMap::new();
+        let mut pending_focus = None;
+        apply_snapshot(
+            &mut tui,
+            crate::config::UiTheme::default(),
+            &mut screens,
+            &mut history,
+            String::from("room"),
+            layout(&[1]),
+            vec![PaneScreenSnapshot {
+                pane_id: 1,
+                state: ScreenUpdate::Snapshot {
+                    sequence: 1,
+                    snapshot: host.current_frame().snapshot.as_ref().to_vec(),
+                    kitty_keyboard_active: false,
+                },
+                history_len: 40,
+                history_end: 40,
+            }],
+            vec![],
+            vec![],
+            1,
+            1,
+            &mut pending_focus,
+        )
+        .unwrap();
+        let view = tui.as_mut().expect("a snapshot builds the view");
+        assert!(view.set_pane_scrollback_offset(1, 12));
+        let mut desired_scroll = BTreeMap::from([(1_u64, 30_usize)]);
+
+        abandon_history(tui.as_mut(), &mut history, &mut desired_scroll, 1);
+
+        assert_eq!(
+            tui.as_ref().expect("view").pane_scrollback_offset(1),
+            0,
+            "the pane is showing live output, so it has to say so"
+        );
+        assert!(!history.contains_key(&1), "the dead session goes with it");
+        assert!(
+            !desired_scroll.contains_key(&1),
+            "and so does whatever the burst had queued behind it"
         );
     }
 
