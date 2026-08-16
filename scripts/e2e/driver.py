@@ -375,6 +375,17 @@ class Peer:
         with self._lock:
             return self._screen.cursor.y, self._screen.cursor.x
 
+    def cursor_hidden(self) -> bool:
+        """Whether the caret is off, which is a claim in its own right.
+
+        p2pmux hides it deliberately -- a pane scrolled into history is not
+        showing where its program's cursor is, and a dialog that has taken the
+        keyboard has taken the caret with it -- so a scenario needs to be able
+        to assert the absence and not only the position.
+        """
+        with self._lock:
+            return bool(self._screen.cursor.hidden)
+
     def raw_text(self) -> str:
         with self._lock:
             return self.raw.decode("utf-8", errors="replace")
