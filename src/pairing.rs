@@ -45,6 +45,7 @@ use std::{
     env, fmt, fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
@@ -692,6 +693,71 @@ pub fn load_or_empty() -> Pairing {
     load().unwrap_or_default()
 }
 
+/// The fleet, kept current for a process that draws it but does not write it.
+///
+/// The client is that process. It used to read the record once, at attach, on
+/// the grounds that pairing is rare and re-parsing a file on every frame would
+/// be silly. The second half is true and the first is not: pairing while a
+/// session is open is the ordinary way to add a machine, and the record is
+/// written by whichever *other* process did it — `p2pmux pair`, `p2pmux enroll`,
+/// or the node writing down a machine that arrived. A client that never looked
+/// again went on believing the fleet it was started with, so a machine you had
+/// just paired was refused a terminal as "someone else's machine" until the
+/// whole session was restarted.
+///
+/// So: ask the cheap question every time, and the expensive one only when the
+/// answer changed. A stat per frame is nothing; a parse per frame would not be.
+#[derive(Debug, Default)]
+pub struct PairedMachineWatch {
+    /// `None` when this machine has no config directory to read, which is the
+    /// same situation as an unreadable record: hold an empty fleet and stop
+    /// asking.
+    path: Option<PathBuf>,
+    machines: Vec<PairedMachine>,
+    /// The mtime the current list was parsed from, and `None` before the first
+    /// successful read — which is also what a missing file leaves behind, so
+    /// one appearing later is picked up rather than waited on forever.
+    read_at: Option<SystemTime>,
+}
+
+impl PairedMachineWatch {
+    pub fn new() -> Self {
+        Self::watching(pairing_path().ok())
+    }
+
+    fn watching(path: Option<PathBuf>) -> Self {
+        let mut watch = Self {
+            path,
+            ..Self::default()
+        };
+        watch.refresh();
+        watch
+    }
+
+    /// The fleet as of now, re-reading the record if it has changed.
+    pub fn machines(&mut self) -> &[PairedMachine] {
+        self.refresh();
+        &self.machines
+    }
+
+    fn refresh(&mut self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let modified = fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        // Unchanged, or gone: keep what is held. A record that cannot be read
+        // right now -- being rewritten, or briefly absent -- leaves the last
+        // fleet in place rather than emptying the rail under somebody's cursor.
+        if modified.is_none() || modified == self.read_at {
+            return;
+        }
+        self.read_at = modified;
+        self.machines = load_from(path).unwrap_or_default().machines;
+    }
+}
+
 fn atomic_write(path: &Path, text: &str) -> Result<(), PairingError> {
     let parent = path.parent().ok_or(PairingError::MissingHome)?;
     fs::create_dir_all(parent)?;
@@ -713,8 +779,8 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), PairingError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemberKind, PAIRING_WINDOW_SECONDS, Pairing, PinRefusal, PinRefused, SeenMachine,
-        WorkDecision, load_from, now_unix, offer_into, pin_into, save_to,
+        MemberKind, PAIRING_WINDOW_SECONDS, PairedMachineWatch, Pairing, PinRefusal, PinRefused,
+        SeenMachine, WorkDecision, load_from, now_unix, offer_into, pin_into, save_to,
     };
     use crate::tui::PairedMachine;
 
@@ -724,6 +790,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp dir");
         path.join("pairing.toml")
+    }
+
+    /// A machine paired while a session is open is in that session's fleet.
+    ///
+    /// The client held the record it read at attach and never looked again, so
+    /// pairing a droplet from another terminal left the inbox refusing it a
+    /// terminal — "someone else's machine" — against a fleet list from before
+    /// the droplet existed. Restarting the whole session was the only way out.
+    #[test]
+    fn the_fleet_a_client_holds_follows_a_machine_paired_after_it_started() {
+        let path = temporary_path("watch");
+        let mut pairing = Pairing::default();
+        pairing.remember("laptop", Some(String::from("aa")), Some(true));
+        save_to(&path, &pairing).expect("write the first record");
+
+        let mut watch = PairedMachineWatch::watching(Some(path.clone()));
+        assert_eq!(
+            watch.machines().iter().map(|m| &m.name).collect::<Vec<_>>(),
+            vec!["laptop"],
+        );
+
+        // Somebody runs `p2pmux pair` in another terminal.
+        pairing.remember("droplet", Some(String::from("bb")), Some(true));
+        save_to(&path, &pairing).expect("write the second record");
+
+        let mut names = watch.machines().iter().map(|m| &m.name).collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["droplet", "laptop"],
+            "a machine paired after the client started is still one of yours"
+        );
+    }
+
+    /// The cheap half of the bargain: it stats, and only parses when that moved.
+    #[test]
+    fn an_unchanged_record_is_not_parsed_again() {
+        let path = temporary_path("watch-unchanged");
+        let mut pairing = Pairing::default();
+        pairing.remember("laptop", Some(String::from("aa")), Some(true));
+        save_to(&path, &pairing).expect("write the record");
+
+        let mut watch = PairedMachineWatch::watching(Some(path.clone()));
+        assert_eq!(watch.machines().len(), 1);
+
+        // Corrupt it *without* touching the mtime the watch already read. A
+        // second parse would fail and empty the fleet; not parsing keeps it.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "this is not toml").expect("overwrite");
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(modified).expect("restore mtime");
+
+        assert_eq!(
+            watch.machines().len(),
+            1,
+            "an unchanged mtime means the file is not read again"
+        );
+    }
+
+    /// A record that appears later is picked up, rather than waited on forever.
+    #[test]
+    fn a_fleet_that_did_not_exist_yet_is_noticed_when_it_does() {
+        let path = temporary_path("watch-missing");
+        let mut watch = PairedMachineWatch::watching(Some(path.clone()));
+        assert!(watch.machines().is_empty(), "nothing paired yet");
+
+        let mut pairing = Pairing::default();
+        pairing.remember("droplet", Some(String::from("bb")), Some(true));
+        save_to(&path, &pairing).expect("write the first record there ever was");
+
+        assert_eq!(
+            watch.machines().iter().map(|m| &m.name).collect::<Vec<_>>(),
+            vec!["droplet"],
+            "the first pairing on a machine has to be noticed too"
+        );
     }
 
     #[test]

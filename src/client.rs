@@ -334,10 +334,17 @@ pub fn run_on(
     let mut pending_resync = BTreeSet::new();
     let mut history_refresh = BTreeSet::new();
     let mut local_peer_id = Vec::new();
-    // Read once at attach: pairing changes when the user runs `p2pmux pair`,
-    // which is a different process and a rare event, so re-reading it on every
-    // snapshot would be a file read several times a second for nothing.
-    let paired_machines = crate::pairing::load_or_empty().machines;
+    // Re-read when the file changes, and only then. Pairing is written by a
+    // different process -- `p2pmux pair`, `p2pmux enroll`, or the node writing a
+    // machine down when it arrives -- so a client that read it once at attach
+    // was wrong for the rest of its life about every machine paired after it
+    // started. That is not an edge case: pairing while a session is open is the
+    // ordinary way to add a machine, and the fleet you just added came back as
+    // "someone else's machine" until the session was restarted.
+    //
+    // Parsing it several times a second would be silly, and is not what this
+    // does: it stats the file and re-reads only when the mtime moves.
+    let mut paired_machines = crate::pairing::PairedMachineWatch::new();
     let mut started_on_home = false;
     // Carried on the snapshot rather than looked up here: only the node holds the ticket,
     // and a member's node has none to send.
@@ -430,7 +437,7 @@ pub fn run_on(
                             // machine you are sitting at, and only the node can
                             // say which peer this client is.
                             tui.set_local_peer_id(local_peer_id.clone());
-                            tui.set_paired_machines(paired_machines.clone());
+                            tui.set_paired_machines(paired_machines.machines().to_vec());
                             // The node outlives this client, so here — and only
                             // here — leaving and ending the session are two
                             // different things worth asking about.
