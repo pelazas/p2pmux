@@ -132,7 +132,7 @@ case ":$PATH:" in
   *) say "NOTE: $INSTALL_DIR is not on your PATH." ;;
 esac
 say ""
-say "  p2pmux create        start a session, then Ctrl+S for the join code"
-say "  p2pmux join <code>   join one"
+say "  p2pmux               you host; Ctrl+S shows the line to send"
+say "  p2pmux join <code>   them, on their own machine"
 say ""
 say "Read https://p2pmux.com/trust before you share a code with anyone."
