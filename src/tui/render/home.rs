@@ -25,7 +25,7 @@ use crate::{
             HomeCard, HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_card,
             home_layout, home_page_size, machine_rows,
         },
-        render::footer::{FooterSegment, render_footer_segments},
+        render::footer::{FooterSegment, footer_segments_width, render_footer_segments},
         text::{sanitize_single_line, text_width, truncate_leading, truncate_trailing},
     },
 };
@@ -109,6 +109,41 @@ const HOME_KEYS_PAGED: &[FooterSegment] = &[
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
+
+/// What survives when the window is too narrow for the bar above it.
+///
+/// Ordered by what a person cannot work out for themselves. Enter is the whole
+/// screen's verb and `q` is the way out, so those are last to go; adding a
+/// machine and opening a terminal are discoverable from the machines rail once
+/// you are there, and paging announces itself with `page 1 of 2` in the header.
+const HOME_KEYS_SHORT: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" open   "),
+    FooterSegment::Key("m"),
+    FooterSegment::Text(" machines   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
+const HOME_KEYS_CORE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" open   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
+const HOME_KEYS_TIERS: &[&[FooterSegment]] = &[HOME_KEYS, HOME_KEYS_SHORT, HOME_KEYS_CORE];
+const HOME_KEYS_PAGED_TIERS: &[&[FooterSegment]] =
+    &[HOME_KEYS_PAGED, HOME_KEYS_SHORT, HOME_KEYS_CORE];
+/// On a machine row `enter` means something else, so the short tier says which.
+const HOME_KEYS_MACHINE_SHORT: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" terminal there   "),
+    FooterSegment::Key("esc"),
+    FooterSegment::Text(" back   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
+const HOME_KEYS_MACHINE_TIERS: &[&[FooterSegment]] =
+    &[HOME_KEYS_MACHINE, HOME_KEYS_MACHINE_SHORT, HOME_KEYS_CORE];
 
 /// Column widths. The machine and agent columns are fixed so the eye can read
 /// down them; everything the row has left over goes to what the agent is doing,
@@ -240,7 +275,7 @@ fn render_home_in(
     if layout.machines.height > 0 {
         let lines = match layout.machine_panel {
             MachinePanel::Rail => machine_rail(tui, theme, layout.machines.height),
-            MachinePanel::Table => machine_table(tui, theme),
+            MachinePanel::Table => machine_table(tui, theme, layout.machines.width),
             MachinePanel::Strip => machine_strip(tui, theme),
             MachinePanel::Empty => Vec::new(),
         };
@@ -941,7 +976,7 @@ fn rail_line(mut spans: Vec<Span<'static>>, theme: &UiTheme) -> Line<'static> {
 
 /// The same facts as a table under the agents, for a terminal too narrow to
 /// give a column away.
-fn machine_table(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
+fn machine_table(tui: &MultiPaneTui, theme: &UiTheme, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::raw(""),
         Line::styled(
@@ -958,7 +993,7 @@ fn machine_table(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
     let (fleet, guests): (Vec<_>, Vec<_>) = rows.iter().partition(|row| row.owned);
     for machine in fleet {
         lines.push(Line::styled(
-            format!(" {}", machine_line(machine)),
+            format!(" {}", machine_line(machine, Some(width.saturating_sub(1)))),
             Style::default().fg(theme.agent_overlay_foreground),
         ));
     }
@@ -974,7 +1009,7 @@ fn machine_table(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
         ));
         for machine in guests {
             lines.push(Line::styled(
-                format!(" {}", machine_line(machine)),
+                format!(" {}", machine_line(machine, Some(width.saturating_sub(1)))),
                 Style::default().fg(theme.agent_overlay_secondary),
             ));
         }
@@ -1008,7 +1043,11 @@ fn machine_strip(tui: &MultiPaneTui, theme: &UiTheme) -> Vec<Line<'static>> {
 
 /// One machine, formatted identically on Home and in `p2pmux machines`, so the
 /// two can never drift into describing the same fleet differently.
-pub fn machine_line(machine: &MachineRow) -> String {
+///
+/// `width` is the room the line has, where the caller knows it. `None` is a
+/// caller printing to a terminal it does not measure -- `p2pmux machines`,
+/// whose output the shell wraps rather than clips.
+pub fn machine_line(machine: &MachineRow, width: Option<u16>) -> String {
     let status = if machine.reachable { "ready" } else { "asleep" };
     // A dash means "never said", not "no". The answer is given on the machine
     // it is about and has no way back here, so printing `no` would show a
@@ -1024,17 +1063,23 @@ pub fn machine_line(machine: &MachineRow) -> String {
         1 => String::from("1 agent"),
         count => format!("{count} agents"),
     };
-    let suffix = if machine.this_machine {
-        "      (this machine)"
-    } else {
-        ""
-    };
-    format!(
-        "{:<12} {:<8} {:<14} {running}{suffix}",
+    let row = format!(
+        "{:<12} {:<8} {:<14} {running}",
         truncate_trailing(&sanitize_single_line(&machine.name), 11),
         status,
         accepts
-    )
+    );
+    if !machine.this_machine {
+        return row;
+    }
+    // The marker is the one part of this row a person can work out for
+    // themselves, so it is the part to drop when the window is too narrow to
+    // hold it. Clipped, it read `(this ma` hanging off the right edge.
+    let suffix = "      (this machine)";
+    match width {
+        Some(width) if row.chars().count() + suffix.chars().count() > usize::from(width) => row,
+        _ => format!("{row}{suffix}"),
+    }
 }
 
 fn render_home_keys(
@@ -1060,13 +1105,31 @@ fn render_home_keys(
         keys.x.saturating_add(1),
         keys.y,
         keys.right(),
-        match (on_machine, paged) {
-            // What the keys do now outranks how to page a list they are not on.
-            (true, _) => HOME_KEYS_MACHINE,
-            (false, true) => HOME_KEYS_PAGED,
-            (false, false) => HOME_KEYS,
-        },
+        home_footer(
+            match (on_machine, paged) {
+                // What the keys do now outranks how to page a list they are not on.
+                (true, _) => HOME_KEYS_MACHINE_TIERS,
+                (false, true) => HOME_KEYS_PAGED_TIERS,
+                (false, false) => HOME_KEYS_TIERS,
+            },
+            keys.right().saturating_sub(keys.x.saturating_add(1)),
+        ),
     );
+}
+
+/// The widest of these bars that fits, rather than the one bar clipped.
+///
+/// The chord footers have had this since a key pushed `Esc BACK` off a
+/// 120-column terminal; the inbox's own bar never got it, and on a 60-column
+/// window ended `n new ter` — which does not name a key, does not name what it
+/// does, and reads as a rendering fault. Dropping a whole hint says less and
+/// says it correctly.
+fn home_footer(tiers: &[&'static [FooterSegment]], width: u16) -> &'static [FooterSegment] {
+    tiers
+        .iter()
+        .copied()
+        .find(|tier| footer_segments_width(tier) <= width)
+        .unwrap_or_else(|| tiers.last().copied().unwrap_or(HOME_KEYS_CORE))
 }
 
 /// The last two components of a working directory: `Desktop/p2pmux` rather than
@@ -1096,10 +1159,12 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        ELAPSED_WIDTH, GUEST_DETAIL, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_ROW_NO_HOOKS,
-        format_home_row, header_line, home_card, home_elapsed, home_kind_label, machine_detail,
-        machine_line,
+        ELAPSED_WIDTH, GUEST_DETAIL, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_KEYS_CORE,
+        HOME_KEYS_MACHINE_TIERS, HOME_KEYS_PAGED_TIERS, HOME_KEYS_TIERS, HOME_ROW_NO_HOOKS,
+        format_home_row, header_line, home_card, home_elapsed, home_footer, home_kind_label,
+        machine_detail, machine_line,
     };
+    use crate::tui::render::footer::{FooterSegment, footer_segments_width};
     use crate::{
         agent_detect::{AgentKind, AgentState, DetectedAgent, PaneAgentTracker},
         config::UiTheme,
@@ -1398,15 +1463,74 @@ mod tests {
             ..here.clone()
         };
 
-        let line = machine_line(&here);
+        let line = machine_line(&here, None);
         assert!(
             line.contains('—'),
             "a dash means never said, not a refusal nobody made: {line:?}"
         );
         assert!(line.contains("2 agents"), "{line:?}");
         assert!(line.contains("(this machine)"), "{line:?}");
-        assert!(machine_line(&there).contains("yes"));
-        assert!(machine_line(&there).contains("1 agent"));
+        assert!(machine_line(&there, None).contains("yes"));
+        assert!(machine_line(&there, None).contains("1 agent"));
+    }
+
+    /// The bar narrows by dropping whole hints, not by clipping a word.
+    ///
+    /// `n new ter` names no key and no action; it reads as a rendering fault.
+    /// The chord footers have had tiers since one of them lost `Esc BACK` off
+    /// the end of a 120-column terminal, and this is the same rule for the
+    /// screen bare `p2pmux` opens on.
+    #[test]
+    fn the_inbox_bar_drops_hints_it_cannot_fit_whole() {
+        for width in [30u16, 40, 50, 60, 70, 80, 120] {
+            for tiers in [
+                HOME_KEYS_TIERS,
+                HOME_KEYS_PAGED_TIERS,
+                HOME_KEYS_MACHINE_TIERS,
+            ] {
+                let chosen = home_footer(tiers, width);
+                let drawn = footer_segments_width(chosen);
+                assert!(
+                    drawn <= width || chosen == HOME_KEYS_CORE,
+                    "at {width} columns the bar drew {drawn}: {chosen:?}"
+                );
+                assert!(
+                    chosen
+                        .iter()
+                        .any(|segment| matches!(segment, FooterSegment::Key("enter"))),
+                    "every tier keeps the key the whole screen is about: {chosen:?}"
+                );
+            }
+        }
+    }
+
+    /// On a narrow window the row drops its marker rather than hanging off the
+    /// edge, where it was clipped to `(this ma`.
+    #[test]
+    fn a_narrow_machine_row_drops_the_marker_rather_than_half_of_it() {
+        let here = MachineRow {
+            name: String::from("host"),
+            peer_id: None,
+            owned: true,
+            reachable: true,
+            accepts_work: None,
+            agents: 6,
+            this_machine: true,
+        };
+
+        let roomy = machine_line(&here, Some(80));
+        assert!(roomy.contains("(this machine)"), "{roomy:?}");
+
+        let narrow = machine_line(&here, Some(58));
+        assert!(
+            !narrow.contains("(this"),
+            "a marker that does not fit is left out whole: {narrow:?}"
+        );
+        assert!(
+            narrow.chars().count() <= 58,
+            "and what is left fits: {narrow:?}"
+        );
+        assert!(narrow.contains("6 agents"), "the facts stay: {narrow:?}");
     }
 
     #[test]
@@ -1421,7 +1545,7 @@ mod tests {
             this_machine: false,
         };
 
-        assert!(machine_line(&asleep).contains("asleep"));
+        assert!(machine_line(&asleep, None).contains("asleep"));
     }
 
     /// The line under a machine's name says what it is and what it is running.

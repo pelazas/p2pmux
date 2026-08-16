@@ -12,6 +12,7 @@ use crate::{
     tui::{ChordMode, text::text_width},
 };
 
+#[derive(Debug, PartialEq)]
 pub(in crate::tui) enum FooterSegment {
     Text(&'static str),
     Key(&'static str),
@@ -250,7 +251,7 @@ pub(in crate::tui) fn render_footer_segments(
     }
     x
 }
-fn footer_segments_width(segments: &[FooterSegment]) -> u16 {
+pub(in crate::tui) fn footer_segments_width(segments: &[FooterSegment]) -> u16 {
     segments
         .iter()
         .map(|segment| match segment {

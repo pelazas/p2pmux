@@ -1055,7 +1055,7 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
         "NAME", "STATUS", "ACCEPTS WORK"
     );
     for row in &fleet {
-        println!("{}", crate::tui::machine_line(row));
+        println!("{}", crate::tui::machine_line(row, None));
     }
     // Under their own heading, never in the fleet table. Someone collaborating
     // on this session from their own laptop is not compute you own, and a list
@@ -1065,7 +1065,7 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
         println!();
         println!("IN THIS SESSION, NOT YOURS");
         for row in &guests {
-            println!("{}", crate::tui::machine_line(row));
+            println!("{}", crate::tui::machine_line(row, None));
         }
     }
     if fleet.len() < 2 {
