@@ -1,5 +1,5 @@
 #!/bin/sh
-# Prints this week's row for docs/METRICS.md.
+# Prints this week's row for the metrics log, which lives in the project's Notion.
 #
 # Four numbers, and the reason each one is here rather than the obvious ones:
 #
@@ -16,7 +16,7 @@
 # Deliberately absent: stars (vanity) and clone counts. 1170 clones from 334 uniques is
 # mirrors, package scanners and CI, not people. Reporting it to anyone would be lying.
 #
-# Usage:  sh scripts/metrics.sh        then paste the row into docs/METRICS.md
+# Usage:  sh scripts/metrics.sh        then paste the row into the Notion metrics log
 set -eu
 
 REPO="${P2PMUX_METRICS_REPO:-pelazas/p2pmux}"
