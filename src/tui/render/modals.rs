@@ -13,10 +13,7 @@ use crate::{
     config::UiTheme,
     tui::{
         RenamePrompt, RenameTarget, ShareView,
-        render::footer::{
-            ADD_MACHINE_HELP, SHARE_HELP, SHARE_HELP_GUEST, SHARE_HELP_NO_CODE,
-            render_footer_segments,
-        },
+        render::footer::{ADD_MACHINE_HELP, SHARE_HELP_GUEST, render_footer_segments, share_help},
         share::{join_command, pair_command},
         text::{truncate_trailing, wrap_fixed},
     },
@@ -147,11 +144,11 @@ pub(in crate::tui) fn render_share_modal(
         help.x.saturating_add(1),
         help.y,
         help.right(),
-        match (share.ticket.is_some(), share.code.is_some()) {
-            (true, true) => SHARE_HELP,
-            (true, false) => SHARE_HELP_NO_CODE,
-            (false, _) => SHARE_HELP_GUEST,
-        },
+        share_help(
+            share.ticket.is_some(),
+            share.code.is_some(),
+            help.width.saturating_sub(1),
+        ),
     );
 }
 /// The install line for a machine that has never had p2pmux on it.

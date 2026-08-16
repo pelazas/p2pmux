@@ -167,6 +167,48 @@ pub(in crate::tui) const SHARE_HELP: &[FooterSegment] = &[
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> CLOSE"),
 ];
+/// The same three keys with the explanation dropped, for a panel too narrow to
+/// carry it. What `t` copies is a ticket either way; that it works offline is
+/// the part a wider window has room to say.
+const SHARE_HELP_TERSE: &[FooterSegment] = &[
+    FooterSegment::Text("<"),
+    FooterSegment::Key("Enter"),
+    FooterSegment::Text("> COPY   <"),
+    FooterSegment::Key("t"),
+    FooterSegment::Text("> TICKET   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> CLOSE"),
+];
+
+/// The widest of these that the panel can hold.
+///
+/// A modal's help line is the only thing on screen that says how to leave it,
+/// and this one was being clipped: at sixty columns it ended `<Esc> CLOS`, and
+/// at fifty the close hint was gone altogether, leaving a panel over the
+/// session with no stated way out. So the tiers drop what can be guessed --
+/// what `t` copies, then `t` itself -- and never the way out.
+pub(in crate::tui) fn share_help(
+    has_ticket: bool,
+    has_code: bool,
+    width: u16,
+) -> &'static [FooterSegment] {
+    let tiers: &[&[FooterSegment]] = match (has_ticket, has_code) {
+        (true, true) => &[
+            SHARE_HELP,
+            SHARE_HELP_TERSE,
+            SHARE_HELP_NO_CODE,
+            SHARE_HELP_GUEST,
+        ],
+        (true, false) => &[SHARE_HELP_NO_CODE, SHARE_HELP_GUEST],
+        (false, _) => &[SHARE_HELP_GUEST],
+    };
+    tiers
+        .iter()
+        .copied()
+        .find(|tier| footer_segments_width(tier) <= width)
+        .unwrap_or(SHARE_HELP_GUEST)
+}
+
 /// When the rendezvous was unreachable there is no code to offer, so Enter falls back to the
 /// ticket and `t` would be the same key twice. Say COPY rather than naming either one.
 pub(in crate::tui) const SHARE_HELP_NO_CODE: &[FooterSegment] = &[
@@ -573,7 +615,42 @@ mod tests {
         tui::{ChordMode, MultiPaneTui, render_multi_pane, test_support::layout},
     };
 
-    use super::{FooterSegment, chord_footer_badge, contextual_footer};
+    use super::{
+        FooterSegment, chord_footer_badge, contextual_footer, footer_segments_width, share_help,
+    };
+
+    /// A modal always says how to leave it.
+    ///
+    /// The share panel's help line was clipped by the panel border: at sixty
+    /// columns it ended `<Esc> CLOS`, and at fifty the close hint was gone
+    /// entirely, leaving a panel over the session with no stated way out.
+    #[test]
+    fn the_share_panel_never_drops_the_way_out() {
+        for width in [12u16, 20, 26, 30, 40, 44, 54, 80] {
+            let chosen = share_help(true, true, width);
+            assert!(
+                chosen
+                    .iter()
+                    .any(|segment| matches!(segment, FooterSegment::Key("Esc"))),
+                "at {width} columns the panel stopped saying how to close it: {chosen:?}"
+            );
+            assert!(
+                footer_segments_width(chosen) <= width || width < 11,
+                "at {width} columns it drew {}: {chosen:?}",
+                footer_segments_width(chosen)
+            );
+        }
+
+        // Room for everything means everything is said.
+        let roomy = share_help(true, true, 80);
+        assert!(
+            roomy.iter().any(|segment| matches!(
+                segment,
+                FooterSegment::Text("> TICKET, WORKS OFFLINE   <")
+            )),
+            "a wide panel keeps the explanation: {roomy:?}"
+        );
+    }
 
     #[test]
     fn shared_footer_uses_help_for_each_chord_mode() {
