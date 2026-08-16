@@ -206,28 +206,69 @@ fn load_service(path: &std::path::Path, load: bool) -> io::Result<()> {
         .map(|_| ())
 }
 
+/// What the agent should do on this tick.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Step {
+    /// Make sure this machine is in that session.
+    Follow(String),
+    /// There is no fleet on this machine yet. Keep running and look again.
+    WaitForPairing,
+}
+
+/// Read one tick's decision off the pairing record.
+///
+/// Split out so the loop below stays a loop and this stays a fact about the
+/// record: an agent with nothing to join waits, and only a ticket makes it act.
+pub fn next_step(pairing: &crate::pairing::Pairing) -> Step {
+    match pairing.ticket.as_deref() {
+        Some(ticket) => Step::Follow(ticket.to_owned()),
+        None => Step::WaitForPairing,
+    }
+}
+
 /// Run the fleet agent in the foreground until told to stop.
 ///
 /// The whole job is keeping this machine's home session up. Everything else —
 /// answering invitations, serving remote terminals, reporting agents — is the
 /// node's, and the node is what this keeps alive.
 pub async fn run() -> Result<(), Box<dyn Error>> {
-    let pairing = crate::pairing::load()?;
-    let Some(ticket) = pairing.ticket.clone() else {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::NotFound,
-            "this machine is not paired, so it has no fleet to join — run `p2pmux pair` first",
-        )));
-    };
     println!("p2pmux fleet agent: keeping this machine in its home session");
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut waiting = false;
     loop {
-        if let Err(error) = ensure_home_session(&ticket).await {
-            // Reported and retried rather than fatal. The usual reason is a
-            // network that is not up yet, and a daemon that exited on that
-            // would need the operating system to restart it into the same
-            // failure a second later.
-            eprintln!("p2pmux fleet agent: {error}");
+        // Asked every tick rather than once at start, because both answers can
+        // change under a service that outlives them: a machine paired after the
+        // agent was installed, and one re-paired into a different session.
+        match next_step(&crate::pairing::load_or_empty()) {
+            Step::Follow(ticket) => {
+                if waiting {
+                    println!("p2pmux fleet agent: paired — joining its home session");
+                    waiting = false;
+                }
+                if let Err(error) = ensure_home_session(&ticket).await {
+                    // Reported and retried rather than fatal. The usual reason is a
+                    // network that is not up yet, and a daemon that exited on that
+                    // would need the operating system to restart it into the same
+                    // failure a second later.
+                    eprintln!("p2pmux fleet agent: {error}");
+                }
+            }
+            // Not an error, and above all not an exit. `Restart=always` turns an
+            // exit here into a process every five seconds for as long as the
+            // machine is up -- which is what an unpaired box got, silently,
+            // after `p2pmux daemon install` told it everything was fine.
+            // Waiting is also the more useful behaviour: install the agent
+            // whenever, pair whenever, and it starts working at the later of
+            // the two.
+            Step::WaitForPairing => {
+                if !waiting {
+                    println!(
+                        "p2pmux fleet agent: this machine is not in a fleet yet — waiting for \
+                         `p2pmux pair`"
+                    );
+                    waiting = true;
+                }
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(SUPERVISION_INTERVAL) => {}
@@ -253,13 +294,35 @@ async fn ensure_home_session(ticket: &str) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SERVICE_LABEL, ServiceUnit};
+    use super::{SERVICE_LABEL, ServiceUnit, Step, next_step};
 
     fn unit() -> ServiceUnit {
         ServiceUnit {
             program: String::from("/usr/local/bin/p2pmux"),
             log_path: String::from("/home/me/.p2pmux-fleet.log"),
         }
+    }
+
+    /// An agent with no fleet to join waits for one. It does not exit.
+    ///
+    /// The unit says `Restart=always`, so exiting is not "stopping" -- it is a
+    /// process every five seconds until somebody notices. A fresh droplet that
+    /// ran `p2pmux daemon install` before `p2pmux pair`, which is the order the
+    /// install output invites, got exactly that: four restarts in the first
+    /// thirty seconds, while the command that installed it had said "This
+    /// machine now rejoins its home session at boot".
+    #[test]
+    fn an_unpaired_machine_waits_instead_of_exiting() {
+        let mut pairing = crate::pairing::Pairing::default();
+        assert_eq!(next_step(&pairing), Step::WaitForPairing);
+
+        // And picks the fleet up when one appears, without being reinstalled.
+        pairing.ticket = Some(String::from("p2pmux-v3:whatever"));
+        assert_eq!(
+            next_step(&pairing),
+            Step::Follow(String::from("p2pmux-v3:whatever")),
+            "a machine paired after the agent was installed is still its fleet"
+        );
     }
 
     /// The two properties the issue asks for, on both platforms, from one

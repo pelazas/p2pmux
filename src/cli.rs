@@ -657,10 +657,23 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Some(DaemonCommand::Install) => {
                 let path = crate::daemon::install()?;
                 println!("fleet agent installed: {}", path.display());
-                println!(
-                    "This machine now rejoins its home session at boot, so your other\n\
-                     machines can find it — and invite it into sessions you start later."
-                );
+                // What it will actually do depends on whether there is a fleet
+                // to keep this machine in. Saying "rejoins its home session at
+                // boot" to a machine that has never been paired is a promise
+                // about a session that does not exist.
+                if crate::pairing::load_or_empty().can_rejoin() {
+                    println!(
+                        "This machine now rejoins its home session at boot, so your other\n\
+                         machines can find it — and invite it into sessions you start later."
+                    );
+                } else {
+                    println!(
+                        "This machine is not in a fleet yet, so the agent is running and\n\
+                         waiting. Pair it — `p2pmux pair` here, `p2pmux pair <code>` on\n\
+                         another machine you own — and it starts keeping this one in that\n\
+                         fleet, at boot and after a crash, without being installed again."
+                    );
+                }
                 Ok(())
             }
             Some(DaemonCommand::Uninstall) => {
