@@ -151,6 +151,15 @@ impl PtyHost {
             }
         };
         command.env("TERM", "xterm-256color");
+        // Cleared before either is set, because a PTY inherits this process's
+        // environment and p2pmux is very often started from inside a p2pmux
+        // pane. A shell that is not a roster pane — `p2pmux local`, the
+        // single-pane host runtime — would otherwise carry the *outer* pane's
+        // id, and an agent hook in it would report its status against a pane it
+        // is not in. A roster pane with no socket of its own is the same wrong
+        // row by a longer route: a fresh id paired with the outer node.
+        command.env_remove(PANE_ID_ENV);
+        command.env_remove(SOCKET_ENV);
         if let Some(pane_id) = pane_id {
             command.env(PANE_ID_ENV, pane_id.to_string());
             if let Some(socket) = AGENT_SOCKET_PATH.get() {

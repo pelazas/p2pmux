@@ -193,7 +193,22 @@ fn pane_shells_learn_their_pane_id_and_plain_shells_do_not() {
 
     // `p2pmux local` and the single-pane host runtime are not roster panes, so
     // nothing inside them can claim to be a pane that exists.
+    //
+    // Including when p2pmux itself was started from inside a p2pmux pane, which
+    // is how anyone working on this runs it. A PTY inherits this process's
+    // environment, so the variable arrives already set and has to be taken back
+    // out — otherwise the shell reports the *outer* pane, and a hook in it files
+    // its status against a pane it is not in.
     let mut plain = PtyHost::spawn_default_shell(size).expect("plain PTY should spawn");
     assert!(run_until(&mut plain, report, "pane=[]").contains("pane=[]"));
     plain.shutdown().expect("PTY should shut down cleanly");
+
+    // The socket travels with the id or not at all: a fresh pane id beside a
+    // stale socket points a hook at the node of the p2pmux this one is running
+    // inside, which is the same wrong row by a longer route.
+    let both = b"printf 'pair=[%s][%s]\\n' \"$P2PMUX_PANE_ID\" \"$P2PMUX_SOCK\"\n";
+    let mut pair =
+        PtyHost::spawn_default_shell_with_cwd(size, None, Some(7)).expect("pane PTY should spawn");
+    assert!(run_until(&mut pair, both, "pair=[7]").contains("pair=[7][]"));
+    pair.shutdown().expect("PTY should shut down cleanly");
 }
