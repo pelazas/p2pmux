@@ -556,31 +556,79 @@ fn offer_into(pairing: &mut Pairing, ticket: &str, now: u64) -> bool {
 /// Machines are never removed either. A paired machine that is switched off
 /// stops being a member and must keep its row — saying `asleep` is the entire
 /// reason the record exists. Unpairing is `p2pmux unpair`, an explicit act.
-pub fn pin_peers(seen: &[SeenMachine]) -> Result<(), PairingError> {
+/// Returns the members it did **not** write down, with the reason for each. The
+/// caller logs them: a pairing that does not happen is otherwise completely
+/// silent on this side, and "my other machine never appeared and nothing said
+/// why" is a bug report nobody -- including the person who wrote this -- can
+/// answer afterwards.
+pub fn pin_peers(seen: &[SeenMachine]) -> Result<Vec<PinRefusal>, PairingError> {
     if seen.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let path = pairing_path()?;
     let mut pairing = load_from(&path)?;
     if !pairing.can_rejoin() {
-        return Ok(());
+        return Ok(seen
+            .iter()
+            .map(|machine| PinRefusal {
+                name: machine.name.clone(),
+                reason: PinRefused::NoFleetHere,
+            })
+            .collect());
     }
     let before = pairing.clone();
-    pin_into(&mut pairing, seen, now_unix());
+    let refused = pin_into(&mut pairing, seen, now_unix());
     if pairing == before {
-        return Ok(());
+        return Ok(refused);
     }
-    save_to(&path, &pairing)
+    save_to(&path, &pairing)?;
+    Ok(refused)
+}
+
+/// A member of the session that this machine's fleet record did not take, and
+/// why not. Every one of these is a deliberate refusal — see [`pin_into`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinRefusal {
+    pub name: String,
+    pub reason: PinRefused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinRefused {
+    /// This machine belongs to no fleet, so there is nothing to add anyone to.
+    NoFleetHere,
+    /// The member never said it is a machine. A person's p2pmux says so, and so
+    /// does one whose node started before its own pairing record existed.
+    NotDeclaredAMachine,
+    /// It is a machine, and no window was open to admit it. The ordinary case:
+    /// a guest in a session you invited somebody to is not one of your machines.
+    NoWindowOpen,
+}
+
+impl std::fmt::Display for PinRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.reason {
+            PinRefused::NoFleetHere => "this machine is in no fleet",
+            PinRefused::NotDeclaredAMachine => "it did not say it is a machine",
+            PinRefused::NoWindowOpen => "no pairing window was open for it",
+        };
+        write!(formatter, "{}: {reason}", self.name)
+    }
 }
 
 /// What a session's member list does to a fleet record. The pure half of
 /// [`pin_peers`], so the rules can be tested without a filesystem.
-fn pin_into(pairing: &mut Pairing, seen: &[SeenMachine], now: u64) {
+fn pin_into(pairing: &mut Pairing, seen: &[SeenMachine], now: u64) -> Vec<PinRefusal> {
+    let mut refused = Vec::new();
     for machine in seen {
         // Writing to the fleet asks the strict question. Silence is enough to
         // be *recognized* as a machine you own; it is not enough to be written
         // in as one, and neither is a peer that says a person is driving it.
         if !machine.kind.declared_machine() {
+            refused.push(PinRefusal {
+                name: machine.name.clone(),
+                reason: PinRefused::NotDeclaredAMachine,
+            });
             continue;
         }
         if pairing.owns(&machine.machine_id, &machine.name, machine.kind) {
@@ -593,8 +641,14 @@ fn pin_into(pairing: &mut Pairing, seen: &[SeenMachine], now: u64) {
         if pairing.pairing_window_open(now) {
             pairing.pending_until = None;
             pairing.remember(&machine.name, machine.identity(), None);
+            continue;
         }
+        refused.push(PinRefusal {
+            name: machine.name.clone(),
+            reason: PinRefused::NoWindowOpen,
+        });
     }
+    refused
 }
 
 /// Seconds since the epoch, or `0` on a clock that will not answer.
@@ -659,8 +713,8 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), PairingError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemberKind, PAIRING_WINDOW_SECONDS, Pairing, SeenMachine, WorkDecision, load_from,
-        now_unix, offer_into, pin_into, save_to,
+        MemberKind, PAIRING_WINDOW_SECONDS, Pairing, PinRefusal, PinRefused, SeenMachine,
+        WorkDecision, load_from, now_unix, offer_into, pin_into, save_to,
     };
     use crate::tui::PairedMachine;
 
@@ -1062,6 +1116,68 @@ mod tests {
         pin_into(&mut pairing, &seen, 1_000 + PAIRING_WINDOW_SECONDS + 1);
 
         assert!(pairing.machines.is_empty());
+    }
+
+    /// Every refusal names the member and the rule that refused it. Silence
+    /// here is what made "it paired and never showed up" unanswerable: the
+    /// machine it happens on is by definition one nobody is sitting at.
+    #[test]
+    fn every_member_left_out_of_the_fleet_says_which_rule_left_it_out() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("t")),
+            ..Pairing::default()
+        };
+        let seen = vec![
+            SeenMachine {
+                name: String::from("quiet-box"),
+                machine_id: String::from("beef"),
+                kind: MemberKind::Unspecified,
+            },
+            SeenMachine {
+                name: String::from("their-laptop"),
+                machine_id: String::from("cafe"),
+                kind: MemberKind::Machine,
+            },
+        ];
+
+        let refused = pin_into(&mut pairing, &seen, 9_999);
+
+        assert_eq!(
+            refused,
+            vec![
+                PinRefusal {
+                    name: String::from("quiet-box"),
+                    reason: PinRefused::NotDeclaredAMachine,
+                },
+                PinRefusal {
+                    name: String::from("their-laptop"),
+                    reason: PinRefused::NoWindowOpen,
+                },
+            ]
+        );
+        assert_eq!(
+            refused[1].to_string(),
+            "their-laptop: no pairing window was open for it"
+        );
+    }
+
+    /// The machine that *is* admitted is not reported as refused, so a healthy
+    /// pairing writes nothing to the log.
+    #[test]
+    fn a_machine_the_window_admits_is_not_reported_as_refused() {
+        let mut pairing = Pairing {
+            ticket: Some(String::from("t")),
+            ..Pairing::default()
+        };
+        pairing.open_pairing_window(1_000);
+        let seen = vec![SeenMachine {
+            name: String::from("droplet"),
+            machine_id: String::from("beef"),
+            kind: MemberKind::Machine,
+        }];
+
+        assert!(pin_into(&mut pairing, &seen, 1_001).is_empty());
+        assert_eq!(pairing.machines.len(), 1);
     }
 
     #[test]

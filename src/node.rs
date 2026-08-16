@@ -541,8 +541,21 @@ fn run_socket_loop(
                         kind: peer.kind,
                     })
                     .collect::<Vec<_>>();
-                if let Err(error) = crate::pairing::pin_peers(&seen) {
-                    eprintln!("p2pmux node: failed to record paired machines: {error}");
+                // Both outcomes are written down. A failure is obvious enough;
+                // a refusal is not, and it is the one that gets reported as
+                // "my other machine paired and never appeared here". Every
+                // line of this is a rule doing its job, and the log is where
+                // somebody can find out which rule, on a machine nobody was
+                // sitting at when it happened.
+                match crate::pairing::pin_peers(&seen) {
+                    Ok(refused) => {
+                        for refusal in refused {
+                            eprintln!("p2pmux node: not added to this fleet — {refusal}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("p2pmux node: failed to record paired machines: {error}")
+                    }
                 }
             }
             // On the same timer, and deliberately not only when the membership
