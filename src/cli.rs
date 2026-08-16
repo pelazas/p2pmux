@@ -1671,6 +1671,17 @@ pub(crate) fn launch_background_node(
         if let Ok(found) = store.read(&id)
             && found.socket_path.exists()
         {
+            // Ready, and from here this process never speaks to it again -- but
+            // it is still its parent, and a child nobody waits on becomes a
+            // zombie the moment it exits. That is not hypothetical for a node
+            // that launches these: a machine following an invitation into a
+            // session it turns out it cannot reach records itself, becomes
+            // "ready", and dies seconds later, and the entry stayed in the
+            // process table for as long as the launcher lived. One thread,
+            // which ends when the node does.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return Ok(found);
         }
         // The node reports why it could not start -- a full room, a dead coordinator, a
