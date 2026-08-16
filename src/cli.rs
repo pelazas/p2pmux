@@ -1136,9 +1136,14 @@ fn run_work(action: Option<WorkCommand>) -> Result<(), Box<dyn Error>> {
 fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
     let mut pairing = crate::pairing::load()?;
     let Some(ticket) = pairing.ticket.clone() else {
+        // Not "or start a session". A session is not a fleet: `ticket` is
+        // written by a pairing and nothing else, so telling somebody to run
+        // `p2pmux` instead sent them round a loop that could not end. The
+        // unattended path really does start with a human pairing once.
         return Err(CliError(
-            "this machine is not in a fleet yet — run `p2pmux pair` on it once, \
-             or start a session with `p2pmux`, and try again",
+            "this machine is not in a fleet yet, and `p2pmux enroll` hands out an \
+             invitation to one that exists — run `p2pmux pair` here and \
+             `p2pmux pair <code>` on another machine you own, then try again",
         )
         .into());
     };

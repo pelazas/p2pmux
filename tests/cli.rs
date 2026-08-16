@@ -27,11 +27,15 @@ fn run(args: &[&str]) -> std::process::Output {
 ///
 /// `XDG_STATE_HOME` outranks `HOME` where it is honoured, so a developer who has
 /// one set would otherwise send the child straight back to their own sessions.
+/// `XDG_CONFIG_HOME` outranks it the same way for `pairing.toml` and the display
+/// name, which is how a machine that is genuinely in a fleet would leak into a
+/// test asserting that this one is not.
 fn run_with_home(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_p2pmux"))
         .args(args)
         .env("HOME", home)
         .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("p2pmux binary should run")
 }
@@ -307,6 +311,29 @@ fn notify_is_a_silent_no_op_outside_a_pane() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     fs::remove_dir_all(&directory).expect("temporary directory should remove");
+}
+
+/// A fleet is something a pairing makes, and the error has to say so.
+///
+/// It used to offer "or start a session with `p2pmux`" as an alternative, which
+/// is a route that does not exist: only `p2pmux pair` and the add-machine panel
+/// write the fleet ticket `enroll` hands out. Somebody provisioning a VM would
+/// start a session, run `enroll` again, get the same error, and have nothing
+/// left to try.
+#[test]
+fn enroll_without_a_fleet_names_pairing_and_offers_no_other_route() {
+    let session = FakeSession::hosted("lisbon");
+
+    let output = run_with_home(session.home(), &["enroll"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("not in a fleet yet"), "{stderr}");
+    assert!(stderr.contains("p2pmux pair"), "{stderr}");
+    assert!(
+        !stderr.contains("start a session"),
+        "the error offers a route that writes no fleet ticket: {stderr}"
+    );
 }
 
 fn minted_ticket() -> JoinTicket {
