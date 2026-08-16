@@ -18,7 +18,8 @@ Say so in the issue — intermittent is still a data point.
 
 ## Setting up
 
-Rust stable, on macOS or Linux. There is no other toolchain.
+Rust stable **1.91 or newer**, on macOS or Linux. There is no other toolchain. The floor is iroh
+1.0's, not ours, and `--locked` builds fail outright below it.
 
 ```sh
 git clone https://github.com/pelazas/p2pmux

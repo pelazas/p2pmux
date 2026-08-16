@@ -193,6 +193,9 @@ If you would rather not run an installer at all, it is [on crates.io](https://cr
 cargo install p2pmux --locked
 ```
 
+That path builds from source and needs **Rust 1.91 or newer** — iroh 1.0 sets the floor, and an
+older toolchain refuses the lockfile rather than building something subtly different.
+
 Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up. A musl system
 has to build from source.
 

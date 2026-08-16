@@ -2,7 +2,7 @@
 name = "p2pmux"
 version = "0.1.9"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 description = "A peer-to-peer terminal multiplexer where every pane runs on its owner's machine"
 authors = ["Carlos Pelazas"]
 license = "MIT"
