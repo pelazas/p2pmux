@@ -193,13 +193,19 @@ Still open in the same vein, in order of how much they are worth:
 4. **`p2pmux --version` and the installer are touchpoints too.** Anywhere the binary already talks
    to a new machine is a place the repo can be named for free.
 
-## Judgement call, not yet made
+## Replying in demand threads — checked, and there is nothing there
 
-Zellij and tmate both have long-running threads from people asking for exactly what p2pmux does.
-That is pre-qualified demand sitting in one place. It is also someone else's issue tracker, and
-"I built the thing you are asking for" lands as help or as spam depending entirely on the thread and
-on how it is written. Worth doing in at most one or two threads, in your own words, only where
-somebody is actually asking. Not something to automate, and not something to do at volume.
+The plausible-sounding idea: find the long-running threads where people ask for exactly what p2pmux
+does, and reply in them. Pre-qualified demand, sitting in one place.
+
+Searched on 2026-08-16 and it does not exist. Zellij has no open collaborative/multiplayer/remote-
+pairing issue at all. A cross-repo search for terminal-sharing and pair-programming requests returns
+one unrelated VS Code Live Share bug and then a wall of noise from a tutorial repo. Nobody is asking.
+
+Read that as a finding rather than a dead end, because it agrees with what
+[LAUNCH_KIT.md](./LAUNCH_KIT.md) already argued: **terminal pairing is not a market with unmet
+demand in it.** The demand that does exist is on the agent side, which is the second reason to lead
+with the inbox. Do not spend another hour looking for these threads.
 
 ## Hacker News
 
