@@ -85,8 +85,8 @@ not an agent orchestration platform.
 - One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
   that contacts no service at all, for when our rendezvous is down.
 - An inbox — `Ctrl+O` from anywhere, and where bare `p2pmux` lands when it rejoins a session you
-  already have — listing every Claude Code, Codex, Cursor, Pi and OpenCode agent running on every
-  machine in the session, sorted by which one is blocking you.
+  already have — listing every Claude Code, Codex, Cursor, Pi, OpenCode, Hermes and OpenClaw agent
+  running on every machine in the session, sorted by which one is blocking you.
   Press Enter on a row and you are typing in that terminal; `Ctrl+O` brings you back. `needs you`
   comes only from the agent's own hooks, never from guessing at output timing: run
   `p2pmux setup` once, and `p2pmux doctor` to check. An agent with no hooks says
@@ -116,8 +116,8 @@ not an agent orchestration platform.
 
 **Early, but real.** Sessions run between machines on different networks and different continents,
 on macOS and Linux, both architectures. Claude Code and OpenCode report their own state through
-hooks; Codex, Cursor and Pi are detected but have no hooks yet, so their rows say so rather than
-guessing. A coordinator that dies no longer ends the session.
+hooks; Codex, Cursor, Pi, Hermes and OpenClaw are detected but have no hooks yet, so their rows say
+so rather than guessing. A coordinator that dies no longer ends the session.
 
 Version history and upgrade notes are in [CHANGELOG.md](./CHANGELOG.md). Peers must be within one
 minor protocol pin of each other — the changelog says where that pin last moved.
