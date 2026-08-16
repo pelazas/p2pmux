@@ -34,8 +34,9 @@ Install is one line on macOS or Linux, no account, no server to run:
 - Site: https://p2pmux.com
 - Trust model (what a session actually grants): https://github.com/pelazas/p2pmux#trust
 
-It's early — coordinator failover isn't built yet, so a coordinator dropping ends the
-session. Happy to answer anything.
+It's early — v0.1.x, and peers have to be within one minor protocol pin of each other,
+so a session across two machines on different versions can refuse to join. Happy to
+answer anything.
 
 Carlos
 
