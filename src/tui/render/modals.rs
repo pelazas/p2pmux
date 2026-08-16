@@ -15,7 +15,7 @@ use crate::{
         RenamePrompt, RenameTarget, ShareView,
         render::footer::{add_machine_help, render_footer_segments, share_help},
         share::{INSTALL_COMMAND, join_command, pair_command},
-        text::{truncate_trailing, wrap_fixed},
+        text::{text_width, truncate_trailing, wrap_fixed},
     },
 };
 
@@ -356,6 +356,10 @@ pub(in crate::tui) fn render_rename_prompt(
     );
     let inner = Block::bordered().inner(panel);
     let field = truncate_trailing(&prompt.value, usize::from(inner.width));
+    let caret = inner
+        .x
+        .saturating_add(text_width(&field))
+        .min(inner.right().saturating_sub(1));
     let mut lines = vec![Line::raw(field)];
     if let Some(error) = &prompt.error {
         lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
@@ -367,6 +371,11 @@ pub(in crate::tui) fn render_rename_prompt(
         Style::default().fg(theme.footer_muted),
     ));
     frame.render_widget(Paragraph::new(lines), inner);
+    // Typing without a caret reads as a field that is not listening. It goes
+    // last because the pane behind this panel has already released it.
+    if inner.width > 0 && inner.height > 0 {
+        frame.set_cursor_position((caret, inner.y));
+    }
 }
 pub(in crate::tui) fn render_delete_tab_confirmation(
     frame: &mut Frame<'_>,
@@ -528,10 +537,144 @@ mod tests {
     use crate::{
         layout::{Node, Tab},
         tui::{
-            ModalState, MultiPaneTui, ShareView, render_multi_pane_with_copy_feedback,
-            test_support::layout,
+            ModalState, MultiPaneTui, PaneViewState, RenamePrompt, RenameTarget, ShareView,
+            render_multi_pane_with_copy_feedback, test_support::layout,
         },
     };
+
+    /// A pane with a caret in it and a dialog over the top of it.
+    fn tui_with_a_live_pane(modal: ModalState) -> MultiPaneTui {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 9)],
+        ))
+        .expect("layout");
+        tui.set_pane_view(
+            1,
+            PaneViewState {
+                ready: true,
+                controller_peer_id: None,
+                controller_active: false,
+                scrollback: 0,
+            },
+        );
+        tui.modal = modal;
+        tui
+    }
+
+    fn draw(tui: &MultiPaneTui, screen: &vt100::Screen) -> Terminal<TestBackend> {
+        let screens = BTreeMap::from([(1, screen)]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_multi_pane_with_copy_feedback(
+                    frame,
+                    tui,
+                    &screens,
+                    None,
+                    None,
+                    ShareView::default(),
+                    None,
+                    None,
+                );
+            })
+            .expect("draw");
+        terminal
+    }
+
+    /// The caret is the only thing on screen that says where typing goes, and
+    /// while a dialog is up it does not go to the pane. It used to be left
+    /// blinking down there, under a panel that had taken the keyboard.
+    #[test]
+    fn a_dialog_takes_the_caret_off_the_pane_behind_it() {
+        let mut parser = vt100::Parser::new(2, 9, 0);
+        parser.process(b"one\r\ntwo");
+
+        let live = draw(&tui_with_a_live_pane(ModalState::None), parser.screen());
+        assert!(
+            live.backend().cursor_visible(),
+            "with nothing over it the pane keeps its caret"
+        );
+
+        for modal in [
+            ModalState::Share,
+            ModalState::Quit,
+            ModalState::ConfirmDeleteTab {
+                tab_id: 1,
+                pane_count: 1,
+            },
+            ModalState::ConfirmRemoteWork {
+                command: vec!["cargo".into(), "test".into()],
+            },
+        ] {
+            let terminal = draw(&tui_with_a_live_pane(modal.clone()), parser.screen());
+            assert!(
+                !terminal.backend().cursor_visible(),
+                "{modal:?} left the caret in the pane behind it"
+            );
+        }
+    }
+
+    /// The one dialog that does take typing puts the caret where the typing
+    /// lands, at the end of what has been typed so far.
+    #[test]
+    fn the_rename_field_carries_the_caret_at_the_end_of_what_is_typed() {
+        let mut parser = vt100::Parser::new(2, 9, 0);
+        parser.process(b"one\r\ntwo");
+        let tui = tui_with_a_live_pane(ModalState::Rename(RenamePrompt {
+            target: RenameTarget::Pane(1),
+            value: "build".into(),
+            error: None,
+        }));
+
+        let mut terminal = draw(&tui, parser.screen());
+
+        assert!(terminal.backend().cursor_visible());
+        let caret = ratatui::backend::Backend::get_cursor_position(terminal.backend_mut())
+            .expect("caret position");
+        let buffer = terminal.backend().buffer();
+        let field = (0..5)
+            .map(|offset| buffer[(caret.x - 5 + offset, caret.y)].symbol())
+            .collect::<String>();
+        assert_eq!(field, "build", "the caret sits just past the typed name");
+        assert_eq!(
+            buffer[(caret.x, caret.y)].symbol(),
+            " ",
+            "and on the empty cell after it"
+        );
+    }
+
+    /// An empty field still has somewhere to type: the caret goes to the front
+    /// of it, not to wherever the last frame left it.
+    #[test]
+    fn an_empty_rename_field_puts_the_caret_at_its_start() {
+        let mut parser = vt100::Parser::new(2, 9, 0);
+        parser.process(b"one\r\ntwo");
+        let empty = tui_with_a_live_pane(ModalState::Rename(RenamePrompt {
+            target: RenameTarget::Pane(1),
+            value: String::new(),
+            error: None,
+        }));
+        let typed = tui_with_a_live_pane(ModalState::Rename(RenamePrompt {
+            target: RenameTarget::Pane(1),
+            value: "x".into(),
+            error: None,
+        }));
+
+        let mut empty = draw(&empty, parser.screen());
+        let mut typed = draw(&typed, parser.screen());
+
+        let start = ratatui::backend::Backend::get_cursor_position(empty.backend_mut())
+            .expect("caret position");
+        let after = ratatui::backend::Backend::get_cursor_position(typed.backend_mut())
+            .expect("caret position");
+        assert_eq!(after.y, start.y);
+        assert_eq!(after.x, start.x + 1);
+    }
 
     #[test]
     fn share_modal_shows_one_runnable_join_line_and_keeps_the_ticket_off_screen() {

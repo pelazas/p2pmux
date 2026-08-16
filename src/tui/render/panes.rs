@@ -633,8 +633,14 @@ pub(in crate::tui) fn render_shared_multi_pane(
             // viewport the node built, whose retained-row count -- and so whose
             // offset -- is always zero. Asking the screen left the caret parked
             // on a row of history, at a position that belonged to the live edge.
+            //
+            // A dialog takes the keyboard, so it takes the caret with it: while
+            // one is up, keystrokes go to it and not to this pane, and a caret
+            // still blinking down in the pane says the opposite. The dialogs
+            // that own a text field place it themselves; the rest leave it off.
             if focused
                 && view.ready
+                && matches!(tui.modal, ModalState::None)
                 && scrollback == 0
                 && !screen.hide_cursor()
                 && !pane.exited
