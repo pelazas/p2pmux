@@ -4,11 +4,40 @@ Newest first. Versions are the tags on [Releases](https://github.com/pelazas/p2p
 
 ## Compatibility
 
-**v0.1.8 and v0.1.9 share sessions.** The wire protocol did not move, so a peer on either can join
-the other. v0.1.7 and older still cannot join either: that pin moved in v0.1.8 — a machine now
-tells the session it has joined a fleet, and a joining machine can present an enrolment token —
-and a peer on the wrong side of it is refused with an unsupported-protocol error rather than
-half-joining.
+**v0.1.8, v0.1.9 and v0.1.10 share sessions.** The wire protocol has not moved since v0.1.8, so a
+peer on any of the three can join the others. v0.1.7 and older cannot join any of them: that pin
+moved in v0.1.8 — a machine now tells the session it has joined a fleet, and a joining machine can
+present an enrolment token — and a peer on the wrong side of it is refused rather than half-joining.
+From v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine
+is the old one; older peers still report it as a host they could not reach.
+
+## v0.1.10 — 2026-08-16
+
+What your machines do while nobody is watching.
+
+A machine that joined a session and was never opened on used to claim it was watching a pane —
+whichever one its layout started on, which belongs to somebody else's laptop. It appeared on their
+tab bar and lit that pane's border as watched. Presence has always been able to say "attached to
+nothing"; nothing ever said it. A node says it now, when no terminal is attached and again the
+moment one leaves, so detaching also takes the dot with it.
+
+The fleet stops costing a session its responsiveness. Deciding whether to follow an invitation
+walked the local session store, and that walk probes every session's socket and waits a quarter of
+a second for an answer — including this node's own socket, which is answered by the loop that is
+blocked doing the probing, so it never answers. On a node with one paired machine that was 41% of
+the main thread, which is also the thread that echoes keystrokes. Those callers now read the
+records without probing them, and this user's id is asked of the system once rather than forked per
+call.
+
+An invitation is acted on once a minute rather than on every announcement. Machines re-announce
+every couple of seconds on purpose, so a machine that was asleep hears about a session started
+while it was — but a session that cannot be joined was being retried thirty times a minute
+forever, and each attempt spawned a node that died. Those nodes are now waited on instead of left
+as zombies, and a follow that fails says so in the session log rather than only in a status line
+nobody is there to read.
+
+`docs/USAGE.md` gains a list of what to check when a machine will not join, and the per-release
+protocol-pin paragraphs move here, where the compatibility table already answers that question.
 
 ## v0.1.9 — 2026-08-15
 

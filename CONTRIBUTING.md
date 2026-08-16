@@ -70,7 +70,8 @@ rejected PR.
 Tag-driven, so whatever `v*` points at is what gets built, hashed and published:
 
 ```sh
-# bump `version` in Cargo.toml and the version named in README.md's Status section
+# bump `version` in Cargo.toml, add the release to CHANGELOG.md — including its
+# compatibility line — and bump the version on services/site/public/index.html
 cargo build                       # so Cargo.lock follows
 git commit -am "release: vX.Y.Z"
 git tag -a vX.Y.Z -m "vX.Y.Z"
