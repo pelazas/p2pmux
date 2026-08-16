@@ -85,6 +85,16 @@ fn start_fake_agent() -> Option<Fake> {
     // does not have it. The process it execs is still plain `sh`.
     let status = Command::new("/bin/bash")
         .arg("-c")
+        // The whole point of this test is the path a hook takes when it is in no
+        // pane, and "no pane" is two environment variables rather than a fact
+        // about the process tree. A p2pmux pane exports them, the fake agent
+        // inherits whatever this test binary was started with, and its hook then
+        // reported to that pane's node instead of writing the record the
+        // assertions read — so the test failed for anyone running it from inside
+        // p2pmux, which on this project is everyone, and passed in CI, where
+        // there is no p2pmux to be inside of.
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
         .arg(format!(
             "(exec -a claude /bin/sh {} {} {} &) </dev/null >/dev/null 2>&1",
             script.display(),
