@@ -209,6 +209,21 @@ pub(in crate::tui) fn share_help(
         .unwrap_or(SHARE_HELP_GUEST)
 }
 
+/// The same rule for the add-machine panel, whose bar is short enough that only
+/// a very small window reaches for this -- but the way out is the way out.
+pub(in crate::tui) fn add_machine_help(has_invite: bool, width: u16) -> &'static [FooterSegment] {
+    let tiers: &[&[FooterSegment]] = if has_invite {
+        &[ADD_MACHINE_HELP, SHARE_HELP_GUEST]
+    } else {
+        &[SHARE_HELP_GUEST]
+    };
+    tiers
+        .iter()
+        .copied()
+        .find(|tier| footer_segments_width(tier) <= width)
+        .unwrap_or(SHARE_HELP_GUEST)
+}
+
 /// When the rendezvous was unreachable there is no code to offer, so Enter falls back to the
 /// ticket and `t` would be the same key twice. Say COPY rather than naming either one.
 pub(in crate::tui) const SHARE_HELP_NO_CODE: &[FooterSegment] = &[
@@ -616,7 +631,8 @@ mod tests {
     };
 
     use super::{
-        FooterSegment, chord_footer_badge, contextual_footer, footer_segments_width, share_help,
+        FooterSegment, add_machine_help, chord_footer_badge, contextual_footer,
+        footer_segments_width, share_help,
     };
 
     /// A modal always says how to leave it.
@@ -638,6 +654,17 @@ mod tests {
                 footer_segments_width(chosen) <= width || width < 11,
                 "at {width} columns it drew {}: {chosen:?}",
                 footer_segments_width(chosen)
+            );
+        }
+
+        // The add-machine panel follows the same rule.
+        for width in [12u16, 20, 22, 40] {
+            let chosen = add_machine_help(true, width);
+            assert!(
+                chosen
+                    .iter()
+                    .any(|segment| matches!(segment, FooterSegment::Key("Esc"))),
+                "at {width} columns add-machine stopped saying how to close: {chosen:?}"
             );
         }
 

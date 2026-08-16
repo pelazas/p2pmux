@@ -13,7 +13,7 @@ use crate::{
     config::UiTheme,
     tui::{
         RenamePrompt, RenameTarget, ShareView,
-        render::footer::{ADD_MACHINE_HELP, SHARE_HELP_GUEST, render_footer_segments, share_help},
+        render::footer::{add_machine_help, render_footer_segments, share_help},
         share::{join_command, pair_command},
         text::{truncate_trailing, wrap_fixed},
     },
@@ -286,11 +286,10 @@ pub(in crate::tui) fn render_add_machine_modal(
         help.x.saturating_add(1),
         help.y,
         help.right(),
-        if share.code.is_some() || share.ticket.is_some() {
-            ADD_MACHINE_HELP
-        } else {
-            SHARE_HELP_GUEST
-        },
+        add_machine_help(
+            share.code.is_some() || share.ticket.is_some(),
+            help.width.saturating_sub(1),
+        ),
     );
 }
 
