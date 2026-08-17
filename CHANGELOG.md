@@ -13,6 +13,19 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
+Narrowing a pane no longer destroys the text it hides.
+
+Dragging a split, unzooming, or attaching a second viewer with a smaller window used to cut every
+visible line at the new width and throw the rest away, so widening the pane again came back to
+blanks rather than to the text. Nothing could undo it: the processes that printed those lines had
+already exited, and a pane's text lives only in the terminal state p2pmux keeps for it. A 300
+character line put through a 118 → 38 → 118 column round trip came back as its first 38 characters.
+
+The visible grid is now read out as logical lines before the resize and laid out again at the new
+width, the way tmux, zellij and alacritty each handle it. Text that no longer fits scrolls into
+scrollback instead of being dropped. An application in the alternate screen still repaints its own
+frame, and a resize that changes only the row count does no work at all.
+
 An upgrade no longer leaves the fleet agent unable to start anything.
 
 A node is launched by re-running the p2pmux binary, so an agent whose binary was replaced
