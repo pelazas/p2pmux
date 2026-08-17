@@ -26,6 +26,39 @@ width, the way tmux, zellij and alacritty each handle it. Text that no longer fi
 scrollback instead of being dropped. An application in the alternate screen still repaints its own
 frame, and a resize that changes only the row count does no work at all.
 
+An agent in one p2pmux session now says what it needs in every other session on the same machine.
+
+Hooks reported to one place or the other: the pane's node socket when there was one, a
+machine-local record when there was not. So an agent in a pane told exactly one node what it was
+doing, and the inbox of any other session on the same box — which finds it by scanning processes,
+sees that it is inside a p2pmux, and names the session it is in — had nothing to say about it. A
+`claude` blocked on a permission prompt read `state unknown — no hooks` to the one person who could
+answer it. Hooks now write both, so the row says `needs you` wherever you are sitting. It still does
+not put a number on the `inbox N` badge: going to an agent is what answers its summons, and there is
+no going to that one from here.
+
+The keybinding bar is a whole tier or nothing, never half a chord.
+
+A footer notice is placed first and the hints are fitted into what it leaves, but the hint bar
+answered a width it could not honour and was then clipped where the room ran out. A long enough
+notice on a narrow enough terminal ended the bar `Ctrl+ <p` — a chord that does not exist, on the
+one line that exists to say what the chords are.
+
+Scrolling back in a pane that has no scrollback yet says nothing, instead of blaming the network.
+
+A wheel notch on a pane nothing had scrolled off answered with one sentence naming three causes —
+a remote pane, a full-screen program, an expired history — none of which described the one-second-old
+shell in front of you. Each cause now says only its own sentence, and a pane with no history says
+nothing at all: there is no error there, only a wheel with nowhere to go.
+
+The fleet agent's crash-loop ceiling is now enforced rather than ignored.
+
+`StartLimitIntervalSec` and `StartLimitBurst` were written under `[Service]`, where systemd has not
+read them since v229 — it logged `Unknown key name … ignoring` and used its own defaults instead, so
+the rate limit the v0.1.11 leak fix leaned on had never once applied. This matters most on systemd
+older than v254, where the escalating restart backoff is itself ignored and this is the only thing
+between a failing agent and twenty starts every five minutes.
+
 An upgrade no longer leaves the fleet agent unable to start anything.
 
 A node is launched by re-running the p2pmux binary, so an agent whose binary was replaced

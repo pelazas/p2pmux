@@ -98,6 +98,36 @@ const _: () =
     assert!(TETHERED_MEMORY_CEILING < (crate::daemon::MEMORY_MAX_MB as u64) * 1024 * 1024);
 const _: () = assert!(MEMORY_WARN_AT < TETHERED_MEMORY_CEILING);
 const MAX_FROZEN_SCROLLBACK_SESSIONS: usize = 8;
+
+/// Why a scrollback query came back with nothing, in the words the footer will
+/// show — one per cause, because the person reading it is looking at exactly
+/// one pane and only one of these is true of it.
+///
+/// There is deliberately no string for a pane that simply has no history yet.
+/// Nothing has scrolled off a shell that has just started, the wheel has
+/// nowhere to go, and an error about remote panes and expired sessions is three
+/// guesses at a pane the node can see perfectly well.
+const SCROLLBACK_EXPIRED: &str = "that scrollback expired — scroll again";
+const SCROLLBACK_ALTERNATE_SCREEN: &str = "a full-screen program owns this pane";
+const SCROLLBACK_NOT_OURS: &str = "that pane's history is on another machine";
+
+/// The longest a footer notice may be and still leave room for the keys.
+///
+/// The footer places a notice first and fits the keybinding hints into the
+/// columns it leaves, so a notice is not free: past a length it takes the whole
+/// bar. Eighty columns, less the seventeen the narrowest tier needs — `Ctrl+
+/// <p> <t> <q>`, the chords without which nothing else in the mux is reachable
+/// — less the two spaces between them.
+///
+/// The string these replaced was ninety characters and did exactly that, on a
+/// ninety-nine-column terminal, to report that a one-second-old shell had no
+/// scrollback.
+const MAX_FOOTER_NOTICE_CHARS: usize = 80 - 17 - 2;
+// Bytes rather than characters, because `chars().count()` is not const. It is
+// the conservative direction: a multi-byte dash counts for three.
+const _: () = assert!(SCROLLBACK_EXPIRED.len() <= MAX_FOOTER_NOTICE_CHARS);
+const _: () = assert!(SCROLLBACK_ALTERNATE_SCREEN.len() <= MAX_FOOTER_NOTICE_CHARS);
+const _: () = assert!(SCROLLBACK_NOT_OURS.len() <= MAX_FOOTER_NOTICE_CHARS);
 const OUTBOUND_QUEUE: usize = 64;
 
 pub struct SharedLayoutNode {
@@ -802,11 +832,19 @@ fn run_socket_loop(
                     offset,
                     request_id,
                 })) => {
+                    // `None` alongside no snapshot means "nothing to report",
+                    // not "nothing went wrong to report": the client shows this
+                    // string on the footer, and a pane that simply has no
+                    // history yet is not something to interrupt anybody about.
+                    let mut unavailable: Option<&'static str> = None;
                     let (history_id, result) = if let Some(history_id) = history_id {
                         let result = frozen_scrollback
                             .get_mut(&history_id)
                             .filter(|frozen| frozen.pane_id == pane_id)
                             .map(|frozen| frozen.viewport(offset));
+                        if result.is_none() {
+                            unavailable = Some(SCROLLBACK_EXPIRED);
+                        }
                         (history_id, result)
                     } else {
                         if frozen_scrollback.len() >= MAX_FROZEN_SCROLLBACK_SESSIONS {
@@ -817,34 +855,46 @@ fn run_socket_loop(
                         frozen_scrollback.retain(|_, frozen| frozen.pane_id != pane_id);
                         let history_id = next_history_id;
                         next_history_id = next_history_id.wrapping_add(1).max(1);
-                        let result = node.node_local_scrollback(pane_id).map(|window| {
-                            // Freeze first, then read through the map: `viewport` needs `&mut`
-                            // now that it moves the stored screen instead of copying it.
-                            frozen_scrollback.insert(
-                                history_id,
-                                FrozenScrollback {
-                                    pane_id,
-                                    total_rows: window.total_rows,
-                                    screen: window.screen,
-                                },
-                            );
-                            frozen_scrollback
-                                .get_mut(&history_id)
-                                .expect("the frozen session was just inserted")
-                                .viewport(offset)
-                        });
+                        let result = match node.node_local_scrollback(pane_id) {
+                            crate::tui::LocalScrollback::Window(window) => {
+                                // Freeze first, then read through the map: `viewport` needs `&mut`
+                                // now that it moves the stored screen instead of copying it.
+                                frozen_scrollback.insert(
+                                    history_id,
+                                    FrozenScrollback {
+                                        pane_id,
+                                        total_rows: window.total_rows,
+                                        screen: window.screen,
+                                    },
+                                );
+                                Some(
+                                    frozen_scrollback
+                                        .get_mut(&history_id)
+                                        .expect("the frozen session was just inserted")
+                                        .viewport(offset),
+                                )
+                            }
+                            // Nothing has scrolled off it yet. The wheel has
+                            // nowhere to go and there is nothing to say about
+                            // that, so the client is told to stay where it is
+                            // and the footer keeps whatever was on it.
+                            crate::tui::LocalScrollback::Empty => None,
+                            crate::tui::LocalScrollback::AlternateScreen => {
+                                unavailable = Some(SCROLLBACK_ALTERNATE_SCREEN);
+                                None
+                            }
+                            crate::tui::LocalScrollback::NotOurs => {
+                                unavailable = Some(SCROLLBACK_NOT_OURS);
+                                None
+                            }
+                        };
                         (history_id, result)
                     };
-                    let (total_rows, snapshot, unavailable) = match result {
-                        Some((total_rows, snapshot)) => (total_rows, Some(snapshot), None),
-                        None => (
-                            0,
-                            None,
-                            Some(String::from(
-                                "local scrollback is unavailable for this pane (remote, alternate screen, or stale history)",
-                            )),
-                        ),
+                    let (total_rows, snapshot) = match result {
+                        Some((total_rows, snapshot)) => (total_rows, Some(snapshot)),
+                        None => (0, None),
                     };
+                    let unavailable = unavailable.map(String::from);
                     let _ = client.writer.enqueue(NodeMessage::ScrollbackWindow {
                         pane_id,
                         request_id,
@@ -1840,10 +1890,7 @@ impl SharedLayoutNode {
     ) {
         self.runtime.node_snapshot()
     }
-    pub(crate) fn node_local_scrollback(
-        &self,
-        pane_id: u64,
-    ) -> Option<crate::tui::LocalScrollbackWindow> {
+    pub(crate) fn node_local_scrollback(&self, pane_id: u64) -> crate::tui::LocalScrollback {
         self.runtime.node_local_scrollback(pane_id)
     }
     pub(crate) fn node_remote_snapshot(&self, pane_id: u64) -> Option<Vec<u8>> {

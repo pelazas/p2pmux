@@ -90,12 +90,20 @@ const NORMAL_FOOTER_KEYS_ONLY: &[FooterSegment] = &[
 /// arrows are muscle memory, sharing happens once a session, and the agent overlay is opened
 /// constantly. `Ctrl+P/T/Q` is the floor — nothing else in the mux is reachable without them,
 /// so they outlive every other hint.
+///
+/// Below the floor is nothing at all, which is the last tier and a real one.
+/// A notice is placed first and the hints are fitted into what it leaves, so a
+/// long enough one leaves less than the floor's seventeen columns — and the
+/// floor was being drawn into that space anyway and clipped where it ran out,
+/// ending the bar `Ctrl+ <p`. Half a hint is worse than none: it names a chord
+/// that does not exist, on the one line the mux uses to say what its keys are.
 const NORMAL_FOOTER_TIERS: &[&[FooterSegment]] = &[
     NORMAL_FOOTER_FULL,
     NORMAL_FOOTER_NO_FOCUS,
     NORMAL_FOOTER_NO_SHARE,
     NORMAL_FOOTER_CORE,
     NORMAL_FOOTER_KEYS_ONLY,
+    &[],
 ];
 const PANE_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
@@ -258,11 +266,13 @@ pub(in crate::tui) fn contextual_footer(
     width: u16,
 ) -> &'static [FooterSegment] {
     match chord_mode {
+        // The last tier is empty and therefore always fits, so the `unwrap_or`
+        // the other arms need is unreachable here by construction.
         ChordMode::None => NORMAL_FOOTER_TIERS
             .iter()
             .copied()
             .find(|tier| footer_segments_width(tier) <= width)
-            .unwrap_or(NORMAL_FOOTER_KEYS_ONLY),
+            .unwrap_or(&[]),
         ChordMode::Pane => PANE_FOOTER_TIERS
             .iter()
             .copied()
@@ -631,9 +641,99 @@ mod tests {
     };
 
     use super::{
-        FooterSegment, add_machine_help, chord_footer_badge, contextual_footer,
+        FooterSegment, add_machine_help, chord_footer_badge, contextual_footer, footer_layout,
         footer_segments_width, share_help,
     };
+
+    /// The help bar is a whole tier or it is nothing.
+    ///
+    /// A notice is laid out first and the hints are fitted into the columns it
+    /// leaves. `contextual_footer` used to answer a width it could not honour —
+    /// falling back to the narrowest tier whether or not that tier fit — and the
+    /// renderer then clipped it wherever the room ran out. The reported case was
+    /// a 90-character scrollback notice on a 99-column terminal, which left the
+    /// bar reading `Ctrl+ <p`: a chord that does not exist, on the one line that
+    /// exists to say what the chords are.
+    ///
+    /// Swept across every width a terminal can be rather than checked at the one
+    /// that was reported, because which tier is on the edge of fitting changes
+    /// with the notice, and the next notice will be a different length.
+    #[test]
+    fn the_help_bar_never_renders_a_tier_too_wide_for_its_span() {
+        let notices = [
+            "",
+            "that scrollback expired — scroll again",
+            "a full-screen program owns this pane",
+            "that pane's history is on another machine",
+            "coordinator unreachable; panes still live, structure frozen",
+            "local scrollback is unavailable for this pane (remote, alternate screen, or stale history)",
+        ];
+        for width in 1u16..=200 {
+            for notice in notices {
+                for status in ["", "relayed"] {
+                    let area = ratatui::layout::Rect::new(0, 0, width, 1);
+                    let notice = (!notice.is_empty()).then_some(notice);
+                    let layout = footer_layout(area, ChordMode::None, status, notice, None);
+                    let span = layout.help_end.saturating_sub(layout.help_start);
+                    assert!(
+                        footer_segments_width(layout.help) <= span,
+                        "width {width} notice {notice:?} status {status:?}: tier needs {} \
+                         columns and has {span}",
+                        footer_segments_width(layout.help),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The reported geometry, drawn: a 99-column terminal carrying a notice too
+    /// long to leave room for even the narrowest tier.
+    ///
+    /// What the daily run of 17 Aug saw was `Ctrl+ <p  local scrollback is …`.
+    /// The keybinding half is either whole or absent; there is no width at which
+    /// it is a prefix of itself.
+    #[test]
+    fn a_notice_too_long_to_share_the_line_takes_it_rather_than_cutting_a_chord() {
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        let mut terminal = Terminal::new(TestBackend::new(99, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                crate::tui::render::panes::render_shared_multi_pane(
+                    frame,
+                    &tui,
+                    &BTreeMap::new(),
+                    "",
+                    None,
+                    Some(
+                        "local scrollback is unavailable for this pane \
+                         (remote, alternate screen, or stale history)",
+                    ),
+                    crate::tui::ShareView::default(),
+                    None,
+                );
+            })
+            .expect("render");
+        let footer = (0..99)
+            .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+            .collect::<String>();
+        assert!(
+            footer.contains("local scrollback is unavailable"),
+            "the notice is what the line is for: {footer:?}"
+        );
+        assert!(
+            !footer.contains("Ctrl"),
+            "a chord that does not fit is dropped whole, not cut: {footer:?}"
+        );
+    }
 
     /// A modal always says how to leave it.
     ///

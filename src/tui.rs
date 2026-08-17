@@ -55,7 +55,8 @@ pub use runtime::{RolePersist, SharedLayoutRuntime};
 pub(crate) use selection::copy_selection_to_clipboard;
 pub(crate) use share::share_copy_result;
 pub(crate) use snapshot::{
-    LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot, NodeScreenSnapshots,
+    LocalScrollback, LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot,
+    NodeScreenSnapshots,
 };
 pub(in crate::tui) use state::{
     AddMachinePrompt, Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget,

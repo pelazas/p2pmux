@@ -11,17 +11,27 @@
 //! - **It never errors into the agent.** Every failure — no session, no
 //!   socket, unparseable payload, a node that vanished — is a silent success.
 //!   A hook that fails is a hook the user disables.
-//! - **It never blocks.** One connect and one small write, both with timeouts.
+//! - **It never blocks.** One connect, one small write, and one rename over a
+//!   file in the per-user runtime directory. No waiting on a reader, because
+//!   neither sink has one: the socket write is fire-and-forget under a timeout,
+//!   and the record is read whenever somebody next opens an inbox.
 //!
-//! Note what is *not* sent: the user's prompt and the tool being run. Those
+//! Both sinks, not one or the other. The socket reaches the node that owns this
+//! pane, which is the session a person is looking at. The record reaches every
+//! *other* p2pmux on this machine, which is the only way an inbox in one session
+//! can say what an agent in another is doing — see [`record_on_this_machine`].
+//!
+//! Note what is *not* reported: the user's prompt and the tool being run. Those
 //! reach this process and are used only to decide the status.
 //!
-//! One line of the assistant's message *is* sent, and travels exactly as far as
-//! the Unix socket this writes to. The node that owns the pane keeps it for its
-//! own inbox and strips it from the roster it publishes — see
-//! `SharedLocalPane::agent_roster_entry`. A p2pmux session is shared with every
-//! member, and the agent's conversation is still not the mux's to publish; it is
-//! only the local user's to read, on their own machine, about their own pane.
+//! One line of the assistant's message *is* reported, and travels no further
+//! than this machine. The node that owns the pane keeps it for its own inbox and
+//! strips it from the roster it publishes — see
+//! `SharedLocalPane::agent_roster_entry` — and the record it is also written to
+//! is `0700` in this user's own runtime directory, read back only by a p2pmux
+//! that same user is running. A p2pmux session is shared with every member, and
+//! the agent's conversation is still not the mux's to publish; it is only the
+//! local user's to read, on their own machine.
 
 use std::{
     error::Error,
@@ -263,17 +273,33 @@ fn send(pane_id: u64, socket: &PathBuf, kind: AgentKind, update: HookUpdate) -> 
     (&stream).write_all(&line).ok()
 }
 
-/// Report a status for an agent that is not running in a p2pmux pane.
+/// Leave this status on the machine, keyed by the agent's own pid.
 ///
-/// There is no pane to name and no node socket to write to — the mux did not
-/// start this agent and may not be running at all — so the status goes to the
-/// machine-local record the process scan reads, keyed by the agent's own pid.
-/// See [`crate::agent_status`] for why that is a file and not a socket.
+/// Written by every hook, in a pane or out of one. Out of one it is the only
+/// report there is: the mux did not start this agent and may not be running at
+/// all, so there is no pane to name and no node socket to write to. In a pane it
+/// is the *second* report, and the one every other p2pmux on this machine can
+/// read.
+///
+/// That second copy is what #98 was missing. A pushed status reaches exactly one
+/// node — the one owning the pane — and the inbox of any other session on the
+/// same box finds the agent by scanning processes, sees it is in a p2pmux
+/// (`AgentScan::enclosing_node`), names the session it is in, and then has
+/// nothing to say about what it is doing. So a `claude` blocked on a permission
+/// prompt showed `state unknown — no hooks` to the one person who could answer
+/// it, on a machine where the hooks were installed and firing.
+///
+/// The state is a fact about the machine and belongs to whoever is at it. The
+/// agent's own words ride along in the same record, which does not widen who can
+/// read them: the file is `0700` in the per-user runtime directory, the same
+/// place and the same reasoning as the pane path's message, and the roster
+/// published to peers still has no field for it — see
+/// `SharedLayoutRuntime::agent_roster_entry` and the loose-agent arm beside it.
 ///
 /// The agent is found by walking up from this process: a hook runner is a child
 /// of the agent that spawned it. Nothing is written when no agent is found —
 /// the row this would name does not exist either.
-fn report_outside_a_pane(kind: AgentKind, update: HookUpdate) -> Option<()> {
+fn record_on_this_machine(kind: AgentKind, update: HookUpdate) -> Option<()> {
     let (pid, _, start_time) = crate::agent_detect::agent_ancestor(std::process::id(), kind)?;
     let directory = crate::agent_status::default_dir()?;
 
@@ -360,14 +386,13 @@ pub fn run(kind: AgentKind, status_arg: Option<&str>) -> Result<(), Box<dyn Erro
     let Some(update) = update else {
         return Ok(());
     };
-    match pane_and_socket() {
-        Some((pane_id, socket)) => {
-            let _ = send(pane_id, &socket, kind, update);
-        }
-        None => {
-            let _ = report_outside_a_pane(kind, update);
-        }
+    // The socket first: it is what the session around this pane redraws from,
+    // and it is the half a person is watching. The record after, for every
+    // other p2pmux on this machine — including the ones not running yet.
+    if let Some((pane_id, socket)) = pane_and_socket() {
+        let _ = send(pane_id, &socket, kind, update.clone());
     }
+    let _ = record_on_this_machine(kind, update);
     Ok(())
 }
 
