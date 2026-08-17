@@ -1118,7 +1118,15 @@ mod tests {
     fn dead_sockets_are_swept_but_a_bound_one_without_a_record_survives() {
         use std::os::unix::net::UnixListener;
 
-        let root = PathBuf::from(format!("/tmp/p2pmux-sweep-{}", std::process::id()));
+        // `/tmp` rather than `temp_dir()` because this test binds a socket, and macOS
+        // caps a socket path at 104 bytes -- which `$TMPDIR` there very nearly spends on
+        // its own. The name has to differ from every other root in this module all the
+        // same: on Linux `temp_dir()` *is* `/tmp`, so a shared name is a shared
+        // directory, and these tests run as threads of one process with one pid between
+        // them. Sharing it with `a_sweep_removes_the_leftovers_of_launches_that_produced
+        // _no_session` had each test's `remove_dir_all` deleting the other's fixture
+        // mid-run, which reddened Linux CI at random and never macOS.
+        let root = PathBuf::from(format!("/tmp/p2pmux-dead-sockets-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let store = SessionStore::at(root.join("s"), root.join("k"));
 
