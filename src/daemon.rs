@@ -134,6 +134,27 @@ pub const SERVICE_LABEL: &str = "com.p2pmux.fleet";
 /// The systemd unit file name, which by convention is not a reverse-DNS label.
 pub const SYSTEMD_UNIT_NAME: &str = "p2pmux-fleet.service";
 
+/// The most memory the agent and everything it starts may hold, in megabytes.
+///
+/// Chosen against what the parts actually cost: the daemon is 8MB, an idle node
+/// is 24MB, and a node hosting several panes with their scrollback has never
+/// been seen past about 150MB. Half a gigabyte is three times the most
+/// legitimate reading and a small fraction of the smallest machine anybody runs
+/// this on.
+///
+/// The point is not the number, it is that there *is* one. Without it the
+/// kernel's own out-of-memory killer picks the victim, and it picks by size
+/// across the whole machine: on 2026-08-16 it took a trading bot, an API server
+/// and a message gateway before it got to the p2pmux processes that had eaten
+/// the memory. Inside a limit, the cgroup's killer only ever chooses from the
+/// processes that are over it.
+const MEMORY_MAX_MB: u32 = 512;
+/// Where the kernel starts reclaiming rather than killing. A leak crosses this
+/// first and gets slower, which is a symptom somebody can see coming.
+const MEMORY_HIGH_MB: u32 = 256;
+/// Processes and threads. A daemon with one node uses about fourteen.
+const TASKS_MAX: u32 = 64;
+
 /// Everything both unit files are generated from.
 ///
 /// A single description rather than two hand-written templates: the properties
@@ -164,8 +185,22 @@ impl ServiceUnit {
         Ok(Self { program, log_path })
     }
 
-    /// A launchd agent: `RunAtLoad` starts it at login, `KeepAlive` restarts it
-    /// when it dies.
+    /// A launchd agent: `RunAtLoad` starts it at login, and `KeepAlive` brings
+    /// it back when it *fails*.
+    ///
+    /// `KeepAlive` as a bare `true` is the shape to avoid. It restarts the job
+    /// whatever the exit status, so an agent asked to stop comes straight back —
+    /// which reads, correctly, as software the user cannot turn off. The
+    /// dictionary form restarts only the inverse of a successful exit, and the
+    /// daemon exits zero when it is signalled, so `launchctl unload` means what
+    /// it says.
+    ///
+    /// macOS has no cgroups, so there is no honest equivalent of the memory
+    /// ceiling the Linux unit gets. `ProcessType` is the documented substitute
+    /// for the resource-limit keys — Apple's own guidance prefers it — and it
+    /// says what this actually is: work the user did not directly ask for,
+    /// which the system may hold back to protect the machine's responsiveness.
+    /// The hard ceiling on this platform has to live in the process itself.
     pub fn launchd_plist(&self) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -182,6 +217,15 @@ impl ServiceUnit {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>{throttle}</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>
     <string>{log}</string>
@@ -192,12 +236,32 @@ impl ServiceUnit {
 "#,
             program = self.program,
             log = self.log_path,
+            throttle = SUPERVISION_INTERVAL.as_secs(),
         )
     }
 
     /// A systemd *user* unit, not a system one: the fleet belongs to a user
     /// account, the pairing record lives in that account's config directory,
     /// and a system service would be running as the wrong person.
+    ///
+    /// `Restart=on-failure` rather than `always`, for the same reason launchd
+    /// gets a `KeepAlive` dictionary: the daemon exits zero when it is asked to
+    /// stop, and a service that restarts through that is a service the user
+    /// cannot stop.
+    ///
+    /// The resource stanza is the part that makes a bug in everything above it
+    /// survivable. `MemoryMax` is enforced by the unit's own cgroup, so when it
+    /// is reached the kernel kills something *inside this unit* rather than
+    /// hunting the machine for the biggest process it can find — which is how a
+    /// p2pmux leak came to kill a trading bot. It needs the memory controller
+    /// delegated to the user manager, which systemd has done by default for
+    /// years and which is worth nothing if untrue: a limit that silently does
+    /// not apply is worse than no limit, so `daemon install` checks and says so.
+    ///
+    /// `CPUWeight` rather than `CPUQuota`: a hard cap would make a terminal
+    /// somebody is typing in stutter, while a weight only yields when something
+    /// else on the machine wants the processor. It is the same intent as
+    /// launchd's `ProcessType=Background`.
     pub fn systemd_unit(&self) -> String {
         format!(
             "[Unit]\n\
@@ -207,12 +271,28 @@ impl ServiceUnit {
              [Service]\n\
              Type=simple\n\
              ExecStart={program} daemon\n\
-             Restart=always\n\
-             RestartSec=5\n\
+             Restart=on-failure\n\
+             RestartSec={restart_sec}\n\
+             RestartSteps=6\n\
+             RestartMaxDelaySec={restart_max}\n\
+             StartLimitIntervalSec=300\n\
+             StartLimitBurst=10\n\
+             MemoryHigh={memory_high}M\n\
+             MemoryMax={memory_max}M\n\
+             TasksMax={tasks_max}\n\
+             CPUWeight=20\n\
+             OOMPolicy=stop\n\
+             KillMode=control-group\n\
+             TimeoutStopSec=10\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n",
             program = self.program,
+            restart_sec = SUPERVISION_INTERVAL.as_secs(),
+            restart_max = MAX_RETRY_INTERVAL.as_secs(),
+            memory_high = MEMORY_HIGH_MB,
+            memory_max = MEMORY_MAX_MB,
+            tasks_max = TASKS_MAX,
         )
     }
 }
@@ -445,8 +525,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Backoff, MAX_RETRY_INTERVAL, SERVICE_LABEL, SUPERVISION_INTERVAL, ServiceUnit, Step,
-        describe, next_step,
+        Backoff, MAX_RETRY_INTERVAL, MEMORY_HIGH_MB, MEMORY_MAX_MB, SERVICE_LABEL,
+        SUPERVISION_INTERVAL, ServiceUnit, Step, describe, next_step,
     };
 
     /// A session that cannot be reached must not be asked about at the same rate
@@ -614,8 +694,123 @@ mod tests {
         assert!(plist.contains(SERVICE_LABEL), "{plist}");
 
         let systemd = unit().systemd_unit();
-        assert!(systemd.contains("Restart=always"), "{systemd}");
+        assert!(systemd.contains("Restart=on-failure"), "{systemd}");
         assert!(systemd.contains("WantedBy=default.target"), "{systemd}");
+    }
+
+    /// A service the user cannot stop is the single loudest thing software can
+    /// do to say it is not on their side.
+    ///
+    /// The daemon exits zero when it is signalled. `Restart=always` and a bare
+    /// `KeepAlive` both restart through that, so `systemctl --user stop` and
+    /// `launchctl unload` were suggestions.
+    #[test]
+    fn asking_the_agent_to_stop_stops_it() {
+        let systemd = unit().systemd_unit();
+        assert!(
+            !systemd.contains("Restart=always"),
+            "a clean exit must stay stopped: {systemd}"
+        );
+
+        let plist = unit().launchd_plist();
+        let keep_alive = plist
+            .split_once("<key>KeepAlive</key>")
+            .expect("the restart policy")
+            .1;
+        assert!(
+            keep_alive.trim_start().starts_with("<dict>"),
+            "a bare <true/> restarts a job that was asked to stop: {plist}"
+        );
+        assert!(
+            keep_alive.contains("<key>SuccessfulExit</key>"),
+            "the dictionary has to say which exits are worth restarting: {plist}"
+        );
+    }
+
+    /// The ceiling that makes every bug above it survivable.
+    ///
+    /// Without it the kernel's out-of-memory killer chooses a victim from the
+    /// whole machine by size. On 2026-08-16 that meant p2pmux ate the memory and
+    /// a trading bot, an API server and a message gateway were killed for it.
+    /// Inside `MemoryMax` the cgroup's own killer can only choose from the
+    /// processes that are over the limit.
+    #[test]
+    fn the_linux_unit_cannot_take_the_machine_down_with_it() {
+        let systemd = unit().systemd_unit();
+        for required in [
+            "MemoryMax=512M",
+            "MemoryHigh=256M",
+            "TasksMax=64",
+            "OOMPolicy=stop",
+            "KillMode=control-group",
+        ] {
+            assert!(
+                systemd.contains(required),
+                "missing {required} from:\n{systemd}"
+            );
+        }
+        assert!(
+            systemd.contains("MemoryHigh=256M") && MEMORY_HIGH_MB < MEMORY_MAX_MB,
+            "the soft limit has to be crossed first, or it is not a warning"
+        );
+        // A hard processor cap would make a terminal somebody is typing in
+        // stutter. A weight only yields when something else wants the CPU.
+        assert!(systemd.contains("CPUWeight="), "{systemd}");
+        assert!(
+            !systemd.contains("CPUQuota="),
+            "a quota would throttle interactive work: {systemd}"
+        );
+    }
+
+    /// macOS has no cgroups, so the plist cannot promise a memory ceiling — and
+    /// must not pretend to. What it can do is declare what this work *is*.
+    ///
+    /// `NumberOfProcesses` is the trap here: it looks like a per-job task limit
+    /// and is in fact `RLIMIT_NPROC`, which is per *user*. Setting it to
+    /// something sensible for one agent would cap the whole login session.
+    #[test]
+    fn the_macos_plist_declares_itself_background_and_sets_no_per_user_limits() {
+        let plist = unit().launchd_plist();
+        assert!(
+            plist.contains("<key>ProcessType</key>")
+                && plist.contains("<string>Background</string>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<key>ThrottleInterval</key>"), "{plist}");
+        assert!(
+            !plist.contains("NumberOfProcesses"),
+            "that rlimit is per-uid and would cap the user's whole session: {plist}"
+        );
+    }
+
+    /// The restart policy has to be slower than the thing it restarts.
+    ///
+    /// A five-second `RestartSec` under a daemon whose own supervision tick is
+    /// fifteen meant a crash loop ran three times faster than the work.
+    #[test]
+    fn the_restart_pace_matches_the_agents_own() {
+        let systemd = unit().systemd_unit();
+        assert!(
+            systemd.contains(&format!("RestartSec={}", SUPERVISION_INTERVAL.as_secs())),
+            "{systemd}"
+        );
+        assert!(
+            systemd.contains(&format!(
+                "RestartMaxDelaySec={}",
+                MAX_RETRY_INTERVAL.as_secs()
+            )),
+            "a crash loop should back off the same way a failed join does: {systemd}"
+        );
+        assert!(systemd.contains("StartLimitBurst="), "{systemd}");
+
+        let plist = unit().launchd_plist();
+        assert!(
+            plist.contains(&format!(
+                "<integer>{}</integer>",
+                SUPERVISION_INTERVAL.as_secs()
+            )),
+            "launchd throttles at 10s by default, which is faster than the tick: {plist}"
+        );
     }
 
     /// A service that resolved p2pmux from `PATH` would start whatever was
