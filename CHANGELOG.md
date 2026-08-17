@@ -11,6 +11,34 @@ present an enrolment token — and a peer on the wrong side of it is refused rat
 From v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine
 is the old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+The fleet agent stops behaving like something you would want to uninstall.
+
+Two machines carrying a ticket for a session neither of them was hosting chased it for four days.
+Every attempt was a whole operating-system process, one every fifteen seconds, and every one that
+failed to start in time was left running: the launcher dropped its handle to the node, which in Rust
+neither stops the process nor reaps it. Nine of those accumulated on a 4GB droplet, holding 3.3GB
+between them, and when memory ran out the kernel's own killer went looking across the whole machine
+for something big — so a trading bot, an API server and a message gateway were killed for p2pmux's
+leak. The same loop left 1014 files in one runtime directory and 1568 in another, and wrote the same
+sentence into the journal a thousand times without once suggesting anything was wrong.
+
+A launch that produces no session now takes the node and its files with it, whatever went wrong.
+The delay between attempts doubles up to fifteen minutes and is jittered, because every machine in a
+fleet loses the same coordinator at the same instant; it is a ceiling rather than a surrender, since
+a home session comes back when the laptop hosting it is opened. Failures are reported once per
+distinct reason and per change of pace, and say what the pace is.
+
+Both service files now have limits the operating system enforces, so a bug above them cannot reach
+the rest of the machine — and neither restarts the agent through a clean exit any more, which means
+`systemctl --user stop` and `launchctl unload` do what they say. macOS has no cgroups to enforce a
+memory ceiling, so a node the agent started carries its own and stops itself before the kernel would
+have to; a session you started by hand is told how large it has grown rather than stopped, because
+the work in it is worth more than the memory. A node the agent started also watches the agent, and
+stops when it goes: that is the only mechanism that survives the agent being killed outright, which
+is exactly how the orphans were made.
+
 ## v0.1.10 — 2026-08-16
 
 What your machines do while nobody is watching.
