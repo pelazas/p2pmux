@@ -4,14 +4,14 @@ Newest first. Versions are the tags on [Releases](https://github.com/pelazas/p2p
 
 ## Compatibility
 
-**v0.1.8, v0.1.9 and v0.1.10 share sessions.** The wire protocol has not moved since v0.1.8, so a
-peer on any of the three can join the others. v0.1.7 and older cannot join any of them: that pin
-moved in v0.1.8 — a machine now tells the session it has joined a fleet, and a joining machine can
-present an enrolment token — and a peer on the wrong side of it is refused rather than half-joining.
-From v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine
-is the old one; older peers still report it as a host they could not reach.
+**v0.1.8 through v0.1.11 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
+on any of the four can join the others. v0.1.7 and older cannot join any of them: that pin moved in
+v0.1.8 — a machine now tells the session it has joined a fleet, and a joining machine can present an
+enrolment token — and a peer on the wrong side of it is refused rather than half-joining. From
+v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
+old one; older peers still report it as a host they could not reach.
 
-## Unreleased
+## v0.1.11 — 2026-08-17
 
 The fleet agent stops behaving like something you would want to uninstall.
 
@@ -25,10 +25,11 @@ leak. The same loop left 1014 files in one runtime directory and 1568 in another
 sentence into the journal a thousand times without once suggesting anything was wrong.
 
 A launch that produces no session now takes the node and its files with it, whatever went wrong.
-The delay between attempts doubles up to fifteen minutes and is jittered, because every machine in a
+The delay between attempts doubles up to five minutes and is jittered, because every machine in a
 fleet loses the same coordinator at the same instant; it is a ceiling rather than a surrender, since
-a home session comes back when the laptop hosting it is opened. Failures are reported once per
-distinct reason and per change of pace, and say what the pace is.
+a home session comes back when the laptop hosting it is opened, and five minutes is also the longest
+a machine should be missing from its own fleet. Failures are reported once per distinct reason and
+per change of pace, and say what the pace is.
 
 Both service files now have limits the operating system enforces, so a bug above them cannot reach
 the rest of the machine — and neither restarts the agent through a clean exit any more, which means
@@ -38,6 +39,13 @@ have to; a session you started by hand is told how large it has grown rather tha
 the work in it is worth more than the memory. A node the agent started also watches the agent, and
 stops when it goes: that is the only mechanism that survives the agent being killed outright, which
 is exactly how the orphans were made.
+
+**Still open, and worth knowing about.** What set all of this off is that `pairing.toml` holds one
+ticket and nothing ever updates it. Start a different session on the coordinator and the record still
+names the old one, so every other machine follows a ticket for a session that no longer exists — and
+it cannot recover on its own, because a machine only hears about new sessions from inside a session it
+has already joined. If a machine keeps reporting that it cannot reach the session host while a session
+is plainly running, that is this: run `p2pmux pair` again to point the fleet at the live one.
 
 ## v0.1.10 — 2026-08-16
 
