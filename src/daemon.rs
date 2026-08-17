@@ -344,7 +344,57 @@ pub fn install() -> Result<PathBuf, Box<dyn Error>> {
     }
     std::fs::write(&path, unit_contents(&unit))?;
     let _ = load_service(&path, true);
+    if let Some(warning) = memory_limit_warning() {
+        eprintln!("p2pmux: {warning}");
+    }
     Ok(path)
+}
+
+/// Whether the memory ceiling in the unit will actually be enforced, and what to
+/// say if it will not.
+///
+/// A user unit can only be held to `MemoryMax` if the memory controller has been
+/// delegated to the user's own systemd manager. It has been by default for
+/// years, and on the machine this was written against it is — but a limit that
+/// silently does not apply is worse than no limit at all, because it is the one
+/// thing standing between a leak and the rest of the machine. So it is checked
+/// rather than assumed, once, at the moment somebody is reading the output.
+///
+/// Not an error: the agent is still worth installing without it, and the
+/// alternative — refusing to install over a kernel setting the user did not
+/// choose — helps nobody.
+fn memory_limit_warning() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        // Nothing to check. macOS has no cgroups, the plist promises no ceiling,
+        // and the node carries its own. See `TETHERED_MEMORY_CEILING`.
+        return None;
+    }
+    let controllers = std::fs::read_to_string(format!(
+        "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service/cgroup.controllers",
+        current_uid()?,
+        current_uid()?
+    ))
+    .ok()?;
+    if controllers.split_whitespace().any(|name| name == "memory") {
+        return None;
+    }
+    Some(format!(
+        "this system does not delegate the memory controller to user services, so the \
+         agent's {MEMORY_MAX_MB}MB limit will not be enforced. It will still start at \
+         boot and restart on failure."
+    ))
+}
+
+fn current_uid() -> Option<u32> {
+    // Read from the runtime directory rather than by calling libc, which is not
+    // a direct dependency: `XDG_RUNTIME_DIR` is `/run/user/<uid>` on every
+    // system that has a user manager to delegate anything in the first place.
+    std::env::var_os("XDG_RUNTIME_DIR")?
+        .to_str()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Stop the service and remove its unit. Missing is success: uninstalling
@@ -683,6 +733,37 @@ mod tests {
             next_step(&pairing),
             Step::Follow(String::from("p2pmux-v3:whatever")),
             "a machine paired after the agent was installed is still its fleet"
+        );
+    }
+
+    /// A limit that silently does not apply is worse than no limit, because it
+    /// is the one thing between a leak and the rest of the machine.
+    ///
+    /// `MemoryMax` in a user unit needs the memory controller delegated to the
+    /// user's own systemd manager. That has been the default for years, which is
+    /// exactly the kind of assumption that is worth one file read to stop
+    /// assuming.
+    #[test]
+    fn the_install_says_so_when_the_ceiling_will_not_be_enforced() {
+        let source = include_str!("daemon.rs");
+        let install = source
+            .split_once("pub fn install()")
+            .expect("the installer")
+            .1
+            .split_once("\n}")
+            .expect("the end of it")
+            .0;
+        assert!(
+            install.contains("memory_limit_warning()"),
+            "the install has to check, not assume: {install}"
+        );
+
+        // And say it rather than fail on it: an agent without a ceiling is still
+        // worth installing, and refusing over a kernel setting the user did not
+        // choose helps nobody.
+        assert!(
+            !install.contains("return Err") && !install.contains("?;\n    Err"),
+            "a missing controller is a warning, not a refusal: {install}"
         );
     }
 
