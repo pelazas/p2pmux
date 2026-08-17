@@ -34,10 +34,16 @@ const SUPERVISION_INTERVAL: Duration = Duration::from_secs(15);
 /// stopped asking would leave its machine missing from the fleet until somebody
 /// thought to restart it. What the ceiling ends is the *rate*: on 2026-08-16 two
 /// machines chased a session neither of them hosted for four days, each asking
-/// every fifteen seconds, each attempt a whole operating-system process. Four
-/// times an hour finds the session back within the same coffee break and costs
-/// nothing anybody can measure.
-const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// every fifteen seconds, each attempt a whole operating-system process.
+///
+/// Five minutes rather than the fifteen this was first written with, because the
+/// ceiling is also the worst case for the thing this daemon exists to do. The
+/// promise at the top of this file is that a machine is *there* when you start a
+/// session somewhere else, and a quarter of an hour of not being there is a
+/// regression somebody would notice and rightly dislike. Five minutes is still
+/// fifty attempts across a four-hour outage where the old build made a thousand,
+/// and every one of those fifty now cleans up after itself.
+const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// How old a launch's leftover files must be before they are assumed to be
 /// litter rather than a launch still in progress.
@@ -644,9 +650,16 @@ mod tests {
             attempts += 1;
         }
         assert!(
-            attempts < 30,
+            attempts < 60,
             "four hours of an unreachable session should cost tens of attempts, not \
              a thousand: got {attempts}"
+        );
+        // And the worst case a returning session waits before being noticed,
+        // which is the cost side of the same number.
+        assert!(
+            MAX_RETRY_INTERVAL <= Duration::from_secs(5 * 60),
+            "a machine missing from its fleet for longer than this is a regression \
+             in the thing the daemon is for"
         );
     }
 
@@ -693,7 +706,7 @@ mod tests {
         assert_eq!(describe(Duration::from_secs(15)), "15s");
         assert_eq!(describe(Duration::from_secs(60)), "1m");
         assert_eq!(describe(Duration::from_secs(90)), "1m30s");
-        assert_eq!(describe(MAX_RETRY_INTERVAL), "15m");
+        assert_eq!(describe(MAX_RETRY_INTERVAL), "5m");
     }
 
     /// The agent says what it is doing once, not once per attempt.
