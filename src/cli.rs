@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
     str::FromStr,
     time::{Duration, Instant},
@@ -1617,6 +1618,95 @@ fn pick_session(
     result
 }
 
+/// A launch that has not been told it worked yet, and everything it would leave
+/// behind if nobody told it.
+///
+/// Between `spawn` and "the session is up" there are five ways out, and all five
+/// used to be a bare `return Err(..)`. That is not a leak of a handle: `Child`
+/// has no `Drop`, so letting one fall out of scope neither stops the process nor
+/// reaps it -- the standard library says as much, and says that dropping child
+/// handles unwaited "is not recommended in long-running applications". The fleet
+/// agent is the longest-running application this has, and it calls this on a
+/// timer. On 2026-08-16 that arithmetic ran to nine abandoned nodes holding
+/// 3.3GB on a 3.9GB machine, and the box's own OOM killer chose which of the
+/// user's unrelated services to shoot.
+///
+/// So the attempt owns the node and its three files until [`Self::keep`] says
+/// the session exists. Anything else -- an error, a timeout, a `?` on a path
+/// nobody thought about -- unwinds through `Drop` and leaves the machine as it
+/// was found.
+struct LaunchAttempt {
+    /// `None` before the spawn, and after [`Self::keep`] has handed the node on.
+    child: Option<std::process::Child>,
+    bootstrap_path: PathBuf,
+    log_path: PathBuf,
+    error_path: PathBuf,
+    kept: bool,
+}
+
+impl LaunchAttempt {
+    fn new(bootstrap_path: PathBuf, log_path: PathBuf, error_path: PathBuf) -> Self {
+        Self {
+            child: None,
+            bootstrap_path,
+            log_path,
+            error_path,
+            // Nothing is worth keeping until a session exists. Built this way
+            // round because the failure that leaked 1014 files was a `?` between
+            // writing the bootstrap and spawning anything at all.
+            kept: false,
+        }
+    }
+
+    /// The node is running and the session is recorded: it owns its own files
+    /// from here, and this stops watching it.
+    fn keep(mut self) {
+        self.kept = true;
+        if let Some(mut child) = self.child.take() {
+            // This process never speaks to the node again -- but it is still its
+            // parent, and a child nobody waits on becomes a zombie the moment it
+            // exits. That is not hypothetical for a node that launches these: a
+            // machine following an invitation into a session it turns out it
+            // cannot reach records itself, becomes "ready", and dies seconds
+            // later. One thread, which ends when the node does.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+
+    /// The node is running. From here an abandoned attempt has a process to stop
+    /// as well as files to remove.
+    fn spawned(&mut self, child: std::process::Child) {
+        self.child = Some(child);
+    }
+}
+
+impl Drop for LaunchAttempt {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            // SIGKILL rather than a polite stop. This node never became ready,
+            // so there is no session to unwind, nothing to flush and nobody
+            // attached -- and the caller is a supervision loop that is trying to
+            // give up on it, which a graceful-stop timeout would hold open.
+            let _ = child.kill();
+            // Reaped here, not merely signalled, so the failure that is being
+            // abandoned does not become a zombie instead of a leak.
+            let _ = child.wait();
+        }
+        if self.kept {
+            return;
+        }
+        // A launch that never produced a session owns nothing, so its files are
+        // litter -- and litter that accumulates: one machine had 1014 orphaned
+        // bootstraps in its runtime directory, one per failed attempt, because
+        // the spawn failed after the file was written and nothing swept up.
+        let _ = std::fs::remove_file(&self.bootstrap_path);
+        let _ = std::fs::remove_file(&self.log_path);
+        let _ = std::fs::remove_file(&self.error_path);
+    }
+}
+
 /// Launches an isolated session owner. It has no terminal file descriptors and its own process
 /// group, so closing the initiating terminal cannot take the PTYs down with it.
 pub(crate) fn launch_background_node(
@@ -1641,6 +1731,12 @@ pub(crate) fn launch_background_node(
     };
     let bootstrap_path = descriptor.socket_path.with_extension("bootstrap");
     crate::node::write_bootstrap(&bootstrap_path, &bootstrap)?;
+    // Armed on the line after the first file exists, so every `?` below this
+    // point unwinds through it.
+    let log_path = descriptor.socket_path.with_extension("log");
+    let error_path = descriptor.socket_path.with_extension("error");
+    let mut attempt =
+        LaunchAttempt::new(bootstrap_path.clone(), log_path.clone(), error_path.clone());
     let mut command = ProcessCommand::new(std::env::current_exe()?);
     command
         .arg("__node")
@@ -1654,7 +1750,6 @@ pub(crate) fn launch_background_node(
     // own warnings, and -- the reason this exists -- the panic message of a node
     // that died under someone who was working in it. `/dev/null` here is what made
     // a session that ended on its own impossible to explain afterwards.
-    let log_path = descriptor.socket_path.with_extension("log");
     match std::fs::File::create(&log_path) {
         Ok(log) => {
             command.stderr(Stdio::from(log));
@@ -1668,9 +1763,8 @@ pub(crate) fn launch_background_node(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let error_path = descriptor.socket_path.with_extension("error");
     let _ = std::fs::remove_file(&error_path);
-    let mut child = command.spawn()?;
+    attempt.spawned(command.spawn()?);
     // A `join` cannot report anything until it has dialled the coordinator, and iroh
     // gives that dial about thirty seconds before it gives up. Waiting five and then
     // printing a local-startup message meant the real cause -- "transport error: Iroh
@@ -1692,17 +1786,9 @@ pub(crate) fn launch_background_node(
         if let Ok(found) = store.read(&id)
             && found.socket_path.exists()
         {
-            // Ready, and from here this process never speaks to it again -- but
-            // it is still its parent, and a child nobody waits on becomes a
-            // zombie the moment it exits. That is not hypothetical for a node
-            // that launches these: a machine following an invitation into a
-            // session it turns out it cannot reach records itself, becomes
-            // "ready", and dies seconds later, and the entry stayed in the
-            // process table for as long as the launcher lived. One thread,
-            // which ends when the node does.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            // Ready. The session exists, so the node keeps its files and this
+            // stops being responsible for stopping it.
+            attempt.keep();
             return Ok(found);
         }
         // The node reports why it could not start -- a full room, a dead coordinator, a
@@ -1715,7 +1801,10 @@ pub(crate) fn launch_background_node(
         // rest of the cap for it would turn a fast failure into a slow one. It writes
         // its reason before exiting, so re-read once after reaping to avoid losing a
         // message that landed between the check above and the exit.
-        if matches!(child.try_wait(), Ok(Some(_))) {
+        if matches!(
+            attempt.child.as_mut().map(std::process::Child::try_wait),
+            Some(Ok(Some(_)))
+        ) {
             return Err(match take_node_error() {
                 Some(message) => NodeStartupError(message).into(),
                 None => Box::<dyn Error>::from(io::Error::other(
@@ -2008,5 +2097,103 @@ mod tests {
             .expect("the node arm")
             .1;
         assert!(node_arm.contains("remove_file(bootstrap.with_extension(\"log\"))"));
+    }
+
+    /// The three files of a launch that produced no session are litter, and the
+    /// launcher is the only thing that knows they are.
+    ///
+    /// One machine accumulated 1014 orphaned bootstraps this way -- one per
+    /// attempt, for four hours -- because the write happened before a `?` that
+    /// nobody had thought could fail.
+    #[test]
+    fn an_abandoned_launch_removes_the_files_it_wrote() {
+        let dir = std::env::temp_dir().join(format!("p2pmux-attempt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let bootstrap = dir.join("a.bootstrap");
+        let log = dir.join("a.log");
+        let error = dir.join("a.error");
+        for path in [&bootstrap, &log, &error] {
+            std::fs::write(path, b"x").expect("fixture");
+        }
+
+        drop(super::LaunchAttempt::new(
+            bootstrap.clone(),
+            log.clone(),
+            error.clone(),
+        ));
+
+        assert!(!bootstrap.exists(), "the bootstrap outlived its launch");
+        assert!(!log.exists(), "the log outlived its launch");
+        assert!(!error.exists(), "the error file outlived its launch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A launch that produced a session hands its files to the node, which owns
+    /// them for as long as it runs and deletes them on the way out.
+    #[test]
+    fn a_kept_launch_leaves_the_session_its_files() {
+        let dir = std::env::temp_dir().join(format!("p2pmux-kept-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let bootstrap = dir.join("b.bootstrap");
+        let log = dir.join("b.log");
+        let error = dir.join("b.error");
+        for path in [&bootstrap, &log, &error] {
+            std::fs::write(path, b"x").expect("fixture");
+        }
+
+        super::LaunchAttempt::new(bootstrap.clone(), log.clone(), error.clone()).keep();
+
+        assert!(log.exists(), "a live session lost the log it is writing to");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one that took a 3.9GB machine down: a node the launcher gave up on
+    /// kept running, because `Child` has no `Drop` and the handle simply went
+    /// out of scope. Nine of those, at up to 598MB each.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_that_is_given_up_on_stops_the_node_it_started() {
+        let dir = std::env::temp_dir().join(format!("p2pmux-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // A stand-in for a node that never becomes ready: it would sit there for
+        // an hour, which is exactly the behaviour being defended against.
+        let child = std::process::Command::new("sleep")
+            .arg("3600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in node");
+        let pid = child.id();
+
+        let mut attempt = super::LaunchAttempt::new(
+            dir.join("c.bootstrap"),
+            dir.join("c.log"),
+            dir.join("c.error"),
+        );
+        attempt.spawned(child);
+        drop(attempt);
+
+        // Reaped, not merely signalled: `kill(pid, 0)` succeeds on a zombie, so
+        // the question is asked of the process table via a second `wait`, which
+        // the guard has already done. What is left is that the pid is not a
+        // running `sleep` any more.
+        let still_running = std::process::Command::new("ps")
+            .arg("-o")
+            .arg("state=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .map(|output| {
+                let state = String::from_utf8_lossy(&output.stdout);
+                let state = state.trim();
+                !state.is_empty() && !state.starts_with('Z')
+            })
+            .unwrap_or(false);
+        assert!(
+            !still_running,
+            "the node outlived the launch that gave up on it (pid {pid})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
