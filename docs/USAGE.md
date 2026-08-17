@@ -393,10 +393,15 @@ An agent in another p2pmux session is drawn dim, and neither the cursor nor the 
 it. Its last line carries the way in instead:
 
 ```
- ○ laptop     claude                  running
-   state unknown — no hooks
+ ● laptop     claude                  needs you
+   permission: write to /etc/hosts
    another p2pmux session · p2pmux attach dakar
 ```
+
+What it is doing is read from this machine, not from the session it is in: its hooks leave a
+record next to the session sockets, and every p2pmux you run reads that back. So the state is as
+true here as it is over there. An agent with no hooks installed still says `state unknown — no
+hooks`, in that session and in this one alike.
 
 Run that from a terminal, not from a pane in here. Reaching it from inside would mean a whole
 second p2pmux nested in a pane of this one — which takes the prefix key from the mux around it
