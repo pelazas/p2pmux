@@ -63,6 +63,11 @@ const PERIODIC_DRAIN_INTERVAL: Duration = TARGET_SCREEN_PUBLISH_INTERVAL;
 // are answers a human reads at human speed, and the sampler that produces the
 // agent counts only runs every five seconds anyway.
 const PEER_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+// How often a tethered node checks that the thing it is tethered to is still
+// running. Matches the fleet agent's own supervision tick: there is nothing to
+// be gained by noticing sooner, and a process-table lookup on a timer is exactly
+// the kind of background cost this whole change exists to keep small.
+const SUPERVISOR_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_FROZEN_SCROLLBACK_SESSIONS: usize = 8;
 const OUTBOUND_QUEUE: usize = 64;
 
@@ -85,10 +90,77 @@ pub enum NodeBootstrapKind {
     },
 }
 
+/// Whether a launched node should outlive the process that started it.
+///
+/// `p2pmux create` and `p2pmux join` are typed by a person at a terminal, and
+/// the entire reason the node is a separate process is that closing that
+/// terminal must not take the session down. tmux and zellij daemonise their
+/// servers for the same reason, and a node that died with its client would be a
+/// multiplexer that does not multiplex.
+///
+/// The fleet agent is the opposite case. Its node is the machine's presence in
+/// the fleet, rebuilt within a tick of the agent coming back, and nobody is
+/// sitting in front of it. A node that survives its agent is not a rescued
+/// session — it is a process nothing is watching, which is precisely what nine
+/// of them at PPID 1 were on 2026-08-16, after the out-of-memory killer took the
+/// agent and left its children running for another twelve hours.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Tether {
+    /// Outlives its launcher. The session belongs to whoever asked for it.
+    #[default]
+    Detached,
+    /// Stops when its launcher does, however the launcher goes.
+    ToLauncher,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeBootstrap {
     pub descriptor: SessionDescriptor,
     pub kind: NodeBootstrapKind,
+    /// The process this node is tethered to, if it is tethered to one.
+    ///
+    /// Checked by the node rather than enforced by the launcher, because the
+    /// mechanisms a launcher has are all worse. `PR_SET_PDEATHSIG` is Linux-only
+    /// and fires on the death of the parent *thread*, which under a Tokio
+    /// runtime is not a thing anybody controls; killing from a `Drop` cannot run
+    /// when the launcher is the one being killed, which is the whole scenario.
+    /// A node asking "is the process that started me still there" works on both
+    /// platforms, survives its parent being SIGKILLed, and needs nothing unsafe.
+    ///
+    /// Missing in a bootstrap written by an older p2pmux, which is what
+    /// `Option` and `#[serde(default)]` are for: a node from before this existed
+    /// is simply untethered.
+    #[serde(default)]
+    pub supervisor: Option<Supervisor>,
+}
+
+/// The process a tethered node watches, and enough about it to be sure.
+///
+/// Pids are reused — quickly, on a machine building software — so a bare pid
+/// would eventually name something else entirely and the node would either
+/// outlive its agent anyway or shut down under a healthy one. The start time
+/// pins it: the pair is unique for as long as the operating system is up.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Supervisor {
+    pub pid: u32,
+    pub started_at: u64,
+}
+
+impl Supervisor {
+    /// This process, for a node it is about to launch on a tether.
+    pub fn current() -> Option<Self> {
+        let pid = std::process::id();
+        Some(Self {
+            pid,
+            started_at: crate::agent_detect::process_start_time(pid)?,
+        })
+    }
+
+    /// Whether the process this node is tethered to is still the one that
+    /// started it.
+    pub fn is_alive(&self) -> bool {
+        crate::agent_detect::process_start_time(self.pid) == Some(self.started_at)
+    }
 }
 
 /// Join a session one of your machines invited you to, in a node of its own.
@@ -102,7 +174,7 @@ pub struct NodeBootstrap {
 /// ordinary case, not a failure: invitations are re-announced on a timer so
 /// that a machine which was asleep still hears about a session started while
 /// it was, and every announcement after the first is a no-op.
-pub fn follow_fleet_invite(ticket: &str) -> Result<bool, Box<dyn Error>> {
+pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn Error>> {
     let parsed = ticket
         .parse::<crate::ticket::JoinTicket>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid invitation ticket"))?;
@@ -136,6 +208,7 @@ pub fn follow_fleet_invite(ticket: &str) -> Result<bool, Box<dyn Error>> {
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
+        tether,
     )?;
     Ok(true)
 }
@@ -347,7 +420,13 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     let listener = UnixListener::bind(&descriptor.socket_path)?;
     listener.set_nonblocking(true)?;
     store.write(&descriptor)?;
-    let result = run_socket_loop(&mut node, listener, &mut descriptor, &store);
+    let result = run_socket_loop(
+        &mut node,
+        listener,
+        &mut descriptor,
+        &store,
+        bootstrap.supervisor,
+    );
     // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
     // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
     tokio::task::block_in_place(|| node.shutdown());
@@ -400,6 +479,7 @@ fn run_socket_loop(
     listener: UnixListener,
     descriptor: &mut SessionDescriptor,
     store: &SessionStore,
+    supervisor: Option<Supervisor>,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
     let mut client: Option<AttachedClient> = None;
@@ -411,6 +491,7 @@ fn run_socket_loop(
     // costs one vector compare per drain and no file write at all.
     let mut last_known_peers: Vec<crate::session_store::SessionPeer> = Vec::new();
     let mut last_peer_scan: Option<Instant> = None;
+    let mut last_supervisor_check: Option<Instant> = None;
     let mut last_work = Instant::now();
     loop {
         let mut shutdown = false;
@@ -564,6 +645,20 @@ fn run_socket_loop(
         // and it produces no pane output at all — so a session sitting quiet,
         // which is the normal state of a machine you are not looking at, would
         // never record the peer that just arrived.
+        // A tethered node outlives nothing. Asked on its own timer rather than
+        // the peer scan's, because it is a question about the process table and
+        // the answer only changes once.
+        if let Some(supervisor) = supervisor
+            && supervisor_check_due(last_supervisor_check, drain_started)
+        {
+            last_supervisor_check = Some(drain_started);
+            if !supervisor.is_alive() {
+                // Said out loud. A node that vanished without a word is how the
+                // last set of these went unexplained for twelve hours.
+                eprintln!("p2pmux node: the fleet agent that started this node is gone — stopping");
+                shutdown = true;
+            }
+        }
         if peer_scan_due(last_peer_scan, drain_started) {
             last_peer_scan = Some(drain_started);
             let peers = node.session_peers();
@@ -876,6 +971,10 @@ fn periodic_drain_due(last_drain: Option<Instant>, now: Instant) -> bool {
 
 fn peer_scan_due(last_scan: Option<Instant>, now: Instant) -> bool {
     last_scan.is_none_or(|last| now.duration_since(last) >= PEER_SCAN_INTERVAL)
+}
+
+fn supervisor_check_due(last_check: Option<Instant>, now: Instant) -> bool {
+    last_check.is_none_or(|last| now.duration_since(last) >= SUPERVISOR_CHECK_INTERVAL)
 }
 
 fn socket_loop_backoff(
@@ -1746,6 +1845,81 @@ impl SharedLayoutNode {
 
 #[cfg(test)]
 mod tests {
+    /// A node the fleet agent started must not outlive it.
+    ///
+    /// The nine that did on 2026-08-16 were reparented to PID 1 when the
+    /// out-of-memory killer took their agent, and ran for another twelve hours
+    /// with nothing watching them and nothing able to find them.
+    #[test]
+    fn a_tethered_node_stops_when_its_launcher_does() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a stand-in launcher");
+        let supervisor = super::Supervisor {
+            pid: child.id(),
+            started_at: crate::agent_detect::process_start_time(child.id())
+                .expect("a running process has a start time"),
+        };
+        assert!(supervisor.is_alive(), "the launcher is running");
+
+        child.kill().expect("stop the stand-in launcher");
+        child.wait().expect("reap it");
+        assert!(
+            !supervisor.is_alive(),
+            "the node would have outlived the process that started it"
+        );
+    }
+
+    /// Pids are reused, quickly, on a machine that builds software. A tether
+    /// that trusted the number alone would eventually be watching somebody
+    /// else's process -- and would either keep a node alive under a dead agent
+    /// or shut one down under a healthy one.
+    #[test]
+    fn a_recycled_pid_is_not_the_process_the_node_was_tethered_to() {
+        let pid = std::process::id();
+        let real = super::Supervisor::current().expect("this process has a start time");
+        assert_eq!(real.pid, pid);
+        assert!(real.is_alive());
+
+        let impostor = super::Supervisor {
+            pid,
+            started_at: real.started_at.wrapping_add(1),
+        };
+        assert!(
+            !impostor.is_alive(),
+            "the same pid at a different start time is a different process"
+        );
+    }
+
+    /// Only the agent's nodes are tethered. A session somebody typed `create`
+    /// for has to survive the terminal it was typed in -- that is the entire
+    /// reason the node is a separate process.
+    #[test]
+    fn an_interactive_session_is_not_tethered_to_the_command_that_started_it() {
+        let source = include_str!("cli.rs");
+        let interactive = source
+            .split_once("Some(Command::Create {")
+            .expect("the create arm")
+            .1
+            .split_once("Tether::")
+            .expect("the create arm's tether")
+            .1;
+        assert!(
+            interactive.starts_with("Detached"),
+            "`create` must outlive its terminal"
+        );
+
+        let agent = include_str!("daemon.rs");
+        assert!(
+            agent.contains("follow_fleet_invite(ticket, crate::node::Tether::ToLauncher)"),
+            "the fleet agent's node is the one that must not outlive its launcher"
+        );
+    }
+
     use super::*;
     use crate::{
         layout::{Axis, Node, Pane},
@@ -2520,6 +2694,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                 },
+                supervisor: None,
             },
         )
         .unwrap();

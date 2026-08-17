@@ -74,6 +74,8 @@ impl Fixture {
                     cols: 80,
                     rows: 24,
                 },
+                // Untethered: this node stands in for one a person started.
+                supervisor: None,
             },
         )
         .unwrap();

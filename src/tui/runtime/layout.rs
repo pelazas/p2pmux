@@ -136,7 +136,11 @@ impl SharedLayoutRuntime {
             self.status = format!("ignored an invitation from {name}, which is not my machine");
             return;
         }
-        let followed = crate::node::follow_fleet_invite(ticket);
+        // Detached: this node is following an invitation on behalf of the
+        // machine, and the session it starts belongs to the fleet rather than to
+        // the node that noticed the invitation. Tethering it would make one
+        // node's restart take another node's session down with it.
+        let followed = crate::node::follow_fleet_invite(ticket, crate::node::Tether::Detached);
         crate::tui::debug_log::ui_debug_log(
             "fleet_invite_received",
             format_args!(

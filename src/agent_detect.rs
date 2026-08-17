@@ -315,6 +315,22 @@ fn is_node_process(process: &ProcessSnapshot) -> bool {
 /// The command line is checked, not just the pid's existence, because pids are
 /// reused -- fast, on a machine building software -- and treating whatever now
 /// holds a dead node's pid as that node would keep a stale record forever.
+/// When `pid` started, as the operating system counts it, or `None` if there is
+/// no such process.
+///
+/// The start time is what makes a pid safe to hold on to. Pids are reused, so
+/// "is 793097 still running" is a question that can start answering yes about a
+/// completely different program; "is 793097 still the process that started at
+/// this instant" cannot.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    refreshed(&mut system, pid).map(sysinfo::Process::start_time)
+}
+
 pub fn node_process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;

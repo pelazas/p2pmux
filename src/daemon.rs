@@ -514,7 +514,10 @@ fn describe(delay: Duration) -> String {
 
 /// Start the home session's node if it is not already running.
 async fn ensure_home_session(ticket: &str) -> Result<(), Box<dyn Error>> {
-    if crate::node::follow_fleet_invite(ticket)? {
+    // Tethered: this node is the machine's presence in the fleet, and the agent
+    // is the only thing watching it. One that outlived the agent would be
+    // exactly the orphan this whole file is now shaped around not producing.
+    if crate::node::follow_fleet_invite(ticket, crate::node::Tether::ToLauncher)? {
         println!("p2pmux fleet agent: rejoined the home session");
     }
     Ok(())

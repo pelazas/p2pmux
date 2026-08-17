@@ -511,6 +511,9 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     .map(Ok)
                     .unwrap_or_else(crate::session_store::generate_name)?,
                 crate::session_store::SessionRole::Coordinator,
+                // A session somebody typed `create` for outlives the terminal
+                // they typed it in. That is what the separate process is for.
+                crate::node::Tether::Detached,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -609,6 +612,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 },
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
+                crate::node::Tether::Detached,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -1513,6 +1517,7 @@ async fn rejoin_paired_session(
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
+        crate::node::Tether::Detached,
     )
 }
 
@@ -1531,6 +1536,7 @@ fn start_solo_session() -> Result<crate::session_store::SessionDescriptor, Box<d
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Coordinator,
+        crate::node::Tether::Detached,
     )
 }
 
@@ -1713,6 +1719,7 @@ pub(crate) fn launch_background_node(
     kind: crate::node::NodeBootstrapKind,
     name: String,
     role: crate::session_store::SessionRole,
+    tether: crate::node::Tether,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let id = crate::session_store::generate_id()?;
@@ -1728,6 +1735,12 @@ pub(crate) fn launch_background_node(
     let bootstrap = crate::node::NodeBootstrap {
         descriptor: descriptor.clone(),
         kind,
+        // Resolved here rather than in the node, which cannot ask "who launched
+        // me" once its parent has already gone -- the case the tether exists for.
+        supervisor: match tether {
+            crate::node::Tether::Detached => None,
+            crate::node::Tether::ToLauncher => crate::node::Supervisor::current(),
+        },
     };
     let bootstrap_path = descriptor.socket_path.with_extension("bootstrap");
     crate::node::write_bootstrap(&bootstrap_path, &bootstrap)?;
