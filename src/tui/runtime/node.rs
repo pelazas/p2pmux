@@ -18,8 +18,8 @@ use crate::{
         AgentRoster, AgentRosterState, MAX_AGENT_CWD_BYTES, MAX_AGENT_MESSAGE_BYTES, Presence,
     },
     tui::{
-        AgentOverlayRow, LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot,
-        NodeScreenSnapshots, UiIntent,
+        AgentOverlayRow, LocalScrollback, LocalScrollbackWindow, NodeLeaseSnapshots,
+        NodeScreenSnapshot, NodeScreenSnapshots, UiIntent,
         clock::unix_ms_now,
         geometry::{contains_leaf, visible_leaf_panes},
         member_label,
@@ -267,16 +267,30 @@ impl SharedLayoutRuntime {
             .map(|(_, pending)| pending.command.clone())
     }
 
-    pub(crate) fn node_local_scrollback(&self, pane_id: PaneId) -> Option<LocalScrollbackWindow> {
-        let pane = self.local.get(&pane_id)?;
-        let (total_rows, _) = pane.screen.history_metadata();
-        if total_rows == 0 || pane.screen.screen().alternate_screen() {
-            return None;
+    /// What this node can offer for a pane the client wants to scroll back in.
+    ///
+    /// Three answers rather than one `Option`, because the caller has to say
+    /// something to the user and "no window" was being reported as a single
+    /// failure that named every cause it might have had — including two that
+    /// are impossible for the pane in front of them. A brand-new local shell
+    /// has no history for the ordinary reason that nothing has scrolled off it
+    /// yet, and telling that user about remote panes and stale sessions is
+    /// three guesses where the node knows the answer.
+    pub(crate) fn node_local_scrollback(&self, pane_id: PaneId) -> LocalScrollback {
+        let Some(pane) = self.local.get(&pane_id) else {
+            return LocalScrollback::NotOurs;
+        };
+        if pane.screen.screen().alternate_screen() {
+            return LocalScrollback::AlternateScreen;
         }
-        Some(LocalScrollbackWindow {
+        let (total_rows, _) = pane.screen.history_metadata();
+        if total_rows == 0 {
+            return LocalScrollback::Empty;
+        }
+        LocalScrollback::Window(Box::new(LocalScrollbackWindow {
             total_rows,
             screen: pane.screen.screen().clone(),
-        })
+        }))
     }
 
     pub(crate) fn node_remote_snapshot(&self, pane_id: PaneId) -> Option<Vec<u8>> {

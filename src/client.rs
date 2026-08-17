@@ -121,9 +121,16 @@ fn take_matching_pending(
 
 /// Give up on a pane's history and put it back at its live edge.
 ///
-/// The node answers "unavailable" for a pane it does not host, for one on the
-/// alternate screen, and for a frozen session it has since evicted — and the
-/// last of those can arrive for a pane that is *already* parked in history.
+/// The node answers with no window for a pane it does not host, for one on the
+/// alternate screen, for a frozen session it has since evicted, and for one
+/// that has no history yet — and the third of those can arrive for a pane that
+/// is *already* parked in history.
+///
+/// Only the first three carry a reason to show. A pane nothing has scrolled off
+/// yet answers with none, and `footer_notice` is assigned it unconditionally
+/// below: a wheel notch that found no history is not news, and the bar should
+/// keep whatever it was already saying rather than flash an error at a shell
+/// that has been alive for one second.
 /// Everything cached for it goes, so what the pane falls back to is its live
 /// screen; leaving the offset behind would leave it reading as scrolled while
 /// showing the newest output, which costs it its caret and swallows the next
