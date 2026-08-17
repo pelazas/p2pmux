@@ -26,6 +26,106 @@ use std::{error::Error, io, path::PathBuf, time::Duration};
 /// node process is gone entirely.
 const SUPERVISION_INTERVAL: Duration = Duration::from_secs(15);
 
+/// The longest the agent waits between attempts to rejoin a session it cannot
+/// reach.
+///
+/// This is a ceiling, not a surrender. A home session legitimately comes back —
+/// the laptop hosting it is opened, the network returns — and an agent that had
+/// stopped asking would leave its machine missing from the fleet until somebody
+/// thought to restart it. What the ceiling ends is the *rate*: on 2026-08-16 two
+/// machines chased a session neither of them hosted for four days, each asking
+/// every fifteen seconds, each attempt a whole operating-system process. Four
+/// times an hour finds the session back within the same coffee break and costs
+/// nothing anybody can measure.
+const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// The delay between one failed attempt and the next.
+///
+/// Doubling, capped, and jittered — the shape every retry loop that has had to
+/// stop hurting the thing it was retrying against converges on. The jitter is
+/// what keeps a fleet of machines that all lost the same coordinator from
+/// coming back at it in lockstep, and it matters more here than in most places
+/// because every machine in a fleet reacts to the *same* event at the *same*
+/// moment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Backoff {
+    base: Duration,
+    ceiling: Duration,
+    failures: u32,
+}
+
+impl Backoff {
+    pub fn new(base: Duration, ceiling: Duration) -> Self {
+        Self {
+            base,
+            ceiling,
+            failures: 0,
+        }
+    }
+
+    /// The session is up. The next check is at the ordinary cadence again.
+    pub fn succeeded(&mut self) {
+        self.failures = 0;
+    }
+
+    pub fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    /// The undithered delay, which is what a log line should quote: "retrying in
+    /// 4m" is a promise the jitter would make a liar of by a few seconds.
+    pub fn plain_interval(&self) -> Duration {
+        if self.failures == 0 {
+            return self.base;
+        }
+        // Saturating at 2^16 rather than relying on the ceiling to catch it: the
+        // shift itself is what overflows first, and a fleet agent left running
+        // for a year gets there.
+        let doublings = (self.failures - 1).min(16);
+        self.base
+            .saturating_mul(1u32 << doublings)
+            .min(self.ceiling)
+    }
+
+    /// Where in the jitter band to land, as a fraction of it.
+    ///
+    /// Split out from [`Self::interval`] so the arithmetic can be tested without
+    /// a random number generator deciding whether the test passes.
+    fn interval_at(&self, fraction: f64) -> Duration {
+        let plain = self.plain_interval();
+        if self.failures == 0 {
+            // A healthy agent keeps a steady heartbeat. There is nothing to
+            // spread out, and a wandering interval would only make the logs
+            // harder to read.
+            return plain;
+        }
+        // Equal jitter: half the delay is guaranteed, the other half is spread.
+        // Full jitter (anywhere from zero to the delay) is the usual advice, but
+        // it lets an unlucky draw retry almost immediately, which is the exact
+        // behaviour the ceiling exists to prevent.
+        let half = plain / 2;
+        half + half.mul_f64(fraction.clamp(0.0, 1.0))
+    }
+
+    /// How long to wait before trying again.
+    pub fn interval(&self) -> Duration {
+        self.interval_at(random_fraction())
+    }
+}
+
+/// A number in `[0, 1)`, from the same source as every other random value here.
+///
+/// Falls back to the middle of the band rather than failing: a machine whose
+/// entropy source is unavailable should still back off, just without the
+/// dithering.
+fn random_fraction() -> f64 {
+    let mut bytes = [0u8; 4];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => f64::from(u32::from_le_bytes(bytes)) / f64::from(u32::MAX),
+        Err(_) => 0.5,
+    }
+}
+
 /// The name both platforms know the service by.
 ///
 /// One constant, because an install that wrote one name and an uninstall that
@@ -235,23 +335,52 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     println!("p2pmux fleet agent: keeping this machine in its home session");
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut waiting = false;
+    let mut backoff = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);
+    // What the last attempt failed with, and how long the agent said it would
+    // wait. Both are kept so the *next* failure can decide whether it is worth
+    // mentioning: a reason that has not changed and a delay that has not moved
+    // is a line the journal has already got.
+    let mut reported: Option<(String, Duration)> = None;
     loop {
         // Asked every tick rather than once at start, because both answers can
         // change under a service that outlives them: a machine paired after the
         // agent was installed, and one re-paired into a different session.
-        match next_step(&crate::pairing::load_or_empty()) {
+        let delay = match next_step(&crate::pairing::load_or_empty()) {
             Step::Follow(ticket) => {
                 if waiting {
                     println!("p2pmux fleet agent: paired — joining its home session");
                     waiting = false;
                 }
-                if let Err(error) = ensure_home_session(&ticket).await {
+                match ensure_home_session(&ticket).await {
+                    Ok(()) => {
+                        if reported.take().is_some() {
+                            println!("p2pmux fleet agent: back in its home session");
+                        }
+                        backoff.succeeded();
+                    }
                     // Reported and retried rather than fatal. The usual reason is a
                     // network that is not up yet, and a daemon that exited on that
                     // would need the operating system to restart it into the same
                     // failure a second later.
-                    eprintln!("p2pmux fleet agent: {error}");
+                    Err(error) => {
+                        backoff.failed();
+                        let reason = error.to_string();
+                        let waited = backoff.plain_interval();
+                        // Once per distinct reason and once per change of pace,
+                        // rather than once per attempt. The same sentence 1014
+                        // times in one journal is how this failure hid: nothing
+                        // in it said the agent was doing anything unusual, and
+                        // the count was the only part that mattered.
+                        if reported.as_ref() != Some(&(reason.clone(), waited)) {
+                            eprintln!(
+                                "p2pmux fleet agent: {reason} (retrying every {})",
+                                describe(waited)
+                            );
+                            reported = Some((reason, waited));
+                        }
+                    }
                 }
+                backoff.interval()
             }
             // Not an error, and above all not an exit. `Restart=always` turns an
             // exit here into a process every five seconds for as long as the
@@ -268,10 +397,16 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     );
                     waiting = true;
                 }
+                // Nothing has failed, so nothing is backing off: an unpaired
+                // machine is idle, not broken, and should notice a `p2pmux pair`
+                // promptly.
+                backoff.succeeded();
+                reported = None;
+                SUPERVISION_INTERVAL
             }
-        }
+        };
         tokio::select! {
-            _ = tokio::time::sleep(SUPERVISION_INTERVAL) => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = interrupt.recv() => {
                 println!("p2pmux fleet agent: stopping");
                 return Ok(());
@@ -281,6 +416,19 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// A delay as somebody reading a log would say it.
+fn describe(delay: Duration) -> String {
+    let seconds = delay.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    match seconds % 60 {
+        0 => format!("{minutes}m"),
+        rest => format!("{minutes}m{rest}s"),
     }
 }
 
@@ -294,7 +442,137 @@ async fn ensure_home_session(ticket: &str) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SERVICE_LABEL, ServiceUnit, Step, next_step};
+    use std::time::Duration;
+
+    use super::{
+        Backoff, MAX_RETRY_INTERVAL, SERVICE_LABEL, SUPERVISION_INTERVAL, ServiceUnit, Step,
+        describe, next_step,
+    };
+
+    /// A session that cannot be reached must not be asked about at the same rate
+    /// forever.
+    ///
+    /// The number that matters is the one at the end: on 2026-08-16 a pair of
+    /// machines chasing a session neither of them hosted made 1014 attempts in
+    /// four hours, one process each. Under this the same four hours is fewer
+    /// than thirty.
+    #[test]
+    fn a_session_that_cannot_be_reached_is_asked_about_less_and_less() {
+        let mut backoff = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);
+        assert_eq!(
+            backoff.plain_interval(),
+            SUPERVISION_INTERVAL,
+            "a healthy agent keeps the ordinary cadence"
+        );
+
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            backoff.failed();
+            seen.push(backoff.plain_interval());
+        }
+
+        assert_eq!(seen[0], SUPERVISION_INTERVAL, "the first retry is prompt");
+        assert!(
+            seen.windows(2).all(|pair| pair[1] >= pair[0]),
+            "the delay never shrinks while the failure persists: {seen:?}"
+        );
+        assert_eq!(
+            *seen.last().expect("a delay"),
+            MAX_RETRY_INTERVAL,
+            "and it settles at the ceiling rather than growing without bound"
+        );
+
+        // How many attempts four hours buys, which is the whole point.
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 0;
+        let mut counting = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);
+        while elapsed < Duration::from_secs(4 * 60 * 60) {
+            counting.failed();
+            elapsed += counting.plain_interval();
+            attempts += 1;
+        }
+        assert!(
+            attempts < 30,
+            "four hours of an unreachable session should cost tens of attempts, not \
+             a thousand: got {attempts}"
+        );
+    }
+
+    /// A session that comes back is noticed at the ordinary cadence, not at
+    /// whatever the agent had backed off to.
+    #[test]
+    fn a_session_that_returns_resets_the_pace() {
+        let mut backoff = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);
+        for _ in 0..10 {
+            backoff.failed();
+        }
+        assert!(backoff.plain_interval() > SUPERVISION_INTERVAL);
+
+        backoff.succeeded();
+        assert_eq!(backoff.plain_interval(), SUPERVISION_INTERVAL);
+    }
+
+    /// Every machine in a fleet loses the same coordinator at the same instant,
+    /// so an undithered delay would bring them all back at once.
+    #[test]
+    fn the_delay_is_spread_out_but_never_collapses() {
+        let mut backoff = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);
+        for _ in 0..5 {
+            backoff.failed();
+        }
+        let plain = backoff.plain_interval();
+
+        let earliest = backoff.interval_at(0.0);
+        let latest = backoff.interval_at(1.0);
+        assert!(
+            earliest >= plain / 2,
+            "an unlucky draw must not retry almost immediately: {earliest:?} of {plain:?}"
+        );
+        assert!(latest <= plain, "and must not exceed the delay it dithers");
+        assert!(earliest < latest, "there is a band to land in");
+
+        // A healthy agent has nothing to spread out and keeps a steady beat.
+        backoff.succeeded();
+        assert_eq!(backoff.interval_at(0.0), backoff.interval_at(1.0));
+    }
+
+    #[test]
+    fn delays_are_written_the_way_somebody_would_say_them() {
+        assert_eq!(describe(Duration::from_secs(15)), "15s");
+        assert_eq!(describe(Duration::from_secs(60)), "1m");
+        assert_eq!(describe(Duration::from_secs(90)), "1m30s");
+        assert_eq!(describe(MAX_RETRY_INTERVAL), "15m");
+    }
+
+    /// The agent says what it is doing once, not once per attempt.
+    ///
+    /// The failure that took a machine down wrote the same sentence to the
+    /// journal 1014 times, and nothing in it said anything was wrong.
+    #[test]
+    fn a_repeated_failure_is_not_repeated_into_the_log() {
+        let source = include_str!("daemon.rs");
+        // Cut at the test module, or this reads its own assertions back and
+        // every one of them passes for the wrong reason.
+        let loop_body = source
+            .split_once("pub async fn run()")
+            .expect("the agent loop")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("the tests, which are not the loop")
+            .0;
+        assert!(
+            loop_body.contains("if reported.as_ref() != Some(&(reason.clone(), waited))"),
+            "the same reason at the same pace must not be reported twice"
+        );
+        assert!(
+            loop_body.contains("backoff.interval()"),
+            "the loop has to actually wait for the backoff it computed"
+        );
+        assert!(
+            !loop_body.contains("tokio::time::sleep(SUPERVISION_INTERVAL)"),
+            "a fixed sleep would make the backoff decorative"
+        );
+    }
 
     fn unit() -> ServiceUnit {
         ServiceUnit {
