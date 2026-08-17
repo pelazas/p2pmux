@@ -497,6 +497,16 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // is a line the journal has already got.
     let mut reported: Option<(String, Duration)> = None;
     loop {
+        // Before anything else, because everything else depends on it: a node is
+        // launched by re-running this program, and there is no point deciding
+        // which session to join with a binary that can no longer be started.
+        if program_was_replaced(&std::env::current_exe()) {
+            println!(
+                "p2pmux fleet agent: the p2pmux binary was replaced — stopping so the \
+                 service manager starts the new one"
+            );
+            return Err(io::Error::other("the p2pmux binary was replaced").into());
+        }
         // Asked every tick rather than once at start, because both answers can
         // change under a service that outlives them: a machine paired after the
         // agent was installed, and one re-paired into a different session.
@@ -574,6 +584,33 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Whether the program this process is running from is still on disk.
+///
+/// An upgrade replaces the binary under the running agent, and the agent keeps
+/// executing the old image — which on Linux is unlinked the moment it is
+/// replaced, so every attempt to launch a node fails with `ENOENT` for as long
+/// as the process lives. That is not a hypothetical: on 2026-08-16 the binary
+/// was replaced at 12:45:52 and the agent that survived it made 1014 doomed
+/// attempts over the next four hours, one every fifteen seconds, without ever
+/// recovering. `Restart=` cannot help, because the process never exits.
+///
+/// So the agent notices and stands down, and the service manager starts it
+/// again from whatever is at that path now. Both platforms are covered by the
+/// same question for different reasons: Linux reports the running image's path
+/// as `<path> (deleted)` once it is unlinked, whichever way it was replaced;
+/// macOS reports the real path, and Homebrew removes the whole versioned
+/// directory it lived in.
+///
+/// Takes the path rather than asking, so the decision can be tested without an
+/// upgrade. An unanswerable question is answered "no": an agent that exited
+/// because it could not tell would be a restart loop.
+fn program_was_replaced(program: &io::Result<PathBuf>) -> bool {
+    match program {
+        Ok(path) => !path.exists(),
+        Err(_) => false,
+    }
+}
+
 /// A delay as somebody reading a log would say it.
 fn describe(delay: Duration) -> String {
     let seconds = delay.as_secs();
@@ -606,6 +643,63 @@ mod tests {
         Backoff, MAX_RETRY_INTERVAL, MEMORY_HIGH_MB, MEMORY_MAX_MB, SERVICE_LABEL,
         SUPERVISION_INTERVAL, ServiceUnit, Step, describe, next_step,
     };
+
+    /// An upgrade replaces the binary under the running agent, and the old
+    /// image cannot launch anything ever again.
+    ///
+    /// This is how the incident started: the binary was replaced at 12:45:52 and
+    /// the agent that survived it spent the next four hours failing every
+    /// fifteen seconds with `No such file or directory`. `Restart=` never fired,
+    /// because the process was healthy — it just could not do the one thing it
+    /// existed to do.
+    #[test]
+    fn an_agent_whose_binary_was_replaced_stands_down() {
+        let dir = std::env::temp_dir().join(format!("p2pmux-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let program = dir.join("p2pmux");
+        std::fs::write(&program, b"#!/bin/true\n").expect("fixture");
+
+        assert!(
+            !super::program_was_replaced(&Ok(program.clone())),
+            "a binary that is still there is not a reason to stop"
+        );
+
+        // Linux reports the running image as "<path> (deleted)" once it has been
+        // replaced, whichever way; macOS just stops having the path, because
+        // Homebrew removes the whole versioned directory.
+        std::fs::remove_file(&program).expect("replace it");
+        assert!(super::program_was_replaced(&Ok(program.clone())));
+        assert!(super::program_was_replaced(&Ok(std::path::PathBuf::from(
+            format!("{} (deleted)", program.display())
+        ))));
+
+        // And an unanswerable question is not a reason to exit: an agent that
+        // stood down because it could not tell would be a restart loop.
+        assert!(!super::program_was_replaced(&Err(std::io::Error::other(
+            "no /proc"
+        ))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check has to come before the work, not after it.
+    #[test]
+    fn the_binary_check_is_the_first_thing_each_tick() {
+        let source = include_str!("daemon.rs");
+        let loop_body = source
+            .split_once("pub async fn run()")
+            .expect("the agent loop")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("the tests, which are not the loop")
+            .0;
+        let checked = loop_body.find("program_was_replaced(").expect("the check");
+        let acted = loop_body.find("next_step(").expect("the work");
+        assert!(
+            checked < acted,
+            "deciding which session to join with a binary that cannot start is wasted work"
+        );
+    }
 
     /// A session that cannot be reached must not be asked about at the same rate
     /// forever.
