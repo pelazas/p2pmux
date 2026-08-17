@@ -39,6 +39,14 @@ const SUPERVISION_INTERVAL: Duration = Duration::from_secs(15);
 /// nothing anybody can measure.
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// How old a launch's leftover files must be before they are assumed to be
+/// litter rather than a launch still in progress.
+///
+/// The launcher gives a node sixty seconds to become ready. This is several
+/// times that, because being slow to tidy up costs nothing and deleting a live
+/// session's bootstrap costs it the session.
+const STALE_LAUNCH_FILE_AGE: Duration = Duration::from_secs(10 * 60);
+
 /// The delay between one failed attempt and the next.
 ///
 /// Doubling, capped, and jittered — the shape every retry loop that has had to
@@ -463,6 +471,17 @@ pub fn next_step(pairing: &crate::pairing::Pairing) -> Step {
 /// node's, and the node is what this keeps alive.
 pub async fn run() -> Result<(), Box<dyn Error>> {
     println!("p2pmux fleet agent: keeping this machine in its home session");
+    // Whatever the last run of this machine left behind. The launcher tidies up
+    // after itself now, so this only ever finds the files of a process that was
+    // killed outright -- which is exactly what happened here, and left 1014 of
+    // them. Done once at start rather than on the timer: it is a directory scan,
+    // and nothing produces litter while the agent is behaving.
+    if let Ok(store) = crate::session_store::SessionStore::for_current_user() {
+        let swept = store.sweep_stale_launch_files(STALE_LAUNCH_FILE_AGE);
+        if swept > 0 {
+            println!("p2pmux fleet agent: cleared {swept} files left by a previous run");
+        }
+    }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut waiting = false;
     let mut backoff = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);

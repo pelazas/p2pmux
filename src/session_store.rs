@@ -555,6 +555,70 @@ impl SessionStore {
         }
     }
 
+    /// Removes the bootstrap, log and error files of launches that produced no
+    /// session, and reports how many.
+    ///
+    /// The launcher takes its own files with it when it gives up, which covers
+    /// every ordinary failure. This is for the one case it cannot cover: a
+    /// launcher that was itself killed, whose `Drop` never ran. Left alone they
+    /// accumulate for as long as the machine is up — 1014 bootstraps in one
+    /// runtime directory and 1568 logs in another, on the two machines that made
+    /// this necessary.
+    ///
+    /// Cautious about what it deletes, because the socket directory is shared by
+    /// every p2pmux this user runs whatever `HOME` each was started with, and
+    /// some of those files belong to sessions somebody is working in. A file is
+    /// only litter if there is no socket beside it, no live node claims that
+    /// socket, and it is old enough that no launch could still be in flight.
+    pub fn sweep_stale_launch_files(&self, older_than: Duration) -> usize {
+        let Ok(entries) = fs::read_dir(&self.socket_dir) else {
+            return 0;
+        };
+        let mut owned: Option<HashSet<PathBuf>> = None;
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("bootstrap" | "log" | "error")
+            ) {
+                continue;
+            }
+            // Young enough that a launcher could still be waiting on it. The
+            // launcher's own cap is a minute; this is several, because being
+            // slow to tidy up costs nothing and deleting a live session's
+            // bootstrap costs it the session.
+            let fresh = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| {
+                    modified
+                        .elapsed()
+                        .map(|age| age < older_than)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if fresh {
+                continue;
+            }
+            let socket = path.with_extension("sock");
+            if socket.exists() {
+                continue;
+            }
+            // The last word belongs to the nodes themselves, which name the
+            // socket they own on their command line -- the only answer that does
+            // not depend on which `HOME` this store was built with.
+            let owned = owned.get_or_insert_with(crate::agent_detect::node_socket_paths);
+            if owned.contains(&socket) {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     pub fn rename(&self, old: &str, new: &str) -> io::Result<SessionDescriptor> {
         if !valid_name(new) {
             return Err(io::Error::new(
@@ -790,6 +854,66 @@ fn read_current_uid() -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The files a killed launcher could not tidy up after itself.
+    ///
+    /// One runtime directory held 1014 of these, one per attempt for four hours,
+    /// and nothing on the machine was ever going to remove them.
+    #[test]
+    fn a_sweep_removes_the_leftovers_of_launches_that_produced_no_session() {
+        let root = std::env::temp_dir().join(format!("p2pmux-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sockets = root.join("run");
+        std::fs::create_dir_all(&sockets).expect("scratch dirs");
+        let store = super::SessionStore::at(root.join("state"), sockets.clone());
+
+        // Litter: old, and with no socket beside it.
+        for extension in ["bootstrap", "log", "error"] {
+            std::fs::write(sockets.join(format!("dead.{extension}")), b"x").expect("fixture");
+        }
+        // A live session's files, which must survive: there is a socket beside
+        // them, so something is using them.
+        std::fs::write(sockets.join("live.bootstrap"), b"x").expect("fixture");
+        std::fs::write(sockets.join("live.sock"), b"").expect("fixture");
+        // Aged past the threshold by asking for a threshold of zero. What the
+        // age check protects is the subject of the next test.
+        let removed = store.sweep_stale_launch_files(std::time::Duration::ZERO);
+        assert_eq!(removed, 3, "the three files of the dead launch");
+        assert!(!sockets.join("dead.bootstrap").exists());
+        assert!(!sockets.join("dead.log").exists());
+        assert!(!sockets.join("dead.error").exists());
+        assert!(
+            sockets.join("live.bootstrap").exists(),
+            "a file with a socket beside it belongs to a session"
+        );
+        assert!(
+            sockets.join("live.sock").exists(),
+            "sockets are not swept here"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A launch that started moments ago is not litter, however dead it looks.
+    ///
+    /// The launcher waits a minute for a node to become ready, and a sweep that
+    /// deleted the bootstrap out from under one would break the session it was
+    /// trying to tidy up around.
+    #[test]
+    fn a_launch_still_in_flight_is_left_alone() {
+        let root = std::env::temp_dir().join(format!("p2pmux-sweep-young-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sockets = root.join("run");
+        std::fs::create_dir_all(&sockets).expect("scratch dirs");
+        let store = super::SessionStore::at(root.join("state"), sockets.clone());
+
+        std::fs::write(sockets.join("young.bootstrap"), b"x").expect("fixture");
+        let removed = store.sweep_stale_launch_files(std::time::Duration::from_secs(600));
+        assert_eq!(removed, 0, "nothing here is old enough to be litter");
+        assert!(sockets.join("young.bootstrap").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
     use std::{
         os::unix::fs::PermissionsExt,
