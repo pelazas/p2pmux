@@ -1917,6 +1917,20 @@ mod tests {
             loop_source.contains("supervisor.is_some() && held > TETHERED_MEMORY_CEILING"),
             "only a node nobody is sitting in front of may be stopped for its size"
         );
+
+        // And the flag has to be raised before the pass that acts on it, or
+        // every one of these decisions is discarded at the top of the next
+        // iteration and the node runs on regardless.
+        let raised = loop_source
+            .find("if self_check_due(")
+            .expect("the self check");
+        let acted_on = loop_source
+            .rfind("if shutdown {")
+            .expect("the pass that stops the node");
+        assert!(
+            raised < acted_on,
+            "a node that decides to stop after the loop has already checked never stops"
+        );
     }
 
     /// A session somebody is working in is worth more than the memory it holds.
