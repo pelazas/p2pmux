@@ -63,11 +63,40 @@ const PERIODIC_DRAIN_INTERVAL: Duration = TARGET_SCREEN_PUBLISH_INTERVAL;
 // are answers a human reads at human speed, and the sampler that produces the
 // agent counts only runs every five seconds anyway.
 const PEER_SCAN_INTERVAL: Duration = Duration::from_secs(2);
-// How often a tethered node checks that the thing it is tethered to is still
-// running. Matches the fleet agent's own supervision tick: there is nothing to
-// be gained by noticing sooner, and a process-table lookup on a timer is exactly
-// the kind of background cost this whole change exists to keep small.
-const SUPERVISOR_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+// How often a node looks at itself: whether the process that started it is still
+// there, and how much memory it is holding. Matches the fleet agent's own
+// supervision tick -- there is nothing to be gained by noticing sooner, and a
+// process-table lookup on a timer is exactly the kind of background cost this
+// whole change exists to keep small.
+const SELF_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+// The most memory a node the fleet agent started may hold before it stops
+// itself.
+//
+// Deliberately *below* the `MemoryMax` on the Linux unit, so that on Linux the
+// node notices first and says why, and the kernel's cgroup killer is only ever
+// the backstop. On macOS there are no cgroups and this is the only ceiling there
+// is -- which is the entire reason it lives in the process rather than in the
+// unit file.
+//
+// Generous against what the work costs: scrollback is capped at 10,000 lines a
+// pane, so even a node hosting a dozen busy panes lands an order of magnitude
+// under this. The nodes that made this necessary were holding 598MB while
+// hosting nothing at all.
+const TETHERED_MEMORY_CEILING: u64 = 384 * 1024 * 1024;
+// Where any node, however it was started, says out loud how big it has become.
+//
+// Only tethered nodes are stopped at a ceiling. A session somebody is working in
+// is worth more than the memory it is holding, and killing it to save a machine
+// that is not actually short of memory would be the tool deciding it knows
+// better. Saying so is not.
+const MEMORY_WARN_AT: u64 = 256 * 1024 * 1024;
+// The node has to notice before the cgroup does, or it never gets to say why it
+// stopped and the kernel's killer becomes the whole explanation. Checked at
+// compile time, because the two numbers live in different files and the one that
+// would catch this at runtime is a log nobody reads.
+const _: () =
+    assert!(TETHERED_MEMORY_CEILING < (crate::daemon::MEMORY_MAX_MB as u64) * 1024 * 1024);
+const _: () = assert!(MEMORY_WARN_AT < TETHERED_MEMORY_CEILING);
 const MAX_FROZEN_SCROLLBACK_SESSIONS: usize = 8;
 const OUTBOUND_QUEUE: usize = 64;
 
@@ -491,7 +520,8 @@ fn run_socket_loop(
     // costs one vector compare per drain and no file write at all.
     let mut last_known_peers: Vec<crate::session_store::SessionPeer> = Vec::new();
     let mut last_peer_scan: Option<Instant> = None;
-    let mut last_supervisor_check: Option<Instant> = None;
+    let mut last_self_check: Option<Instant> = None;
+    let mut warned_about_size = false;
     let mut last_work = Instant::now();
     loop {
         let mut shutdown = false;
@@ -645,18 +675,37 @@ fn run_socket_loop(
         // and it produces no pane output at all — so a session sitting quiet,
         // which is the normal state of a machine you are not looking at, would
         // never record the peer that just arrived.
-        // A tethered node outlives nothing. Asked on its own timer rather than
-        // the peer scan's, because it is a question about the process table and
-        // the answer only changes once.
-        if let Some(supervisor) = supervisor
-            && supervisor_check_due(last_supervisor_check, drain_started)
-        {
-            last_supervisor_check = Some(drain_started);
-            if !supervisor.is_alive() {
+        // What the node knows about itself: who is watching it, and how big it
+        // has become. On its own timer rather than the peer scan's, because both
+        // are questions about the process table whose answers change slowly.
+        if self_check_due(last_self_check, drain_started) {
+            last_self_check = Some(drain_started);
+            // A tethered node outlives nothing.
+            if let Some(supervisor) = supervisor
+                && !supervisor.is_alive()
+            {
                 // Said out loud. A node that vanished without a word is how the
                 // last set of these went unexplained for twelve hours.
                 eprintln!("p2pmux node: the fleet agent that started this node is gone — stopping");
                 shutdown = true;
+            }
+            if let Some(held) = crate::agent_detect::process_memory(std::process::id()) {
+                let megabytes = held / (1024 * 1024);
+                if supervisor.is_some() && held > TETHERED_MEMORY_CEILING {
+                    eprintln!(
+                        "p2pmux node: holding {megabytes}MB, past the {}MB a fleet node is \
+                         allowed — stopping. The agent starts a fresh one.",
+                        TETHERED_MEMORY_CEILING / (1024 * 1024),
+                    );
+                    shutdown = true;
+                } else if held > MEMORY_WARN_AT && !warned_about_size {
+                    // Once. The point is that somebody reading a log can see it
+                    // coming, not that the log fills up with it.
+                    warned_about_size = true;
+                    eprintln!(
+                        "p2pmux node: holding {megabytes}MB, which is more than this should need"
+                    );
+                }
             }
         }
         if peer_scan_due(last_peer_scan, drain_started) {
@@ -973,8 +1022,8 @@ fn peer_scan_due(last_scan: Option<Instant>, now: Instant) -> bool {
     last_scan.is_none_or(|last| now.duration_since(last) >= PEER_SCAN_INTERVAL)
 }
 
-fn supervisor_check_due(last_check: Option<Instant>, now: Instant) -> bool {
-    last_check.is_none_or(|last| now.duration_since(last) >= SUPERVISOR_CHECK_INTERVAL)
+fn self_check_due(last_check: Option<Instant>, now: Instant) -> bool {
+    last_check.is_none_or(|last| now.duration_since(last) >= SELF_CHECK_INTERVAL)
 }
 
 fn socket_loop_backoff(
@@ -1845,6 +1894,58 @@ impl SharedLayoutNode {
 
 #[cfg(test)]
 mod tests {
+    /// Where cgroups do not exist, the ceiling has to live in the process.
+    ///
+    /// macOS has no memory controller for launchd to enforce, so the plist
+    /// cannot promise what the systemd unit does. A node that polices itself is
+    /// the only thing that works on both platforms -- and on Linux it is still
+    /// the better half of the pair, because it notices first and says why,
+    /// leaving the kernel's killer as a backstop rather than the explanation.
+    #[test]
+    fn a_fleet_node_stops_itself_before_the_kernel_has_to() {
+        // That the ceiling sits under the cgroup's, and the warning under the
+        // ceiling, is asserted at compile time where the constants are. What is
+        // left to check here is that the rule is applied to the right nodes.
+        let loop_source = include_str!("node.rs")
+            .split_once("fn run_socket_loop(")
+            .expect("the socket loop")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("the tests, which are not the loop")
+            .0;
+        assert!(
+            loop_source.contains("supervisor.is_some() && held > TETHERED_MEMORY_CEILING"),
+            "only a node nobody is sitting in front of may be stopped for its size"
+        );
+    }
+
+    /// A session somebody is working in is worth more than the memory it holds.
+    ///
+    /// Stopping one to save a machine that is not actually short of memory would
+    /// be the tool deciding it knows better than the person using it. Saying how
+    /// big it has got is not.
+    #[test]
+    fn a_session_somebody_started_is_told_about_rather_than_stopped() {
+        let loop_source = include_str!("node.rs")
+            .split_once("fn run_socket_loop(")
+            .expect("the socket loop")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("the tests")
+            .0;
+        let warn_arm = loop_source
+            .split_once("} else if held > MEMORY_WARN_AT")
+            .expect("the warning arm")
+            .1
+            .split_once('}')
+            .expect("the end of it")
+            .0;
+        assert!(
+            !warn_arm.contains("shutdown = true"),
+            "warning about a size must not also act on it: {warn_arm}"
+        );
+    }
+
     /// A node the fleet agent started must not outlive it.
     ///
     /// The nine that did on 2026-08-16 were reparented to PID 1 when the

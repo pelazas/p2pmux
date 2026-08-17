@@ -315,6 +315,25 @@ fn is_node_process(process: &ProcessSnapshot) -> bool {
 /// The command line is checked, not just the pid's existence, because pids are
 /// reused -- fast, on a machine building software -- and treating whatever now
 /// holds a dead node's pid as that node would keep a stale record forever.
+/// How much resident memory `pid` is holding, in bytes.
+///
+/// Asked of the operating system rather than tracked in the process, because
+/// what matters is the number a person would read in `top` — the one that ran to
+/// 598MB while every allocation inside the program looked reasonable.
+pub fn process_memory(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).map(sysinfo::Process::memory)
+}
+
 /// When `pid` started, as the operating system counts it, or `None` if there is
 /// no such process.
 ///

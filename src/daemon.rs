@@ -148,7 +148,7 @@ pub const SYSTEMD_UNIT_NAME: &str = "p2pmux-fleet.service";
 /// and a message gateway before it got to the p2pmux processes that had eaten
 /// the memory. Inside a limit, the cgroup's killer only ever chooses from the
 /// processes that are over it.
-const MEMORY_MAX_MB: u32 = 512;
+pub(crate) const MEMORY_MAX_MB: u32 = 512;
 /// Where the kernel starts reclaiming rather than killing. A leak crosses this
 /// first and gets slower, which is a symptom somebody can see coming.
 const MEMORY_HIGH_MB: u32 = 256;
