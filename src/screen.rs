@@ -435,7 +435,27 @@ impl HostScreen {
             .sequence
             .checked_add(1)
             .ok_or(ScreenError::SequenceExhausted)?;
+        // Read the text out before `set_size` truncates every visible row to the new
+        // width. Only a width change can lose anything, and only on the normal screen:
+        // an application drawing in the alternate screen owns the whole frame and
+        // repaints it on the resize, so replaying the old one would fight its redraw.
+        let reflow = (cols != self.parser.screen().size().1
+            && !self.parser.screen().alternate_screen())
+        .then(|| {
+            (
+                capture_visible_text(self.parser.screen()),
+                self.parser.screen().attributes_formatted(),
+            )
+        });
         self.parser.screen_mut().set_size(rows, cols);
+        if let Some((text, pen)) = reflow {
+            self.parser
+                .process(&reflow_payload(&text, rows, cols, &pen));
+            // Rows the replay pushed past the top are history now, and the monotonic
+            // end position has to count them or scrollback addressing drifts.
+            let (_, scrolled) = replay_extent(&text, rows, cols);
+            self.history_end = self.history_end.saturating_add(scrolled as u64);
+        }
         // Replaying the batch keeps the baseline in step everywhere except here: `set_size`
         // reflows against the retained row buffer, which the scrollback-free baseline does
         // not have. Rebuild it from the live visible state instead, exactly as the client
@@ -565,6 +585,223 @@ fn retained_scrollback_len(screen: &mut vt100::Screen) -> usize {
     let retained = screen.scrollback();
     screen.set_scrollback(restore);
     retained
+}
+
+/// One logical line of the visible grid, joined back across the soft wraps the
+/// old width imposed on it.
+struct LogicalLine {
+    /// Styled bytes that redraw the line's cells at whatever width they land on.
+    bytes: Vec<u8>,
+    /// Printable width in columns, so a replay's height can be predicted.
+    width: usize,
+}
+
+/// The visible grid as text that outlives a width change.
+struct VisibleText {
+    lines: Vec<LogicalLine>,
+    /// Which logical line the cursor sits on, and how far into it.
+    cursor: (usize, usize),
+}
+
+/// One cell's drawing attributes, compared to decide when to re-emit an SGR.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct CellStyle {
+    fgcolor: vt100::Color,
+    bgcolor: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl CellStyle {
+    fn of(cell: &vt100::Cell) -> Self {
+        Self {
+            fgcolor: cell.fgcolor(),
+            bgcolor: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    /// Writes the whole style rather than a diff against the previous one. A
+    /// resize is rare and the payload is thrown away immediately, so the few
+    /// extra bytes buy a function with no state to get wrong.
+    fn write(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[0");
+        for (enabled, code) in [
+            (self.bold, "1"),
+            (self.dim, "2"),
+            (self.italic, "3"),
+            (self.underline, "4"),
+            (self.inverse, "7"),
+        ] {
+            if enabled {
+                out.push(b';');
+                out.extend_from_slice(code.as_bytes());
+            }
+        }
+        out.extend_from_slice(color_params(self.fgcolor, 3).as_bytes());
+        out.extend_from_slice(color_params(self.bgcolor, 4).as_bytes());
+        out.push(b'm');
+    }
+}
+
+/// SGR parameters for one color, as a foreground (`base` 3) or background (`base` 4).
+fn color_params(color: vt100::Color, base: u8) -> String {
+    match color {
+        vt100::Color::Default => String::new(),
+        vt100::Color::Idx(index) if index < 8 => format!(";{}", base * 10 + index),
+        vt100::Color::Idx(index) if index < 16 => format!(";{}", base * 10 + 52 + index),
+        vt100::Color::Idx(index) => format!(";{base}8;5;{index}"),
+        vt100::Color::Rgb(red, green, blue) => format!(";{base}8;2;{red};{green};{blue}"),
+    }
+}
+
+/// Whether a cell puts anything on screen, and so has to survive a reflow.
+///
+/// A blank cell still counts when it carries a background or a decoration: that
+/// is a painted run, and trimming it would lose the paint.
+fn cell_is_painted(cell: &vt100::Cell) -> bool {
+    cell.has_contents()
+        || cell.bgcolor() != vt100::Color::Default
+        || cell.inverse()
+        || cell.underline()
+}
+
+/// One past the last painted column of `row`, so trailing blanks are not replayed.
+fn last_painted_column(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
+    (0..cols)
+        .rev()
+        .find(|col| screen.cell(row, *col).is_some_and(cell_is_painted))
+        .map_or(0, |col| col + 1)
+}
+
+/// Reads the visible grid as logical lines, before a resize truncates it.
+///
+/// `vt100::Screen::set_size` resizes every visible row with `Vec::resize`, which
+/// drops the cells past the new width outright — widening the pane afterwards
+/// leaves blanks where the text was. Joining the rows the old width wrapped, and
+/// replaying them once the grid has its new size, is what tmux, zellij and
+/// alacritty all do; this is the same idea expressed through `vt100`'s public API.
+fn capture_visible_text(screen: &vt100::Screen) -> VisibleText {
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let mut lines = Vec::new();
+    let mut cursor = (0, 0);
+    let mut row = 0;
+    while row < rows {
+        let start = row;
+        while row + 1 < rows && screen.row_wrapped(row) {
+            row += 1;
+        }
+        let end = row;
+        row += 1;
+        if (start..=end).contains(&cursor_row) {
+            cursor = (
+                lines.len(),
+                usize::from(cursor_row - start) * usize::from(cols) + usize::from(cursor_col),
+            );
+        }
+        lines.push(capture_logical_line(screen, start, end, cols));
+    }
+    // Blank rows under the last line are the grid's own padding, not text. Replaying
+    // them would scroll real content off the top the moment the text grows taller
+    // than the pane, so they are dropped -- except any the cursor is parked on.
+    let used = lines
+        .iter()
+        .rposition(|line| line.width > 0)
+        .map_or(0, |last| last + 1);
+    lines.truncate(used.max(cursor.0 + 1));
+    VisibleText { lines, cursor }
+}
+
+fn capture_logical_line(screen: &vt100::Screen, start: u16, end: u16, cols: u16) -> LogicalLine {
+    let mut bytes = Vec::new();
+    let mut width = 0;
+    let mut style = CellStyle::default();
+    let last = last_painted_column(screen, end, cols);
+    for row in start..=end {
+        let limit = if row == end { last } else { cols };
+        let mut col = 0;
+        while col < limit {
+            let Some(cell) = screen.cell(row, col) else {
+                break;
+            };
+            // The second half of a wide character carries no contents of its own;
+            // the character was already emitted with the cell that owns it.
+            if cell.is_wide_continuation() {
+                col += 1;
+                continue;
+            }
+            let cell_style = CellStyle::of(cell);
+            if cell_style != style {
+                cell_style.write(&mut bytes);
+                style = cell_style;
+            }
+            match cell.contents() {
+                "" => bytes.push(b' '),
+                contents => bytes.extend_from_slice(contents.as_bytes()),
+            }
+            let cell_width = 1 + u16::from(cell.is_wide());
+            width += usize::from(cell_width);
+            col += cell_width;
+        }
+    }
+    LogicalLine { bytes, width }
+}
+
+/// How many rows the replayed text occupies at `cols`, and how many of them
+/// scroll off the top of a `rows`-tall grid.
+fn replay_extent(text: &VisibleText, rows: u16, cols: u16) -> (usize, usize) {
+    let total: usize = text.lines.iter().map(|line| line_height(line, cols)).sum();
+    (total, total.saturating_sub(usize::from(rows)))
+}
+
+fn line_height(line: &LogicalLine, cols: u16) -> usize {
+    line.width.div_ceil(usize::from(cols)).max(1)
+}
+
+/// Where the cursor lands once the text has been laid out again at `cols`.
+fn replay_cursor(text: &VisibleText, rows: u16, cols: u16) -> (u16, u16) {
+    let (_, scrolled) = replay_extent(text, rows, cols);
+    let before: usize = text
+        .lines
+        .iter()
+        .take(text.cursor.0)
+        .map(|line| line_height(line, cols))
+        .sum();
+    let row = (before + text.cursor.1 / usize::from(cols)).saturating_sub(scrolled);
+    let col = text.cursor.1 % usize::from(cols);
+    (
+        row.min(usize::from(rows) - 1) as u16,
+        col.min(usize::from(cols) - 1) as u16,
+    )
+}
+
+/// The byte stream that redraws captured text into a freshly resized grid.
+///
+/// `pen` is the screen's own drawing attributes, restored at the end so the
+/// application's next write is styled the way it left off.
+fn reflow_payload(text: &VisibleText, rows: u16, cols: u16, pen: &[u8]) -> Vec<u8> {
+    // Clear with default attributes: erasing under a coloured pen would paint the
+    // whole grid in that background before a single cell is replayed.
+    let mut out = b"\x1b[m\x1b[H\x1b[2J".to_vec();
+    for (index, line) in text.lines.iter().enumerate() {
+        if index > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(&line.bytes);
+    }
+    out.extend_from_slice(b"\x1b[m");
+    let (row, col) = replay_cursor(text, rows, cols);
+    out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    out.extend_from_slice(pen);
+    out
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -889,6 +1126,101 @@ mod tests {
         assert_eq!(host.retained_scrollback(), clone_and_clamp(host.screen()));
     }
 
+    /// The visible grid read back with its soft wraps joined away.
+    fn unwrapped(host: &HostScreen) -> String {
+        host.screen().contents().replace('\n', "")
+    }
+
+    #[test]
+    /// A pane that narrows and widens again has to come back with its text.
+    ///
+    /// `vt100::Screen::set_size` resizes each visible row with `Vec::resize`, so before
+    /// the reflow the shrink dropped every cell past the new width and the widening
+    /// filled the gap with blanks -- the line came back as its first 40 characters.
+    fn a_narrower_pane_rewraps_its_text_instead_of_losing_it() {
+        let line = "abcdefghij".repeat(12);
+        let mut host = HostScreen::new(24, 100).expect("valid dimensions");
+        host.process_pty(line.as_bytes()).expect("processed");
+        assert!(unwrapped(&host).contains(&line));
+
+        host.resize(24, 40).expect("valid dimensions");
+        assert!(unwrapped(&host).contains(&line), "the shrink lost text");
+
+        host.resize(24, 100).expect("valid dimensions");
+        assert!(unwrapped(&host).contains(&line), "the widening lost text");
+    }
+
+    #[test]
+    /// Text taller than the pane after a shrink belongs in history, not in the bin.
+    fn a_shrink_that_outgrows_the_pane_scrolls_the_overflow_into_scrollback() {
+        let mut host = HostScreen::new(4, 60).expect("valid dimensions");
+        for index in 0..4 {
+            host.process_pty(format!("line{index} {}\r\n", "x".repeat(50)).as_bytes())
+                .expect("processed");
+        }
+        let (_, before_end) = host.history_metadata();
+        let before_retained = host.retained_scrollback();
+
+        // At 20 columns each of those lines needs three rows, so most of them cannot
+        // fit a four-row pane and have to move up into history rather than vanish.
+        host.resize(4, 20).expect("valid dimensions");
+        let (total_rows, end) = host.history_metadata();
+        assert!(end > before_end, "the scrolled rows never reached history");
+        assert!(total_rows > 0, "expected retained history after the reflow");
+        assert_eq!(
+            host.retained_scrollback(),
+            before_retained + (end - before_end) as usize,
+            "history and its monotonic end disagree about the reflow",
+        );
+    }
+
+    #[test]
+    fn a_reflow_keeps_the_colours_and_puts_the_cursor_back_on_its_character() {
+        let mut host = HostScreen::new(10, 20).expect("valid dimensions");
+        // 37 printable characters: two rows at 20 columns, one at 40.
+        host.process_pty(b"\x1b[31mred\x1b[m plain and then a much longer tail")
+            .expect("processed");
+        assert_eq!(host.screen().cursor_position(), (1, 17));
+
+        host.resize(10, 40).expect("valid dimensions");
+        assert_eq!(host.screen().cursor_position(), (0, 37));
+        assert_eq!(
+            host.screen().cell(0, 0).map(vt100::Cell::fgcolor),
+            Some(vt100::Color::Idx(1)),
+            "the reflow dropped the styling it replayed",
+        );
+        assert!(unwrapped(&host).contains("red plain and then a much longer tail"));
+    }
+
+    #[test]
+    /// An application in the alternate screen owns the whole frame and repaints it
+    /// when it sees the new size, so the columns a shrink takes are its to redraw.
+    /// Replaying the old frame instead would only fight that redraw.
+    fn the_alternate_screen_is_left_for_its_application_to_repaint() {
+        let mut host = HostScreen::new(10, 20).expect("valid dimensions");
+        host.process_pty(b"\x1b[?1049h").expect("processed");
+        host.process_pty(b"a full width row of text")
+            .expect("processed");
+
+        host.resize(10, 10).expect("valid dimensions");
+        assert!(
+            !unwrapped(&host).contains("a full width row of text"),
+            "the alternate screen was reflowed instead of left alone",
+        );
+    }
+
+    #[test]
+    fn a_resize_that_only_changes_rows_leaves_the_text_where_it_was() {
+        let mut host = HostScreen::new(10, 20).expect("valid dimensions");
+        host.process_pty(b"first\r\nsecond").expect("processed");
+        let drawn = host.screen().contents();
+        let cursor = host.screen().cursor_position();
+
+        host.resize(20, 20).expect("valid dimensions");
+        assert_eq!(host.screen().contents(), drawn);
+        assert_eq!(host.screen().cursor_position(), cursor);
+    }
+
     #[test]
     fn scrollback_free_baseline_produces_the_same_deltas_as_a_cloned_screen() {
         let mut host = HostScreen::new(24, 80).expect("valid dimensions");
@@ -1094,7 +1426,9 @@ mod tests {
 
         screen.resize(2, 10).unwrap();
         let (after_total, after) = screen.visual_scrollback(4, 4096);
-        assert_eq!(after_total, before_total);
+        // Not equal: rewrapping the visible rows at ten columns makes them taller than
+        // the pane, and the rows pushed past the top join history like any other scroll.
+        assert!(after_total >= before_total);
         assert_eq!(after.len(), 4);
     }
 
