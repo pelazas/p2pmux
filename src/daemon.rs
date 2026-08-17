@@ -276,11 +276,27 @@ impl ServiceUnit {
     /// somebody is typing in stutter, while a weight only yields when something
     /// else on the machine wants the processor. It is the same intent as
     /// launchd's `ProcessType=Background`.
+    ///
+    /// `StartLimitIntervalSec` and `StartLimitBurst` are `[Unit]` keys, not
+    /// `[Service]` ones — systemd moved them in v229 and logs `Unknown key
+    /// name … in section 'Service', ignoring` for the old spelling. Written
+    /// under `[Service]` the ceiling did not exist, which is the failure this
+    /// unit's own `MemoryMax` note calls worse than no limit at all.
+    ///
+    /// It matters most where it is least visible. On systemd v254 and newer the
+    /// escalating `RestartSteps`/`RestartMaxDelaySec` backoff reaches five
+    /// minutes on its own, so ten starts per five minutes is a ceiling nothing
+    /// ordinarily touches. Below v254 those two keys are themselves ignored and
+    /// every restart waits a flat `RestartSec` — twenty starts in the same
+    /// window — so on exactly the systems with no backoff, this is the only
+    /// thing that stops a crash loop.
     pub fn systemd_unit(&self) -> String {
         format!(
             "[Unit]\n\
              Description=p2pmux fleet agent\n\
              After=network-online.target\n\
+             StartLimitIntervalSec=300\n\
+             StartLimitBurst=10\n\
              \n\
              [Service]\n\
              Type=simple\n\
@@ -289,8 +305,6 @@ impl ServiceUnit {
              RestartSec={restart_sec}\n\
              RestartSteps=6\n\
              RestartMaxDelaySec={restart_max}\n\
-             StartLimitIntervalSec=300\n\
-             StartLimitBurst=10\n\
              MemoryHigh={memory_high}M\n\
              MemoryMax={memory_max}M\n\
              TasksMax={tasks_max}\n\
@@ -1011,8 +1025,6 @@ mod tests {
             )),
             "a crash loop should back off the same way a failed join does: {systemd}"
         );
-        assert!(systemd.contains("StartLimitBurst="), "{systemd}");
-
         let plist = unit().launchd_plist();
         assert!(
             plist.contains(&format!(
@@ -1021,6 +1033,79 @@ mod tests {
             )),
             "launchd throttles at 10s by default, which is faster than the tick: {plist}"
         );
+    }
+
+    /// Which `[section]` each key of the generated unit was written under.
+    fn systemd_sections() -> Vec<(String, String)> {
+        let unit = unit().systemd_unit();
+        let mut section = String::new();
+        let mut placed = Vec::new();
+        for line in unit.lines().map(str::trim) {
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = name.to_owned();
+            } else if let Some((key, _)) = line.split_once('=') {
+                placed.push((section.clone(), key.to_owned()));
+            }
+        }
+        placed
+    }
+
+    /// systemd ignores a key written under the wrong section, and says so only
+    /// in the journal of whoever installed it.
+    ///
+    /// `StartLimitIntervalSec` and `StartLimitBurst` sat under `[Service]`,
+    /// where systemd has not read them since v229. Both were accepted by the
+    /// old assertion — it asked whether the text appeared anywhere in the file,
+    /// which is true of a key in a section that ignores it. So the rate limit
+    /// the 16 Aug leak fix leaned on was never enforced on any machine, and
+    /// every `daemon install` logged `Unknown key name 'StartLimitIntervalSec'
+    /// in section 'Service', ignoring`.
+    ///
+    /// Asserted as a whole table rather than for those two keys: the next key
+    /// added to this unit is the one that will be misplaced, and it should fail
+    /// here rather than in somebody's journal.
+    #[test]
+    fn every_unit_key_is_written_under_the_section_systemd_reads_it_from() {
+        // From systemd.unit(5), systemd.service(5) and systemd.resource-control(5).
+        let expected = [
+            ("Description", "Unit"),
+            ("After", "Unit"),
+            ("StartLimitIntervalSec", "Unit"),
+            ("StartLimitBurst", "Unit"),
+            ("Type", "Service"),
+            ("ExecStart", "Service"),
+            ("Restart", "Service"),
+            ("RestartSec", "Service"),
+            ("RestartSteps", "Service"),
+            ("RestartMaxDelaySec", "Service"),
+            ("MemoryHigh", "Service"),
+            ("MemoryMax", "Service"),
+            ("TasksMax", "Service"),
+            ("CPUWeight", "Service"),
+            ("OOMPolicy", "Service"),
+            ("KillMode", "Service"),
+            ("TimeoutStopSec", "Service"),
+            ("WantedBy", "Install"),
+        ];
+        let placed = systemd_sections();
+        for (section, key) in &placed {
+            let Some((_, wanted)) = expected.iter().find(|(name, _)| name == key) else {
+                panic!(
+                    "{key} is new to this unit; add it to the table with the section \
+                     systemd.unit(5) says it belongs in"
+                );
+            };
+            assert_eq!(
+                section, wanted,
+                "systemd reads {key} from [{wanted}] and ignores it under [{section}]"
+            );
+        }
+        for (key, _) in expected {
+            assert!(
+                placed.iter().any(|(_, placed)| placed == key),
+                "{key} is in the table but no longer in the unit"
+            );
+        }
     }
 
     /// A service that resolved p2pmux from `PATH` would start whatever was
