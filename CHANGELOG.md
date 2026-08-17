@@ -11,6 +11,19 @@ enrolment token — and a peer on the wrong side of it is refused rather than ha
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+An upgrade no longer leaves the fleet agent unable to start anything.
+
+A node is launched by re-running the p2pmux binary, so an agent whose binary was replaced
+underneath it — which is what every upgrade does — keeps executing an image that is no longer on
+disk, and every launch fails with `No such file or directory` for as long as the process lives.
+`Restart=` never fires, because nothing crashes. This is what set the v0.1.11 incident off in the
+first place: the binary was replaced at 12:45:52 and the surviving agent made 1014 doomed attempts
+over the next four hours. It turned up again while releasing v0.1.11, when `brew upgrade` removed
+the directory the running agent was executing from. The agent now notices and stands down, and the
+service manager starts it again from whatever is at that path now.
+
 ## v0.1.11 — 2026-08-17
 
 The fleet agent stops behaving like something you would want to uninstall.
