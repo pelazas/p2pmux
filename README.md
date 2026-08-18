@@ -17,14 +17,22 @@
   <a href="#install">Install</a> ·
   <a href="./docs/USAGE.md">Usage</a> ·
   <a href="#trust">Trust model</a> ·
+  <a href="#faq">FAQ</a> ·
   <a href="./CONTRIBUTING.md">Contributing</a>
 </p>
 
 </div>
 
-**Everyone brings their own terminal.** Every pane runs on the machine of whoever opened it — their
-toolchain, their libraries, their env, their AI subscription. Hop into a teammate's pane and you get
-a real shell on *their* machine, running *their* setup, without ever holding their keys.
+Peer-to-peer terminal multiplexer for macOS and Linux. **Everyone brings their own
+terminal.** Every pane runs on the machine of whoever opened it — their toolchain,
+their libraries, their env, their AI subscription. Hop into a teammate's pane and you
+get a real shell on *their* machine, running *their* setup, without ever holding their
+keys.
+
+**A shared control surface, not a shared computer.** Your processes and credential
+files never leave your machine. But whoever holds a pane has a real shell on the
+machine hosting it — both halves are true at once, and [the trust model](#trust) says
+exactly what that means.
 
 <p align="center">
   <img src="docs/assets/demo.gif" width="820"
@@ -32,14 +40,10 @@ a real shell on *their* machine, running *their* setup, without ever holding the
 </p>
 
 <p align="center">
-  <em>userB joins with the ten-character code, opens a pane of their own, then takes control of
-  userA's pane and runs a command in it. Both windows are real clients; the pane titles say who
-  hosts what.</em>
+  <em>userB joins with the ten-character code, opens a pane of their own, then takes
+  control of userA's pane and runs a command in it. Both windows are real clients;
+  the pane titles say who hosts what.</em>
 </p>
-
-**A shared control surface, not a shared computer.** Your processes and credential files never
-leave your machine. But whoever holds a pane has a real shell on the machine hosting it — both
-halves are true at once, and [the trust model](#trust) says exactly what that means.
 
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
@@ -48,55 +52,81 @@ p2pmux                       # you host; Ctrl+S shows the line to send
 p2pmux join 4KP7Q-M2XRW      # them, on their own machine
 ```
 
-`Ctrl+S` gives you that second line, ready to paste into a chat window. Your teammate runs it on
-their own machine, on their own network, and lands in your grid. Ten characters, nothing else to
-set up on either side. A Mac and a Linux box work the same session; nobody has to match anybody.
+`Ctrl+S` gives you that second line, ready to paste into a chat window. Your teammate
+runs it on their own machine, on their own network, and lands in your grid. A Mac and
+a Linux box work the same session; nobody has to match anybody.
+
+No second person yet? Two terminals on this machine is enough to see the grid:
+
+```sh
+p2pmux create                # terminal 1; Ctrl+S copies the join line
+p2pmux join 4KP7Q-M2XRW      # terminal 2
+```
+
+Two machines you already own: `p2pmux pair` on the new one, then `p2pmux pair <code>`
+on this one. After that, bare `p2pmux` rejoins on either with no code typed.
+[Your machines](#your-machines).
+
+The join code is a password. Anyone who has it can take a real shell on every pane
+they control. It is not a sandbox. [Read the trust model](#trust) before you send it.
 
 ## Why it exists
 
-Every other way to share a terminal collapses onto one box. SSH, tmux, tmate, screen sharing, cloud
-dev environments — one machine runs everything, one person's toolchain is the only one in the room,
-and one person's keys pay for it. Whoever joins arrives empty-handed.
+Every other way to share a terminal collapses onto one box. SSH, tmux, tmate, screen
+sharing, cloud workspaces — one machine runs the processes, one account's toolchain
+is the only one in the room, and one person's keys pay for it. Whoever joins arrives
+empty-handed.
 
-p2pmux keeps the machines separate and joins the surface instead. You bring your laptop, your
-dotfiles, your language versions and your Claude subscription. Your teammate brings theirs. Both
-setups are live in the same grid at once, and either of you can reach into the other's.
+p2pmux keeps the machines separate and joins the surface instead. You bring your
+laptop, your dotfiles, your language versions and your Claude subscription. Your
+teammate brings theirs. Both setups are live in the same grid at once, and either of
+you can reach into the other's.
 
-Concretely: your teammate opens a pane on your machine and runs Claude Code on your subscription —
-they drive it, you pay for it, they never see the key. The pane beside it is on their box, with
-their Python env and their GPU, and you drive that one without installing a thing.
+| | Where the process runs | Credentials used there | How people join |
+|---|---|---|---|
+| SSH + tmux | One tmux host | An account on that host | SSH |
+| tmate | One shared-session host | That host's account | tmate link |
+| Screen share / cloud workspace | Shared machine or workspace | Varies by product | Share or invite |
+| **p2pmux** | Each pane owner's machine | That pane owner's account | 10-character code |
 
-**That is all it does.** It is not a cloud VM, not a remote box everyone's processes run on, and
-not an agent orchestration platform.
+Concretely: your teammate opens a pane on your machine and runs Claude Code on your
+subscription — they drive it, you pay for it, they never see the key. The pane beside
+it is on their box, with their Python env and their GPU, and you drive that one
+without installing a thing.
+
+**That is all it does.** It is not a cloud VM, not a remote box everyone's processes
+run on, and not an agent orchestration platform.
 
 ## What you get
 
-- Every pane is a PTY on its owner's machine — shell, Docker, an agent — with that machine's PATH,
-  env, and subscriptions. Host and guest are **per pane**, not per person.
-- Take control of any free pane by typing into it, or hand yours over. Active typing is protected,
-  so there is no forced takeover.
-- Zellij-like tabs, panes, and nested splits, shared live: up to 8 members, 9 tabs, 8 panes a tab.
-- Presence — a color per member, showing who is on which tab and watching which pane.
-- The session outlives the machine that started it. If the coordinator's laptop closes, every pane
-  on every other machine keeps running and keeps taking input; only structural edits pause, and
-  after five minutes the earliest-joined survivor takes the role over.
-- End-to-end encrypted peer-to-peer streaming, over an iroh relay when NAT requires it. The tab bar
-  says which you got: `direct 55ms` or `relayed 120ms`.
-- One ten-character join code, good for 6 hours, and nothing else to exchange — backed by a ticket
-  that contacts no service at all, for when our rendezvous is down.
-- An inbox — `Ctrl+O` from anywhere, and where bare `p2pmux` lands when it rejoins a session you
-  already have — listing every Claude Code, Codex, Cursor, Pi, OpenCode, Hermes and OpenClaw agent
-  running on every machine in the session, sorted by which one is blocking you.
-  Press Enter on a row and you are typing in that terminal; `Ctrl+O` brings you back. `needs you`
-  comes only from the agent's own hooks, never from guessing at output timing: run
-  `p2pmux setup` once, and `p2pmux doctor` to check. An agent with no hooks says
-  *state unknown — no hooks* on its own row rather than being guessed about.
-- `p2pmux pair` associates two machines you own, once and permanently. After that, bare `p2pmux`
-  rejoins on either with no code typed, and `p2pmux machines` says which of them are awake.
-  For a machine with nobody sitting at it, `p2pmux enroll` prints a revocable token to paste into
-  a provisioning script, and the VM joins your fleet unattended.
-- What your machines may start on one of them is written on that machine: `p2pmux work allow`,
-  matched in full, default closed. Being in your fleet grants nothing on its own.
+- Every pane is a PTY on its owner's machine — shell, Docker, an agent — with that
+  machine's PATH, env, and subscriptions. Host and guest are **per pane**, not per
+  person.
+- Take control of any free pane by typing into it, or hand yours over. Active typing
+  is protected, so there is no forced takeover.
+- Zellij-like tabs, panes, and nested splits, shared live, with presence: up to 8
+  members, 9 tabs, 8 panes a tab.
+- End-to-end encrypted peer-to-peer streaming, over an iroh relay when NAT requires
+  it. The tab bar says which you got: `direct 55ms` or `relayed 120ms`.
+- If the coordinator's laptop closes, panes on every *other* machine keep running and
+  keep taking input. Layout changes and new joins pause; after five minutes the
+  earliest-joined survivor takes the role over. Panes on the machine that left stay
+  as unavailable placeholders until it comes back.
+- One ten-character join code, refreshed while the session is live and gone within
+  six hours of the last refresh — backed by a ticket that contacts no service at all,
+  for when our rendezvous is down.
+
+### Inbox
+
+Bare `p2pmux` opens the inbox when it rejoins a session you already have — and
+`Ctrl+O` opens it from anywhere. It lists every Claude Code, Codex, Cursor, Pi,
+OpenCode, Hermes and OpenClaw agent running on every machine in the session, sorted
+by which one is blocking you. Press Enter on a row and you are typing in that
+terminal; `Ctrl+O` brings you back.
+
+`needs you` comes only from the agent's own hooks, never from guessing at output
+timing. Run `p2pmux setup` once, and `p2pmux doctor` to check. An agent with no hooks
+says *state unknown — no hooks* on its own row rather than being guessed about.
 
 <p align="center">
   <a href="docs/assets/workflow.mp4">
@@ -106,43 +136,85 @@ not an agent orchestration platform.
 </p>
 
 <p align="center">
-  <em><a href="docs/assets/workflow.mp4">Ninety seconds, three machines</a>: a MacBook and two
-  DigitalOcean droplets share one session, an <code>opencode</code> agent is started from the
-  laptop on each droplet, and the inbox says which of them is blocking a human. Recorded live by
-  <a href="scripts/demo/record_workflow.py"><code>scripts/demo/record_workflow.py</code></a>.</em>
+  <em><a href="docs/assets/workflow.mp4">Ninety seconds, three machines</a>: a
+  MacBook and two DigitalOcean droplets share one session, an
+  <code>opencode</code> agent is started from the laptop on each droplet, and the
+  inbox says which of them is blocking a human.</em>
 </p>
 
-## Status
+### Your machines
 
-**Early, but real.** Sessions run between machines on different networks and different continents,
-on macOS and Linux, both architectures. Claude Code and OpenCode report their own state through
-hooks; Codex, Cursor, Pi, Hermes and OpenClaw are detected but have no hooks yet, so their rows say
-so rather than guessing. A coordinator that dies no longer ends the session.
+`p2pmux pair` on the new machine prints a code; `p2pmux pair <code>` on one you
+already own consumes it. The code lasts ten minutes and admits one machine.
+`p2pmux machines` then says which of them are awake.
 
-Version history and upgrade notes are in [CHANGELOG.md](./CHANGELOG.md). Peers must be within one
-minor protocol pin of each other — the changelog says where that pin last moved.
+A machine with nobody sitting at it is a second step. Pair two machines by hand
+first — `p2pmux enroll` cannot start a fleet on its own — then `p2pmux enroll`
+prints a revocable token to paste into a provisioning script. On that box,
+`p2pmux daemon install` is what brings it back after a reboot.
+
+What your machines may start on one of them is written on that machine:
+`p2pmux work allow <command>` matches the full command; bare `p2pmux work allow`
+permits a login shell. Default closed. Being in your fleet grants nothing on its
+own.
+
+## Trust
+
+A p2pmux session is a **fully trusted shared shell**. Anyone with the join code or
+ticket can see every pane and can obtain interactive control of the terminals in it
+— run commands, read output, touch any file that user account can touch.
+
+Processes and credential *files* stay on the pane host's machine and are never
+uploaded to peers. That is a real boundary, and it is the point of the design. It is
+**not** a sandbox: a controller can still use your credentials, or print one to the
+screen, through the shell you handed them.
+
+So: treat the code like a password, and share it only with people you would hand an
+unlocked laptop to. For anyone else, use a separate low-privilege account and keep
+production credentials out of shared panes.
+
+The longer version is at [p2pmux.com/trust](https://p2pmux.com/trust).
 
 ## Install
+
+### Install script
 
 ```sh
 curl -fsSL https://p2pmux.com/install.sh | sh
 ```
 
-macOS and Linux, Apple Silicon, Intel and arm64. The script fetches a binary and its SHA256 from
-GitHub Releases and checks the hash before installing. It is served as plain text so you can read
-it first.
+macOS and Linux, x86_64 and arm64 (Intel and Apple Silicon). The script fetches a
+binary and its SHA256 from GitHub Releases and checks the hash before installing.
+It is served as plain text, so you can [read it in a browser](https://p2pmux.com/install.sh)
+first — the binaries never come from this domain, only from GitHub.
 
-If you would rather not run an installer at all, it is [on crates.io](https://crates.io/crates/p2pmux):
+### Homebrew
+
+```sh
+brew tap pelazas/tap
+brew trust pelazas/tap
+brew install p2pmux
+```
+
+Homebrew 6 will not load a formula from a third-party tap until you trust it, so the
+middle line is not optional there. On Homebrew 5 that command does not exist — skip
+it.
+
+### From source
 
 ```sh
 cargo install p2pmux --locked
 ```
 
-That path builds from source and needs **Rust 1.91 or newer** — iroh 1.0 sets the floor, and an
-older toolchain refuses the lockfile rather than building something subtly different.
+That path builds from source and needs **Rust 1.91 or newer** — iroh 1.0 sets the
+floor, and an older toolchain refuses the lockfile rather than building something
+subtly different.
 
-Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up. A musl system
-has to build from source.
+### Platforms
+
+- macOS and Linux; Windows is not supported.
+- Linux builds link glibc 2.35 or newer — Ubuntu 22.04, Debian 12, Fedora 36 and up.
+- A musl system has to build from source.
 
 Updating is however you installed:
 
@@ -152,36 +224,46 @@ curl -fsSL https://p2pmux.com/install.sh | sh                        # the insta
 cargo install p2pmux --locked --force                                # from source
 ```
 
-`p2pmux --version` says what you are running. Sessions already running keep the binary they
-started with — the node is a long-lived process — so `p2pmux kill <name>` and start again to pick
-a new version up.
+`p2pmux --version` says what you are running. Sessions already running keep the
+binary they started with — the node is a long-lived process — so `p2pmux kill <name>`
+and start again to pick a new version up.
 
-## Trust
+## Status
 
-A p2pmux session is a **fully trusted shared shell**. Anyone with the join code or ticket can see
-every pane and can obtain interactive control of the terminals in it — run commands, read output,
-touch any file that user account can touch.
+**Early, but real.** Sessions run between machines on different networks and
+different continents, on macOS and Linux, both architectures. Claude Code and
+OpenCode report their own state through hooks; Codex, Cursor, Pi, Hermes and
+OpenClaw are detected but have no hooks yet, so their rows say so rather than
+guessing. A coordinator that dies no longer ends the session.
 
-Processes and credential *files* stay on the pane host's machine and are never uploaded to peers.
-That is a real boundary, and it is the point of the design. It is **not** a sandbox: a controller
-can still use your credentials, or print one to the screen, through the shell you handed them.
+Version history and upgrade notes are in [CHANGELOG.md](./CHANGELOG.md). Peers must
+share a protocol pin — the changelog says [which releases can join each
+other](./CHANGELOG.md#compatibility).
 
-So: treat the code like a password, and share it only with people you would hand an unlocked
-laptop to. For anyone else, use a separate low-privilege account and keep production credentials
-out of shared panes.
+## FAQ
 
-## Using it
+**Is this a sandbox?**
+No. A p2pmux session is a fully trusted shared shell. Treat the join code like a
+password. [Trust model](#trust).
 
-Run `p2pmux` with no arguments and you end up in a session: a new one on a machine that has none,
-or the one your machines share once you have paired. A brand-new session opens on its own terminal
-rather than the inbox, because a session a moment old has one pane and no agents to list. `Ctrl+O`
-opens the inbox from anywhere, including from inside a live terminal; `Ctrl+A` does the same, for
-the muscle memory the old agents overlay built. `Ctrl+S` shares, `Ctrl+P` is pane mode, `Ctrl+T` is tab mode, and `Ctrl+Q`
-asks whether to detach — leaving the session running — or to end it. `p2pmux --resume` brings back
-a specific session by name.
+**Do I need a second person?**
+No. `p2pmux create` in one terminal and `p2pmux join <code>` in another is enough to
+see the grid. Two machines you own: `p2pmux pair`.
 
-Full walkthrough — keys, control leases, presence, mouse, scrollback, agent hooks and every config
-key — is in [docs/USAGE.md](./docs/USAGE.md).
+**Can p2pmux.com see my terminal?**
+Not the contents. The rendezvous service stores an opaque handle and a sealed blob.
+Pane streams travel peer-to-peer, or through an iroh relay when NAT requires it;
+the tab bar says which. We do not run that relay.
+
+**Does it work on Windows?**
+Not yet. macOS and Linux only.
+
+**They cannot join / versions disagree?**
+Everyone in a session has to share a protocol pin. Run `p2pmux --version` on both
+machines and check [CHANGELOG.md](./CHANGELOG.md#compatibility).
+
+Keys, control leases, presence, mouse, scrollback, agent hooks and every config key
+are in [docs/USAGE.md](./docs/USAGE.md).
 
 ## Docs
 
@@ -189,14 +271,13 @@ key — is in [docs/USAGE.md](./docs/USAGE.md).
 |-----|-------------|
 | [docs/USAGE.md](./docs/USAGE.md) | Everything you can do once it is running |
 | [CHANGELOG.md](./CHANGELOG.md) | What changed in each release, and which versions interoperate |
-| [docs/PRODUCT.md](./docs/PRODUCT.md) | Vision, is/isn't, why it matters |
-| [docs/MVP_DESIGN.md](./docs/MVP_DESIGN.md) | **Locked** MVP design (source of truth) |
-| [docs/SPIKE_PLAN.md](./docs/SPIKE_PLAN.md) | Build order / spikes |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | Bug reports, build, and what gets merged |
+| [p2pmux.com/trust](https://p2pmux.com/trust) | What a join code grants, and what rendezvous can see |
 
 Built in Rust with ratatui, portable-pty, vt100, and iroh. macOS and Linux.
 
-Found a rough edge? Please open an issue — a specific report of what broke is the most useful
-thing anyone can send right now.
+Found a rough edge? Please open an issue — a specific report of what broke is the
+most useful thing anyone can send right now.
 
 ## License
 
