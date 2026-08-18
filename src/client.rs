@@ -119,6 +119,16 @@ fn take_matching_pending(
     pending.remove(&pane_id)
 }
 
+/// Consume only the reply the current selection asked for. A later drag can
+/// finish before an earlier node reply, and that older text must not replace it.
+fn take_matching_selection_copy(pending: &mut Option<u64>, request_id: u64) -> bool {
+    if *pending != Some(request_id) {
+        return false;
+    }
+    *pending = None;
+    true
+}
+
 /// Give up on a pane's history and put it back at its live edge.
 ///
 /// The node answers with no window for a pane it does not host, for one on the
@@ -319,8 +329,11 @@ pub fn run_on(
             rows: initial_rows,
         },
     )?;
-    let generation = match read_message(&mut reader)? {
-        Some(NodeMessage::AttachAccepted { generation }) => generation,
+    let (generation, selection_copy) = match read_message(&mut reader)? {
+        Some(NodeMessage::AttachAccepted {
+            generation,
+            selection_copy,
+        }) => (generation, selection_copy),
         Some(NodeMessage::AttachRejected { reason }) => return Err(AttachRejected(reason).into()),
         _ => return Err(io::Error::other("node did not accept attachment").into()),
     };
@@ -346,6 +359,8 @@ pub fn run_on(
     // instead of one per notch.
     let mut desired_scroll: BTreeMap<u64, usize> = BTreeMap::new();
     let mut next_scrollback_request_id = 1_u64;
+    let mut next_selection_copy_request_id = 1_u64;
+    let mut pending_selection_copy = None;
     let mut copied_lines = None;
     let mut footer_notice = None;
     let mut link_summary: Option<String> = None;
@@ -598,6 +613,31 @@ pub fn run_on(
                                 )?;
                             }
                         }
+                    }
+                    NodeMessage::SelectionCopy {
+                        request_id,
+                        text,
+                        unavailable,
+                    } => {
+                        if !take_matching_selection_copy(&mut pending_selection_copy, request_id) {
+                            continue;
+                        }
+                        if let Some(text) = text {
+                            match copy_selection_to_clipboard(&text) {
+                                Ok(lines) => {
+                                    copied_lines = Some(lines);
+                                    footer_notice = None;
+                                }
+                                Err(error) => {
+                                    copied_lines = None;
+                                    footer_notice = Some(format!("clipboard copy failed: {error}"));
+                                }
+                            }
+                        } else if let Some(unavailable) = unavailable {
+                            copied_lines = None;
+                            footer_notice = Some(unavailable);
+                        }
+                        dirty = true;
                     }
                     NodeMessage::Leases { leases } => {
                         if let Some(view) = tui.as_mut() {
@@ -953,7 +993,38 @@ pub fn run_on(
                     }
                     send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
                     if handling.copy_selection_requested {
-                        copied_lines = copy_attach_selection(tui, &screens, &history);
+                        if selection_copy {
+                            if let Some((
+                                pane_id,
+                                anchor_scrollback,
+                                anchor_row,
+                                anchor_col,
+                                cursor_scrollback,
+                                cursor_row,
+                                cursor_col,
+                            )) = tui.selection_copy_coordinates()
+                            {
+                                let request_id = next_selection_copy_request_id;
+                                next_selection_copy_request_id =
+                                    next_selection_copy_request_id.wrapping_add(1).max(1);
+                                pending_selection_copy = Some(request_id);
+                                write_message(
+                                    &mut stream,
+                                    &ClientMessage::SelectionCopy {
+                                        pane_id,
+                                        request_id,
+                                        anchor_scrollback,
+                                        anchor_row,
+                                        anchor_col,
+                                        cursor_scrollback,
+                                        cursor_row,
+                                        cursor_col,
+                                    },
+                                )?;
+                            }
+                        } else {
+                            copied_lines = copy_attach_selection(tui, &screens, &history);
+                        }
                     }
                 }
                 dirty = true;
@@ -1815,6 +1886,16 @@ mod tests {
         assert!(pending.is_empty());
         // The answer is claimed once; a duplicate must not re-apply it.
         assert!(take_matching_pending(&mut pending, 1, 4).is_none());
+    }
+
+    #[test]
+    fn a_stale_selection_reply_cannot_replace_the_newer_drag() {
+        let mut pending = Some(4);
+
+        assert!(!take_matching_selection_copy(&mut pending, 3));
+        assert_eq!(pending, Some(4));
+        assert!(take_matching_selection_copy(&mut pending, 4));
+        assert_eq!(pending, None);
     }
 
     /// A burst has to accumulate. Stepping from the visible offset made every notch ask

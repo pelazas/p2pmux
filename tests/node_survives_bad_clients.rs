@@ -234,7 +234,7 @@ fn attach(socket: &std::path::Path) -> (UnixStream, BufReader<UnixStream>, u64) 
     send(&mut stream, &ClientMessage::Hello { cols: 80, rows: 24 });
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let generation = match receive(&mut reader) {
-        NodeMessage::AttachAccepted { generation } => generation,
+        NodeMessage::AttachAccepted { generation, .. } => generation,
         message => panic!("unexpected attach response: {message:?}"),
     };
     (stream, reader, generation)

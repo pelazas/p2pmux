@@ -321,6 +321,23 @@ impl MultiPaneTui {
         self.selection().map(|selection| selection.pane_id)
     }
 
+    /// Scalar selection ends for the local node protocol. The node rebuilds
+    /// its private UI type before reading its authoritative scrollback.
+    pub(crate) fn selection_copy_coordinates(
+        &self,
+    ) -> Option<(PaneId, u64, u16, u16, u64, u16, u16)> {
+        let selection = self.selection()?;
+        Some((
+            selection.pane_id,
+            selection.anchor.scrollback as u64,
+            selection.anchor.cell.row,
+            selection.anchor.cell.col,
+            selection.cursor.scrollback as u64,
+            selection.cursor.cell.row,
+            selection.cursor.cell.col,
+        ))
+    }
+
     /// The selected text, read from whichever views the caller can supply.
     ///
     /// `view_at` answers "the pane, scrolled back this many rows". A selection

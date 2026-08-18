@@ -130,6 +130,22 @@ const _: () = assert!(SCROLLBACK_ALTERNATE_SCREEN.len() <= MAX_FOOTER_NOTICE_CHA
 const _: () = assert!(SCROLLBACK_NOT_OURS.len() <= MAX_FOOTER_NOTICE_CHARS);
 const OUTBOUND_QUEUE: usize = 64;
 
+fn selection_copy_reply(request_id: u64, selection: Result<Option<String>, ()>) -> NodeMessage {
+    let (text, unavailable) = match selection {
+        Ok(Some(text)) if crate::local_ipc::selection_copy_fits_frame(request_id, &text) => {
+            (Some(text), None)
+        }
+        Ok(Some(_)) => (None, Some("selection too large to copy".into())),
+        Ok(None) => (None, None),
+        Err(()) => (None, Some(SCROLLBACK_NOT_OURS.into())),
+    };
+    NodeMessage::SelectionCopy {
+        request_id,
+        text,
+        unavailable,
+    }
+}
+
 pub struct SharedLayoutNode {
     runtime: SharedLayoutRuntime,
 }
@@ -927,6 +943,31 @@ fn run_socket_loop(
                     });
                     did_work = true;
                 }
+                Ok(Some(ClientMessage::SelectionCopy {
+                    pane_id,
+                    request_id,
+                    anchor_scrollback,
+                    anchor_row,
+                    anchor_col,
+                    cursor_scrollback,
+                    cursor_row,
+                    cursor_col,
+                })) => {
+                    let selection = crate::tui::selection_from_coordinates(
+                        pane_id,
+                        anchor_scrollback,
+                        anchor_row,
+                        anchor_col,
+                        cursor_scrollback,
+                        cursor_row,
+                        cursor_col,
+                    );
+                    let _ = client.writer.enqueue(selection_copy_reply(
+                        request_id,
+                        node.runtime.node_selection_text(selection),
+                    ));
+                    did_work = true;
+                }
                 Ok(Some(ClientMessage::Focus { tab_id, pane_id })) => {
                     node.focus(tab_id, pane_id)
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1155,7 +1196,10 @@ fn attach_client(
     let mut publish = AttachmentPublishState::default();
     write_message(
         reader.get_mut(),
-        &NodeMessage::AttachAccepted { generation },
+        &NodeMessage::AttachAccepted {
+            generation,
+            selection_copy: true,
+        },
     )?;
     write_snapshot(
         reader.get_mut(),
@@ -2922,5 +2966,17 @@ mod tests {
             .0;
 
         assert!(invite.contains("connect_timeout_ms: None"));
+    }
+
+    #[test]
+    fn remote_history_selection_is_unavailable_instead_of_blank_lines() {
+        assert!(matches!(
+            selection_copy_reply(9, Err(())),
+            NodeMessage::SelectionCopy {
+                request_id: 9,
+                text: None,
+                unavailable: Some(reason),
+            } if reason == SCROLLBACK_NOT_OURS
+        ));
     }
 }

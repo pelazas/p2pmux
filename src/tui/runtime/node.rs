@@ -23,6 +23,8 @@ use crate::{
         clock::unix_ms_now,
         geometry::{contains_leaf, visible_leaf_panes},
         member_label,
+        render::vt::viewed_screen,
+        selection::selection_text,
         text::{sanitize_single_line, truncate_bytes},
     },
 };
@@ -291,6 +293,32 @@ impl SharedLayoutRuntime {
             total_rows,
             screen: pane.screen.screen().clone(),
         }))
+    }
+
+    /// Read a copy from the pane owner, whose normal-screen buffer retains all
+    /// of the rows an attached client's sparse viewport cache may have evicted.
+    pub(crate) fn node_selection_text(
+        &self,
+        selection: crate::tui::PaneTextSelection,
+    ) -> Result<Option<String>, ()> {
+        if let Some(pane) = self.local.get(&selection.pane_id) {
+            return Ok(selection_text(selection, |offset| {
+                Some(viewed_screen(pane.screen.screen(), offset))
+            }));
+        }
+        let Some(pane) = self.remote.get(&selection.pane_id) else {
+            return Err(());
+        };
+        // A remote screen has no retained history on this node. The live edge
+        // is complete, but filling an older selection from it would fabricate
+        // blank-looking lines that were never available here.
+        if selection.anchor.scrollback != 0 || selection.cursor.scrollback != 0 {
+            return Err(());
+        }
+        Ok(pane
+            .screen
+            .screen()
+            .and_then(|screen| selection_text(selection, |_| Some(viewed_screen(screen, 0)))))
     }
 
     pub(crate) fn node_remote_snapshot(&self, pane_id: PaneId) -> Option<Vec<u8>> {

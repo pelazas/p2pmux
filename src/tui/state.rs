@@ -411,7 +411,7 @@ impl SelectionPoint {
 
 /// A local, pane-scoped text selection. Both ends are inclusive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::tui) struct PaneTextSelection {
+pub(crate) struct PaneTextSelection {
     pub(in crate::tui) pane_id: PaneId,
     pub(in crate::tui) anchor: SelectionPoint,
     pub(in crate::tui) cursor: SelectionPoint,
@@ -443,5 +443,37 @@ impl PaneTextSelection {
         } else {
             (self.cursor, self.anchor)
         }
+    }
+}
+
+/// Rebuild the UI's private selection type from the scalar local-IPC form.
+///
+/// The wire stays independent from the UI structs, but the node must use the
+/// same line-coordinate rules as the renderer when it owns the pane buffer.
+pub(crate) fn selection_from_coordinates(
+    pane_id: PaneId,
+    anchor_scrollback: u64,
+    anchor_row: u16,
+    anchor_col: u16,
+    cursor_scrollback: u64,
+    cursor_row: u16,
+    cursor_col: u16,
+) -> PaneTextSelection {
+    PaneTextSelection {
+        pane_id,
+        anchor: SelectionPoint {
+            scrollback: anchor_scrollback as usize,
+            cell: ScreenCell {
+                row: anchor_row,
+                col: anchor_col,
+            },
+        },
+        cursor: SelectionPoint {
+            scrollback: cursor_scrollback as usize,
+            cell: ScreenCell {
+                row: cursor_row,
+                col: cursor_col,
+            },
+        },
     }
 }

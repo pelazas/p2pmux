@@ -169,7 +169,10 @@ fn osc52_sequence(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::{PaneTextSelection, ScreenCell, SelectionPoint, render::vt::viewed_screen};
+    use crate::{
+        screen::HostScreen,
+        tui::{PaneTextSelection, ScreenCell, SelectionPoint, render::vt::viewed_screen},
+    };
 
     use super::selection_text;
 
@@ -223,25 +226,26 @@ mod tests {
     /// back every line between them — not the page that happens to be visible
     /// when the button comes up.
     #[test]
-    fn a_selection_that_spans_a_scroll_reads_across_every_view_it_covers() {
-        let mut parser = vt100::Parser::new(2, 6, 20);
-        parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+    fn node_owned_host_buffer_copies_a_scrolled_selection_without_viewport_holes() {
+        let mut host = HostScreen::new(2, 6).expect("host screen");
+        host.process_pty(b"LINE-1\r\nLINE-2\r\nLINE-3\r\nLINE-4\r\nLINE-5\r\nLINE-6")
+            .expect("screen contents");
 
-        // Anchored on `six` at the live edge, then dragged up until `one` —
+        // Anchored on `LINE-6` at the live edge, then dragged up until `LINE-1` —
         // four rows back — is the top row on screen. Three screens' worth, and
         // only two of those rows were ever visible at once.
         let selection = PaneTextSelection {
             pane_id: 1,
-            anchor: point(0, 1, 2),
+            anchor: point(0, 1, 5),
             cursor: point(4, 0, 0),
         };
 
         assert_eq!(
             selection_text(selection, |offset| Some(viewed_screen(
-                parser.screen(),
+                host.screen(),
                 offset
             ))),
-            Some("one\ntwo\nthree\nfour\nfive\nsix".to_owned())
+            Some("LINE-1\nLINE-2\nLINE-3\nLINE-4\nLINE-5\nLINE-6".to_owned())
         );
     }
 

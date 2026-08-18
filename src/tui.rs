@@ -58,6 +58,7 @@ pub(crate) use snapshot::{
     LocalScrollback, LocalScrollbackWindow, NodeLeaseSnapshots, NodeScreenSnapshot,
     NodeScreenSnapshots,
 };
+pub(crate) use state::selection_from_coordinates;
 pub(in crate::tui) use state::{
     AddMachinePrompt, Invite, ModalState, PaneTextSelection, RenamePrompt, RenameTarget,
     ScreenCell, SelectionPoint,

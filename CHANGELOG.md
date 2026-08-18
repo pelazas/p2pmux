@@ -13,6 +13,11 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
+An attached client only keeps the scrollback pages it has recently drawn, so copying a drag that
+crossed an evicted page quietly turned the missing rows into blanks. Copying now asks the local
+node that owns the complete buffer; history on another machine is named as unavailable instead of
+being made up.
+
 A bare `p2pmux` on a machine whose paired session was asleep waited in silence long enough to
 look wedged, then kept trying after opening a local fallback. Its rejoin now has the short window
 an interactive command needs, and the fallback is remembered as the ticket's local answer.

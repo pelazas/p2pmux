@@ -14,7 +14,7 @@ use tokio::{
 
 use crate::{layout::LayoutSnapshot, tui::UiIntent};
 
-const MAX_FRAME: usize = 1024 * 1024;
+pub(crate) const MAX_FRAME: usize = 1024 * 1024;
 pub const OUTBOUND_QUEUE: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -72,6 +72,17 @@ pub enum ClientMessage {
         offset: u64,
         request_id: u64,
     },
+    /// Copy a selection from the node that owns the complete local pane buffer.
+    SelectionCopy {
+        pane_id: u64,
+        request_id: u64,
+        anchor_scrollback: u64,
+        anchor_row: u16,
+        anchor_col: u16,
+        cursor_scrollback: u64,
+        cursor_row: u16,
+        cursor_col: u16,
+    },
     Focus {
         tab_id: u64,
         pane_id: u64,
@@ -118,6 +129,10 @@ pub enum NodeMessage {
     ProbeAck,
     AttachAccepted {
         generation: u64,
+        /// New clients wait for this acknowledgement before asking a node to
+        /// copy: an old node rejects unknown requests by dropping the client.
+        #[serde(default)]
+        selection_copy: bool,
     },
     AttachRejected {
         reason: String,
@@ -160,6 +175,12 @@ pub enum NodeMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot: Option<Vec<u8>>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        unavailable: Option<String>,
+    },
+    SelectionCopy {
+        request_id: u64,
+        text: Option<String>,
+        #[serde(default)]
         unavailable: Option<String>,
     },
     Layout {
@@ -394,6 +415,19 @@ pub async fn receive<T: DeserializeOwned>(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid local IPC message"))
 }
 
+/// Keep a local reply inside the same one-megabyte contract the reader enforces.
+pub(crate) fn selection_copy_fits_frame(request_id: u64, text: &str) -> bool {
+    serde_json::to_vec(&NodeMessage::SelectionCopy {
+        request_id,
+        text: Some(text.to_owned()),
+        unavailable: None,
+    })
+    .is_ok_and(|mut frame| {
+        frame.push(b'\n');
+        frame.len() <= MAX_FRAME
+    })
+}
+
 pub fn bounded_outbound() -> (mpsc::Sender<NodeMessage>, mpsc::Receiver<NodeMessage>) {
     mpsc::channel(OUTBOUND_QUEUE)
 }
@@ -434,6 +468,7 @@ mod tests {
                 &mut writer,
                 &NodeMessage::AttachAccepted {
                     generation: gate_for_task.attach().unwrap(),
+                    selection_copy: true,
                 },
             )
             .await
@@ -446,7 +481,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             receive::<NodeMessage>(&mut reader).await.unwrap(),
-            Some(NodeMessage::AttachAccepted { generation: 1 })
+            Some(NodeMessage::AttachAccepted {
+                generation: 1,
+                selection_copy: true,
+            })
         );
         timeout(Duration::from_secs(1), server)
             .await
@@ -492,5 +530,28 @@ mod tests {
             panic!("expected snapshot");
         };
         assert_eq!(ticket, None);
+    }
+
+    #[test]
+    fn old_attach_acknowledgement_disables_node_owned_copy() {
+        let message: NodeMessage = serde_json::from_value(serde_json::json!({
+            "type": "attach_accepted",
+            "generation": 1
+        }))
+        .expect("old acknowledgement parses");
+
+        assert!(matches!(
+            message,
+            NodeMessage::AttachAccepted {
+                selection_copy: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oversized_selection_copy_reply_is_not_sent() {
+        assert!(selection_copy_fits_frame(1, "x"));
+        assert!(!selection_copy_fits_frame(1, &"x".repeat(MAX_FRAME)));
     }
 }
