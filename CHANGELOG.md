@@ -11,6 +11,12 @@ enrolment token — and a peer on the wrong side of it is refused rather than ha
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+A bare `p2pmux` on a machine whose paired session was asleep waited in silence long enough to
+look wedged, then kept trying after opening a local fallback. Its rejoin now has the short window
+an interactive command needs, and the fallback is remembered as the ticket's local answer.
+
 ## v0.1.12 — 2026-08-17
 
 Six fixes and no protocol change: four in what a pane and its footer tell you, two in the agent

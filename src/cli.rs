@@ -609,6 +609,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     display_name: display_name.clone(),
                     cols,
                     rows,
+                    connect_timeout_ms: None,
                 },
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
@@ -928,7 +929,7 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     pairing.offered_here = false;
     crate::pairing::save(&pairing)?;
 
-    let descriptor = rejoin_paired_session(&ticket_text).await?;
+    let descriptor = rejoin_paired_session(&ticket_text, None).await?;
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
@@ -1248,7 +1249,7 @@ async fn enroll_with_token(
     pairing.open_pairing_window(crate::pairing::now_unix());
     crate::pairing::save(&pairing)?;
 
-    let descriptor = rejoin_paired_session(&invite.ticket).await?;
+    let descriptor = rejoin_paired_session(&invite.ticket, None).await?;
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
@@ -1401,6 +1402,7 @@ fn machine_rows() -> Result<Vec<crate::tui::MachineRow>, Box<dyn Error>> {
 async fn open_home() -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let pairing = crate::pairing::load_or_empty();
+    let mut failed_rejoin_ticket = None;
     if let Some(ticket) = pairing.ticket.as_deref() {
         // A node here is already in the fleet's session: use it rather than
         // standing up a second one alongside it. Only while it is free — an
@@ -1417,22 +1419,19 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     // attaching to while it is running here, and never worth dialling once it
     // is not. See `Pairing::rejoin_ticket`.
     if let Some(ticket) = pairing.rejoin_ticket(crate::pairing::now_unix()) {
-        // Said before the dial, not after it. Reaching a machine that is not
-        // answering costs iroh about thirty seconds, and this command spent
-        // every one of them printing nothing at all: a bare `p2pmux` on a laptop
-        // whose paired desktop is asleep looked exactly like a command that had
-        // hung. Thirty seconds of "waiting for my other machine" is a wait; the
-        // same thirty seconds in silence is what "p2pmux does nothing" was.
+        // Said before the dial, not after it. A sleeping paired machine still
+        // makes the short rejoin window visible, where silence reads exactly
+        // like a command that hung.
         {
             let mut stderr = io::stderr().lock();
             writeln!(
                 stderr,
                 "rejoining the session this machine is paired with; this can take \
-                 up to half a minute if the other machine is asleep…"
+                 a few seconds if the other machine is asleep…"
             )?;
             stderr.flush()?;
         }
-        match rejoin_paired_session(ticket).await {
+        match rejoin_paired_session(ticket, Some(5000)).await {
             Ok(descriptor) => {
                 return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
             }
@@ -1440,13 +1439,21 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
             // is gone, must not leave the user with nothing. Say so and open a
             // session here — the inbox still has this machine's agents on it.
             Err(error) => {
+                failed_rejoin_ticket = Some(ticket);
                 let mut stderr = io::stderr().lock();
                 writeln!(stderr, "could not rejoin the paired session: {error}")?;
                 writeln!(stderr, "starting a session on this machine instead")?;
             }
         }
     }
-    let descriptor = start_solo_session()?;
+    let mut descriptor = start_solo_session()?;
+    if let Some(ticket) = failed_rejoin_ticket {
+        // The fallback is this machine's answer to that ticket. Remembering it
+        // lets the next bare command attach here instead of attempting the same
+        // unreachable dial again.
+        descriptor.joined_ticket = Some(ticket.to_owned());
+        store.write(&descriptor)?;
+    }
     // The session screen, not the inbox. A session created a moment ago has one
     // pane and no agents in it, so Home would open on an empty list — the blank
     // screen a first run is least able to interpret. Rejoining a fleet session
@@ -1504,6 +1511,7 @@ fn newest_live(
 
 async fn rejoin_paired_session(
     ticket: &str,
+    connect_timeout_ms: Option<u64>,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let ticket = resolve_join_ticket(ticket).await?;
     let display_name = display_name_or_hostname()?;
@@ -1514,6 +1522,7 @@ async fn rejoin_paired_session(
             display_name,
             cols,
             rows,
+            connect_timeout_ms,
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
@@ -2052,11 +2061,9 @@ mod tests {
 
     /// Bare `p2pmux` says it is dialling *before* it dials.
     ///
-    /// Reaching a paired machine that is asleep costs iroh about thirty
-    /// seconds. Printing afterwards — which is all this did — meant those
-    /// thirty seconds were blank, and a blank terminal is indistinguishable
-    /// from a hung command. Measured on a droplet whose peer was unreachable,
-    /// the first byte arrived at t=31.6s.
+    /// Reaching a paired machine that is asleep still costs a few seconds.
+    /// Printing afterwards would make that short wait blank, and a blank
+    /// terminal is indistinguishable from a hung command.
     ///
     /// Pinned by order rather than by behaviour because the alternative is a
     /// test that waits out a real dial to a machine that is deliberately not
@@ -2078,12 +2085,36 @@ mod tests {
             .find("rejoining the session this machine is paired with")
             .expect("open_home should say it is rejoining");
         let dial = body
-            .find("rejoin_paired_session(ticket)")
+            .find("rejoin_paired_session(ticket, Some(5000))")
             .expect("open_home should rejoin");
         assert!(
             announcement < dial,
             "the notice must be printed before the dial it explains, not after it"
         );
+        assert!(body.contains("a few seconds"));
+        assert!(!body.contains("up to half a minute"));
+    }
+
+    #[test]
+    fn only_bare_home_uses_the_short_rejoin_timeout() {
+        let source = include_str!("cli.rs");
+        let open_home = source
+            .split_once("async fn open_home()")
+            .expect("open_home")
+            .1
+            .split_once("\nasync fn rejoin_paired_session")
+            .expect("next function")
+            .0;
+        let explicit_join = source
+            .split_once("Some(Command::Join { ticket, name }) => {")
+            .expect("explicit join")
+            .1
+            .split_once("if std::env::var_os(\"P2PMUX_LEGACY_FOREGROUND\")")
+            .expect("background join")
+            .0;
+
+        assert!(open_home.contains("rejoin_paired_session(ticket, Some(5000))"));
+        assert!(explicit_join.contains("connect_timeout_ms: None"));
     }
 
     /// The node has no terminal, so whatever it writes to stderr is the only

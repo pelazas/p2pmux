@@ -45,7 +45,7 @@ use crate::{
     },
     screen::ScreenFrame,
     ticket::{JoinTicket, TicketError},
-    transport::{HANDSHAKE_TIMEOUT, Transport, TransportError},
+    transport::{CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, Transport, TransportError},
 };
 
 pub const DEFAULT_PANE_ID: &[u8] = b"default-pane";
@@ -4089,7 +4089,19 @@ pub async fn join_layout_with_display_name(
     ticket: JoinTicket,
     display_name: String,
 ) -> Result<SharedLayoutMember, SessionError> {
-    let connection = transport.connect(ticket.endpoint_addr().clone()).await?;
+    join_layout_with_display_name_and_timeout(transport, ticket, display_name, CONNECT_TIMEOUT)
+        .await
+}
+
+pub async fn join_layout_with_display_name_and_timeout(
+    transport: Transport,
+    ticket: JoinTicket,
+    display_name: String,
+    connect_timeout: Duration,
+) -> Result<SharedLayoutMember, SessionError> {
+    let connection = transport
+        .connect_with_timeout(ticket.endpoint_addr().clone(), connect_timeout)
+        .await?;
     let result = async {
         let receipt =
             join_handshake_with_display_name(&transport, &connection, &ticket, display_name)

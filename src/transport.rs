@@ -328,7 +328,15 @@ impl Transport {
     }
 
     pub async fn connect(&self, remote: EndpointAddr) -> Result<Connection, TransportError> {
-        let connection = timeout(CONNECT_TIMEOUT, self.endpoint.connect(remote, ALPN))
+        self.connect_with_timeout(remote, CONNECT_TIMEOUT).await
+    }
+
+    pub async fn connect_with_timeout(
+        &self,
+        remote: EndpointAddr,
+        connect_timeout: Duration,
+    ) -> Result<Connection, TransportError> {
+        let connection = timeout(connect_timeout, self.endpoint.connect(remote, ALPN))
             .await
             .map_err(|_| TransportError::TimedOut("connect"))?
             .map_err(TransportError::Connect)?;

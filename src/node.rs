@@ -28,8 +28,8 @@ use crate::{
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
     },
     session::{
-        HostSession, LayoutControlEvent, SharedLayoutHost, join_layout_with_display_name,
-        layout_snapshot_from_state,
+        HostSession, LayoutControlEvent, SharedLayoutHost,
+        join_layout_with_display_name_and_timeout, layout_snapshot_from_state,
     },
     session_store::{SessionDescriptor, SessionRole, SessionStore},
     ticket::JoinTicket,
@@ -146,6 +146,10 @@ pub enum NodeBootstrapKind {
         display_name: String,
         cols: u16,
         rows: u16,
+        /// Local launch policy only. Old launchers omit it and keep the normal
+        /// thirty-second join window.
+        #[serde(default)]
+        connect_timeout_ms: Option<u64>,
     },
 }
 
@@ -264,6 +268,7 @@ pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn
             // attaches. Guessing small would make the first frame a resize.
             cols: 80,
             rows: 24,
+            connect_timeout_ms: None,
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
@@ -425,24 +430,40 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             display_name,
             cols: _,
             rows: _,
+            connect_timeout_ms,
         } => {
             let ticket = ticket
                 .parse::<JoinTicket>()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ticket"))?;
             let transport = Transport::bind().await?;
-            let mut member = join_layout_with_display_name(transport, ticket.clone(), display_name)
+            let join_timeout = Duration::from_millis(connect_timeout_ms.unwrap_or(30_000));
+            // The first snapshot is the join becoming usable. Keeping handshake and that
+            // snapshot inside this deadline prevents a five-second dial plus another
+            // five-second wait when a sleeping paired machine does answer late.
+            let (member, state) = tokio::time::timeout(join_timeout, async {
+                let mut member = join_layout_with_display_name_and_timeout(
+                    transport,
+                    ticket.clone(),
+                    display_name,
+                    join_timeout,
+                )
                 .await
                 .map_err(describe_join_failure)?;
-            let state = match member.events.recv().await {
-                Some(LayoutControlEvent::Snapshot(snapshot)) => {
-                    snapshot.state.ok_or("missing layout snapshot")?
-                }
-                _ => {
-                    return Err(
-                        io::Error::other("layout coordinator disconnected during join").into(),
-                    );
-                }
-            };
+                let state = match member.events.recv().await {
+                    Some(LayoutControlEvent::Snapshot(snapshot)) => {
+                        snapshot.state.ok_or("missing layout snapshot")?
+                    }
+                    _ => {
+                        return Err(io::Error::other(
+                            "layout coordinator disconnected during join",
+                        )
+                        .into());
+                    }
+                };
+                Ok::<_, Box<dyn Error>>((member, state))
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "join timed out"))??;
             // Recorded, not probed, for the same reason naming a session never
             // probes: this node is mid-join and its own record is already on
             // disk, so `list_live` would spend the ack timeout waiting for a
@@ -2866,5 +2887,40 @@ mod tests {
         );
         assert_eq!(read_bootstrap(&path).unwrap().descriptor, descriptor);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn old_join_bootstrap_keeps_the_thirty_second_connect_timeout() {
+        let kind: NodeBootstrapKind = serde_json::from_value(serde_json::json!({
+            "Join": {
+                "ticket": "ticket",
+                "display_name": "A",
+                "cols": 80,
+                "rows": 24
+            }
+        }))
+        .expect("old bootstrap parses");
+
+        assert!(matches!(
+            kind,
+            NodeBootstrapKind::Join {
+                connect_timeout_ms: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fleet_invites_keep_the_default_join_timeout() {
+        let source = include_str!("node.rs");
+        let invite = source
+            .split_once("pub fn follow_fleet_invite")
+            .expect("invite launcher")
+            .1
+            .split_once("pub fn write_bootstrap")
+            .expect("next function")
+            .0;
+
+        assert!(invite.contains("connect_timeout_ms: None"));
     }
 }
