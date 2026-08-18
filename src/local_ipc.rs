@@ -305,6 +305,10 @@ pub struct PresenceRow {
 pub struct PaneScreenSnapshot {
     pub pane_id: u64,
     pub state: ScreenUpdate,
+    /// The local terminal must invalidate ratatui's outer back-buffer before
+    /// drawing this frame after a full erase or alternate-screen exit.
+    #[serde(default)]
+    pub reset_outer: bool,
     /// Local-host history metadata. Remote panes publish zeroes.
     pub history_len: u64,
     pub history_end: u64,
@@ -553,5 +557,22 @@ mod tests {
     fn oversized_selection_copy_reply_is_not_sent() {
         assert!(selection_copy_fits_frame(1, "x"));
         assert!(!selection_copy_fits_frame(1, &"x".repeat(MAX_FRAME)));
+    }
+
+    #[test]
+    fn old_screen_snapshot_does_not_reset_the_outer_terminal() {
+        let snapshot: PaneScreenSnapshot = serde_json::from_value(serde_json::json!({
+            "pane_id": 1,
+            "state": {
+                "kind": "unchanged",
+                "sequence": 1,
+                "kitty_keyboard_active": false
+            },
+            "history_len": 0,
+            "history_end": 0
+        }))
+        .expect("old snapshot parses");
+
+        assert!(!snapshot.reset_outer);
     }
 }

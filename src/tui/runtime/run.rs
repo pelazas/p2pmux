@@ -135,6 +135,8 @@ impl SharedLayoutRuntime {
         clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
         self.tui.set_home_viewport_for(Rect::new(0, 0, cols, rows));
         let mut dirty = true;
+        let mut reset_outer_pending = false;
+        let mut seen_outer_resets = BTreeMap::new();
         let mut last_draw: Option<Instant> = None;
         let mut pending_escape = PendingEscape::default();
         // The viewport is fixed, so ratatui never resizes it for us: the drawn
@@ -191,6 +193,19 @@ impl SharedLayoutRuntime {
                 dirty = true;
             }
             if dirty && frame_due(last_draw) {
+                for (pane_id, pane) in &self.local {
+                    let screen = pane.screen.current_frame();
+                    if screen.reset_outer
+                        && seen_outer_resets.get(pane_id).copied() != Some(screen.sequence)
+                    {
+                        seen_outer_resets.insert(*pane_id, screen.sequence);
+                        reset_outer_pending = true;
+                    }
+                }
+                if reset_outer_pending {
+                    clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
+                    reset_outer_pending = false;
+                }
                 let mut screens = BTreeMap::new();
                 for (pane_id, pane) in &self.local {
                     screens.insert(*pane_id, pane.screen.screen());

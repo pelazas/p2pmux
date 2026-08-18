@@ -13,6 +13,10 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
+Full-screen applications and `clear` erase the real terminal behind ratatui, while its cached
+back-buffer can still believe old glyphs are there. The next frame now clears that outer buffer
+when such output arrives, so a return from an alternate screen does not leave a ghost behind.
+
 An attached client only keeps the scrollback pages it has recently drawn, so copying a drag that
 crossed an evicted page quietly turned the missing rows into blanks. Copying now asks the local
 node that owns the complete buffer; history on another machine is named as unavailable instead of

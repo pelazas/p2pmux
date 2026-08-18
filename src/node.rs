@@ -1803,14 +1803,26 @@ where
                             delta: frame.delta.as_ref().to_vec(),
                             kitty_keyboard_active: frame.kitty_keyboard_active,
                         };
-                        Some((frame.sequence, state, history_len, history_end))
+                        Some((
+                            frame.sequence,
+                            state,
+                            history_len,
+                            history_end,
+                            frame.reset_outer,
+                        ))
                     } else {
                         let state = ScreenUpdate::Snapshot {
                             sequence: frame.sequence,
                             snapshot: frame.snapshot.as_ref().to_vec(),
                             kitty_keyboard_active: frame.kitty_keyboard_active,
                         };
-                        Some((frame.sequence, state, history_len, history_end))
+                        Some((
+                            frame.sequence,
+                            state,
+                            history_len,
+                            history_end,
+                            frame.reset_outer,
+                        ))
                     }
                 }
                 crate::tui::NodeScreenSnapshot::Remote {
@@ -1829,14 +1841,16 @@ where
                             },
                             0,
                             0,
+                            false,
                         ))
                     }
                 }
             };
-            let (_, state, history_len, history_end) = update?;
+            let (_, state, history_len, history_end, reset_outer) = update?;
             Some(PaneScreenSnapshot {
                 pane_id,
                 state,
+                reset_outer,
                 history_len,
                 history_end,
             })
@@ -2422,6 +2436,7 @@ mod tests {
                 sequence: 1,
                 kitty_keyboard_active: false,
             },
+            reset_outer: false,
             history_len: 0,
             history_end: 0,
         }];
@@ -2876,6 +2891,7 @@ mod tests {
                         snapshot: vec![b'x'; 256 * 1024],
                         kitty_keyboard_active: false,
                     },
+                    reset_outer: false,
                     history_len: 0,
                     history_end: 0,
                 }],

@@ -153,6 +153,7 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                         snapshot: vec![1],
                         kitty_keyboard_active: false,
                     },
+                    reset_outer: false,
                     history_len: 4,
                     history_end: 12,
                 },
@@ -164,6 +165,7 @@ fn incremental_node_messages_round_trip_without_unchanged_screens() {
                         delta: vec![2],
                         kitty_keyboard_active: true,
                     },
+                    reset_outer: false,
                     history_len: 0,
                     history_end: 0,
                 },
@@ -239,6 +241,7 @@ fn scrollback_query_round_trips_and_screen_updates_carry_no_rows() {
             sequence: 4,
             kitty_keyboard_active: false,
         },
+        reset_outer: false,
         history_len: 2,
         history_end: 9,
     };

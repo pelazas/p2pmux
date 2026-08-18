@@ -361,6 +361,7 @@ pub fn run_on(
     let mut next_scrollback_request_id = 1_u64;
     let mut next_selection_copy_request_id = 1_u64;
     let mut pending_selection_copy = None;
+    let mut reset_outer_pending = false;
     let mut copied_lines = None;
     let mut footer_notice = None;
     let mut link_summary: Option<String> = None;
@@ -439,7 +440,7 @@ pub fn run_on(
                             room_name,
                             *layout,
                         )?;
-                        let resync = apply_screens(
+                        let (resync, reset_outer) = apply_screens(
                             view,
                             &mut screens,
                             &mut history,
@@ -447,6 +448,7 @@ pub fn run_on(
                             &mut pending_resync,
                             &mut history_refresh,
                         )?;
+                        reset_outer_pending |= reset_outer;
                         apply_leases(view, leases);
                         view.set_presence(presence);
                         apply_focus(view, &mut pending_focus, tab_id, pane_id)?;
@@ -515,7 +517,7 @@ pub fn run_on(
                         let view = tui.as_mut().ok_or_else(|| {
                             io::Error::other("screens received before attachment snapshot")
                         })?;
-                        let resync = apply_screens(
+                        let (resync, reset_outer) = apply_screens(
                             view,
                             &mut screens,
                             &mut history,
@@ -523,6 +525,7 @@ pub fn run_on(
                             &mut pending_resync,
                             &mut history_refresh,
                         )?;
+                        reset_outer_pending |= reset_outer;
                         for pane_id in new_resync_requests(&mut pending_resync, resync) {
                             write_message(&mut stream, &ClientMessage::ResyncScreen { pane_id })?;
                         }
@@ -751,6 +754,11 @@ pub fn run_on(
         }
         if dirty {
             if let Some(tui) = tui.as_ref() {
+                if reset_outer_pending {
+                    let area = terminal.size()?.into();
+                    clear_before_first_frame(&mut terminal, area)?;
+                    reset_outer_pending = false;
+                }
                 let draw_started = Instant::now();
                 terminal.draw(|frame| {
                     let viewport_screens = screens
@@ -1214,7 +1222,7 @@ fn apply_snapshot(
     pending_focus: &mut Option<(u64, u64)>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let view = apply_layout(tui, theme, screens, history, room_name, layout)?;
-    let resync = apply_screens(
+    let (resync, _) = apply_screens(
         view,
         screens,
         history,
@@ -1262,11 +1270,13 @@ fn apply_screens(
     next_screens: Vec<crate::local_ipc::PaneScreenSnapshot>,
     pending_resync: &mut BTreeSet<u64>,
     _history_refresh: &mut BTreeSet<u64>,
-) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<u64>, bool), Box<dyn std::error::Error>> {
     let mut resync = Vec::new();
+    let mut reset_outer = false;
     for frame in next_screens {
         let pane_id = frame.pane_id;
         let history_len = frame.history_len;
+        reset_outer |= frame.reset_outer;
         let screen = screens.entry(frame.pane_id).or_default();
         match frame.state {
             ScreenUpdate::Snapshot {
@@ -1300,7 +1310,7 @@ fn apply_screens(
             }
         }
     }
-    Ok(resync)
+    Ok((resync, reset_outer))
 }
 
 fn apply_leases(view: &mut MultiPaneTui, leases: Vec<crate::local_ipc::PaneLeaseSnapshot>) {
@@ -1989,6 +1999,7 @@ mod tests {
                     snapshot: host.current_frame().snapshot.as_ref().to_vec(),
                     kitty_keyboard_active: false,
                 },
+                reset_outer: false,
                 history_len: 40,
                 history_end: 40,
             }],
@@ -2038,6 +2049,7 @@ mod tests {
                     snapshot: host.current_frame().snapshot.as_ref().to_vec(),
                     kitty_keyboard_active: false,
                 },
+                reset_outer: false,
                 history_len: 1,
                 history_end: 1,
             }],
@@ -2063,6 +2075,7 @@ mod tests {
                     sequence: 1,
                     kitty_keyboard_active: false,
                 },
+                reset_outer: false,
                 history_len: 1,
                 history_end: 1,
             }],
@@ -2095,6 +2108,7 @@ mod tests {
                     snapshot: host.current_frame().snapshot.as_ref().to_vec(),
                     kitty_keyboard_active: false,
                 },
+                reset_outer: false,
                 history_len: 0,
                 history_end: 0,
             }],

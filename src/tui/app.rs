@@ -22,7 +22,7 @@ use crate::{
     kitty_keyboard::KittyKeyboardTracker,
     lease::{IDLE_AFTER, LeaseDecision},
     pty_host::PtyHost,
-    screen::{GuestScreen, SyncGate},
+    screen::{GuestScreen, OuterResetRecognizer, SyncGate},
     session::{GuestEvent, GuestPane, HostControlEvent},
     tui::{
         HostPaneRuntime,
@@ -56,6 +56,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     let mut host = PtyHost::spawn_default_shell(size)?;
     let mut parser = vt100::Parser::new(rows, cols, 0);
     let mut kitty_keyboard = KittyKeyboardTracker::default();
+    let mut outer_reset = OuterResetRecognizer::default();
 
     let mut guard = TerminalGuard::new();
     enable_raw_mode()?;
@@ -77,6 +78,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     )?;
     clear_before_first_frame(&mut terminal, fixed_area)?;
     let mut dirty = true;
+    let mut reset_outer_pending = false;
     let mut last_draw: Option<Instant> = None;
     let mut sync_gate = SyncGate::default();
 
@@ -98,6 +100,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
             sync_gate.feed(&pending, Instant::now())
         };
         if !ready.is_empty() {
+            reset_outer_pending |= outer_reset.feed(&ready);
             kitty_keyboard.observe(&ready);
             parser.process(&ready);
             if let Some(reply) = kitty_keyboard.take_query_reply() {
@@ -110,6 +113,10 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
         }
 
         if dirty && frame_due(last_draw) {
+            if reset_outer_pending {
+                clear_before_first_frame(&mut terminal, fixed_area)?;
+                reset_outer_pending = false;
+            }
             begin_synchronized_output()?;
             terminal.draw(|frame| {
                 let screen = parser.screen();
@@ -178,6 +185,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
     let footer = CONTROL_HELP.to_owned();
     let mut dirty = true;
+    let mut reset_outer_pending = false;
     let mut last_draw: Option<Instant> = None;
     let mut sync_gate = SyncGate::default();
     loop {
@@ -246,6 +254,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
         };
         if !ready.is_empty() {
             if let Ok(frame) = runtime.screen.process_pty(&ready) {
+                reset_outer_pending |= frame.reset_outer;
                 if let Some(reply) = runtime.screen.take_kitty_keyboard_query_reply() {
                     runtime.host.write_input(&reply)?;
                 }
@@ -257,6 +266,10 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
             break;
         }
         if dirty && frame_due(last_draw) {
+            if reset_outer_pending {
+                clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
+                reset_outer_pending = false;
+            }
             begin_synchronized_output()?;
             terminal.draw(|frame| {
                 let screen = runtime.screen.screen();

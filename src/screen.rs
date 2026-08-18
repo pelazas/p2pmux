@@ -22,6 +22,8 @@ pub struct ScreenFrame {
     pub snapshot: Arc<[u8]>,
     pub delta: Arc<[u8]>,
     pub kitty_keyboard_active: bool,
+    /// The terminal outside ratatui was cleared or an alternate screen ended.
+    pub reset_outer: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -194,6 +196,67 @@ struct HvpRewriter {
     state: VtState,
 }
 
+/// Notices the terminal operations that invalidate ratatui's cached outer grid.
+///
+/// This shares the VT state boundaries with [`HvpRewriter`] instead of looking
+/// for bytes: `2J` in a title is text, not an erase, and a CSI can cross reads.
+#[derive(Debug, Default)]
+pub(crate) struct OuterResetRecognizer {
+    state: VtState,
+    params: Vec<u8>,
+}
+
+impl OuterResetRecognizer {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut reset = false;
+        for &byte in bytes {
+            self.state = match self.state {
+                VtState::Ground if byte == 0x1b => VtState::Escape,
+                VtState::Ground => VtState::Ground,
+                VtState::Escape => {
+                    let state = HvpRewriter::after_escape(byte);
+                    if state == VtState::Csi {
+                        self.params.clear();
+                    }
+                    state
+                }
+                VtState::Csi if (0x40..=0x7e).contains(&byte) => {
+                    if byte == b'J' && csi_erases_whole_screen(&self.params) {
+                        reset = true;
+                    }
+                    self.params.clear();
+                    VtState::Ground
+                }
+                VtState::Csi => {
+                    self.params.push(byte);
+                    VtState::Csi
+                }
+                VtState::StringBody => match byte {
+                    0x07 => VtState::Ground,
+                    0x1b => VtState::StringEscape,
+                    _ => VtState::StringBody,
+                },
+                VtState::StringEscape if byte == b'\\' => VtState::Ground,
+                VtState::StringEscape => {
+                    let state = HvpRewriter::after_escape(byte);
+                    if state == VtState::Csi {
+                        self.params.clear();
+                    }
+                    state
+                }
+            };
+        }
+        reset
+    }
+}
+
+fn csi_erases_whole_screen(params: &[u8]) -> bool {
+    params
+        .split(|byte| *byte == b';')
+        .filter_map(|param| std::str::from_utf8(param).ok()?.parse::<u8>().ok())
+        .any(|param| matches!(param, 2 | 3))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VtState {
     #[default]
@@ -356,6 +419,7 @@ pub struct HostScreen {
     /// Carries VT parse state across reads, so a `CSI` split over two of them is
     /// still recognised.
     hvp: HvpRewriter,
+    outer_reset: OuterResetRecognizer,
 }
 
 impl HostScreen {
@@ -377,16 +441,20 @@ impl HostScreen {
                 snapshot,
                 delta: Arc::from([]),
                 kitty_keyboard_active: false,
+                reset_outer: false,
             },
             kitty_keyboard: KittyKeyboardTracker::default(),
             history_end: 0,
             retained_scrollback: 0,
             hvp: HvpRewriter::default(),
+            outer_reset: OuterResetRecognizer::default(),
         })
     }
 
     pub fn process_pty(&mut self, bytes: &[u8]) -> Result<ScreenFrame, ScreenError> {
         let before_history = self.retained_scrollback;
+        let was_alternate_screen = self.parser.screen().alternate_screen();
+        let erased_outer = self.outer_reset.feed(bytes);
         // Both parsers see the same rewritten bytes, or the delta baseline would
         // drift from the live screen by exactly the cursor moves being repaired.
         let bytes = &*self.hvp.feed(bytes);
@@ -420,6 +488,8 @@ impl HostScreen {
             snapshot,
             delta: Arc::from(delta),
             kitty_keyboard_active: self.kitty_keyboard.active(),
+            reset_outer: erased_outer
+                || (was_alternate_screen && !self.parser.screen().alternate_screen()),
         };
         // Catch the baseline up to the live screen by replaying the same batch.
         self.previous.process(bytes);
@@ -476,6 +546,7 @@ impl HostScreen {
             snapshot: snapshot_payload(self.parser.screen())?,
             delta: Arc::from([]),
             kitty_keyboard_active: self.current.kitty_keyboard_active,
+            reset_outer: false,
         };
         self.current = frame.clone();
         Ok(frame)
@@ -1207,6 +1278,44 @@ mod tests {
             !unwrapped(&host).contains("a full width row of text"),
             "the alternate screen was reflowed instead of left alone",
         );
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_resets_the_outer_terminal() {
+        let mut host = HostScreen::new(2, 20).expect("valid dimensions");
+        host.process_pty(b"\x1b[?1049hClaude")
+            .expect("entered alternate");
+
+        assert!(
+            host.process_pty(b"\x1b[?1049l")
+                .expect("left alternate")
+                .reset_outer
+        );
+    }
+
+    #[test]
+    fn full_screen_erases_reset_the_outer_terminal() {
+        let mut host = HostScreen::new(2, 20).expect("valid dimensions");
+
+        assert!(host.process_pty(b"\x1b[2J").unwrap().reset_outer);
+        assert!(host.process_pty(b"\x1b[3J").unwrap().reset_outer);
+        assert!(!host.process_pty(b"\x1b[0J").unwrap().reset_outer);
+        assert!(!host.process_pty(b"\x1b[J").unwrap().reset_outer);
+    }
+
+    #[test]
+    fn outer_reset_recognizer_ignores_plain_and_string_text() {
+        let mut host = HostScreen::new(2, 20).expect("valid dimensions");
+
+        assert!(!host.process_pty(b"hello\r\n").unwrap().reset_outer);
+        assert!(!host.process_pty(b"\x1b]0;foo2J\x07").unwrap().reset_outer);
+    }
+
+    #[test]
+    fn split_full_screen_erase_resets_the_outer_terminal() {
+        let mut host = HostScreen::new(2, 20).expect("valid dimensions");
+        assert!(!host.process_pty(b"\x1b[2").unwrap().reset_outer);
+        assert!(host.process_pty(b"J").unwrap().reset_outer);
     }
 
     #[test]
