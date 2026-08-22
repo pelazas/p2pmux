@@ -289,6 +289,7 @@ pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
         tether,
+        None,
     )?;
     Ok(true)
 }
