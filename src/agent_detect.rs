@@ -695,7 +695,11 @@ impl<'a> AgentScan<'a> {
     /// State is not answered here. The scan says which agents are running; a
     /// hook says what they are doing, and the caller reads those from
     /// [`crate::agent_status`].
-    pub fn loose_agents(&self, pane_roots: &[u32]) -> Vec<LooseAgent> {
+    /// `known_nodes` are node pids the session store has on record for this
+    /// machine. They are consulted only when the command line does not already
+    /// say a process is a node -- see [`Self::enclosing_node_among`] for why a
+    /// second opinion is worth having at all.
+    pub fn loose_agents(&self, pane_roots: &[u32], known_nodes: &HashSet<u32>) -> Vec<LooseAgent> {
         let outside = self
             .agents
             .iter()
@@ -721,7 +725,9 @@ impl<'a> AgentScan<'a> {
                 pid: process.pid,
                 cwd: process.cwd.clone().unwrap_or_default(),
                 start_time: process.start_time,
-                node_pid: self.enclosing_node(process.pid).unwrap_or_default(),
+                node_pid: self
+                    .enclosing_node_among(process.pid, known_nodes)
+                    .unwrap_or_default(),
                 session: String::new(),
                 state: AgentState::Unknown,
                 message: String::new(),
@@ -748,10 +754,30 @@ impl<'a> AgentScan<'a> {
     /// session from inside another's pane: the agent belongs to the session
     /// whose pane it is actually in.
     pub fn enclosing_node(&self, pid: u32) -> Option<u32> {
+        self.enclosing_node_among(pid, &HashSet::new())
+    }
+
+    /// The same walk, willing to take the session store's word for it.
+    ///
+    /// [`is_node_process`] decides from the command line, which is the only
+    /// evidence available when nothing else knows what is running here. It is
+    /// not the *best* evidence: the session store records the pid of every node
+    /// on this machine, and that is a fact rather than an inference from a
+    /// string a process sampler may or may not have managed to read.
+    ///
+    /// Why it matters that this can fail at all: a loose agent whose node is
+    /// not recognised is reported as `running outside p2pmux`, and the caller
+    /// that would fix the label caches on `node_pid != 0` -- so one failed walk
+    /// is not a flicker, it is a row that stays wrong for the life of the
+    /// session. Consulting the store means the cmdline has to fail *and* the
+    /// store has to be missing the node before that can happen.
+    pub fn enclosing_node_among(&self, pid: u32, known_nodes: &HashSet<u32>) -> Option<u32> {
         self.ancestors_of(pid).find(|ancestor| {
-            self.by_pid
-                .get(ancestor)
-                .is_some_and(|p| is_node_process(p))
+            known_nodes.contains(ancestor)
+                || self
+                    .by_pid
+                    .get(ancestor)
+                    .is_some_and(|p| is_node_process(p))
         })
     }
 
@@ -1197,7 +1223,7 @@ mod tests {
         ];
         let scan = AgentScan::new(&processes);
 
-        let loose = scan.loose_agents(&[99]);
+        let loose = scan.loose_agents(&[99], &HashSet::new());
 
         assert_eq!(
             loose
@@ -1255,7 +1281,7 @@ mod tests {
         ];
         let scan = AgentScan::new(&processes);
 
-        let loose = scan.loose_agents(&[80]);
+        let loose = scan.loose_agents(&[80], &HashSet::new());
 
         assert_eq!(
             loose
@@ -1356,8 +1382,8 @@ mod tests {
         let backwards = forwards.iter().rev().cloned().collect::<Vec<_>>();
 
         assert_eq!(
-            AgentScan::new(&forwards).loose_agents(&[]),
-            AgentScan::new(&backwards).loose_agents(&[])
+            AgentScan::new(&forwards).loose_agents(&[], &HashSet::new()),
+            AgentScan::new(&backwards).loose_agents(&[], &HashSet::new())
         );
     }
 
@@ -1742,6 +1768,70 @@ mod tests {
             1_000,
         );
         assert!(!tracker.has_owning_push());
+    }
+
+    /// Issue #109: an agent in another session's pane reported as `running
+    /// outside p2pmux`.
+    ///
+    /// The wiring that names the other session is correct and has its own
+    /// coverage; what was never covered is what happens when the *node* is not
+    /// recognised. Identifying one means reading its command line out of a
+    /// process sampler, and a sampler that returns nothing for a process --
+    /// which is a thing that happens, and happens more on some platforms than
+    /// on the laptop this is developed on -- turns the row into a permanent
+    /// lie, because the caller only re-reads its session map for agents whose
+    /// node it already found.
+    ///
+    /// The session store knows every node pid on this machine as a fact. Given
+    /// it, the walk no longer depends on the string.
+    #[test]
+    fn a_node_the_sampler_could_not_describe_is_still_found_via_the_session_store() {
+        // A real node, except that `cmdline` came back empty.
+        let mut node = process(50, Some(1), "p2pmux", Some(50));
+        node.cmdline = Vec::new();
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            node,
+            process(51, Some(50), "zsh", Some(51)),
+            process(52, Some(51), "opencode", Some(52)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        // What the command line alone can say: nothing. This is the bug.
+        let blind = scan.loose_agents(&[], &HashSet::new());
+        assert_eq!(
+            blind.iter().map(|agent| agent.node_pid).collect::<Vec<_>>(),
+            vec![0],
+            "with no command line the agent looks like it is in no session at all"
+        );
+
+        // What it says once the store has been consulted.
+        let known = HashSet::from([50]);
+        let found = scan.loose_agents(&[], &known);
+        assert_eq!(
+            found.iter().map(|agent| agent.node_pid).collect::<Vec<_>>(),
+            vec![50],
+            "the store records node 50, so the agent is in node 50's session"
+        );
+    }
+
+    /// The store is a second opinion, not a licence to call anything a node.
+    #[test]
+    fn a_pid_the_store_does_not_name_is_still_not_a_node() {
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            // A plain shell, and a stale record pointing at some *other* pid.
+            process(60, Some(1), "zsh", Some(60)),
+            process(61, Some(60), "opencode", Some(61)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        let found = scan.loose_agents(&[], &HashSet::from([999]));
+        assert_eq!(
+            found.iter().map(|agent| agent.node_pid).collect::<Vec<_>>(),
+            vec![0],
+            "an agent in a bare terminal is in no session, whatever the store has on file"
+        );
     }
 
     #[test]

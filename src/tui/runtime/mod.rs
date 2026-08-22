@@ -91,6 +91,13 @@ pub struct SharedLayoutRuntime {
     /// node this map has never heard of, which happens when a session starts
     /// and then not again.
     pub(in crate::tui) session_records: HashMap<u32, crate::session_store::LocalSession>,
+    /// Whether [`Self::session_records`] has ever been read from disk.
+    ///
+    /// An empty map is ambiguous -- it means both "no other session on this
+    /// machine" and "never looked" -- and the difference decides whether a
+    /// loose agent with no enclosing node is genuinely outside p2pmux or merely
+    /// unrecognised. See `name_their_sessions`.
+    pub(in crate::tui) session_records_loaded: bool,
     /// Whether this node has told the session it belongs to a fleet. See
     /// `announce_fleet_membership`.
     pub(in crate::tui) announced_fleet_membership: bool,
@@ -275,6 +282,7 @@ impl SharedLayoutRuntime {
             last_local_agent_entries: Vec::new(),
             loose_agents: Vec::new(),
             session_records: HashMap::new(),
+            session_records_loaded: false,
             announced_fleet_membership: false,
             considered_fleet_invites: HashMap::new(),
             next_agent_roster_heartbeat: Instant::now(),
