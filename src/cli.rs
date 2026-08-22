@@ -514,6 +514,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 // A session somebody typed `create` for outlives the terminal
                 // they typed it in. That is what the separate process is for.
                 crate::node::Tether::Detached,
+                None,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -614,6 +615,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
                 crate::node::Tether::Detached,
+                None,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -850,7 +852,7 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let descriptor = match newest_live(&store.list_live()?) {
         Some(descriptor) => descriptor,
-        None => start_solo_session()?,
+        None => start_solo_session(None)?,
     };
     // The node publishes the code a moment after it starts, so a session
     // created two lines ago has not necessarily got one yet.
@@ -1446,14 +1448,19 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let mut descriptor = start_solo_session()?;
-    if let Some(ticket) = failed_rejoin_ticket {
-        // The fallback is this machine's answer to that ticket. Remembering it
-        // lets the next bare command attach here instead of attempting the same
-        // unreachable dial again.
-        descriptor.joined_ticket = Some(ticket.to_owned());
-        store.write(&descriptor)?;
-    }
+    // The fallback is this machine's answer to that ticket, and remembering it
+    // is what lets the next bare command attach here instead of attempting the
+    // same unreachable dial again.
+    //
+    // Handed to the node *before* it starts rather than written over its record
+    // afterwards. The node holds its own copy of this descriptor from the
+    // bootstrap and puts the whole thing back whenever it persists a role
+    // change or notices its peer list move -- both of which happen within the
+    // first seconds of a fresh coordinator's life. Writing the field from out
+    // here was a race against those, lost on a machine where publishing the
+    // role takes a moment longer than it does on a laptop, and losing it left
+    // every later `p2pmux` paying the rejoin window again.
+    let descriptor = start_solo_session(failed_rejoin_ticket.map(str::to_owned))?;
     // The session screen, not the inbox. A session created a moment ago has one
     // pane and no agents in it, so Home would open on an empty list — the blank
     // screen a first run is least able to interpret. Rejoining a fleet session
@@ -1527,6 +1534,7 @@ async fn rejoin_paired_session(
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
         crate::node::Tether::Detached,
+        None,
     )
 }
 
@@ -1534,7 +1542,14 @@ async fn rejoin_paired_session(
 ///
 /// No trust warning: nothing is shared until the user hands out a code, and
 /// `create` and `pair` — the two commands that do that — both print it.
-fn start_solo_session() -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+/// Start a session of this machine's own.
+///
+/// `stands_in_for` is the pairing ticket this session is the local answer to,
+/// when it is one -- see `open_home`. `None` for a session that is simply a
+/// session.
+fn start_solo_session(
+    stands_in_for: Option<String>,
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let display_name = display_name_or_hostname()?;
     let (cols, rows) = terminal_size_or_default();
     launch_background_node(
@@ -1546,6 +1561,7 @@ fn start_solo_session() -> Result<crate::session_store::SessionDescriptor, Box<d
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Coordinator,
         crate::node::Tether::Detached,
+        stands_in_for,
     )
 }
 
@@ -1729,6 +1745,7 @@ pub(crate) fn launch_background_node(
     name: String,
     role: crate::session_store::SessionRole,
     tether: crate::node::Tether,
+    stands_in_for: Option<String>,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let id = crate::session_store::generate_id()?;
@@ -1738,8 +1755,18 @@ pub(crate) fn launch_background_node(
     // Recorded before the node starts, because it is what a *later* invitation
     // is compared against: a machine has to be able to say "I am already in
     // that session" without attaching to it.
+    //
+    // `stands_in_for` is the same field reached by the other road: a session
+    // started *because* a paired rejoin failed is this machine's answer to that
+    // ticket, and has to say so or bare `p2pmux` dials the sleeping machine
+    // again on every run. It is set here, before the bootstrap is written,
+    // rather than by the caller once the node is up -- see the comment on
+    // `open_home`. The `Join` arm keeps precedence: a real join's own ticket is
+    // never a stand-in for something else.
     if let crate::node::NodeBootstrapKind::Join { ticket, .. } = &kind {
         descriptor.joined_ticket = Some(ticket.clone());
+    } else {
+        descriptor.joined_ticket = stands_in_for;
     }
     let bootstrap = crate::node::NodeBootstrap {
         descriptor: descriptor.clone(),

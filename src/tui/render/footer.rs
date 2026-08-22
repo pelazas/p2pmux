@@ -30,11 +30,10 @@ const NORMAL_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::Key("s"),
     FooterSegment::Text("> SHARE   <"),
     FooterSegment::Key("q"),
-    FooterSegment::Text("> QUIT   "),
-    FooterSegment::OrangeKey("Option"),
-    FooterSegment::Text("+ <"),
-    FooterSegment::Key("shift"),
-    FooterSegment::Text("> + <"),
+    // The arrows hang off the `Ctrl` this bar already opens with, which is
+    // both what they now do and four words shorter than spelling out the
+    // Option+Shift form that still works.
+    FooterSegment::Text("> QUIT   <"),
     FooterSegment::Key("↑↓←→"),
     FooterSegment::Text("> FOCUS"),
 ];
@@ -796,7 +795,7 @@ mod tests {
         for (mode, expected) in [
             (
                 ChordMode::None,
-                "Ctrl+ <p> PANE   <t> TAB   <o> INBOX   <s> SHARE   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS",
+                "Ctrl+ <p> PANE   <t> TAB   <o> INBOX   <s> SHARE   <q> QUIT   <↑↓←→> FOCUS",
             ),
             (
                 // 120 columns cannot hold the session lock as well, so the tier

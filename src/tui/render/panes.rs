@@ -624,7 +624,12 @@ pub(in crate::tui) fn render_shared_multi_pane(
                         tui.selection()
                             .filter(|selection| selection.pane_id == pane_id),
                     )
-                    .at_scrollback(scrollback),
+                    .at_scrollback(scrollback)
+                    // The pane the user is typing into stays at full strength
+                    // and every other one steps back. An exited pane is dimmed
+                    // like any other: it is not where the keystrokes are going
+                    // either, and its border already says it is finished.
+                    .dimmed(tui.dim_unfocused_panes && !focused),
                 viewport,
             );
             let (row, col) = screen.cursor_position();
@@ -1293,6 +1298,84 @@ mod tests {
 
         assert!(title.contains("host: 686f7374"));
         assert!(!title.contains("host: 66616b65"));
+    }
+
+    /// Two panes side by side, and only one of them is being typed into.
+    ///
+    /// The border already carried this, in the two cells of it a user is not
+    /// looking at. What they are looking at is three screenfuls of text that
+    /// were all exactly as bright as each other.
+    #[test]
+    fn only_the_focused_panes_text_is_drawn_at_full_strength() {
+        let mut left = vt100::Parser::new(1, 4, 0);
+        left.process(b"LEFT");
+        let mut right = vt100::Parser::new(1, 4, 0);
+        right.process(b"RGHT");
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 1, 4), (2, 1, 4)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        for pane_id in [1, 2] {
+            tui.set_pane_view(
+                pane_id,
+                PaneViewState {
+                    ready: true,
+                    controller_peer_id: None,
+                    controller_active: false,
+                    scrollback: 0,
+                },
+            );
+        }
+        let screens = BTreeMap::from([(1, left.screen()), (2, right.screen())]);
+
+        let dim_of = |tui: &MultiPaneTui| {
+            let mut terminal = Terminal::new(TestBackend::new(24, 5)).expect("test terminal");
+            terminal
+                .draw(|frame| render_multi_pane(frame, tui, &screens))
+                .expect("render");
+            let buffer = terminal.backend().buffer().clone();
+            let find = |needle: char| {
+                (0..24)
+                    .flat_map(|x| (0..5).map(move |y| (x, y)))
+                    .find(|position| buffer[*position].symbol() == needle.to_string())
+                    .map(|position| buffer[position].modifier.contains(Modifier::DIM))
+                    .expect("both panes drew their text")
+            };
+            (find('L'), find('R'))
+        };
+
+        tui.select_pane(1, 1, "test");
+        assert_eq!(
+            dim_of(&tui),
+            (false, true),
+            "focus is on the left pane, so the right one steps back"
+        );
+
+        tui.select_pane(1, 2, "test");
+        assert_eq!(
+            dim_of(&tui),
+            (true, false),
+            "and it swaps the moment focus does"
+        );
+
+        // The escape hatch, for a terminal that renders reduced intensity so
+        // faintly that watching an unfocused build scroll past is a strain.
+        tui.set_dim_unfocused_panes(false);
+        assert_eq!(
+            dim_of(&tui),
+            (false, false),
+            "`dim_unfocused_panes = false` puts every pane back at full strength"
+        );
     }
 
     #[test]

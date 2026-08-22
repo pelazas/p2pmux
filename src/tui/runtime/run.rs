@@ -517,7 +517,12 @@ impl SharedLayoutRuntime {
             // machine are in none of those trees. That is a bot under systemd,
             // which is how both assistant agents are meant to run and the one
             // shape the inbox could not see.
-            let mut loose = scan.loose_agents(&pane_roots);
+            // The node pids the store already told us about, so a node whose
+            // command line the sampler could not read is still recognised as
+            // one. Empty on the very first pass, which is the pass
+            // `name_their_sessions` then fills in.
+            let known_nodes = self.session_records.keys().copied().collect();
+            let mut loose = scan.loose_agents(&pane_roots, &known_nodes);
             self.name_their_sessions(&mut loose);
             // …and then what each of them is doing, which the scan cannot know
             // and their hooks have left on this machine for exactly this. An
@@ -597,11 +602,23 @@ impl SharedLayoutRuntime {
         let unknown = loose.iter().any(|agent| {
             agent.node_pid != 0 && !self.session_records.contains_key(&agent.node_pid)
         });
-        if unknown
+        // …and once, unconditionally, as soon as there is any loose agent at
+        // all. `unknown` alone cannot ask for this: it is keyed on `node_pid !=
+        // 0`, so an agent whose enclosing node was *not* identified never
+        // triggers a re-read, and the map it would have been found in is never
+        // loaded. That is the difference between a row that is briefly wrong
+        // and one that says `running outside p2pmux` for the life of the
+        // session about an agent sitting in a pane two windows over.
+        //
+        // Reading it also gives the next pass its `known_nodes`, which is what
+        // lets that failed walk succeed the second time round.
+        let never_loaded = !self.session_records_loaded && !loose.is_empty();
+        if (unknown || never_loaded)
             && let Ok(store) = crate::session_store::SessionStore::for_current_user()
             && let Ok(sessions) = store.sessions_by_node_pid()
         {
             self.session_records = sessions;
+            self.session_records_loaded = true;
         }
         let ours = std::process::id();
         // Cloned rather than borrowed: the retain below reads the same map, and

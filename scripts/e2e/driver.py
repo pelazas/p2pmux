@@ -815,17 +815,30 @@ def agent_panel(screen: str) -> str:
     Note the panel prints the lowercase kind (`claude`, `codex`), not the display label:
     `AgentKind::display_label` is no longer what the overlay renders. The panel drawing
     in docs/USAGE.md is the reference.
+
+    Home draws the agents down the left of a vertical divider with the machines
+    list on the right, under a plain `Agents` heading -- not inside a box. This
+    used to look for a `┌` on the heading line, found none, and returned the
+    empty string, so every assertion scoped to the panel failed no matter what
+    was on screen. Both shapes are accepted now: the border, if a build ever
+    draws one again, and the divider.
     """
     rows: list[str] = []
     inside = False
     for line in screen.split("\n"):
-        if not inside and "Agents" in line and "┌" in line:
-            inside = True
+        # The agents column is whatever sits left of the first divider.
+        left = line.split("│")[0].rstrip()
+        if not inside:
+            if "Agents" in line and ("┌" in line or left.strip() == "Agents"):
+                inside = True
             continue
-        if inside:
-            if "└" in line:
-                break
-            rows.append(line)
+        if "└" in line:
+            break
+        # The key hints run the full width under both columns, and are the
+        # bottom of the screen rather than part of either.
+        if "│" not in line and left.strip():
+            break
+        rows.append(left)
     return "\n".join(rows)
 
 

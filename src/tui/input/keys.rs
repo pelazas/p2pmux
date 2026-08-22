@@ -7,9 +7,23 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::tui::ChordMode;
 
 pub(in crate::tui) const ESC_PREFIX_WINDOW: Duration = Duration::from_millis(50);
-pub(in crate::tui) fn is_option_arrow(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::ALT)
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
+/// Whether this key is one of the two ways to move focus between panes.
+///
+/// Option+arrow is the original and stays; Ctrl+arrow was asked for because it
+/// is what every other tiling thing on a desktop uses, and reaching for Option
+/// and Shift together to look at the pane next door is a lot of hand for a very
+/// ordinary action.
+///
+/// Ctrl+arrow does cost something: it is word-jump in readline, and inside a
+/// pane it no longer reaches the shell. **Ctrl+Alt+arrow** is the escape hatch
+/// and is forwarded untouched, which is why holding both is deliberately not a
+/// focus key. `Ctrl+P` then an arrow is the other way, for anyone who would
+/// rather rebind nothing.
+pub(in crate::tui) fn is_focus_arrow(key: KeyEvent) -> bool {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Exactly one of them. Both together is the way back to the shell.
+    (alt != control)
         && matches!(
             key.code,
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down

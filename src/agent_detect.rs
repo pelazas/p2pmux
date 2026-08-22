@@ -695,7 +695,11 @@ impl<'a> AgentScan<'a> {
     /// State is not answered here. The scan says which agents are running; a
     /// hook says what they are doing, and the caller reads those from
     /// [`crate::agent_status`].
-    pub fn loose_agents(&self, pane_roots: &[u32]) -> Vec<LooseAgent> {
+    /// `known_nodes` are node pids the session store has on record for this
+    /// machine. They are consulted only when the command line does not already
+    /// say a process is a node -- see [`Self::enclosing_node_among`] for why a
+    /// second opinion is worth having at all.
+    pub fn loose_agents(&self, pane_roots: &[u32], known_nodes: &HashSet<u32>) -> Vec<LooseAgent> {
         let outside = self
             .agents
             .iter()
@@ -721,7 +725,9 @@ impl<'a> AgentScan<'a> {
                 pid: process.pid,
                 cwd: process.cwd.clone().unwrap_or_default(),
                 start_time: process.start_time,
-                node_pid: self.enclosing_node(process.pid).unwrap_or_default(),
+                node_pid: self
+                    .enclosing_node_among(process.pid, known_nodes)
+                    .unwrap_or_default(),
                 session: String::new(),
                 state: AgentState::Unknown,
                 message: String::new(),
@@ -748,10 +754,30 @@ impl<'a> AgentScan<'a> {
     /// session from inside another's pane: the agent belongs to the session
     /// whose pane it is actually in.
     pub fn enclosing_node(&self, pid: u32) -> Option<u32> {
+        self.enclosing_node_among(pid, &HashSet::new())
+    }
+
+    /// The same walk, willing to take the session store's word for it.
+    ///
+    /// [`is_node_process`] decides from the command line, which is the only
+    /// evidence available when nothing else knows what is running here. It is
+    /// not the *best* evidence: the session store records the pid of every node
+    /// on this machine, and that is a fact rather than an inference from a
+    /// string a process sampler may or may not have managed to read.
+    ///
+    /// Why it matters that this can fail at all: a loose agent whose node is
+    /// not recognised is reported as `running outside p2pmux`, and the caller
+    /// that would fix the label caches on `node_pid != 0` -- so one failed walk
+    /// is not a flicker, it is a row that stays wrong for the life of the
+    /// session. Consulting the store means the cmdline has to fail *and* the
+    /// store has to be missing the node before that can happen.
+    pub fn enclosing_node_among(&self, pid: u32, known_nodes: &HashSet<u32>) -> Option<u32> {
         self.ancestors_of(pid).find(|ancestor| {
-            self.by_pid
-                .get(ancestor)
-                .is_some_and(|p| is_node_process(p))
+            known_nodes.contains(ancestor)
+                || self
+                    .by_pid
+                    .get(ancestor)
+                    .is_some_and(|p| is_node_process(p))
         })
     }
 
@@ -994,13 +1020,36 @@ impl PaneAgentTracker {
 
     /// The authoritative pushed status, if a producer currently owns this pane.
     ///
-    /// An `Idle` push is deliberately not authoritative: it means "no activity"
-    /// (Claude's `/clear`, a session ending), which should hand the pane back to
-    /// process detection rather than blank a row whose agent is still running.
+    /// An `Idle` push does not *own* the pane: it means "no activity" (Claude's
+    /// `/clear`, a session ending), and a row whose agent the scan can no longer
+    /// see must go rather than sit there claiming to be idle forever. Ownership
+    /// is about whether this row exists at all.
+    ///
+    /// It is emphatically still the pane's state — see [`Self::pushed_state`].
+    /// Conflating the two questions is what made `p2pmux notify idle` land as
+    /// `state unknown — no hooks` on a pane whose hooks had just fired.
     fn owning_push(&self) -> Option<&PushedAgent> {
         self.pushed
             .as_ref()
             .filter(|pushed| pushed.state != AgentState::Idle)
+    }
+
+    /// The pushed status for an agent the scan can still see, whatever its
+    /// state.
+    ///
+    /// The other half of [`Self::owning_push`]. A producer that reported `idle`
+    /// has told us the one thing process detection can never work out, and
+    /// throwing it away left the row saying `running` / `state unknown — no
+    /// hooks` about an agent whose hooks were wired up and firing. So the scan
+    /// still decides *whether* there is a row, and the push decides what it
+    /// says.
+    ///
+    /// Matched on `kind` because a stale push from the agent that used to be in
+    /// this pane is not the status of the one in it now.
+    fn pushed_state(&self, detected: &DetectedAgent) -> Option<&PushedAgent> {
+        self.pushed
+            .as_ref()
+            .filter(|pushed| pushed.kind == detected.kind)
     }
 
     /// Whether a producer currently owns this pane's state.
@@ -1020,6 +1069,14 @@ impl PaneAgentTracker {
     /// whole point of accepting pushes. A scanned agent with nothing pushed
     /// gets a row too, reported as [`AgentState::Unknown`] — it is running, and
     /// that is genuinely all anyone here knows about it.
+    ///
+    /// Between those two sits the agent that reported `idle`. The scan is what
+    /// keeps its row alive, because an idle agent is one nobody has heard from
+    /// and its process leaving is the only thing that ends the row — but the
+    /// state on that row is the one it reported, not `Unknown`. Reporting
+    /// `Unknown` there is a lie with a specific cost: `state unknown — no
+    /// hooks` is the line that tells a user to go and run `p2pmux setup`, shown
+    /// to the one user who already had.
     pub fn listed_agent(&self) -> Option<ListedAgent> {
         if let Some(pushed) = self.owning_push() {
             return Some(ListedAgent {
@@ -1032,11 +1089,20 @@ impl PaneAgentTracker {
                 working_since_unix_ms: pushed.working_since_unix_ms,
             });
         }
-        self.active_agent.as_ref().map(|agent| ListedAgent {
-            agent: agent.clone(),
-            state: AgentState::Unknown,
-            message: String::new(),
-            working_since_unix_ms: 0,
+        let detected = self.active_agent.as_ref()?;
+        let Some(pushed) = self.pushed_state(detected) else {
+            return Some(ListedAgent {
+                agent: detected.clone(),
+                state: AgentState::Unknown,
+                message: String::new(),
+                working_since_unix_ms: 0,
+            });
+        };
+        Some(ListedAgent {
+            agent: detected.clone(),
+            state: pushed.state,
+            message: pushed.message.clone(),
+            working_since_unix_ms: pushed.working_since_unix_ms,
         })
     }
 }
@@ -1157,7 +1223,7 @@ mod tests {
         ];
         let scan = AgentScan::new(&processes);
 
-        let loose = scan.loose_agents(&[99]);
+        let loose = scan.loose_agents(&[99], &HashSet::new());
 
         assert_eq!(
             loose
@@ -1215,7 +1281,7 @@ mod tests {
         ];
         let scan = AgentScan::new(&processes);
 
-        let loose = scan.loose_agents(&[80]);
+        let loose = scan.loose_agents(&[80], &HashSet::new());
 
         assert_eq!(
             loose
@@ -1316,8 +1382,8 @@ mod tests {
         let backwards = forwards.iter().rev().cloned().collect::<Vec<_>>();
 
         assert_eq!(
-            AgentScan::new(&forwards).loose_agents(&[]),
-            AgentScan::new(&backwards).loose_agents(&[])
+            AgentScan::new(&forwards).loose_agents(&[], &HashSet::new()),
+            AgentScan::new(&backwards).loose_agents(&[], &HashSet::new())
         );
     }
 
@@ -1704,6 +1770,70 @@ mod tests {
         assert!(!tracker.has_owning_push());
     }
 
+    /// Issue #109: an agent in another session's pane reported as `running
+    /// outside p2pmux`.
+    ///
+    /// The wiring that names the other session is correct and has its own
+    /// coverage; what was never covered is what happens when the *node* is not
+    /// recognised. Identifying one means reading its command line out of a
+    /// process sampler, and a sampler that returns nothing for a process --
+    /// which is a thing that happens, and happens more on some platforms than
+    /// on the laptop this is developed on -- turns the row into a permanent
+    /// lie, because the caller only re-reads its session map for agents whose
+    /// node it already found.
+    ///
+    /// The session store knows every node pid on this machine as a fact. Given
+    /// it, the walk no longer depends on the string.
+    #[test]
+    fn a_node_the_sampler_could_not_describe_is_still_found_via_the_session_store() {
+        // A real node, except that `cmdline` came back empty.
+        let mut node = process(50, Some(1), "p2pmux", Some(50));
+        node.cmdline = Vec::new();
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            node,
+            process(51, Some(50), "zsh", Some(51)),
+            process(52, Some(51), "opencode", Some(52)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        // What the command line alone can say: nothing. This is the bug.
+        let blind = scan.loose_agents(&[], &HashSet::new());
+        assert_eq!(
+            blind.iter().map(|agent| agent.node_pid).collect::<Vec<_>>(),
+            vec![0],
+            "with no command line the agent looks like it is in no session at all"
+        );
+
+        // What it says once the store has been consulted.
+        let known = HashSet::from([50]);
+        let found = scan.loose_agents(&[], &known);
+        assert_eq!(
+            found.iter().map(|agent| agent.node_pid).collect::<Vec<_>>(),
+            vec![50],
+            "the store records node 50, so the agent is in node 50's session"
+        );
+    }
+
+    /// The store is a second opinion, not a licence to call anything a node.
+    #[test]
+    fn a_pid_the_store_does_not_name_is_still_not_a_node() {
+        let processes = vec![
+            process(1, None, "launchd", Some(1)),
+            // A plain shell, and a stale record pointing at some *other* pid.
+            process(60, Some(1), "zsh", Some(60)),
+            process(61, Some(60), "opencode", Some(61)),
+        ];
+        let scan = AgentScan::new(&processes);
+
+        let found = scan.loose_agents(&[], &HashSet::from([999]));
+        assert_eq!(
+            found.iter().map(|agent| agent.node_pid).collect::<Vec<_>>(),
+            vec![0],
+            "an agent in a bare terminal is in no session, whatever the store has on file"
+        );
+    }
+
     #[test]
     fn ignores_agents_outside_the_pane_tree_and_cycles() {
         let processes = vec![
@@ -1747,7 +1877,78 @@ mod tests {
         assert_eq!(listed.agent.cwd, "/repo");
 
         // An idle push means "no activity", not "blank the row": the pane goes
-        // back to what detection can see rather than losing a live agent.
+        // back to what detection can see rather than losing a live agent. What
+        // it does *not* mean is that nobody reported — the row says `idle`,
+        // because that is what the agent said about itself.
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Idle,
+            String::from("sitting idle"),
+            now,
+            1_000,
+        );
+        let listed = tracker
+            .listed_agent()
+            .expect("the scanned agent keeps its row");
+        assert_eq!(
+            listed.agent.cwd, "/detected",
+            "the scan owns the row now, so the row is where the scan says"
+        );
+        assert_eq!(
+            listed.state,
+            AgentState::Idle,
+            "the agent reported idle; reporting `Unknown` would send a user who \
+             has run `p2pmux setup` off to run it again"
+        );
+        assert_eq!(listed.message, "sitting idle");
+        assert_eq!(
+            listed.working_since_unix_ms, 1_000,
+            "idle rows get a clock too"
+        );
+    }
+
+    /// Issue #110, in the shape it was reported: working and needs-you update
+    /// live, and then `p2pmux notify idle` makes the row forget that hooks ever
+    /// fired.
+    #[test]
+    fn an_idle_push_is_the_panes_state_rather_than_no_hooks_at_all() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(Some(DetectedAgent {
+            kind: AgentKind::OpenCode,
+            cwd: "/repo".into(),
+        }));
+
+        for (state, message) in [
+            (AgentState::Working, "working on the tests"),
+            (AgentState::Pending, "permission: write to /etc/hosts"),
+            (AgentState::Idle, "sitting idle"),
+        ] {
+            tracker.record_pushed_status(
+                AgentKind::OpenCode,
+                "/repo".into(),
+                state,
+                String::from(message),
+                now,
+                7_000,
+            );
+            let listed = tracker.listed_agent().expect("the agent is still running");
+            assert_eq!(listed.state, state, "reported {state:?}");
+            assert_eq!(listed.message, message);
+        }
+    }
+
+    /// The half of the old behaviour that was right, and has to stay right: an
+    /// idle push is not a life-support machine for a row whose agent has gone.
+    #[test]
+    fn an_idle_push_does_not_keep_a_row_the_scan_can_no_longer_see() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.update(Some(DetectedAgent {
+            kind: AgentKind::Claude,
+            cwd: "/repo".into(),
+        }));
         tracker.record_pushed_status(
             AgentKind::Claude,
             "/repo".into(),
@@ -1756,15 +1957,44 @@ mod tests {
             now,
             1_000,
         );
-        let listed = tracker
-            .listed_agent()
-            .expect("the scanned agent keeps its row");
-        assert_eq!(listed.agent.cwd, "/detected");
+        assert!(tracker.listed_agent().is_some());
+
+        // The agent exited. Nothing fires a hook for that, so the scan losing
+        // it is the whole signal.
+        tracker.update(None);
+        assert!(
+            tracker.listed_agent().is_none(),
+            "an idle push must not outlive the process it describes"
+        );
+    }
+
+    /// A pid gets reused, or the user closes one agent and opens another in the
+    /// same pane. The previous agent's status is not the new one's.
+    #[test]
+    fn a_push_from_another_agent_kind_does_not_colour_this_ones_row() {
+        let now = Instant::now();
+        let mut tracker = PaneAgentTracker::default();
+        tracker.record_pushed_status(
+            AgentKind::Claude,
+            "/repo".into(),
+            AgentState::Idle,
+            String::from("claude went quiet"),
+            now,
+            1_000,
+        );
+        tracker.update(Some(DetectedAgent {
+            kind: AgentKind::Codex,
+            cwd: "/repo".into(),
+        }));
+
+        let listed = tracker.listed_agent().expect("codex is running");
+        assert_eq!(listed.agent.kind, AgentKind::Codex);
         assert_eq!(
             listed.state,
             AgentState::Unknown,
-            "nothing is reporting on it any more, and saying `idle` would be a guess"
+            "nothing has reported on *codex*, and claude's last word is not its state"
         );
+        assert!(listed.message.is_empty());
     }
 
     #[test]

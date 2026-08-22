@@ -42,6 +42,12 @@ use crate::{
 pub struct MultiPaneTui {
     pub(in crate::tui) title: String,
     pub(in crate::tui) theme: UiTheme,
+    /// Whether panes without focus are drawn at reduced intensity.
+    ///
+    /// Local chrome, like the theme beside it: which pane *this* user is typing
+    /// into is not a fact about the session, and dimming it on one client says
+    /// nothing to any other.
+    pub(in crate::tui) dim_unfocused_panes: bool,
     pub(in crate::tui) snapshot: LayoutSnapshot,
     pub(in crate::tui) current_tab: TabId,
     pub(in crate::tui) focused_pane: PaneId,
@@ -152,6 +158,11 @@ impl MultiPaneTui {
         Self::with_theme(snapshot, UiTheme::default())
     }
 
+    /// Turn the unfocused-pane dimming off, for a client whose config asked.
+    pub fn set_dim_unfocused_panes(&mut self, dim: bool) {
+        self.dim_unfocused_panes = dim;
+    }
+
     pub fn with_theme(snapshot: LayoutSnapshot, theme: UiTheme) -> Result<Self, LayoutError> {
         crate::layout::SessionState::validate_snapshot(&snapshot)?;
         let current_tab = snapshot.tabs[0].tab_id;
@@ -164,6 +175,7 @@ impl MultiPaneTui {
         Ok(Self {
             title: TOP_BAR_BRAND.into(),
             theme,
+            dim_unfocused_panes: true,
             snapshot,
             current_tab,
             focused_pane,
