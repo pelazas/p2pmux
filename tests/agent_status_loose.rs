@@ -149,7 +149,8 @@ fn a_hook_outside_every_pane_reaches_the_row_its_agent_has_in_the_inbox() {
     let mut sampler = SysinfoSampler::default();
     let agent = wait_for(|| {
         let snapshot = sample_global_snapshot(&mut sampler);
-        let mut loose = AgentScan::new(&snapshot).loose_agents(&[]);
+        let mut loose =
+            AgentScan::new(&snapshot).loose_agents(&[], &std::collections::HashSet::new());
         agent_status::attach(directory, &mut loose);
         loose.into_iter().find(|agent| agent.pid == fake.pid)
     })

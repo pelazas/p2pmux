@@ -1902,7 +1902,10 @@ mod tests {
              has run `p2pmux setup` off to run it again"
         );
         assert_eq!(listed.message, "sitting idle");
-        assert_eq!(listed.working_since_unix_ms, 1_000, "idle rows get a clock too");
+        assert_eq!(
+            listed.working_since_unix_ms, 1_000,
+            "idle rows get a clock too"
+        );
     }
 
     /// Issue #110, in the shape it was reported: working and needs-you update

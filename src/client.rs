@@ -1251,9 +1251,8 @@ fn apply_layout<'a>(
             view
         }
         None => {
-            let mut view = MultiPaneTui::with_theme(layout, ui.theme).map_err(|error| {
-                io::Error::other(format!("invalid layout snapshot: {error:?}"))
-            })?;
+            let mut view = MultiPaneTui::with_theme(layout, ui.theme)
+                .map_err(|error| io::Error::other(format!("invalid layout snapshot: {error:?}")))?;
             view.set_dim_unfocused_panes(ui.dim_unfocused_panes);
             tui.insert(view)
         }

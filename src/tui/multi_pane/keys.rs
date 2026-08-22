@@ -11,9 +11,7 @@ use crate::{
     tui::{
         ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, ModalState, MultiPaneTui, QuitAction,
         RenameTarget, UiIntent,
-        geometry::{
-            grid_for_pane, nearest_in_direction, visible_leaf_panes,
-        },
+        geometry::{grid_for_pane, nearest_in_direction, visible_leaf_panes},
         input::keys::{
             ends_chord_mode, is_chord_command, is_chord_navigation, is_focus_arrow, is_quit,
         },
