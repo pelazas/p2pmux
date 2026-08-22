@@ -11,6 +11,17 @@ enrolment token — and a peer on the wrong side of it is refused rather than ha
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+Dimming the pane you are not typing into now reaches the terminal. The frame always asked for it,
+and on a terminal whose environment carries `NO_COLOR` the request was cancelled a byte before the
+text it applied to: crossterm answers that variable by writing a cell's colours as an SGR with no
+parameters, which is a full reset, and ratatui writes colours after attributes. Bold, reverse and
+underline died there too, so a selection did not look selected and a pane replaying a colourful
+program lost the emphasis that program chose. p2pmux now keeps its own attributes through
+`NO_COLOR`; a multiplexer draws mostly other programs' output, and each of those programs read the
+same variable and already answered it.
+
 ## v0.1.13 — 2026-08-22
 
 Six fixes and two additions, and no protocol change: what a pane draws and what you can copy out

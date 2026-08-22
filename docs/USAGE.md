@@ -737,6 +737,10 @@ lowercase named values (`white`, `yellow`, `gray`, `dark_gray`) or case-insensit
 values. The theme is client-local and is never synchronized over P2P; detach and reattach after
 editing the file to reload it.
 
+`NO_COLOR` in the environment does not blank this chrome. Most of what p2pmux puts on screen is
+the output of the programs in your panes, which inherit the variable and answer it themselves;
+overriding their answer is not p2pmux's call. Set the theme keys above to shape the chrome.
+
 `member_colors` under `[ui.theme]` is a list of up to eight colors, one per member slot in join
 order, used for the presence dots and chips. Listing fewer than eight overrides from the front and
 leaves the rest at their built-in color. The first slot — the session host — defaults to a vivid

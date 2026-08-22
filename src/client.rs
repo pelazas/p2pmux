@@ -34,8 +34,9 @@ use crate::{
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
         PaneMouseProtocol, PaneViewState, QuitAction, ShareView, clear_before_first_frame,
-        copy_selection_to_clipboard, render_multi_pane_with_copy_feedback, resize_recheck_due,
-        share_copy_result, stale_node_size,
+        copy_selection_to_clipboard, keep_attributes_through_no_color,
+        render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
+        stale_node_size,
     },
 };
 
@@ -341,6 +342,7 @@ pub fn run_on(
     let reader_thread = spawn_message_reader(reader, wake_tx.clone());
     let terminal_stop = Arc::new(AtomicBool::new(false));
     let mut guard = ClientTerminalGuard::enter(&descriptor.name)?;
+    keep_attributes_through_no_color();
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,

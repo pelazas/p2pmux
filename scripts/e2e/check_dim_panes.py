@@ -10,6 +10,13 @@ So this drives the real binary, splits a pane, writes a marker into each, and
 reads the *escape sequences* rather than the rendered text: SGR 2 is faint, SGR
 22 turns it back off. It then moves focus and checks the two panes swapped.
 
+Issue #113 added the second run. Crossterm reads `NO_COLOR` process-wide and
+then writes a cell's colours as `ESC [ ; m` -- a parameterless SGR, which is a
+full reset -- immediately after ratatui asked for faint and immediately before
+the glyph. Every attribute in the frame died there, and only a terminal whose
+environment carried `NO_COLOR` ever saw it, which is why the first run was green
+on the machine that shipped the feature.
+
 Run: python3 scripts/e2e/check_dim_panes.py
 """
 
@@ -53,18 +60,12 @@ def intensity_at(raw: str, marker: str) -> bool | None:
     return faint
 
 
-def main() -> int:
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
-    baseline = p2pmux_pids()
-    failures = 0
+def split_and_read(label: str, env: dict[str, str]) -> str:
+    """Everything one client drew, from startup through a right-split.
 
-    def check(name: str, ok: bool, detail: str = "") -> None:
-        nonlocal failures
-        if not ok:
-            failures += 1
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail else ""))
-
-    with Harness("dim-panes") as harness:
+    Pane 1 holds AAAAA and loses focus to pane 2, which holds BBBBB.
+    """
+    with Harness(f"dim-panes-{label}") as harness:
         peer = harness.spawn(
             "solo", ["create", "--name", "dim", "--session-name", "dim"],
             cols=COLS, rows=ROWS, env=env,
@@ -81,17 +82,44 @@ def main() -> int:
         peer.run_in_shell("printf 'BBBBB\\n'")
         time.sleep(2.0)
 
-        # Everything the client has drawn since it started.
-        raw = peer.raw_text()
+        return peer.raw_text()
+
+
+def main() -> int:
+    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    baseline = p2pmux_pids()
+    failures = 0
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures
+        if not ok:
+            failures += 1
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail else ""))
+
+    # The same split, run in a plain environment and in one that sets NO_COLOR.
+    # A terminal multiplexer draws mostly other programs' output, so NO_COLOR is
+    # theirs to honour and not p2pmux's -- but either way it must never cost the
+    # frame its text attributes.
+    for label, extra in (("plain env", {}), ("NO_COLOR=1", {"NO_COLOR": "1"})):
+        print(f"  [{label}]")
+        raw = split_and_read(label.split("=")[0].replace(" ", "-"), {**base, **extra})
 
         first = intensity_at(raw, "AAAAA")
         second = intensity_at(raw, "BBBBB")
-        check("both panes drew their marker", first is not None and second is not None,
+        check(f"{label}: both panes drew their marker",
+              first is not None and second is not None,
               f"pane1={first} pane2={second}")
         if first is None or second is None:
-            return 1
-        check("the focused pane (2) is at full intensity", second is False, f"faint={second}")
-        check("the unfocused pane (1) is faint", first is True, f"faint={first}")
+            continue
+        check(f"{label}: the focused pane (2) is at full intensity",
+              second is False, f"faint={second}")
+        check(f"{label}: the unfocused pane (1) is faint", first is True, f"faint={first}")
+        # The empty SGR is the bug's fingerprint, not a symptom: it resets bold,
+        # reverse and underline along with the dim, so nothing the frame asked
+        # for survives it.
+        check(f"{label}: no parameterless SGR reaches the terminal",
+              "\x1b[;m" not in raw,
+              f"{raw.count(chr(27) + '[;m')} of them")
 
     leaked = orphans_after(baseline)
     if leaked:
