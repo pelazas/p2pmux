@@ -268,9 +268,23 @@ pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn
     // seconds, for as long as both are up — and `list_live` would spend a
     // quarter of a second there waiting for this very node to answer a probe it
     // cannot answer while it is blocked sending it.
+    //
+    // A record is only evidence of membership while the node that wrote it is
+    // still running. It outlives one: a machine that was rebooted, or whose
+    // p2pmux was killed, keeps the file. Believing it meant a machine that had
+    // been away decided it was already in its home session, never rejoined, and
+    // so never heard any of the invitations that travel over that session --
+    // including the one to the session started while it was away. "Your trusted
+    // machines join immediately" quietly became "unless one of them has been
+    // switched off since", which is the case it exists for.
+    //
+    // The liveness test is `node_process_is_alive`, which reads the process
+    // table. Still not a socket probe, so the reasoning above about not
+    // blocking this loop holds.
     if store.list_recorded()?.iter().any(|session| {
-        session.ticket.as_deref() == Some(ticket.as_str())
-            || session.joined_ticket.as_deref() == Some(ticket.as_str())
+        let names_it = session.ticket.as_deref() == Some(ticket.as_str())
+            || session.joined_ticket.as_deref() == Some(ticket.as_str());
+        names_it && crate::agent_detect::node_process_is_alive(session.node_pid)
     }) {
         return Ok(false);
     }
@@ -2983,6 +2997,34 @@ mod tests {
             .0;
 
         assert!(invite.contains("connect_timeout_ms: None"));
+    }
+
+    /// Issue #107: a machine that was switched off must not decide it is still
+    /// in its home session.
+    ///
+    /// Asserted against the source in the style of the test above, because the
+    /// function it guards reaches the real session store and the real process
+    /// table, and the bug is precisely that a record and a running node are not
+    /// the same thing. The behaviour itself is covered on two real machines by
+    /// `scripts/e2e/scenario_am_trusted_autojoin.py`, where the check without
+    /// this line fails and with it passes.
+    #[test]
+    fn already_being_in_a_session_requires_the_node_to_still_be_running() {
+        let source = include_str!("node.rs");
+        let invite = source
+            .split_once("pub fn follow_fleet_invite")
+            .expect("invite launcher")
+            .1
+            .split_once("pub fn write_bootstrap")
+            .expect("next function")
+            .0;
+
+        assert!(
+            invite.contains("node_process_is_alive(session.node_pid)"),
+            "a recorded session only proves membership while its node is alive; \
+             without this a rebooted machine never rejoins and so never hears \
+             about any session started while it was away"
+        );
     }
 
     #[test]
