@@ -174,8 +174,16 @@ command.
 
 ## Keys
 
-- `Option+` `<shift>` + arrows — move focus to the nearest pane in that direction in the current
-  tab. Some terminals need Shift with Option for horizontal arrows.
+- `Ctrl+` arrows — move focus to the neighbouring pane in that direction in the current tab.
+- `Option+` `<shift>` + arrows — the same thing. Kept for the muscle memory it built; some
+  terminals need Shift with Option for horizontal arrows.
+- `Ctrl+Alt+` arrows — *not* a focus key. Forwarded to the pane untouched, which is how you still
+  send a readline word-jump now that `Ctrl+` arrows stop at p2pmux. `Ctrl+P` then an arrow is the
+  other way round it.
+
+A pane is a neighbour if it is past this pane's edge in that direction and its span overlaps this
+one's. Panes that only sit past a corner are used just when nothing is properly beside you, so an
+arrow never leaves sideways when there is somewhere it should have gone.
 - `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new PTY
   runs on the requester's machine and inherits the target pane's cwd when that pane is hosted
   locally by the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
@@ -226,7 +234,7 @@ gives the locally focused pane a red border; Tab mode dims inactive tab labels. 
 to switch tabs without claiming control or sending input.
 
 The dark contextual footer uses red key accents: normal mode is
-`Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS    type to claim when free`;
+`Ctrl+ <p> PANE   <t> TAB   <q> QUIT   <↑↓←→> FOCUS    type to claim when free`;
 pane mode is
 `PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <L> SESSION   <Esc> BACK`, dropping `<L> SESSION` on a terminal too narrow to hold it whole rather than clipping the bar mid-word;
 tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.

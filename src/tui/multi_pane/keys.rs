@@ -12,10 +12,10 @@ use crate::{
         ChordMode, HOME_TOGGLE_WINDOW, KeyHandling, ModalState, MultiPaneTui, QuitAction,
         RenameTarget, UiIntent,
         geometry::{
-            direction_distance, grid_for_pane, is_in_direction, rect_center, visible_leaf_panes,
+            grid_for_pane, nearest_in_direction, visible_leaf_panes,
         },
         input::keys::{
-            ends_chord_mode, is_chord_command, is_chord_navigation, is_option_arrow, is_quit,
+            ends_chord_mode, is_chord_command, is_chord_navigation, is_focus_arrow, is_quit,
         },
     },
 };
@@ -155,7 +155,7 @@ impl MultiPaneTui {
             self.exit_chord_mode();
             return KeyHandling::Consumed(vec![]);
         }
-        if matches!(self.chord_mode, ChordMode::None | ChordMode::Pane) && is_option_arrow(key) {
+        if matches!(self.chord_mode, ChordMode::None | ChordMode::Pane) && is_focus_arrow(key) {
             self.touch_chord_activity();
             return KeyHandling::Consumed(self.move_focus(key.code, area).into_iter().collect());
         }
@@ -345,24 +345,13 @@ impl MultiPaneTui {
     fn move_focus_within_layout(&mut self, direction: KeyCode, area: Rect) -> Option<UiIntent> {
         let geometry = self.geometry(area);
         let source = *geometry.panes.get(&self.focused_pane)?;
-        let source_center = rect_center(source);
         let candidates = geometry
             .panes
             .iter()
             .filter(|(pane_id, _)| **pane_id != self.focused_pane)
             .map(|(pane_id, rect)| (*pane_id, *rect))
             .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return None;
-        }
-        let pane_id = candidates
-            .iter()
-            .copied()
-            .filter(|(_, rect)| is_in_direction(source_center, rect_center(*rect), direction))
-            .min_by_key(|(pane_id, rect)| {
-                direction_distance(source_center, rect_center(*rect), direction, *pane_id)
-            })?
-            .0;
+        let pane_id = nearest_in_direction(source, candidates, direction)?;
         self.select_pane(self.current_tab, pane_id, "key");
         Some(UiIntent::FocusPane { pane_id })
     }
@@ -475,6 +464,50 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 3 }])
         );
         assert_eq!(tui.chord_mode(), ChordMode::Pane);
+    }
+
+    /// Issue #106: Ctrl+arrow, because that is what every other tiling thing
+    /// on a desktop uses and Option+Shift+arrow is a lot of hand.
+    #[test]
+    fn control_arrows_move_focus_and_option_arrows_still_do() {
+        let area = Rect::new(0, 0, 80, 24);
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+            assert_eq!(
+                tui.handle_key(KeyEvent::new(KeyCode::Right, modifiers), area),
+                KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }]),
+                "modifiers: {modifiers:?}"
+            );
+            assert_eq!(tui.focused_pane(), 2, "modifiers: {modifiers:?}");
+        }
+    }
+
+    /// The escape hatch the new binding owes the shell.
+    ///
+    /// Ctrl+arrow is word-jump in readline, and inside a pane it now stops at
+    /// p2pmux. Holding Alt as well is how you still send it, so it must not be
+    /// a focus key -- and must not move focus on its way past either.
+    #[test]
+    fn control_alt_arrows_are_forwarded_to_the_pane_untouched() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Up, KeyCode::Down] {
+            assert_eq!(
+                tui.handle_key(
+                    KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::CONTROL),
+                    area,
+                ),
+                KeyHandling::Forward,
+                "{code:?} with both modifiers belongs to the shell"
+            );
+            assert_eq!(tui.focused_pane(), 1, "{code:?} must not move focus either");
+        }
     }
 
     #[test]
@@ -865,12 +898,32 @@ mod tests {
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 1 }])
         );
         assert_eq!(tui.focused_pane(), 1);
+
+        // Pane 1 is the full-height left column, so its top edge is the top of
+        // the tab and there is nothing above it. This used to move focus to
+        // pane 2 -- up *and to the right* -- because pane 2 is half height and
+        // so its centre sits higher. That is issue #106's "the arrows don't
+        // work quite well": focus leaving sideways when you press Up, and not
+        // coming back when you press Down.
         let _ = tui.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             area,
         );
         assert_eq!(
             tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![]),
+            "nothing is above the full-height pane, so Up stays put"
+        );
+        assert_eq!(tui.focused_pane(), 1);
+
+        // The right-hand column is still two keys away, and by a route that
+        // reads the way the screen looks.
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), area),
             KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 2 }])
         );
         assert_eq!(tui.focused_pane(), 2);

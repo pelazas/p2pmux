@@ -297,38 +297,96 @@ pub(in crate::tui) fn rect_center(rect: Rect) -> (u32, u32) {
         u32::from(rect.y) * 2 + u32::from(rect.height),
     )
 }
-pub(in crate::tui) fn is_in_direction(
-    source: (u32, u32),
-    target: (u32, u32),
-    direction: KeyCode,
-) -> bool {
-    match direction {
-        KeyCode::Left => target.0 < source.0,
-        KeyCode::Right => target.0 > source.0,
-        KeyCode::Up => target.1 < source.1,
-        KeyCode::Down => target.1 > source.1,
-        _ => false,
-    }
+/// How far two spans overlap, in cells. `0` means they do not.
+fn span_overlap(start: u16, length: u16, other_start: u16, other_length: u16) -> u16 {
+    let end = start.saturating_add(length);
+    let other_end = other_start.saturating_add(other_length);
+    end.min(other_end).saturating_sub(start.max(other_start))
 }
-pub(in crate::tui) fn direction_distance(
-    source: (u32, u32),
-    target: (u32, u32),
+
+/// The pane an arrow should move focus to, or `None` if there is nothing that
+/// way.
+///
+/// Replaces a comparison of pane *centres*, which produced two complaints that
+/// turn out to be the same bug. A centre says nothing about whether two
+/// rectangles are actually beside each other, so a pane sitting diagonally
+/// counted as being above:
+///
+/// ```text
+/// +--------------+----+
+/// |              | 2  |     Up from pane 1 moved focus to pane 2, because
+/// |      1       +----+     2's centre is higher than 1's -- never mind that
+/// |              | 3  |     2 is to the *right* and nothing is above 1 at all.
+/// +--------------+----+
+/// ```
+///
+/// Which also explains "the arrows cannot even get to the desired pane": focus
+/// that leaves sideways when you press Up does not come back when you press
+/// Down, and from some panes there was no sequence of arrows that reached the
+/// one you were looking at.
+///
+/// So a candidate has to *start* beyond the source along the axis being
+/// travelled, and a candidate whose perpendicular span overlaps the source's
+/// beats one that merely floats past a corner. Among equals, the nearest edge
+/// wins, then the nearest perpendicular centre, then the lowest pane id so the
+/// answer never depends on map order.
+pub(in crate::tui) fn nearest_in_direction(
+    source: Rect,
+    candidates: impl IntoIterator<Item = (PaneId, Rect)>,
     direction: KeyCode,
-    pane_id: PaneId,
-) -> (u32, u32, u32, PaneId) {
-    match direction {
-        KeyCode::Left | KeyCode::Right => {
-            let primary = source.0.abs_diff(target.0);
-            let secondary = source.1.abs_diff(target.1);
-            (primary + secondary, secondary, primary, pane_id)
-        }
-        KeyCode::Up | KeyCode::Down => {
-            let primary = source.1.abs_diff(target.1);
-            let secondary = source.0.abs_diff(target.0);
-            (primary + secondary, secondary, primary, pane_id)
-        }
-        _ => (u32::MAX, u32::MAX, u32::MAX, pane_id),
+) -> Option<PaneId> {
+    let vertical = matches!(direction, KeyCode::Up | KeyCode::Down);
+    if !vertical && !matches!(direction, KeyCode::Left | KeyCode::Right) {
+        return None;
     }
+    candidates
+        .into_iter()
+        .filter_map(|(pane_id, rect)| {
+            // Clear of the source's *far* edge, not merely of its near one.
+            // Comparing near edges reads a short pane stacked beside a tall one
+            // as being below it -- pane 3 in the diagram above starts lower
+            // than pane 1 does, while pane 1 runs past the bottom of it.
+            //
+            // `BORDER_SLACK` because two panes either side of a split share the
+            // row or column their borders are drawn in, so a genuine neighbour
+            // can start one cell before this pane's rectangle ends. Erring
+            // towards admitting one is the cheap direction to be wrong in: the
+            // overlap ranking below sorts it, whereas excluding it would strand
+            // the pane.
+            const BORDER_SLACK: u16 = 1;
+            let beyond = match direction {
+                KeyCode::Left => rect.x + rect.width <= source.x + BORDER_SLACK,
+                KeyCode::Right => rect.x + BORDER_SLACK >= source.x + source.width,
+                KeyCode::Up => rect.y + rect.height <= source.y + BORDER_SLACK,
+                KeyCode::Down => rect.y + BORDER_SLACK >= source.y + source.height,
+                _ => false,
+            };
+            if !beyond {
+                return None;
+            }
+            let overlap = if vertical {
+                span_overlap(source.x, source.width, rect.x, rect.width)
+            } else {
+                span_overlap(source.y, source.height, rect.y, rect.height)
+            };
+            let (gap, offset) = if vertical {
+                (
+                    source.y.abs_diff(rect.y),
+                    rect_center(rect).0.abs_diff(rect_center(source).0),
+                )
+            } else {
+                (
+                    source.x.abs_diff(rect.x),
+                    rect_center(rect).1.abs_diff(rect_center(source).1),
+                )
+            };
+            // `overlap == 0` first, and as a bool: `false` sorts before `true`,
+            // so a pane genuinely beside this one is always preferred to one
+            // that is only diagonally past it.
+            Some((pane_id, (overlap == 0, u32::from(gap), offset, pane_id)))
+        })
+        .min_by_key(|(_, key)| *key)
+        .map(|(pane_id, _)| pane_id)
 }
 pub(in crate::tui) fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> Rect {
     let width = inner.width.min(cols);
@@ -455,8 +513,10 @@ mod tests {
     use super::{
         RESIZE_RECHECK_INTERVAL, allocate_node_with_preview, area_from_terminal_size,
         grid_for_pane, initial_root_pane_grid, missed_resize, mouse_to_screen_cell,
-        resize_recheck_due, stale_node_size,
+        nearest_in_direction, resize_recheck_due, stale_node_size,
     };
+    use crate::layout::PaneId;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn terminal_area_is_absent_when_terminal_size_is_unavailable() {
@@ -593,5 +653,109 @@ mod tests {
             .expect("root pane");
         assert_eq!(grid_for_pane(pane), (20, 78));
         assert_eq!(initial_root_pane_grid(80, 24), (20, 78));
+    }
+
+    /// Issue #106, the half that is not about which key you press.
+    ///
+    /// ```text
+    /// +--------------+----+
+    /// |              | 2  |
+    /// |      1       +----+
+    /// |              | 3  |
+    /// +--------------+----+
+    /// ```
+    #[test]
+    fn an_arrow_never_leaves_sideways_when_nothing_is_that_way() {
+        let one = Rect::new(0, 0, 40, 20);
+        let two = Rect::new(40, 0, 20, 10);
+        let three = Rect::new(40, 10, 20, 10);
+        let from_one = [(2, two), (3, three)];
+
+        // Comparing centres, pane 2's is higher than pane 1's, so Up used to
+        // move focus up *and to the right*. Nothing is above pane 1.
+        assert_eq!(nearest_in_direction(one, from_one, KeyCode::Up), None);
+        assert_eq!(nearest_in_direction(one, from_one, KeyCode::Down), None);
+        assert_eq!(nearest_in_direction(one, from_one, KeyCode::Left), None);
+        assert_eq!(nearest_in_direction(one, from_one, KeyCode::Right), Some(2));
+
+        // And the right-hand column navigates the way it looks.
+        assert_eq!(
+            nearest_in_direction(two, [(1, one), (3, three)], KeyCode::Down),
+            Some(3)
+        );
+        assert_eq!(
+            nearest_in_direction(three, [(1, one), (2, two)], KeyCode::Up),
+            Some(2)
+        );
+        assert_eq!(
+            nearest_in_direction(three, [(1, one), (2, two)], KeyCode::Left),
+            Some(1)
+        );
+    }
+
+    /// A pane that is beside the source beats one that is only past a corner,
+    /// which is what "the arrows cannot even get to the desired pane" meant.
+    ///
+    /// ```text
+    /// +----+----+
+    /// | 1  | 2  |
+    /// +----+----+
+    /// | 3  | 4  |
+    /// +----+----+
+    /// ```
+    #[test]
+    fn a_neighbour_beats_a_diagonal_and_a_grid_walks_the_way_it_reads() {
+        let panes = [
+            (1, Rect::new(0, 0, 20, 10)),
+            (2, Rect::new(20, 0, 20, 10)),
+            (3, Rect::new(0, 10, 20, 10)),
+            (4, Rect::new(20, 10, 20, 10)),
+        ];
+        let without = |id: PaneId| {
+            panes
+                .iter()
+                .copied()
+                .filter(move |(pane_id, _)| *pane_id != id)
+                .collect::<Vec<_>>()
+        };
+        let rect_of = |id: PaneId| panes.iter().find(|(p, _)| *p == id).unwrap().1;
+
+        for (from, direction, expected) in [
+            (1, KeyCode::Right, Some(2)),
+            (1, KeyCode::Down, Some(3)),
+            (1, KeyCode::Up, None),
+            (1, KeyCode::Left, None),
+            (2, KeyCode::Left, Some(1)),
+            (2, KeyCode::Down, Some(4)),
+            (3, KeyCode::Up, Some(1)),
+            (3, KeyCode::Right, Some(4)),
+            (4, KeyCode::Up, Some(2)),
+            (4, KeyCode::Left, Some(3)),
+            (4, KeyCode::Down, None),
+            (4, KeyCode::Right, None),
+        ] {
+            assert_eq!(
+                nearest_in_direction(rect_of(from), without(from), direction),
+                expected,
+                "from pane {from} going {direction:?}"
+            );
+        }
+    }
+
+    /// Nothing overlaps, so the fallback has to pick *something* rather than
+    /// stranding the user -- but only among panes genuinely that way.
+    #[test]
+    fn a_pane_past_a_corner_is_still_reachable_when_nothing_is_beside_you() {
+        // A narrow strip at the top left, and a wide one below and to the right
+        // that its columns do not touch.
+        let source = Rect::new(0, 0, 10, 5);
+        let away = Rect::new(30, 10, 20, 5);
+
+        assert_eq!(
+            nearest_in_direction(source, [(2, away)], KeyCode::Down),
+            Some(2),
+            "with no neighbour below, the one past the corner is better than nowhere"
+        );
+        assert_eq!(nearest_in_direction(source, [(2, away)], KeyCode::Up), None);
     }
 }

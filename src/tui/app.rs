@@ -43,7 +43,7 @@ use crate::{
 };
 
 /// The legacy fixed-grid host/guest footer, which has no chords, agents, or share modal.
-const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   Option+ <shift> + <↑↓←→> FOCUS";
+const CONTROL_HELP: &str = "Ctrl+ <p> PANE   <t> TAB   <q> QUIT   <↑↓←→> FOCUS";
 /// Run one local shell in a PTY whose dimensions never change after startup.
 pub fn run_local() -> Result<(), Box<dyn Error>> {
     let (cols, rows) = terminal::size()?;
