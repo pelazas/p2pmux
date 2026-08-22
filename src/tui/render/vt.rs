@@ -24,6 +24,8 @@ pub(in crate::tui) struct VtScreen<'a> {
     /// How far back the pane is scrolled, so a selection pinned to its lines
     /// can be drawn on the rows those lines are on now.
     scrollback: usize,
+    /// Whether this pane is one the user is not typing into.
+    dimmed: bool,
 }
 impl<'a> VtScreen<'a> {
     pub(in crate::tui) fn new(screen: &'a vt100::Screen) -> Self {
@@ -31,7 +33,25 @@ impl<'a> VtScreen<'a> {
             screen,
             selection: None,
             scrollback: 0,
+            dimmed: false,
         }
+    }
+
+    /// Draw every cell at reduced intensity.
+    ///
+    /// For a pane that does not have focus. A border colour answers "which pane
+    /// am I typing into" in the handful of cells the border occupies; this
+    /// answers it across the whole rectangle, which is where the eye actually
+    /// goes.
+    ///
+    /// `Modifier::DIM` rather than a computed colour because a cell's colour is
+    /// very often `Color::Reset` -- the terminal's own default, whose value
+    /// this process does not know and must not guess. Asking the terminal to
+    /// draw its own colours faintly is the only form of this that is right for
+    /// a default foreground, a 256-colour index and a true-colour triple alike.
+    pub(in crate::tui) fn dimmed(mut self, dimmed: bool) -> Self {
+        self.dimmed = dimmed;
+        self
     }
 
     pub(in crate::tui) fn with_selection(mut self, selection: Option<PaneTextSelection>) -> Self {
@@ -84,9 +104,16 @@ impl Widget for VtScreen<'_> {
                 let style = if self.selection.is_some_and(|selection| {
                     selection.contains(ScreenCell { row, col }, self.scrollback)
                 }) {
+                    // Never dimmed. A selection is something the user made a
+                    // moment ago and is about to copy, and it can perfectly
+                    // well sit in a pane they have since focused away from --
+                    // selecting in one pane and working in another is the
+                    // ordinary way to use two of them.
                     vt_style(source)
                         .bg(Color::DarkGray)
                         .add_modifier(Modifier::REVERSED)
+                } else if self.dimmed {
+                    vt_style(source).add_modifier(Modifier::DIM)
                 } else {
                     vt_style(source)
                 };

@@ -713,6 +713,14 @@ the value for that run and future sessions.
 Run `p2pmux config init` to create a fully commented configuration template; it refuses to
 overwrite an existing file.
 
+### Dimming
+
+Panes you are not typing into are drawn at reduced intensity, so a glance across a split finds the
+focused one without reading the border colors. Set `dim_unfocused_panes = false` under `[ui]` to
+turn it off — worth doing if your terminal renders faint text so faint that watching an unfocused
+build scroll past is a strain. Like the theme below, it is client-local: which pane *you* are in is
+not a fact about the session, and no peer sees your setting.
+
 ### Theme
 
 Local TUI chrome colors live under `[ui.theme]`. Every theme key is optional, and omitted keys

@@ -317,7 +317,7 @@ pub fn run_on(
             config_path.display()
         ))
     })?;
-    let theme = config.ui.theme;
+    let ui = config.ui;
     let mut stream = UnixStream::connect(&descriptor.socket_path)?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
@@ -434,7 +434,7 @@ pub fn run_on(
                         let apply_started = Instant::now();
                         let view = apply_layout(
                             &mut tui,
-                            theme,
+                            ui,
                             &mut screens,
                             &mut history,
                             room_name,
@@ -502,7 +502,7 @@ pub fn run_on(
                     NodeMessage::Layout { layout } => {
                         apply_layout(
                             &mut tui,
-                            theme,
+                            ui,
                             &mut screens,
                             &mut history,
                             String::new(),
@@ -1209,7 +1209,7 @@ fn should_forward_paste(tui: &MultiPaneTui, local_peer_id: &[u8]) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn apply_snapshot(
     tui: &mut Option<MultiPaneTui>,
-    theme: crate::config::UiTheme,
+    ui: crate::config::UiConfig,
     screens: &mut BTreeMap<u64, GuestScreen>,
     history: &mut BTreeMap<u64, HistoryCache>,
     room_name: String,
@@ -1221,7 +1221,7 @@ fn apply_snapshot(
     pane_id: u64,
     pending_focus: &mut Option<(u64, u64)>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-    let view = apply_layout(tui, theme, screens, history, room_name, layout)?;
+    let view = apply_layout(tui, ui, screens, history, room_name, layout)?;
     let (resync, _) = apply_screens(
         view,
         screens,
@@ -1238,7 +1238,7 @@ fn apply_snapshot(
 
 fn apply_layout<'a>(
     tui: &'a mut Option<MultiPaneTui>,
-    theme: crate::config::UiTheme,
+    ui: crate::config::UiConfig,
     screens: &mut BTreeMap<u64, GuestScreen>,
     history: &mut BTreeMap<u64, HistoryCache>,
     room_name: String,
@@ -1250,10 +1250,13 @@ fn apply_layout<'a>(
                 .map_err(|error| io::Error::other(format!("invalid layout snapshot: {error:?}")))?;
             view
         }
-        None => tui
-            .insert(MultiPaneTui::with_theme(layout, theme).map_err(|error| {
+        None => {
+            let mut view = MultiPaneTui::with_theme(layout, ui.theme).map_err(|error| {
                 io::Error::other(format!("invalid layout snapshot: {error:?}"))
-            })?),
+            })?;
+            view.set_dim_unfocused_panes(ui.dim_unfocused_panes);
+            tui.insert(view)
+        }
     };
     if !room_name.is_empty() {
         view.set_title(format!("p2pmux ({room_name})"));
@@ -1766,7 +1769,7 @@ mod tests {
         let mut pending_focus = None;
         apply_snapshot(
             tui,
-            crate::config::UiTheme::default(),
+            crate::config::UiConfig::default(),
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             String::from("room"),
@@ -1790,7 +1793,7 @@ mod tests {
     ) {
         apply_snapshot(
             tui,
-            crate::config::UiTheme::default(),
+            crate::config::UiConfig::default(),
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             String::from("room"),
@@ -1987,7 +1990,7 @@ mod tests {
         let mut pending_focus = None;
         apply_snapshot(
             &mut tui,
-            crate::config::UiTheme::default(),
+            crate::config::UiConfig::default(),
             &mut screens,
             &mut history,
             String::from("room"),
@@ -2037,7 +2040,7 @@ mod tests {
         let mut pending_focus = None;
         apply_snapshot(
             &mut tui,
-            crate::config::UiTheme::default(),
+            crate::config::UiConfig::default(),
             &mut screens,
             &mut history,
             String::from("room"),
@@ -2064,7 +2067,7 @@ mod tests {
 
         apply_snapshot(
             &mut tui,
-            crate::config::UiTheme::default(),
+            crate::config::UiConfig::default(),
             &mut screens,
             &mut history,
             String::from("room"),
