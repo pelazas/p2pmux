@@ -24,7 +24,27 @@ being made up.
 
 A bare `p2pmux` on a machine whose paired session was asleep waited in silence long enough to
 look wedged, then kept trying after opening a local fallback. Its rejoin now has the short window
-an interactive command needs, and the fallback is remembered as the ticket's local answer.
+an interactive command needs, and the fallback is remembered as the ticket's local answer. That
+last part was written after the node had already started and lost a race against it; the ticket
+now travels in the node's own bootstrap, so there is no window to lose it in.
+
+A machine that was switched off when you opened a session did not join it, and did not join it
+when it came back either: its own session record outlives the node that wrote it, and the fleet
+agent read that record as proof it was still in its home session. It now checks that the node is
+running, so a machine that has been away rejoins and catches up on whatever started while it was
+gone.
+
+`p2pmux notify idle` reached the inbox as `state unknown — no hooks`, which is the line that tells
+you to run `p2pmux setup`. An agent that reports idle now reads as idle; the process scan still
+decides whether the row exists at all.
+
+Panes you are not typing into are drawn dimmed, so a glance across a split finds the focused one.
+`dim_unfocused_panes = false` under `[ui]` turns it off.
+
+`Ctrl+` arrows move focus between panes, alongside the `Option+` `<shift>` + arrows that already
+did; `Ctrl+Alt+` arrows are forwarded to the shell so a readline word-jump still gets through.
+Focus also stops leaving sideways: it compared pane centres, so a pane sitting diagonally counted
+as being above, and an arrow that left that way did not come back.
 
 ## v0.1.12 — 2026-08-17
 
