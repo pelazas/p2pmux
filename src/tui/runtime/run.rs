@@ -26,7 +26,7 @@ use crate::{
             },
             keys::PendingEscape,
         },
-        missed_resize,
+        keep_attributes_through_no_color, missed_resize,
         pane::remote::{RemotePaneDrain, SharedRemotePane},
         render::{
             panes::render_shared_multi_pane,
@@ -125,6 +125,7 @@ impl SharedLayoutRuntime {
         guard.mouse_capture = true;
         execute!(io::stdout(), EnableMouseCapture)?;
         guard.keyboard_enhancement = enable_keyboard_enhancement()?;
+        keep_attributes_through_no_color();
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,

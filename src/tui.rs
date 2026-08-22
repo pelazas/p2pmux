@@ -67,8 +67,8 @@ pub use state::{
     AgentOverlayRow, ChordMode, HomeRowId, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
     PaneViewState, QuitAction, ShareCopy, ShareView, UiIntent,
 };
-pub(crate) use terminal::clear_before_first_frame;
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
+pub(crate) use terminal::{clear_before_first_frame, keep_attributes_through_no_color};
 
 /// Kept as the module's public marker from the scaffold.
 pub struct Tui;
