@@ -872,6 +872,7 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket.clone());
     pairing.accepts_work = accepts_work;
+    let fleet_key = pairing.ensure_fleet_key()?;
     // This machine's own session, offered to a machine that may never come for
     // it. What that costs when nobody does is `Pairing::rejoin_ticket`'s
     // subject, and it can only tell an offer from an invitation if the offer
@@ -886,8 +887,9 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     crate::pairing::save(&pairing)?;
 
     let mut stdout = io::stdout().lock();
-    match descriptor.join_code.as_deref() {
+    match mint_pairing_code(&ticket, &fleet_key).await {
         Some(code) => {
+            let code = code.printable();
             writeln!(stdout, "pairing code: {code}")?;
             writeln!(
                 stdout,
@@ -917,6 +919,36 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Mint the code `p2pmux pair` prints, and put both halves behind it.
+///
+/// Its own code rather than the session's join code, which is what this used to
+/// print. They are different credentials that happened to be one string: a
+/// pairing code puts a machine in your fleet, and a join code invites somebody
+/// to a session. Handing a collaborator the second used to hand them the first
+/// for as long as the window stood open — and would now also hand them the
+/// address of the fleet they were invited to sit beside.
+///
+/// Two records, under contexts only one of which an older build knows. The
+/// ticket goes where it has always gone so a machine running last month's
+/// binary can still type this code; the fleet address goes in the sibling
+/// record, where that machine will never look. See `crate::fleet`.
+///
+/// `None` means the rendezvous service could not be reached, which costs the
+/// short code and not the pairing — the ticket still works and is printed
+/// instead.
+async fn mint_pairing_code(ticket: &str, fleet_key: &crate::fleet::FleetKey) -> Option<JoinCode> {
+    let store = HostedRendezvous::new().ok()?;
+    let code = JoinCode::mint().ok()?;
+    store.republish(&code, ticket).await.ok()?;
+    // Best effort, and the pairing is still worth making without it: a machine
+    // that pairs with no address behaves exactly as every machine did before
+    // this existed, and picks one up from the first session they share.
+    if let Err(error) = crate::fleet::offer_handover(&code, fleet_key).await {
+        crate::perf::log(&format!("P2PMUX_FLEET handover not offered: {error}"));
+    }
+    Some(code)
+}
+
 /// `p2pmux pair <code>`: join the machine that printed it, permanently.
 async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Error>> {
     {
@@ -926,6 +958,12 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     }
     let ticket = resolve_join_ticket(code).await?;
     let ticket_text = ticket.to_string();
+    // The other half of what that code names, when the machine that printed it
+    // had one to give. A pairing that gets no address still pairs.
+    let handed_over = match JoinCode::parse(code) {
+        Ok(code) => crate::fleet::accept_handover(&code).await,
+        Err(_) => None,
+    };
     // Recorded before the join rather than after it. A join that connects and
     // then drops has still paired the machines, and losing the ticket to a
     // network blip would mean typing the code again for a pairing that
@@ -933,6 +971,14 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket_text.clone());
     pairing.accepts_work = accepts_work;
+    // Taking somebody else's fleet is joining it, so this one is replaced
+    // rather than kept: `adopt_fleet_key` refuses to overwrite, which is right
+    // for a key that arrives mid-session and wrong for a pairing a person just
+    // typed. A machine that was in a fleet of its own and is now in yours must
+    // read your record, not the one nobody else can see.
+    if let Some(key) = &handed_over {
+        pairing.fleet_key = Some(key.hex().to_owned());
+    }
     // Somebody else's session, and the machine hosting it may be asleep rather
     // than absent — so this ticket keeps its thirty seconds even before any
     // machine has answered on it. An offer this machine made earlier does not
@@ -980,7 +1026,13 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-/// Wait for the node to publish the session's invite material.
+/// Wait for the node to publish the session's ticket.
+///
+/// The ticket alone, where this used to wait for the session's join code too.
+/// Pairing mints a code of its own now — see `mint_pairing_code` — so waiting
+/// for that one bought nothing and cost the full twenty seconds on a machine
+/// whose rendezvous was unreachable, before printing the ticket it had been
+/// holding the whole time.
 async fn wait_for_invite(
     store: &crate::session_store::SessionStore,
     id: &str,
@@ -994,15 +1046,13 @@ async fn wait_for_invite(
             .into_iter()
             .find(|descriptor| descriptor.id == id)
         {
-            if descriptor.ticket.is_some() && descriptor.join_code.is_some() {
+            if descriptor.ticket.is_some() {
                 return Ok(descriptor);
             }
             last = Some(descriptor);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // A ticket with no code still pairs, so a rendezvous outage falls through
-    // here rather than failing.
     last.ok_or_else(|| CliError("the session did not start").into())
 }
 
@@ -1103,6 +1153,19 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
         } else {
             println!("No other machines paired yet. Run `p2pmux pair` to add one.");
         }
+    }
+    // Said before it matters rather than after. A fleet with no address of its
+    // own works perfectly until the session it was paired around ends, and then
+    // stops working in a way that looks like a network fault and can only be
+    // fixed by a person. Naming it here — with the one command that fixes it —
+    // is the difference between an upgrade note and a support thread.
+    if pairing.fleet_has_no_address() {
+        println!();
+        println!(
+            "This fleet was paired before fleets had an address of their own, so\n\
+             it can only meet in the one session it was paired around. Run\n\
+             `p2pmux pair` once on either machine to give it a permanent one."
+        );
     }
     // Only about this machine, because this machine's own file is the only
     // policy it can honestly report. Every other row's `ACCEPTS WORK` column

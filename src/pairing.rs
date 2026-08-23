@@ -153,8 +153,8 @@ pub struct Pairing {
     /// a corpse forever and only a person could rescue it.
     ///
     /// Optional because a fleet paired by an older build has none yet. Those
-    /// keep working on the ticket alone, and adopt a key the next time a member
-    /// that has one shares a session with them — see [`Self::adopt_fleet_key`].
+    /// keep working on the ticket alone until it goes stale; one `p2pmux pair`
+    /// gives them an address. See [`Self::fleet_has_no_address`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_key: Option<String>,
 }
@@ -359,24 +359,21 @@ impl Pairing {
         Ok(key)
     }
 
-    /// Take on the fleet address a member turned up holding.
+    /// Whether this machine is in a fleet that has no address of its own.
     ///
-    /// The upgrade path for a fleet paired before addresses existed. Both
-    /// machines are already in a session together, which is the one situation
-    /// where they are provably the same fleet, so the key can travel then and
-    /// only then.
+    /// True for every fleet paired before addresses existed, and for no other
+    /// reason. Such a fleet still works — it follows its ticket exactly as it
+    /// always did — right up until the session that ticket names ends, at which
+    /// point it strands, which is the failure `crate::fleet` exists to end.
     ///
-    /// It never *replaces* one. Two members that each minted a key would
-    /// otherwise take turns overwriting each other, and the fleet would split
-    /// in two along a line nobody could see. First key wins, and the loser
-    /// keeps its own record pointing nowhere until somebody re-pairs — which is
-    /// visible and fixable, unlike a fleet that silently forked.
-    pub fn adopt_fleet_key(&mut self, key: &crate::fleet::FleetKey) -> bool {
-        if self.fleet_key().is_some() {
-            return false;
-        }
-        self.fleet_key = Some(key.hex().to_owned());
-        true
+    /// It is surfaced rather than repaired quietly because it *cannot* be
+    /// repaired quietly. Handing the key over needs a channel only fleet
+    /// members can read, and the one channel two machines share inside a
+    /// session reaches the guests in it too. So the fix is one `p2pmux pair`,
+    /// and the product's job is to say so before the stranding rather than
+    /// after it.
+    pub fn fleet_has_no_address(&self) -> bool {
+        self.can_rejoin() && self.fleet_key().is_none()
     }
 
     /// Record a machine, or update the one already there.
@@ -1672,26 +1669,24 @@ mod tests {
     }
 
     #[test]
-    fn the_first_fleet_key_wins_and_a_second_never_replaces_it() {
-        // Two members that each minted a key would otherwise take turns
-        // overwriting each other, and the fleet would fork along a line nobody
-        // could see.
+    fn a_fleet_paired_before_addresses_existed_says_so() {
+        // The upgrade case, and the only thing that produces it. It has to be
+        // visible, because it cannot be fixed quietly: handing the address over
+        // needs a channel only fleet members can read, and the one two machines
+        // share inside a session reaches the guests in it too.
         let mut pairing = Pairing::default();
-        let ours = pairing.ensure_fleet_key().expect("should mint");
-        let theirs = crate::fleet::FleetKey::mint().expect("should mint");
+        pairing.ticket = Some(String::from("p2pmux-v3:TICKET"));
+        assert!(pairing.fleet_has_no_address());
 
-        assert!(!pairing.adopt_fleet_key(&theirs));
-        assert_eq!(pairing.fleet_key(), Some(ours));
+        pairing.ensure_fleet_key().expect("should mint");
+        assert!(!pairing.fleet_has_no_address());
     }
 
     #[test]
-    fn a_fleet_without_an_address_adopts_the_one_a_member_brings() {
-        // The upgrade path for a fleet paired before addresses existed.
-        let mut pairing = Pairing::default();
-        let theirs = crate::fleet::FleetKey::mint().expect("should mint");
-
-        assert!(pairing.adopt_fleet_key(&theirs));
-        assert_eq!(pairing.fleet_key(), Some(theirs));
+    fn a_machine_in_no_fleet_is_not_a_fleet_missing_an_address() {
+        // It is not missing anything. Telling somebody to re-pair a machine
+        // that was never paired sends them to fix the wrong thing.
+        assert!(!Pairing::default().fleet_has_no_address());
     }
 
     #[test]

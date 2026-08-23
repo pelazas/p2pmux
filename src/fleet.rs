@@ -159,6 +159,56 @@ impl FleetRecord {
     }
 }
 
+/// A second, independent record that a pairing code also names.
+///
+/// `p2pmux pair` has to hand over the fleet's address, and the obvious place —
+/// inside the record its code already points at — is the one place it must not
+/// go. That record holds a bare ticket, and a build from last month reads it
+/// expecting exactly that; putting a structure there would make an old machine
+/// refuse a code a new one printed, on the single command whose entire job is
+/// introducing two machines.
+///
+/// So the address goes in a sibling record under its own contexts. An old
+/// client fetches the ticket and never knows this exists; a new one fetches
+/// both and finds nothing here when the machine that printed the code was old.
+/// Neither has to know what the other is.
+const HANDOVER_INDEX_CONTEXT: &str = "p2pmux fleet handover 2026-08-23 record index";
+const HANDOVER_KEY_CONTEXT: &str = "p2pmux fleet handover 2026-08-23 record key";
+
+fn handover_locator(code: &crate::hosted_rendezvous::JoinCode) -> RecordLocator {
+    RecordLocator::derive(
+        HANDOVER_INDEX_CONTEXT,
+        HANDOVER_KEY_CONTEXT,
+        code.canonical().as_bytes(),
+    )
+}
+
+/// Offer this fleet's address to whoever types `code`.
+///
+/// Only ever a code minted for a pairing, never the session's own join code.
+/// They are different credentials and were only ever one string by accident:
+/// a guest you hand a join code to could otherwise read the address of the
+/// fleet they were invited to sit beside.
+pub async fn offer_handover(
+    code: &crate::hosted_rendezvous::JoinCode,
+    key: &FleetKey,
+) -> Result<(), crate::hosted_rendezvous::PublishError> {
+    crate::hosted_rendezvous::HostedRendezvous::new()?
+        .publish_at(&handover_locator(code), key.hex())
+        .await
+}
+
+/// Take the fleet address a pairing code offers, if it offers one.
+///
+/// `None` for a code printed by a build that had no address to hand over, which
+/// is not a failure: the machine pairs on the ticket as it always did, and picks
+/// an address up from the first session it shares with a machine that has one.
+pub async fn accept_handover(code: &crate::hosted_rendezvous::JoinCode) -> Option<FleetKey> {
+    let store = crate::hosted_rendezvous::HostedRendezvous::new().ok()?;
+    let raw = store.resolve_at(&handover_locator(code)).await.ok()?;
+    FleetKey::parse(&raw).ok()
+}
+
 /// Why a fleet's meeting place could not be read.
 #[derive(Debug)]
 pub enum LocateError {
