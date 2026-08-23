@@ -397,23 +397,46 @@ fn machines_still_says_nobody_is_paired_when_no_invitation_is_open() {
 ///
 /// It used to offer "or start a session with `p2pmux`" as an alternative, which
 /// is a route that does not exist: only `p2pmux pair` and the add-machine panel
-/// write the fleet ticket `enroll` hands out. Somebody provisioning a VM would
-/// start a session, run `enroll` again, get the same error, and have nothing
-/// left to try.
+/// write a fleet. Somebody provisioning a VM would start a session, ask for a
+/// token again, get the same error, and have nothing left to try.
+///
+/// Both spellings, because the old one is baked into machine images: they have
+/// to fail the same way as well as work the same way.
 #[test]
-fn enroll_without_a_fleet_names_pairing_and_offers_no_other_route() {
+fn a_token_without_a_fleet_names_pairing_and_offers_no_other_route() {
+    for command in [vec!["pair", "--token"], vec!["enroll"]] {
+        let session = FakeSession::hosted("lisbon");
+
+        let output = run_with_home(session.home(), &command);
+
+        assert!(!output.status.success(), "{command:?}");
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+        assert!(
+            stderr.contains("not in a fleet yet"),
+            "{command:?}: {stderr}"
+        );
+        assert!(stderr.contains("p2pmux pair"), "{command:?}: {stderr}");
+        assert!(
+            !stderr.contains("start a session"),
+            "{command:?} offers a route that makes no fleet: {stderr}"
+        );
+    }
+}
+
+/// The old spelling still works, and is no longer advertised.
+///
+/// `p2pmux enroll` is written into cloud-init files months before anything runs
+/// them, so it has to keep working — and a person reading `--help` has to find
+/// one way to add a machine rather than two.
+#[test]
+fn enroll_is_kept_for_machine_images_and_kept_out_of_the_help() {
     let session = FakeSession::hosted("lisbon");
 
-    let output = run_with_home(session.home(), &["enroll"]);
+    let help = run_with_home(session.home(), &["--help"]);
+    let help = String::from_utf8(help.stdout).expect("stdout should be UTF-8");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
-    assert!(stderr.contains("not in a fleet yet"), "{stderr}");
-    assert!(stderr.contains("p2pmux pair"), "{stderr}");
-    assert!(
-        !stderr.contains("start a session"),
-        "the error offers a route that writes no fleet ticket: {stderr}"
-    );
+    assert!(!help.contains("enroll"), "{help}");
+    assert!(help.contains("pair"), "{help}");
 }
 
 fn minted_ticket() -> JoinTicket {

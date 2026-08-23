@@ -55,12 +55,31 @@ enum Command {
     },
     /// Pair this machine with another one you own, once and permanently.
     ///
-    /// With no code, prints one for the other machine to type. With a code,
-    /// pairs with the machine that printed it. After either, bare `p2pmux`
-    /// rejoins on both with no code typed again.
+    /// With no arguments, prints a code for the other machine to type. With a
+    /// code or a token, joins the fleet it names. After either, bare `p2pmux`
+    /// rejoins on both with nothing typed again.
+    ///
+    /// `--token` is the same act with nobody sitting at the other machine: a
+    /// code expires in ten minutes and has to be typed by a person, which is
+    /// right for two laptops and unusable from a provisioning script. The token
+    /// is reusable until `--revoke`. It is a flag rather than a separate
+    /// command because it is not a separate idea — both put a machine you own
+    /// in your fleet, and having two names for that was one concept too many.
     Pair {
-        /// The pairing code printed by `p2pmux pair` on your other machine.
+        /// The pairing code or enrolment token printed on your other machine.
         code: Option<String>,
+        /// Print a reusable token for a machine with nobody at it, instead of a
+        /// code somebody types within ten minutes.
+        #[arg(long, conflicts_with = "code")]
+        token: bool,
+        /// Withdraw the standing token. Machines already in the fleet stay;
+        /// `p2pmux unpair` is how one leaves.
+        #[arg(long, conflicts_with = "code")]
+        revoke: bool,
+        /// The name this machine goes by in the fleet. Defaults to its
+        /// hostname, which on a droplet is rarely what you want to read.
+        #[arg(long)]
+        name: Option<String>,
         /// Answer the accepts-work question without being asked. The first of
         /// two gates; `p2pmux work allow` here opens the second.
         #[arg(long = "accept-work")]
@@ -127,26 +146,26 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Put a machine you own in your fleet without anybody sitting at it.
+    /// What `p2pmux pair --token` is now called.
     ///
-    /// `p2pmux pair` is a code one human types on one machine within ten
-    /// minutes, which is right for two laptops and unusable from a provisioning
-    /// script. With no arguments this prints a token to paste into one; on the
-    /// new machine, `p2pmux enroll <token>` joins the fleet unattended.
+    /// Kept and hidden rather than removed. This command's whole reason for
+    /// existing is being baked into machine images and cloud-init files months
+    /// before anybody runs it, so removing it would break provisioning that was
+    /// written correctly against the release it was written for. It is not in
+    /// `--help` because a person reading that should find one way to add a
+    /// machine, not two.
+    #[command(hide = true)]
     Enroll {
-        /// The token printed by `p2pmux enroll` on a machine already in the
-        /// fleet. Omit it to print one here instead.
+        /// The token printed on a machine already in the fleet. Omit it to
+        /// print one here instead.
         token: Option<String>,
-        /// The name this machine goes by in the fleet. Defaults to its
-        /// hostname, which on a droplet is rarely what you want to read.
+        /// The name this machine goes by in the fleet.
         #[arg(long)]
         name: Option<String>,
-        /// Withdraw the standing invitation. Machines already enrolled stay;
-        /// `p2pmux unpair` is how one leaves.
+        /// Withdraw the standing invitation.
         #[arg(long)]
         revoke: bool,
-        /// Let your other machines start a login shell here. Unattended boxes
-        /// usually want this, and it is the same thing `p2pmux work allow` does.
+        /// Let your other machines start a login shell here.
         #[arg(long = "accept-work")]
         accept_work: bool,
     },
@@ -474,25 +493,28 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             _ => Err(CliError("config key must be name").into()),
         },
         Some(Command::Work { action }) => run_work(action),
+        // The old spelling of `p2pmux pair --token`, kept for the cloud-init
+        // files it was written into. `--accept-work` alone rather than the pair
+        // of flags: an unattended box has nobody to ask, so there was never a
+        // question here to answer either way.
         Some(Command::Enroll {
             token,
             name,
             revoke,
             accept_work,
-        }) => match (token, revoke) {
-            (_, true) => {
-                let mut pairing = crate::pairing::load()?;
-                if crate::pairing::revoke_enrolment(&mut pairing) {
-                    crate::pairing::save(&pairing)?;
-                    println!("enrolment token revoked; machines already in the fleet stay");
-                } else {
-                    println!("no enrolment token to revoke");
-                }
-                Ok(())
-            }
-            (None, false) => print_enrolment_token(),
-            (Some(token), false) => enroll_with_token(&token, name.as_deref(), accept_work).await,
-        },
+        }) => {
+            join_or_invite(JoinOrInvite {
+                code: token,
+                token: true,
+                revoke,
+                name,
+                accept_work,
+                // There is nobody at an unattended box to say no, and this
+                // spelling never had the flag to say it with.
+                no_accept_work: false,
+            })
+            .await
+        }
         Some(Command::Create { name, session_name }) => {
             {
                 let mut stdout = io::stdout().lock();
@@ -663,14 +685,21 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Some(Command::Pair {
             code,
+            token,
+            revoke,
+            name,
             accept_work,
             no_accept_work,
         }) => {
-            let answer = accepts_work_answer(accept_work, no_accept_work)?;
-            match code {
-                Some(code) => pair_with_code(&code, answer).await,
-                None => offer_pairing(answer).await,
-            }
+            join_or_invite(JoinOrInvite {
+                code,
+                token,
+                revoke,
+                name,
+                accept_work,
+                no_accept_work,
+            })
+            .await
         }
         Some(Command::Machines) => print_machines(),
         Some(Command::Daemon { command }) => match command {
@@ -917,6 +946,59 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     drop(stdout);
     offer_fleet_daemon()?;
     Ok(())
+}
+
+/// Everything `p2pmux pair` was asked to do, before it works out which.
+struct JoinOrInvite {
+    code: Option<String>,
+    token: bool,
+    revoke: bool,
+    name: Option<String>,
+    accept_work: bool,
+    no_accept_work: bool,
+}
+
+/// The one command that puts a machine you own in your fleet.
+///
+/// Five shapes, and they were two commands until this: `pair`, and `enroll`
+/// with the same four arms under different names. Nothing about them differed
+/// except how long the invitation lasts and whether a person has to be there to
+/// type it — which is a flag, not a second idea. Somebody reading `--help` and
+/// finding two ways to add a machine has to work out which one they are in
+/// before they can start, and the answer was always "either".
+///
+/// The accepts-work question is asked only where there is something to answer.
+/// Printing an invitation and revoking one are both about a machine that is
+/// already here and has already said; re-asking would look like the answer had
+/// been lost.
+async fn join_or_invite(args: JoinOrInvite) -> Result<(), Box<dyn Error>> {
+    if args.revoke {
+        let mut pairing = crate::pairing::load()?;
+        if crate::pairing::revoke_enrolment(&mut pairing) {
+            crate::pairing::save(&pairing)?;
+            println!("token revoked; machines already in the fleet stay");
+        } else {
+            println!("no token to revoke");
+        }
+        return Ok(());
+    }
+    if let Some(code) = args.code {
+        let accepts_work = accepts_work_answer(args.accept_work, args.no_accept_work)?;
+        // Which kind of invitation this is, by shape. A person handed one
+        // string and told to run one command should not also have to know
+        // which of two forms they were handed.
+        if crate::pairing::EnrolInvite::decode(&code).is_ok() {
+            return enroll_with_token(&code, args.name.as_deref(), accepts_work).await;
+        }
+        if let Some(name) = args.name.as_deref() {
+            crate::config::save(name)?;
+        }
+        return pair_with_code(&code, accepts_work).await;
+    }
+    if args.token {
+        return print_enrolment_token();
+    }
+    offer_pairing(accepts_work_answer(args.accept_work, args.no_accept_work)?).await
 }
 
 /// Mint the code `p2pmux pair` prints, and put both halves behind it.
@@ -1258,7 +1340,7 @@ fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
         // `p2pmux` instead sent them round a loop that could not end. The
         // unattended path really does start with a human pairing once.
         return Err(CliError(
-            "this machine is not in a fleet yet, and `p2pmux enroll` hands out an \
+            "this machine is not in a fleet yet, and `--token` hands out an \
              invitation to one that exists — run `p2pmux pair` here and \
              `p2pmux pair <code>` on another machine you own, then try again",
         )
@@ -1284,15 +1366,15 @@ fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
     writeln!(
         stdout,
         "Anyone holding this token can put a machine in your fleet until you run\n\
-         `p2pmux enroll --revoke`. Membership on its own starts nothing: what may\n\
+         `p2pmux pair --revoke`. Membership on its own starts nothing: what may\n\
          run on a machine is that machine's own `p2pmux work allow`.\n"
     )?;
     writeln!(stdout, "On the machine you are adding, run:\n")?;
-    writeln!(stdout, "  p2pmux enroll {invite} --name <name>\n")?;
+    writeln!(stdout, "  p2pmux pair {invite} --name <name>\n")?;
     writeln!(
         stdout,
         "In cloud-init, with nobody there to type it:\n\n  \
-         runcmd:\n    - [ sh, -c, \"p2pmux enroll {invite} --name build-box --accept-work\" ]"
+         runcmd:\n    - [ sh, -c, \"p2pmux pair {invite} --name build-box --accept-work\" ]"
     )?;
     Ok(())
 }
