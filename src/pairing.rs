@@ -774,6 +774,10 @@ pub struct PairedMachineWatch {
     /// asking.
     path: Option<PathBuf>,
     machines: Vec<PairedMachine>,
+    /// Whether this fleet predates fleet addresses. Read here rather than
+    /// separately because it comes off the same file at the same moment, and a
+    /// second reader would be a second mtime race for one boolean.
+    has_no_address: bool,
     /// The mtime the current list was parsed from, and `None` before the first
     /// successful read — which is also what a missing file leaves behind, so
     /// one appearing later is picked up rather than waited on forever.
@@ -800,6 +804,16 @@ impl PairedMachineWatch {
         &self.machines
     }
 
+    /// Whether this fleet is one that can only ever meet in a single session.
+    ///
+    /// See [`Pairing::fleet_has_no_address`]. Surfaced to the inbox because it
+    /// is the one thing about a fleet that a person has to act on before it
+    /// goes wrong rather than after.
+    pub fn fleet_has_no_address(&mut self) -> bool {
+        self.refresh();
+        self.has_no_address
+    }
+
     fn refresh(&mut self) {
         let Some(path) = self.path.as_deref() else {
             return;
@@ -814,7 +828,9 @@ impl PairedMachineWatch {
             return;
         }
         self.read_at = modified;
-        self.machines = load_from(path).unwrap_or_default().machines;
+        let pairing = load_from(path).unwrap_or_default();
+        self.has_no_address = pairing.fleet_has_no_address();
+        self.machines = pairing.machines;
     }
 }
 

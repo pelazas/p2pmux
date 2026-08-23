@@ -677,6 +677,20 @@ impl MultiPaneTui {
         true
     }
 
+    /// Whether this fleet can only ever meet in one session.
+    ///
+    /// Read off the same file as the fleet, at the same moment. See
+    /// [`crate::pairing::Pairing::fleet_has_no_address`] for why the inbox is
+    /// the right place to say it: the fleet works until the day it does not,
+    /// and by then only a person can undo it.
+    pub fn set_fleet_has_no_address(&mut self, missing: bool) -> bool {
+        if self.fleet_has_no_address == missing {
+            return false;
+        }
+        self.fleet_has_no_address = missing;
+        true
+    }
+
     /// Land on Home rather than in the session. Set once, before the first
     /// frame, by a client that was started with no session named.
     pub fn open_home_on_start(&mut self) {
