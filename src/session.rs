@@ -593,6 +593,16 @@ impl LayoutCoordinator {
             endpoint_addr,
             identity,
         )?;
+        // Here rather than at the top of this function, so a member whose
+        // network flapped and came back through the readmission branch above is
+        // not counted as somebody new arriving.
+        crate::telemetry::bump(crate::telemetry::Counter::Peers, 1);
+        // Two members is the whole product. One person in a p2pmux session is
+        // using a worse tmux, and every number that does not distinguish the two
+        // flatters the thing that has not been proved yet.
+        if self.state.members().len() >= 2 {
+            crate::telemetry::mark_activated();
+        }
         self.membership_change(peer_id, MembershipEvent::Joined, invalidated)
     }
 

@@ -168,6 +168,14 @@ pub fn platform() -> String {
 /// agent that installs p2pmux on every run is not a user, and counting it would
 /// quietly invent a population.
 fn suppressed() -> bool {
+    // A test run is not a user. The counters are bumped from `Coordinator::admit`
+    // and from the session launcher, both of which the unit tests drive hundreds
+    // of times, and a contributor's `cargo test` must not post their afternoon to
+    // the metrics service as real use. Integration tests reach the binary rather
+    // than this crate, so they isolate `HOME` instead.
+    if cfg!(test) {
+        return true;
+    }
     suppressed_by(|name| std::env::var(name).ok())
 }
 
@@ -425,6 +433,28 @@ pub fn payload() -> Option<Payload> {
         agents: record.agents,
         activated: record.activated,
     })
+}
+
+/// The line this machine would send, whether or not it is sending.
+///
+/// Separate from [`payload`] because the question `p2pmux telemetry show` answers
+/// is "what would this send about me", and answering it with nothing on a machine
+/// that declined reads as evasion rather than as reassurance. A machine that has
+/// not been asked has no id yet, and says so rather than inventing one it would
+/// then have to keep.
+pub fn would_send() -> Payload {
+    let record = read_record();
+    Payload {
+        id: record
+            .id
+            .unwrap_or_else(|| String::from("<generated if you say yes>")),
+        version: env!("CARGO_PKG_VERSION"),
+        os: platform(),
+        sessions: record.sessions,
+        peers: record.peers,
+        agents: record.agents,
+        activated: record.activated,
+    }
 }
 
 /// Whether enough time has passed since the last successful send.
