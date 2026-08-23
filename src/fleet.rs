@@ -159,6 +159,117 @@ impl FleetRecord {
     }
 }
 
+/// Why a fleet's meeting place could not be read.
+#[derive(Debug)]
+pub enum LocateError {
+    /// The store answered, and nothing is there. Nobody in this fleet is
+    /// hosting a session right now — which is an ordinary state, not a fault.
+    ///
+    /// A record this build cannot parse arrives here too. It means the same
+    /// thing to every caller: there is nowhere to go, so make somewhere.
+    Nobody,
+    /// The store could not be asked. Distinct from [`Self::Nobody`] because the
+    /// fleet may well be meeting somewhere and this machine simply cannot find
+    /// out — the difference between "start a session" and "say why not".
+    Unreachable(String),
+}
+
+impl fmt::Display for LocateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nobody => formatter.write_str("no machine in this fleet is hosting a session"),
+            Self::Unreachable(detail) => {
+                write!(formatter, "could not reach the fleet directory ({detail})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocateError {}
+
+/// Where this fleet is meeting, according to the record.
+///
+/// The answer is a hint, not a promise. The machine that published it may have
+/// shut its laptop a second later, and no amount of freshness checking here
+/// would find that out — dialling it is the only test that means anything. A
+/// caller that fails to reach what this returns should publish its own session
+/// over the top; see this module's header.
+pub async fn locate(key: &FleetKey) -> Result<FleetRecord, LocateError> {
+    let store = crate::hosted_rendezvous::HostedRendezvous::new()
+        .map_err(|error| LocateError::Unreachable(error.to_string()))?;
+    match store.resolve_at(&key.locator()).await {
+        Ok(raw) => FleetRecord::decode(&raw).ok_or(LocateError::Nobody),
+        Err(crate::hosted_rendezvous::ResolveError::NotFound) => Err(LocateError::Nobody),
+        // A record we cannot open is one sealed under a different key, which
+        // for a fleet means the file was hand-edited or two builds disagree.
+        // Either way there is nothing here for us, and taking over is right.
+        Err(crate::hosted_rendezvous::ResolveError::WrongCode) => Err(LocateError::Nobody),
+        Err(error) => Err(LocateError::Unreachable(error.to_string())),
+    }
+}
+
+/// Say that this fleet is meeting where `record` says.
+pub async fn publish(
+    key: &FleetKey,
+    record: &FleetRecord,
+) -> Result<(), crate::hosted_rendezvous::PublishError> {
+    crate::hosted_rendezvous::HostedRendezvous::new()?
+        .publish_at(&key.locator(), &record.encode())
+        .await
+}
+
+/// Take the record down, on a clean exit.
+///
+/// Best effort, and deliberately so: a member that finds a dead ticket here
+/// publishes over it, so the cost of failing is one wasted dial rather than a
+/// stranded fleet.
+pub async fn withdraw(key: &FleetKey) -> Result<(), crate::hosted_rendezvous::PublishError> {
+    crate::hosted_rendezvous::HostedRendezvous::new()?
+        .remove_at(&key.locator())
+        .await
+}
+
+/// A fleet record held open for as long as this machine is hosting the session.
+///
+/// The store expires a record that stops being refreshed, which is what keeps a
+/// machine that was unplugged from advertising a session that died with it.
+/// A machine that is still hosting therefore has to keep saying so, and say
+/// otherwise on the way out by deleting the record outright.
+pub struct HostedFleet {
+    key: FleetKey,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl HostedFleet {
+    /// Publish `record` and hold its TTL open until [`Self::retire`].
+    pub async fn claim(
+        key: FleetKey,
+        record: FleetRecord,
+    ) -> Result<Self, crate::hosted_rendezvous::PublishError> {
+        publish(&key, &record).await?;
+        let refresh = tokio::spawn({
+            let key = key.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(crate::hosted_rendezvous::REFRESH_INTERVAL).await;
+                    // A failed refresh is not worth retrying tightly: the record
+                    // still has most of its TTL, and the next tick is well
+                    // inside it. A fleet whose record does lapse is not stranded
+                    // either — the next member to look takes over.
+                    let _ = publish(&key, &record).await;
+                }
+            }
+        });
+        Ok(Self { key, refresh })
+    }
+
+    /// Stop refreshing and take the record down.
+    pub async fn retire(self) {
+        self.refresh.abort();
+        let _ = withdraw(&self.key).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

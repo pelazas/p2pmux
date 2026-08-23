@@ -144,6 +144,19 @@ pub struct Pairing {
     /// The standing invitation for machines you own. See [`EnrolToken`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrol: Option<EnrolToken>,
+    /// This fleet's permanent address, as hex. See [`crate::fleet`].
+    ///
+    /// [`Self::ticket`] above is a session, and a session ends. This does not:
+    /// it names a record that says which session the fleet is meeting in now,
+    /// rewritten by whichever machine is hosting. A member that was switched
+    /// off for a month reads it on waking and rejoins, where before it dialled
+    /// a corpse forever and only a person could rescue it.
+    ///
+    /// Optional because a fleet paired by an older build has none yet. Those
+    /// keep working on the ticket alone, and adopt a key the next time a member
+    /// that has one shares a session with them — see [`Self::adopt_fleet_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_key: Option<String>,
 }
 
 /// A long-lived, revocable secret that admits a machine to this fleet.
@@ -322,6 +335,50 @@ impl Pairing {
         self.ticket.as_deref()
     }
 
+    /// This fleet's permanent address, if it has one.
+    ///
+    /// A key that fails to parse is treated as absent rather than as an error.
+    /// The file is one a person is invited to edit — the header says so — and a
+    /// mistyped key must degrade to "this fleet has no address yet", which the
+    /// next pairing repairs, rather than to a machine that refuses to start.
+    pub fn fleet_key(&self) -> Option<crate::fleet::FleetKey> {
+        crate::fleet::FleetKey::parse(self.fleet_key.as_deref()?).ok()
+    }
+
+    /// Mint this fleet's address if it does not have one, and return it.
+    ///
+    /// Called by the two commands that create a fleet, so that the invitation
+    /// they hand out carries an address rather than a session. The caller saves.
+    pub fn ensure_fleet_key(&mut self) -> Result<crate::fleet::FleetKey, PairingError> {
+        if let Some(key) = self.fleet_key() {
+            return Ok(key);
+        }
+        let key = crate::fleet::FleetKey::mint()
+            .map_err(|error| PairingError::Invalid(error.to_string()))?;
+        self.fleet_key = Some(key.hex().to_owned());
+        Ok(key)
+    }
+
+    /// Take on the fleet address a member turned up holding.
+    ///
+    /// The upgrade path for a fleet paired before addresses existed. Both
+    /// machines are already in a session together, which is the one situation
+    /// where they are provably the same fleet, so the key can travel then and
+    /// only then.
+    ///
+    /// It never *replaces* one. Two members that each minted a key would
+    /// otherwise take turns overwriting each other, and the fleet would split
+    /// in two along a line nobody could see. First key wins, and the loser
+    /// keeps its own record pointing nowhere until somebody re-pairs — which is
+    /// visible and fixable, unlike a fleet that silently forked.
+    pub fn adopt_fleet_key(&mut self, key: &crate::fleet::FleetKey) -> bool {
+        if self.fleet_key().is_some() {
+            return false;
+        }
+        self.fleet_key = Some(key.hex().to_owned());
+        true
+    }
+
     /// Record a machine, or update the one already there.
     ///
     /// Pairing twice with the same machine is a re-pair, not a second machine:
@@ -438,6 +495,12 @@ impl Pairing {
             self.ticket = None;
             self.pending_until = None;
             self.offered_here = false;
+            // The address goes with the fleet it addressed. Keeping it would
+            // leave this machine publishing and reading a record for a fleet of
+            // nobody, and — worse — would silently put it back in the old fleet
+            // if one of those machines ever came back, which is precisely what
+            // the unpair said not to do.
+            self.fleet_key = None;
         }
         true
     }
@@ -898,6 +961,7 @@ mod tests {
             machines: Vec::new(),
             work: Default::default(),
             enrol: None,
+            fleet_key: None,
         };
         pairing.remember("desktop", Some(String::from("aa")), Some(false));
         pairing.remember("droplet", Some(String::from("bb")), Some(true));
@@ -1552,6 +1616,94 @@ mod tests {
 
         let pairing = load_from(&path).expect("load");
         assert!(!pairing.accepts_work);
+    }
+
+    #[test]
+    fn a_fleet_key_is_minted_once_and_then_kept() {
+        let mut pairing = Pairing::default();
+        assert!(pairing.fleet_key().is_none());
+
+        let first = pairing.ensure_fleet_key().expect("should mint");
+        let second = pairing.ensure_fleet_key().expect("should return the same one");
+
+        assert_eq!(first, second);
+        assert_eq!(pairing.fleet_key(), Some(first));
+    }
+
+    #[test]
+    fn a_fleet_key_survives_the_file() {
+        let path = temporary_path("fleet-key-round-trip");
+        let mut pairing = Pairing::default();
+        let key = pairing.ensure_fleet_key().expect("should mint");
+        save_to(&path, &pairing).expect("save");
+
+        assert_eq!(load_from(&path).expect("load").fleet_key(), Some(key));
+    }
+
+    #[test]
+    fn a_mistyped_fleet_key_reads_as_none_rather_than_failing_to_load() {
+        // The header invites people to edit this file. A key somebody broke has
+        // to degrade to "this fleet has no address yet", which the next pairing
+        // repairs — not to a machine that will not start.
+        let path = temporary_path("fleet-key-mistyped");
+        std::fs::write(&path, "ticket = \"t\"\nfleet_key = \"nonsense\"\n").expect("write");
+
+        let pairing = load_from(&path).expect("load");
+        assert!(pairing.fleet_key().is_none());
+        assert!(pairing.can_rejoin(), "the ticket still works meanwhile");
+    }
+
+    #[test]
+    fn the_first_fleet_key_wins_and_a_second_never_replaces_it() {
+        // Two members that each minted a key would otherwise take turns
+        // overwriting each other, and the fleet would fork along a line nobody
+        // could see.
+        let mut pairing = Pairing::default();
+        let ours = pairing.ensure_fleet_key().expect("should mint");
+        let theirs = crate::fleet::FleetKey::mint().expect("should mint");
+
+        assert!(!pairing.adopt_fleet_key(&theirs));
+        assert_eq!(pairing.fleet_key(), Some(ours));
+    }
+
+    #[test]
+    fn a_fleet_without_an_address_adopts_the_one_a_member_brings() {
+        // The upgrade path for a fleet paired before addresses existed.
+        let mut pairing = Pairing::default();
+        let theirs = crate::fleet::FleetKey::mint().expect("should mint");
+
+        assert!(pairing.adopt_fleet_key(&theirs));
+        assert_eq!(pairing.fleet_key(), Some(theirs));
+    }
+
+    #[test]
+    fn unpairing_the_last_machine_gives_up_the_fleet_address_too() {
+        // It addressed a fleet that no longer exists. Keeping it would leave
+        // this machine reading and writing a record for nobody — and would put
+        // it silently back in the old fleet if one of those machines returned.
+        let mut pairing = Pairing::default();
+        pairing.ticket = Some(String::from("p2pmux-v3:TICKET"));
+        pairing.ensure_fleet_key().expect("should mint");
+        pairing.remember("laptop", Some(String::from("id")), None);
+
+        assert!(pairing.forget("laptop"));
+        assert!(pairing.fleet_key().is_none());
+        assert!(pairing.ticket.is_none());
+    }
+
+    #[test]
+    fn unpairing_one_of_several_keeps_the_fleet_address() {
+        let mut pairing = Pairing::default();
+        let key = pairing.ensure_fleet_key().expect("should mint");
+        pairing.remember("laptop", Some(String::from("one")), None);
+        pairing.remember("droplet", Some(String::from("two")), None);
+
+        assert!(pairing.forget("laptop"));
+        assert_eq!(
+            pairing.fleet_key(),
+            Some(key),
+            "the fleet it leaves is still a fleet"
+        );
     }
 }
 
