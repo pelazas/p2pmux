@@ -148,10 +148,11 @@ says *state unknown — no hooks* on its own row rather than being guessed about
 already own consumes it. The code lasts ten minutes and admits one machine.
 `p2pmux machines` then says which of them are awake.
 
-A machine with nobody sitting at it is a second step. Pair two machines by hand
-first — `p2pmux enroll` cannot start a fleet on its own — then `p2pmux enroll`
-prints a revocable token to paste into a provisioning script. On that box,
-`p2pmux daemon install` is what brings it back after a reboot.
+A machine with nobody sitting at it takes the same command with `--token`: pair
+two machines by hand first — a token cannot start a fleet on its own — then
+`p2pmux pair --token` prints a revocable one to paste into a provisioning
+script. On that box, `p2pmux daemon install` is what brings it back after a
+reboot.
 
 What your machines may start on one of them is written on that machine:
 `p2pmux work allow <command>` matches the full command; bare `p2pmux work allow`

@@ -144,6 +144,19 @@ pub struct Pairing {
     /// The standing invitation for machines you own. See [`EnrolToken`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrol: Option<EnrolToken>,
+    /// This fleet's permanent address, as hex. See [`crate::fleet`].
+    ///
+    /// [`Self::ticket`] above is a session, and a session ends. This does not:
+    /// it names a record that says which session the fleet is meeting in now,
+    /// rewritten by whichever machine is hosting. A member that was switched
+    /// off for a month reads it on waking and rejoins, where before it dialled
+    /// a corpse forever and only a person could rescue it.
+    ///
+    /// Optional because a fleet paired by an older build has none yet. Those
+    /// keep working on the ticket alone until it goes stale; one `p2pmux pair`
+    /// gives them an address. See [`Self::fleet_has_no_address`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_key: Option<String>,
 }
 
 /// A long-lived, revocable secret that admits a machine to this fleet.
@@ -322,6 +335,47 @@ impl Pairing {
         self.ticket.as_deref()
     }
 
+    /// This fleet's permanent address, if it has one.
+    ///
+    /// A key that fails to parse is treated as absent rather than as an error.
+    /// The file is one a person is invited to edit — the header says so — and a
+    /// mistyped key must degrade to "this fleet has no address yet", which the
+    /// next pairing repairs, rather than to a machine that refuses to start.
+    pub fn fleet_key(&self) -> Option<crate::fleet::FleetKey> {
+        crate::fleet::FleetKey::parse(self.fleet_key.as_deref()?).ok()
+    }
+
+    /// Mint this fleet's address if it does not have one, and return it.
+    ///
+    /// Called by the two commands that create a fleet, so that the invitation
+    /// they hand out carries an address rather than a session. The caller saves.
+    pub fn ensure_fleet_key(&mut self) -> Result<crate::fleet::FleetKey, PairingError> {
+        if let Some(key) = self.fleet_key() {
+            return Ok(key);
+        }
+        let key = crate::fleet::FleetKey::mint()
+            .map_err(|error| PairingError::Invalid(error.to_string()))?;
+        self.fleet_key = Some(key.hex().to_owned());
+        Ok(key)
+    }
+
+    /// Whether this machine is in a fleet that has no address of its own.
+    ///
+    /// True for every fleet paired before addresses existed, and for no other
+    /// reason. Such a fleet still works — it follows its ticket exactly as it
+    /// always did — right up until the session that ticket names ends, at which
+    /// point it strands, which is the failure `crate::fleet` exists to end.
+    ///
+    /// It is surfaced rather than repaired quietly because it *cannot* be
+    /// repaired quietly. Handing the key over needs a channel only fleet
+    /// members can read, and the one channel two machines share inside a
+    /// session reaches the guests in it too. So the fix is one `p2pmux pair`,
+    /// and the product's job is to say so before the stranding rather than
+    /// after it.
+    pub fn fleet_has_no_address(&self) -> bool {
+        self.can_rejoin() && self.fleet_key().is_none()
+    }
+
     /// Record a machine, or update the one already there.
     ///
     /// Pairing twice with the same machine is a re-pair, not a second machine:
@@ -438,6 +492,12 @@ impl Pairing {
             self.ticket = None;
             self.pending_until = None;
             self.offered_here = false;
+            // The address goes with the fleet it addressed. Keeping it would
+            // leave this machine publishing and reading a record for a fleet of
+            // nobody, and — worse — would silently put it back in the old fleet
+            // if one of those machines ever came back, which is precisely what
+            // the unpair said not to do.
+            self.fleet_key = None;
         }
         true
     }
@@ -714,6 +774,10 @@ pub struct PairedMachineWatch {
     /// asking.
     path: Option<PathBuf>,
     machines: Vec<PairedMachine>,
+    /// Whether this fleet predates fleet addresses. Read here rather than
+    /// separately because it comes off the same file at the same moment, and a
+    /// second reader would be a second mtime race for one boolean.
+    has_no_address: bool,
     /// The mtime the current list was parsed from, and `None` before the first
     /// successful read — which is also what a missing file leaves behind, so
     /// one appearing later is picked up rather than waited on forever.
@@ -740,6 +804,16 @@ impl PairedMachineWatch {
         &self.machines
     }
 
+    /// Whether this fleet is one that can only ever meet in a single session.
+    ///
+    /// See [`Pairing::fleet_has_no_address`]. Surfaced to the inbox because it
+    /// is the one thing about a fleet that a person has to act on before it
+    /// goes wrong rather than after.
+    pub fn fleet_has_no_address(&mut self) -> bool {
+        self.refresh();
+        self.has_no_address
+    }
+
     fn refresh(&mut self) {
         let Some(path) = self.path.as_deref() else {
             return;
@@ -754,7 +828,9 @@ impl PairedMachineWatch {
             return;
         }
         self.read_at = modified;
-        self.machines = load_from(path).unwrap_or_default().machines;
+        let pairing = load_from(path).unwrap_or_default();
+        self.has_no_address = pairing.fleet_has_no_address();
+        self.machines = pairing.machines;
     }
 }
 
@@ -898,6 +974,7 @@ mod tests {
             machines: Vec::new(),
             work: Default::default(),
             enrol: None,
+            fleet_key: None,
         };
         pairing.remember("desktop", Some(String::from("aa")), Some(false));
         pairing.remember("droplet", Some(String::from("bb")), Some(true));
@@ -1489,6 +1566,7 @@ mod tests {
         let invite = super::EnrolInvite {
             ticket: String::from("p2pmux-v3:abc"),
             secret: String::from("f00d"),
+            fleet_key: Some(String::from("ab").repeat(32)),
         };
         let encoded = invite.encode();
         assert!(encoded.starts_with(super::ENROL_PREFIX));
@@ -1510,11 +1588,13 @@ mod tests {
             &super::EnrolInvite {
                 ticket: String::new(),
                 secret: String::from("f00d"),
+                fleet_key: None,
             }
             .encode(),
             &super::EnrolInvite {
                 ticket: String::from("p2pmux-v3:abc"),
                 secret: String::new(),
+                fleet_key: None,
             }
             .encode(),
         ] {
@@ -1523,6 +1603,19 @@ mod tests {
                 "must refuse {refused:?}"
             );
         }
+
+        // A token minted before fleets had addresses still enrols a machine.
+        // It is the shape sitting in every machine image built last month, and
+        // refusing it would break a provisioning run on upgrade.
+        let older = super::EnrolInvite {
+            ticket: String::from("p2pmux-v3:abc"),
+            secret: String::from("f00d"),
+            fleet_key: None,
+        };
+        assert_eq!(
+            super::EnrolInvite::decode(&older.encode()).expect("decode"),
+            older
+        );
     }
 
     #[test]
@@ -1553,6 +1646,98 @@ mod tests {
         let pairing = load_from(&path).expect("load");
         assert!(!pairing.accepts_work);
     }
+
+    #[test]
+    fn a_fleet_key_is_minted_once_and_then_kept() {
+        let mut pairing = Pairing::default();
+        assert!(pairing.fleet_key().is_none());
+
+        let first = pairing.ensure_fleet_key().expect("should mint");
+        let second = pairing
+            .ensure_fleet_key()
+            .expect("should return the same one");
+
+        assert_eq!(first, second);
+        assert_eq!(pairing.fleet_key(), Some(first));
+    }
+
+    #[test]
+    fn a_fleet_key_survives_the_file() {
+        let path = temporary_path("fleet-key-round-trip");
+        let mut pairing = Pairing::default();
+        let key = pairing.ensure_fleet_key().expect("should mint");
+        save_to(&path, &pairing).expect("save");
+
+        assert_eq!(load_from(&path).expect("load").fleet_key(), Some(key));
+    }
+
+    #[test]
+    fn a_mistyped_fleet_key_reads_as_none_rather_than_failing_to_load() {
+        // The header invites people to edit this file. A key somebody broke has
+        // to degrade to "this fleet has no address yet", which the next pairing
+        // repairs — not to a machine that will not start.
+        let path = temporary_path("fleet-key-mistyped");
+        std::fs::write(&path, "ticket = \"t\"\nfleet_key = \"nonsense\"\n").expect("write");
+
+        let pairing = load_from(&path).expect("load");
+        assert!(pairing.fleet_key().is_none());
+        assert!(pairing.can_rejoin(), "the ticket still works meanwhile");
+    }
+
+    #[test]
+    fn a_fleet_paired_before_addresses_existed_says_so() {
+        // The upgrade case, and the only thing that produces it. It has to be
+        // visible, because it cannot be fixed quietly: handing the address over
+        // needs a channel only fleet members can read, and the one two machines
+        // share inside a session reaches the guests in it too.
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-v3:TICKET")),
+            ..Default::default()
+        };
+        assert!(pairing.fleet_has_no_address());
+
+        pairing.ensure_fleet_key().expect("should mint");
+        assert!(!pairing.fleet_has_no_address());
+    }
+
+    #[test]
+    fn a_machine_in_no_fleet_is_not_a_fleet_missing_an_address() {
+        // It is not missing anything. Telling somebody to re-pair a machine
+        // that was never paired sends them to fix the wrong thing.
+        assert!(!Pairing::default().fleet_has_no_address());
+    }
+
+    #[test]
+    fn unpairing_the_last_machine_gives_up_the_fleet_address_too() {
+        // It addressed a fleet that no longer exists. Keeping it would leave
+        // this machine reading and writing a record for nobody — and would put
+        // it silently back in the old fleet if one of those machines returned.
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-v3:TICKET")),
+            ..Default::default()
+        };
+        pairing.ensure_fleet_key().expect("should mint");
+        pairing.remember("laptop", Some(String::from("id")), None);
+
+        assert!(pairing.forget("laptop"));
+        assert!(pairing.fleet_key().is_none());
+        assert!(pairing.ticket.is_none());
+    }
+
+    #[test]
+    fn unpairing_one_of_several_keeps_the_fleet_address() {
+        let mut pairing = Pairing::default();
+        let key = pairing.ensure_fleet_key().expect("should mint");
+        pairing.remember("laptop", Some(String::from("one")), None);
+        pairing.remember("droplet", Some(String::from("two")), None);
+
+        assert!(pairing.forget("laptop"));
+        assert_eq!(
+            pairing.fleet_key(),
+            Some(key),
+            "the fleet it leaves is still a fleet"
+        );
+    }
 }
 
 /// The printable form of an enrolment invitation: the fleet's session ticket
@@ -1564,13 +1749,28 @@ mod tests {
 /// it can be recognized, base64 so it survives YAML.
 pub const ENROL_PREFIX: &str = "p2pmux-enrol-v1:";
 
-/// The two halves of an enrolment invitation, as they travel.
+/// What an enrolment invitation carries.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EnrolInvite {
-    /// The session every machine in this fleet rejoins.
+    /// Where the fleet was meeting when this was minted.
+    ///
+    /// Kept, but no longer the important half. A token pasted into a machine
+    /// image is read months after it was printed, by which time this names a
+    /// session that ended long ago — which is precisely how a machine used to
+    /// enrol into nothing and report success. It is now a first guess that the
+    /// address below corrects.
     pub ticket: String,
     /// The standing secret. See [`EnrolToken`].
     pub secret: String,
+    /// The fleet's permanent address. See [`crate::fleet`].
+    ///
+    /// Optional only so a token minted by an older build still parses. One
+    /// without it enrols a machine that has no way to find the fleet again once
+    /// the ticket above goes stale, so [`crate::fleet`]'s in-session hand-off is
+    /// what rescues it: the first session it shares with a machine that has an
+    /// address is where it gets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_key: Option<String>,
 }
 
 impl EnrolInvite {

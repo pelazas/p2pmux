@@ -489,6 +489,7 @@ pub fn run_on(
                             // say which peer this client is.
                             tui.set_local_peer_id(local_peer_id.clone());
                             tui.set_paired_machines(paired_machines.machines().to_vec());
+                            tui.set_fleet_has_no_address(paired_machines.fleet_has_no_address());
                             // The node outlives this client, so here — and only
                             // here — leaving and ending the session are two
                             // different things worth asking about.

@@ -9,6 +9,7 @@ pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod failover;
+pub mod fleet;
 pub mod hosted_rendezvous;
 pub mod install_path;
 pub mod kitty_keyboard;

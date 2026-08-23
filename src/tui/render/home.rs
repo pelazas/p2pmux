@@ -60,6 +60,16 @@ const HOME_EMPTY_STEPS: &[(&str, &str)] = &[
 /// inbox that cannot say `needs you` is a list of processes.
 pub(in crate::tui) const HOME_EMPTY_NO_HOOKS: &str =
     "Run `p2pmux setup` to see which agents need you.";
+/// The nudge shown to a fleet that was paired before fleets had an address.
+///
+/// It outranks the hooks nudge, which is unusual and deliberate. Unreported
+/// agents make the inbox less useful; a fleet with no address of its own goes
+/// on working perfectly until the session it was paired around ends, and then
+/// strands in a way that looks like a network fault and only a person can undo.
+/// One is worth saying whenever there is room, the other is worth saying before
+/// it happens.
+pub(in crate::tui) const HOME_FLEET_HAS_NO_ADDRESS: &str =
+    "This fleet can only meet in one session. Run `p2pmux pair` once to fix that.";
 /// What sits in the description column of a row nothing has reported on.
 ///
 /// Per-row rather than a banner over the list: the warning belongs exactly
@@ -242,10 +252,13 @@ fn render_home_in(
         // An answer to something the reader just did outranks a standing nudge:
         // the nudge will still be true next frame, and "that machine is asleep"
         // is only worth saying now.
-        let hint = tui
-            .home_notice
-            .clone()
-            .unwrap_or_else(|| String::from(HOME_EMPTY_NO_HOOKS));
+        let hint = tui.home_notice.clone().unwrap_or_else(|| {
+            String::from(if tui.fleet_has_no_address {
+                HOME_FLEET_HAS_NO_ADDRESS
+            } else {
+                HOME_EMPTY_NO_HOOKS
+            })
+        });
         frame.render_widget(
             Paragraph::new(Line::styled(
                 format!(" {hint}"),
@@ -1405,6 +1418,18 @@ mod tests {
         let drawn = screen(&unwired, 120, 30).join("\n");
         assert!(drawn.contains(HOME_EMPTY_NO_HOOKS), "{drawn}");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
+
+        // A fleet that can only meet in one session outranks the setup nudge.
+        // Unreported agents make the inbox less useful; a fleet with no address
+        // works perfectly until the day it strands, and only a person can undo
+        // that — so it is worth saying before it happens rather than after.
+        let mut stranding =
+            crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Unknown)]);
+        stranding.set_home_open(true, "test");
+        assert!(stranding.set_fleet_has_no_address(true));
+        let drawn = screen(&stranding, 120, 30).join("\n");
+        assert!(drawn.contains("p2pmux pair"), "{drawn}");
+        assert!(!drawn.contains(HOME_EMPTY_NO_HOOKS), "{drawn}");
 
         // It has a line of its own, so an answer to something the reader just
         // did does not push it off the screen — the two are different messages

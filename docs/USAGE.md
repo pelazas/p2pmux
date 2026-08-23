@@ -636,9 +636,9 @@ In the order they actually happen:
   because the refusal arrives in a protocol it cannot read.
 - **The code was typed more than ten minutes after it was printed**, or another machine used it
   first. Print a fresh one with `p2pmux pair` and type it within the window.
-- **`p2pmux enroll` says this machine is not in a fleet.** A token is an invitation to a fleet that
-  already exists, and a fleet begins with one human pairing two machines. Run `p2pmux pair` between
-  two of yours first; enrol the third and every one after it.
+- **`p2pmux pair --token` says this machine is not in a fleet.** A token is an invitation to a fleet
+  that already exists, and a fleet begins with one human pairing two machines. Run `p2pmux pair`
+  between two of yours first; use a token for the third and every one after it.
 - **A machine that paired is `asleep` in `p2pmux machines`.** It is paired but nothing is running
   on it. A box with somebody at it rejoins with bare `p2pmux`; one without needs the fleet agent —
   `p2pmux daemon install` on that machine, once.
@@ -647,24 +647,30 @@ In the order they actually happen:
   goes on inviting for as long as it is up. `p2pmux list` on that machine says what it is running,
   and `p2pmux kill <name>` ends it.
 
-### Enrolling a machine nobody is sitting at
+### Adding a machine nobody is sitting at
 
 `p2pmux pair` is a code one human types on one machine within ten minutes. That is right for two
-laptops and unusable from a provisioning script, so a VM gets a token instead. It needs a fleet to
-invite the machine *into*, so pair two machines by hand first — a token cannot create one.
+laptops and unusable from a provisioning script, so a VM gets a token instead — the same command
+with `--token`. It needs a fleet to invite the machine *into*, so pair two machines by hand first;
+a token cannot create one.
 
 ```text
-On a machine already in the fleet:   p2pmux enroll
-                                     → p2pmux enroll p2pmux-enrol-v1:… --name <name>
+On a machine already in the fleet:   p2pmux pair --token
+                                     → p2pmux pair p2pmux-enrol-v1:… --name <name>
                                      → and the cloud-init line to paste it into
 
-On the new machine:                  p2pmux enroll p2pmux-enrol-v1:… --name build-box --accept-work
+On the new machine:                  p2pmux pair p2pmux-enrol-v1:… --name build-box --accept-work
                                      → enrolled as build-box
 ```
 
 Printing the token twice gives the same token, so an image built from last week's paste still
-works. `p2pmux enroll --revoke` withdraws it; machines already enrolled stay, and `p2pmux unpair`
+works. `p2pmux pair --revoke` withdraws it; machines already in the fleet stay, and `p2pmux unpair`
 is how one leaves.
+
+`p2pmux enroll` is what `p2pmux pair --token` used to be called, and still works: those tokens live
+in machine images written months before anything runs them. It is no longer in `--help` — there is
+one command for adding a machine, and this is the flag that says whether a person is there to type
+it.
 
 Enrolling puts the machine in the fleet for as long as it stays up. Surviving its next reboot is a
 second step, and on a box nobody logs into it is the one that matters:
@@ -686,8 +692,9 @@ lists it under `IN THIS SESSION, NOT YOURS`, which is the difference the heading
 
 ### What your machines may start here
 
-Two gates, both closed until you open them: this machine has to accept work at all, and the exact
-command has to be on its allowlist. `p2pmux work` prints where both stand.
+Closed by default, and opened by answering one question. `p2pmux pair` asks whether your other
+machines may start work here; yes allows a login shell — everything this user account can do —
+and `p2pmux work` prints what stands.
 
 ```text
 p2pmux work                 # what this machine allows, and what to run to change it
@@ -703,9 +710,9 @@ decisions. There is no blocklist, because a blocklist on an interactive shell is
 against accidents and not a boundary: allow a shell and you have allowed everything that user can
 do, and the allowlist says so in those words rather than pretending otherwise.
 
-Granting anything turns `accepts_work` on with it — an allowlist behind a closed gate is a list
-nothing reads. When a machine refuses a terminal, the machine that asked is told the command that
-lifts it and where to run it:
+Underneath there are two records — whether this machine accepts work at all, and what it accepts —
+and every command here writes both, because either one alone permits nothing. When a machine
+refuses a terminal, the machine that asked is told the command that lifts it and where to run it:
 
 ```text
 droplet refused — run `p2pmux work allow` on droplet

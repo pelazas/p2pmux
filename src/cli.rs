@@ -55,17 +55,36 @@ enum Command {
     },
     /// Pair this machine with another one you own, once and permanently.
     ///
-    /// With no code, prints one for the other machine to type. With a code,
-    /// pairs with the machine that printed it. After either, bare `p2pmux`
-    /// rejoins on both with no code typed again.
+    /// With no arguments, prints a code for the other machine to type. With a
+    /// code or a token, joins the fleet it names. After either, bare `p2pmux`
+    /// rejoins on both with nothing typed again.
+    ///
+    /// `--token` is the same act with nobody sitting at the other machine: a
+    /// code expires in ten minutes and has to be typed by a person, which is
+    /// right for two laptops and unusable from a provisioning script. The token
+    /// is reusable until `--revoke`. It is a flag rather than a separate
+    /// command because it is not a separate idea — both put a machine you own
+    /// in your fleet, and having two names for that was one concept too many.
     Pair {
-        /// The pairing code printed by `p2pmux pair` on your other machine.
+        /// The pairing code or enrolment token printed on your other machine.
         code: Option<String>,
-        /// Answer the accepts-work question without being asked. The first of
-        /// two gates; `p2pmux work allow` here opens the second.
+        /// Print a reusable token for a machine with nobody at it, instead of a
+        /// code somebody types within ten minutes.
+        #[arg(long, conflicts_with = "code")]
+        token: bool,
+        /// Withdraw the standing token. Machines already in the fleet stay;
+        /// `p2pmux unpair` is how one leaves.
+        #[arg(long, conflicts_with = "code")]
+        revoke: bool,
+        /// The name this machine goes by in the fleet. Defaults to its
+        /// hostname, which on a droplet is rarely what you want to read.
+        #[arg(long)]
+        name: Option<String>,
+        /// Let your other machines start a login shell here, without being
+        /// asked. `p2pmux work allow <command>` narrows it afterwards.
         #[arg(long = "accept-work")]
         accept_work: bool,
-        /// Refuse the accepts-work question without being asked.
+        /// Refuse, without being asked. This is the default.
         #[arg(long = "no-accept-work", conflicts_with = "accept_work")]
         no_accept_work: bool,
     },
@@ -137,26 +156,26 @@ enum Command {
         #[command(subcommand)]
         command: Option<TelemetryCommand>,
     },
-    /// Put a machine you own in your fleet without anybody sitting at it.
+    /// What `p2pmux pair --token` is now called.
     ///
-    /// `p2pmux pair` is a code one human types on one machine within ten
-    /// minutes, which is right for two laptops and unusable from a provisioning
-    /// script. With no arguments this prints a token to paste into one; on the
-    /// new machine, `p2pmux enroll <token>` joins the fleet unattended.
+    /// Kept and hidden rather than removed. This command's whole reason for
+    /// existing is being baked into machine images and cloud-init files months
+    /// before anybody runs it, so removing it would break provisioning that was
+    /// written correctly against the release it was written for. It is not in
+    /// `--help` because a person reading that should find one way to add a
+    /// machine, not two.
+    #[command(hide = true)]
     Enroll {
-        /// The token printed by `p2pmux enroll` on a machine already in the
-        /// fleet. Omit it to print one here instead.
+        /// The token printed on a machine already in the fleet. Omit it to
+        /// print one here instead.
         token: Option<String>,
-        /// The name this machine goes by in the fleet. Defaults to its
-        /// hostname, which on a droplet is rarely what you want to read.
+        /// The name this machine goes by in the fleet.
         #[arg(long)]
         name: Option<String>,
-        /// Withdraw the standing invitation. Machines already enrolled stay;
-        /// `p2pmux unpair` is how one leaves.
+        /// Withdraw the standing invitation.
         #[arg(long)]
         revoke: bool,
-        /// Let your other machines start a login shell here. Unattended boxes
-        /// usually want this, and it is the same thing `p2pmux work allow` does.
+        /// Let your other machines start a login shell here.
         #[arg(long = "accept-work")]
         accept_work: bool,
     },
@@ -547,25 +566,28 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             _ => Err(CliError("config key must be name").into()),
         },
         Some(Command::Work { action }) => run_work(action),
+        // The old spelling of `p2pmux pair --token`, kept for the cloud-init
+        // files it was written into. `--accept-work` alone rather than the pair
+        // of flags: an unattended box has nobody to ask, so there was never a
+        // question here to answer either way.
         Some(Command::Enroll {
             token,
             name,
             revoke,
             accept_work,
-        }) => match (token, revoke) {
-            (_, true) => {
-                let mut pairing = crate::pairing::load()?;
-                if crate::pairing::revoke_enrolment(&mut pairing) {
-                    crate::pairing::save(&pairing)?;
-                    println!("enrolment token revoked; machines already in the fleet stay");
-                } else {
-                    println!("no enrolment token to revoke");
-                }
-                Ok(())
-            }
-            (None, false) => print_enrolment_token(),
-            (Some(token), false) => enroll_with_token(&token, name.as_deref(), accept_work).await,
-        },
+        }) => {
+            join_or_invite(JoinOrInvite {
+                code: token,
+                token: true,
+                revoke,
+                name,
+                accept_work,
+                // There is nobody at an unattended box to say no, and this
+                // spelling never had the flag to say it with.
+                no_accept_work: false,
+            })
+            .await
+        }
         Some(Command::Create { name, session_name }) => {
             {
                 let mut stdout = io::stdout().lock();
@@ -587,7 +609,11 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 // A session somebody typed `create` for outlives the terminal
                 // they typed it in. That is what the separate process is for.
                 crate::node::Tether::Detached,
-                None,
+                // `create` is a session of its own, however many of your own
+                // machines end up in it. Publishing it as the fleet's meeting
+                // place would move the whole fleet into a session that was
+                // never meant to be one.
+                FleetRole::Bystander,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -688,7 +714,8 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
                 crate::node::Tether::Detached,
-                None,
+                // Somebody else's session, reached with somebody else's code.
+                FleetRole::Bystander,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -731,14 +758,21 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Some(Command::Pair {
             code,
+            token,
+            revoke,
+            name,
             accept_work,
             no_accept_work,
         }) => {
-            let answer = accepts_work_answer(accept_work, no_accept_work)?;
-            match code {
-                Some(code) => pair_with_code(&code, answer).await,
-                None => offer_pairing(answer).await,
-            }
+            join_or_invite(JoinOrInvite {
+                code,
+                token,
+                revoke,
+                name,
+                accept_work,
+                no_accept_work,
+            })
+            .await
         }
         Some(Command::Machines) => print_machines(),
         Some(Command::Daemon { command }) => match command {
@@ -851,14 +885,23 @@ fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<
         .ok_or_else(|| CliError("no live session with that name").into())
 }
 
-/// The accepts-work answer, asked once during pairing rather than left to a
-/// separate configuration step nobody would find.
+/// What this machine will let your other machines start, asked once.
 ///
-/// Default-deny, and the wording matters: it means *accepts work from me*,
+/// Default-deny, and the wording matters: it means *from my own machines*,
 /// never *from anyone in the session*. Otherwise a join code you hand to a
-/// colleague becomes remote code execution on your desktop. Saying yes here is
-/// consent to be asked; what may actually be started is the allowlist in the
-/// pairing file, which is empty until somebody writes in it.
+/// colleague becomes remote code execution on your desktop.
+///
+/// One question, where there used to be two gates opened at two different times
+/// by two different commands. Saying yes here set `accepts_work` and nothing
+/// else, and an empty allowlist permits nothing — so a machine paired with
+/// `--accept-work` refused every terminal, and the only way to find out why was
+/// to read a refusal that named a command nobody had been told about. Somebody
+/// who answers yes to "let your other machines start work here" has answered
+/// the question they were asked; this now writes down what that means.
+///
+/// A login shell, spelled out, because it is the honest answer to the question
+/// as posed and the one an unattended box wants. Anything narrower is
+/// `p2pmux work allow <command>`, which replaces this rather than adding to it.
 fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error>> {
     if accept {
         return Ok(true);
@@ -866,11 +909,31 @@ fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error
     if refuse || !io::stdin().is_terminal() {
         return Ok(false);
     }
+    println!();
+    println!(
+        "Your other machines can start a terminal here. Yes allows a login shell —\n\
+         everything this user account can do. `p2pmux work allow <command>` narrows\n\
+         it later, and `p2pmux work off` closes it."
+    );
     print!("Let your other machines start work here? [y/N] ");
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Write down what the accepts-work answer meant.
+///
+/// Both gates or neither. The allowlist is left alone when it already says
+/// something: a machine that was narrowed to `claude` and is being re-paired
+/// has an answer on file, and widening it to a login shell because somebody
+/// typed `y` to a question about starting work at all would be a grant nobody
+/// made.
+fn apply_accepts_work(pairing: &mut crate::pairing::Pairing, accepts_work: bool) {
+    pairing.accepts_work = accepts_work;
+    if accepts_work && pairing.work.allow.is_empty() {
+        pairing.work.allow(&[]);
+    }
 }
 
 /// Offer to keep this machine in its fleet across reboots.
@@ -925,7 +988,11 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let descriptor = match newest_live(&store.list_live()?) {
         Some(descriptor) => descriptor,
-        None => start_solo_session(None)?,
+        // The session this pairing is about to hand out is, by construction,
+        // the one the fleet will meet in.
+        None => start_solo_session(FleetRole::Home {
+            stands_in_for: None,
+        })?,
     };
     // The node publishes the code a moment after it starts, so a session
     // created two lines ago has not necessarily got one yet.
@@ -935,7 +1002,8 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     ))?;
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket.clone());
-    pairing.accepts_work = accepts_work;
+    apply_accepts_work(&mut pairing, accepts_work);
+    let fleet_key = pairing.ensure_fleet_key()?;
     // This machine's own session, offered to a machine that may never come for
     // it. What that costs when nobody does is `Pairing::rejoin_ticket`'s
     // subject, and it can only tell an offer from an invitation if the offer
@@ -950,8 +1018,9 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     crate::pairing::save(&pairing)?;
 
     let mut stdout = io::stdout().lock();
-    match descriptor.join_code.as_deref() {
+    match mint_pairing_code(&ticket, &fleet_key).await {
         Some(code) => {
+            let code = code.printable();
             writeln!(stdout, "pairing code: {code}")?;
             writeln!(
                 stdout,
@@ -971,14 +1040,97 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
             )?;
         }
     }
-    writeln!(
-        stdout,
-        "\naccepts work from your machines: {}",
-        if accepts_work { "yes" } else { "no" }
-    )?;
+    // The policy itself rather than "accepts work: yes", which was true of a
+    // machine that went on to refuse everything. What somebody needs to read
+    // back is what they just allowed.
+    writeln!(stdout)?;
+    write!(stdout, "{}", work_policy_summary(&crate::pairing::load()?))?;
     drop(stdout);
     offer_fleet_daemon()?;
     Ok(())
+}
+
+/// Everything `p2pmux pair` was asked to do, before it works out which.
+struct JoinOrInvite {
+    code: Option<String>,
+    token: bool,
+    revoke: bool,
+    name: Option<String>,
+    accept_work: bool,
+    no_accept_work: bool,
+}
+
+/// The one command that puts a machine you own in your fleet.
+///
+/// Five shapes, and they were two commands until this: `pair`, and `enroll`
+/// with the same four arms under different names. Nothing about them differed
+/// except how long the invitation lasts and whether a person has to be there to
+/// type it — which is a flag, not a second idea. Somebody reading `--help` and
+/// finding two ways to add a machine has to work out which one they are in
+/// before they can start, and the answer was always "either".
+///
+/// The accepts-work question is asked only where there is something to answer.
+/// Printing an invitation and revoking one are both about a machine that is
+/// already here and has already said; re-asking would look like the answer had
+/// been lost.
+async fn join_or_invite(args: JoinOrInvite) -> Result<(), Box<dyn Error>> {
+    if args.revoke {
+        let mut pairing = crate::pairing::load()?;
+        if crate::pairing::revoke_enrolment(&mut pairing) {
+            crate::pairing::save(&pairing)?;
+            println!("token revoked; machines already in the fleet stay");
+        } else {
+            println!("no token to revoke");
+        }
+        return Ok(());
+    }
+    if let Some(code) = args.code {
+        let accepts_work = accepts_work_answer(args.accept_work, args.no_accept_work)?;
+        // Which kind of invitation this is, by shape. A person handed one
+        // string and told to run one command should not also have to know
+        // which of two forms they were handed.
+        if crate::pairing::EnrolInvite::decode(&code).is_ok() {
+            return enroll_with_token(&code, args.name.as_deref(), accepts_work).await;
+        }
+        if let Some(name) = args.name.as_deref() {
+            crate::config::save(name)?;
+        }
+        return pair_with_code(&code, accepts_work).await;
+    }
+    if args.token {
+        return print_enrolment_token();
+    }
+    offer_pairing(accepts_work_answer(args.accept_work, args.no_accept_work)?).await
+}
+
+/// Mint the code `p2pmux pair` prints, and put both halves behind it.
+///
+/// Its own code rather than the session's join code, which is what this used to
+/// print. They are different credentials that happened to be one string: a
+/// pairing code puts a machine in your fleet, and a join code invites somebody
+/// to a session. Handing a collaborator the second used to hand them the first
+/// for as long as the window stood open — and would now also hand them the
+/// address of the fleet they were invited to sit beside.
+///
+/// Two records, under contexts only one of which an older build knows. The
+/// ticket goes where it has always gone so a machine running last month's
+/// binary can still type this code; the fleet address goes in the sibling
+/// record, where that machine will never look. See `crate::fleet`.
+///
+/// `None` means the rendezvous service could not be reached, which costs the
+/// short code and not the pairing — the ticket still works and is printed
+/// instead.
+async fn mint_pairing_code(ticket: &str, fleet_key: &crate::fleet::FleetKey) -> Option<JoinCode> {
+    let store = HostedRendezvous::new().ok()?;
+    let code = JoinCode::mint().ok()?;
+    store.republish(&code, ticket).await.ok()?;
+    // Best effort, and the pairing is still worth making without it: a machine
+    // that pairs with no address behaves exactly as every machine did before
+    // this existed, and picks one up from the first session they share.
+    if let Err(error) = crate::fleet::offer_handover(&code, fleet_key).await {
+        crate::perf::log(&format!("P2PMUX_FLEET handover not offered: {error}"));
+    }
+    Some(code)
 }
 
 /// `p2pmux pair <code>`: join the machine that printed it, permanently.
@@ -990,13 +1142,27 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     }
     let ticket = resolve_join_ticket(code).await?;
     let ticket_text = ticket.to_string();
+    // The other half of what that code names, when the machine that printed it
+    // had one to give. A pairing that gets no address still pairs.
+    let handed_over = match JoinCode::parse(code) {
+        Ok(code) => crate::fleet::accept_handover(&code).await,
+        Err(_) => None,
+    };
     // Recorded before the join rather than after it. A join that connects and
     // then drops has still paired the machines, and losing the ticket to a
     // network blip would mean typing the code again for a pairing that
     // succeeded.
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket_text.clone());
-    pairing.accepts_work = accepts_work;
+    apply_accepts_work(&mut pairing, accepts_work);
+    // Taking somebody else's fleet is joining it, so this one is replaced
+    // rather than kept: `adopt_fleet_key` refuses to overwrite, which is right
+    // for a key that arrives mid-session and wrong for a pairing a person just
+    // typed. A machine that was in a fleet of its own and is now in yours must
+    // read your record, not the one nobody else can see.
+    if let Some(key) = &handed_over {
+        pairing.fleet_key = Some(key.hex().to_owned());
+    }
     // Somebody else's session, and the machine hosting it may be asleep rather
     // than absent — so this ticket keeps its thirty seconds even before any
     // machine has answered on it. An offer this machine made earlier does not
@@ -1037,6 +1203,8 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
         }
     }
     writeln!(stdout, "\nFrom now on, bare `p2pmux` rejoins with no code.")?;
+    writeln!(stdout)?;
+    write!(stdout, "{}", work_policy_summary(&crate::pairing::load()?))?;
     drop(stdout);
     // Asked after the pairing is reported, not before: the machines are paired
     // either way, and this question is about what happens after a reboot.
@@ -1044,7 +1212,13 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-/// Wait for the node to publish the session's invite material.
+/// Wait for the node to publish the session's ticket.
+///
+/// The ticket alone, where this used to wait for the session's join code too.
+/// Pairing mints a code of its own now — see `mint_pairing_code` — so waiting
+/// for that one bought nothing and cost the full twenty seconds on a machine
+/// whose rendezvous was unreachable, before printing the ticket it had been
+/// holding the whole time.
 async fn wait_for_invite(
     store: &crate::session_store::SessionStore,
     id: &str,
@@ -1058,15 +1232,13 @@ async fn wait_for_invite(
             .into_iter()
             .find(|descriptor| descriptor.id == id)
         {
-            if descriptor.ticket.is_some() && descriptor.join_code.is_some() {
+            if descriptor.ticket.is_some() {
                 return Ok(descriptor);
             }
             last = Some(descriptor);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // A ticket with no code still pairs, so a rendezvous outage falls through
-    // here rather than failing.
     last.ok_or_else(|| CliError("the session did not start").into())
 }
 
@@ -1168,6 +1340,19 @@ fn print_machines() -> Result<(), Box<dyn Error>> {
             println!("No other machines paired yet. Run `p2pmux pair` to add one.");
         }
     }
+    // Said before it matters rather than after. A fleet with no address of its
+    // own works perfectly until the session it was paired around ends, and then
+    // stops working in a way that looks like a network fault and can only be
+    // fixed by a person. Naming it here — with the one command that fixes it —
+    // is the difference between an upgrade note and a support thread.
+    if pairing.fleet_has_no_address() {
+        println!();
+        println!(
+            "This fleet was paired before fleets had an address of their own, so\n\
+             it can only meet in the one session it was paired around. Run\n\
+             `p2pmux pair` once on either machine to give it a permanent one."
+        );
+    }
     // Only about this machine, because this machine's own file is the only
     // policy it can honestly report. Every other row's `ACCEPTS WORK` column
     // already says `—` for the same reason.
@@ -1259,32 +1444,41 @@ fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
         // `p2pmux` instead sent them round a loop that could not end. The
         // unattended path really does start with a human pairing once.
         return Err(CliError(
-            "this machine is not in a fleet yet, and `p2pmux enroll` hands out an \
+            "this machine is not in a fleet yet, and `--token` hands out an \
              invitation to one that exists — run `p2pmux pair` here and \
              `p2pmux pair <code>` on another machine you own, then try again",
         )
         .into());
     };
-    let minted = pairing.enrol.is_none();
+    let before = (pairing.enrol.clone(), pairing.fleet_key.clone());
     let secret = crate::pairing::enrolment_token(&mut pairing, crate::pairing::now_unix())?;
-    if minted {
+    // A fleet that predates addresses gets one here rather than staying without
+    // until somebody re-pairs. Handing out a token that carries only a session
+    // is how the machine on the other end of it enrols into nothing.
+    let fleet_key = pairing.ensure_fleet_key()?;
+    if before != (pairing.enrol.clone(), pairing.fleet_key.clone()) {
         crate::pairing::save(&pairing)?;
     }
-    let invite = crate::pairing::EnrolInvite { ticket, secret }.encode();
+    let invite = crate::pairing::EnrolInvite {
+        ticket,
+        secret,
+        fleet_key: Some(fleet_key.hex().to_owned()),
+    }
+    .encode();
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{TRUST_WARNING}\n")?;
     writeln!(
         stdout,
         "Anyone holding this token can put a machine in your fleet until you run\n\
-         `p2pmux enroll --revoke`. Membership on its own starts nothing: what may\n\
+         `p2pmux pair --revoke`. Membership on its own starts nothing: what may\n\
          run on a machine is that machine's own `p2pmux work allow`.\n"
     )?;
     writeln!(stdout, "On the machine you are adding, run:\n")?;
-    writeln!(stdout, "  p2pmux enroll {invite} --name <name>\n")?;
+    writeln!(stdout, "  p2pmux pair {invite} --name <name>\n")?;
     writeln!(
         stdout,
         "In cloud-init, with nobody there to type it:\n\n  \
-         runcmd:\n    - [ sh, -c, \"p2pmux enroll {invite} --name build-box --accept-work\" ]"
+         runcmd:\n    - [ sh, -c, \"p2pmux pair {invite} --name build-box --accept-work\" ]"
     )?;
     Ok(())
 }
@@ -1306,6 +1500,7 @@ async fn enroll_with_token(
     }
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(invite.ticket.clone());
+    pairing.fleet_key = invite.fleet_key.clone();
     // The token names a session on the machine that minted it, which is the one
     // case where nobody is sitting here to notice it did not answer. Dialling
     // it on every boot until it does is the whole point of enrolling.
@@ -1315,8 +1510,7 @@ async fn enroll_with_token(
         created_at: crate::pairing::now_unix(),
     });
     if accept_work {
-        pairing.accepts_work = true;
-        pairing.work.allow(&[]);
+        apply_accepts_work(&mut pairing, true);
     }
     // The window the classic flow opens by hand. The machine that minted the
     // token is about to write this one into its fleet on sight; this is the
@@ -1324,8 +1518,34 @@ async fn enroll_with_token(
     pairing.open_pairing_window(crate::pairing::now_unix());
     crate::pairing::save(&pairing)?;
 
-    let descriptor = rejoin_paired_session(&invite.ticket, None).await?;
-    let peers = wait_for_peers(&descriptor).await;
+    // Where the fleet is *now*, before the ticket baked into the token, which
+    // is usually months old by the time a provisioning script reads it. That
+    // ticket naming a session that had ended was the whole of this command's
+    // failure mode: it reported "could not reach the session host … the invite
+    // may be out of date" from the new machine, which sends somebody to debug
+    // a network that was never the problem.
+    let mut joined = None;
+    for ticket in fleet_addresses(&pairing).await {
+        match rejoin_paired_session(&ticket, None).await {
+            Ok(descriptor) => {
+                joined = Some((descriptor, ticket));
+                break;
+            }
+            Err(error) => {
+                eprintln!("p2pmux: {error}");
+            }
+        }
+    }
+    // Not an error. The record is already written, the fleet agent will keep
+    // looking, and a provisioning run that failed here would tear down a
+    // machine that is enrolled and simply early.
+    let peers = match &joined {
+        Some((descriptor, ticket)) => {
+            remember_fleet_session(ticket);
+            wait_for_peers(descriptor).await
+        }
+        None => Vec::new(),
+    };
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
         pairing.remember(
@@ -1478,22 +1698,32 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let pairing = crate::pairing::load_or_empty();
     let mut failed_rejoin_ticket = None;
-    if let Some(ticket) = pairing.ticket.as_deref() {
-        // A node here is already in the fleet's session: use it rather than
-        // standing up a second one alongside it. Only while it is free — an
-        // occupied one falls through to a node of this terminal's own, which
-        // lands in the same shared session anyway.
-        if let Some(descriptor) = newest_live(&joined_to(&store.list_live()?, ticket))
-            && let Some(result) = attach_unless_busy(&descriptor, crate::client::StartScreen::Home)
-        {
-            return result;
-        }
+    // A node here is already in the fleet's session: use it rather than standing
+    // up a second one alongside it. Only while it is free — an occupied one
+    // falls through to a node of this terminal's own, which lands in the same
+    // shared session anyway.
+    //
+    // Asked before the fleet is looked up, and that order is the whole reason
+    // this stayed fast: the common case is a machine that already has p2pmux
+    // running, and making it wait on a network round trip to be told what it
+    // could see locally would put a visible pause on every bare `p2pmux`.
+    let live = store.list_live()?;
+    if let Some(descriptor) = newest_live(&hosting_the_fleet(&live, pairing.ticket.as_deref()))
+        && let Some(result) = attach_unless_busy(&descriptor, crate::client::StartScreen::Home)
+    {
+        return result;
     }
+    // Where the fleet says it is meeting, and then — if that is unreachable or
+    // unknown — the last place this machine saw it. Two addresses rather than
+    // one, because they fail in different ways: the record is right about a
+    // fleet that has moved and silent when the store is down, and the stored
+    // ticket is the reverse.
+    //
     // Which is a different question from whether there is a ticket at all: the
     // session offered to a machine that never came for it is still worth
     // attaching to while it is running here, and never worth dialling once it
     // is not. See `Pairing::rejoin_ticket`.
-    if let Some(ticket) = pairing.rejoin_ticket(crate::pairing::now_unix()) {
+    for ticket in fleet_addresses(&pairing).await {
         // Said before the dial, not after it. A sleeping paired machine still
         // makes the short rejoin window visible, where silence reads exactly
         // like a command that hung.
@@ -1506,8 +1736,13 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
             )?;
             stderr.flush()?;
         }
-        match rejoin_paired_session(ticket, Some(5000)).await {
+        match rejoin_paired_session(&ticket, Some(5000)).await {
             Ok(descriptor) => {
+                // The address that worked, kept for the next run. It is what
+                // gets dialled when the store cannot be reached, and a machine
+                // that has been in a fleet all week should not depend on a
+                // third party being up to find its own session.
+                remember_fleet_session(&ticket);
                 return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
             }
             // A paired machine that is asleep, or a session whose coordinator
@@ -1517,9 +1752,12 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
                 failed_rejoin_ticket = Some(ticket);
                 let mut stderr = io::stderr().lock();
                 writeln!(stderr, "could not rejoin the paired session: {error}")?;
-                writeln!(stderr, "starting a session on this machine instead")?;
             }
         }
+    }
+    if failed_rejoin_ticket.is_some() {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "starting a session on this machine instead")?;
     }
     // The fallback is this machine's answer to that ticket, and remembering it
     // is what lets the next bare command attach here instead of attempting the
@@ -1533,7 +1771,9 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     // here was a race against those, lost on a machine where publishing the
     // role takes a moment longer than it does on a laptop, and losing it left
     // every later `p2pmux` paying the rejoin window again.
-    let descriptor = start_solo_session(failed_rejoin_ticket.map(str::to_owned))?;
+    let descriptor = start_solo_session(FleetRole::Home {
+        stands_in_for: failed_rejoin_ticket,
+    })?;
     // The session screen, not the inbox. A session created a moment ago has one
     // pane and no agents in it, so Home would open on an empty list — the blank
     // screen a first run is least able to interpret. Rejoining a fleet session
@@ -1557,25 +1797,99 @@ fn attach_unless_busy(
     }
 }
 
-/// The live sessions here that are the one the pairing recorded.
+/// The live sessions here that are this machine's place in its fleet.
 ///
-/// Matched by ticket rather than taken as "the newest", because a machine in a
-/// fleet also starts sessions of its own: attaching one of those for a bare
-/// `p2pmux` would put the user somewhere their other machines are not, which is
-/// the one place this command must never leave them. The coordinator that
-/// minted the pairing ticket holds it as `ticket`; every machine that joined
-/// holds the same string as `joined_ticket`.
-fn joined_to(
+/// Never "the newest", because a machine in a fleet also starts sessions of its
+/// own: attaching one of those for a bare `p2pmux` would put the user somewhere
+/// their other machines are not, which is the one place this command must never
+/// leave them.
+///
+/// `hosts_fleet` is the direct answer and is what every session started by this
+/// build carries. `stored_ticket` is how a session started by an older one is
+/// still recognised — a coordinator holds the ticket as `ticket` and a machine
+/// that joined holds the same string as `joined_ticket`. Dropping that second
+/// test would make the first `p2pmux` after an upgrade stand up a second
+/// session beside the one already running.
+fn hosting_the_fleet(
     live: &[crate::session_store::SessionDescriptor],
-    ticket: &str,
+    stored_ticket: Option<&str>,
 ) -> Vec<crate::session_store::SessionDescriptor> {
     live.iter()
         .filter(|descriptor| {
-            descriptor.joined_ticket.as_deref() == Some(ticket)
-                || descriptor.ticket.as_deref() == Some(ticket)
+            descriptor.hosts_fleet
+                || stored_ticket.is_some_and(|ticket| {
+                    descriptor.joined_ticket.as_deref() == Some(ticket)
+                        || descriptor.ticket.as_deref() == Some(ticket)
+                })
         })
         .cloned()
         .collect()
+}
+
+/// Every address worth dialling to reach this fleet, best first.
+///
+/// The record is asked first because it is the only one that can be *right*
+/// about a fleet that has moved. The stored ticket follows because it is the
+/// only one that answers when the store is unreachable — and a machine that has
+/// been in a fleet all week should not lose its own session to a third party
+/// being down.
+///
+/// Never the same address twice: the ordinary healthy case is a record that
+/// says exactly what the file already said, and paying the rejoin window twice
+/// for it would be a five-second pause nobody could explain.
+async fn fleet_addresses(pairing: &crate::pairing::Pairing) -> Vec<String> {
+    let mut published = None;
+    if let Some(key) = pairing.fleet_key() {
+        match crate::fleet::locate(&key).await {
+            Ok(record) => published = Some(record.ticket),
+            // Both are ordinary. Nobody hosting is what an idle fleet looks
+            // like, and an unreachable store is a network this machine may be
+            // about to get back. Neither is worth a line on stderr before the
+            // stored ticket has had its turn.
+            Err(error) => {
+                crate::perf::log(&format!("P2PMUX_FLEET locate failed: {error}"));
+            }
+        }
+    }
+    fleet_addresses_from(published, pairing.rejoin_ticket(crate::pairing::now_unix()))
+}
+
+/// The ordering itself, with the lookup already done.
+///
+/// Separated so the rule can be tested without a rendezvous service: what these
+/// two addresses are worth relative to each other is the decision, and reaching
+/// the network is only how one of them is obtained.
+fn fleet_addresses_from(published: Option<String>, stored: Option<&str>) -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Some(published) = published {
+        addresses.push(published);
+    }
+    if let Some(stored) = stored
+        && !addresses.iter().any(|known| known == stored)
+    {
+        addresses.push(stored.to_owned());
+    }
+    addresses
+}
+
+/// Keep the address that worked, so the next run has somewhere to go when the
+/// store does not answer.
+///
+/// Best effort and deliberately quiet: failing to write it costs one lookup
+/// later, and there is nothing a person reading a terminal could do about it.
+fn remember_fleet_session(ticket: &str) {
+    let Ok(mut pairing) = crate::pairing::load() else {
+        return;
+    };
+    if pairing.ticket.as_deref() == Some(ticket) {
+        return;
+    }
+    pairing.ticket = Some(ticket.to_owned());
+    // The ticket is somebody else's session now, whoever minted it. Saying
+    // otherwise would let `rejoin_ticket` decide this fleet is an invitation
+    // nobody accepted and stop dialling it.
+    pairing.offered_here = false;
+    let _ = crate::pairing::save(&pairing);
 }
 
 /// The most recently created live session, which is the one a bare command
@@ -1607,7 +1921,12 @@ async fn rejoin_paired_session(
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
         crate::node::Tether::Detached,
-        None,
+        // Reached by looking the fleet up, so this is the fleet's home session
+        // — and if this machine is later promoted to coordinate it, it is the
+        // one that has to keep saying where the fleet is.
+        FleetRole::Home {
+            stands_in_for: None,
+        },
     )
 }
 
@@ -1617,11 +1936,13 @@ async fn rejoin_paired_session(
 /// `create` and `pair` — the two commands that do that — both print it.
 /// Start a session of this machine's own.
 ///
-/// `stands_in_for` is the pairing ticket this session is the local answer to,
-/// when it is one -- see `open_home`. `None` for a session that is simply a
-/// session.
+/// `fleet_role` says whether this session is where this machine meets its own
+/// machines -- see `FleetRole`. Both of this function's callers are founding or
+/// re-founding a fleet home, but it is passed rather than assumed: a third
+/// caller that wanted an ordinary session would otherwise silently move the
+/// whole fleet into it.
 fn start_solo_session(
-    stands_in_for: Option<String>,
+    fleet_role: FleetRole,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let display_name = display_name_or_hostname()?;
     let (cols, rows) = terminal_size_or_default();
@@ -1634,7 +1955,7 @@ fn start_solo_session(
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Coordinator,
         crate::node::Tether::Detached,
-        stands_in_for,
+        fleet_role,
     )
 }
 
@@ -1813,12 +2134,49 @@ impl Drop for LaunchAttempt {
 
 /// Launches an isolated session owner. It has no terminal file descriptors and its own process
 /// group, so closing the initiating terminal cannot take the PTYs down with it.
+/// What a session is to the fleet on this machine.
+///
+/// Two different questions used to share one `Option<String>`, and only one of
+/// them was ever asked. `stands_in_for` says *which ticket this session is the
+/// local answer to*, which a brand-new fleet home has no answer for — there was
+/// no earlier ticket to stand in for. What the fleet record needs to know is the
+/// other thing: whether this session is where this machine meets its own
+/// machines, or a session that merely happens to be running here.
+///
+/// Getting that wrong in either direction is a bug somebody would report.
+/// `p2pmux create` publishing itself as the fleet's home would hijack the fleet
+/// from whatever session it was actually meeting in; bare `p2pmux` not
+/// publishing would leave the fleet with no address at all.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FleetRole {
+    /// A session of its own: `p2pmux create`, a guest's `join`, a second
+    /// window. It is not where the fleet meets and must never say it is.
+    #[default]
+    Bystander,
+    /// This machine's place in its fleet's home session — the thing bare
+    /// `p2pmux`, the fleet agent, and `pair` are all trying to reach.
+    Home {
+        /// The pairing ticket this session is the local answer to, when it is
+        /// answering one. `None` for a home this machine is founding.
+        stands_in_for: Option<String>,
+    },
+}
+
+impl FleetRole {
+    fn stands_in_for(self) -> Option<String> {
+        match self {
+            Self::Bystander => None,
+            Self::Home { stands_in_for } => stands_in_for,
+        }
+    }
+}
+
 pub(crate) fn launch_background_node(
     kind: crate::node::NodeBootstrapKind,
     name: String,
     role: crate::session_store::SessionRole,
     tether: crate::node::Tether,
-    stands_in_for: Option<String>,
+    fleet_role: FleetRole,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     // Every session on this machine comes through here, hosted or joined, so
     // this is the one place the count cannot drift from what actually ran.
@@ -1839,10 +2197,11 @@ pub(crate) fn launch_background_node(
     // rather than by the caller once the node is up -- see the comment on
     // `open_home`. The `Join` arm keeps precedence: a real join's own ticket is
     // never a stand-in for something else.
+    descriptor.hosts_fleet = matches!(fleet_role, FleetRole::Home { .. });
     if let crate::node::NodeBootstrapKind::Join { ticket, .. } = &kind {
         descriptor.joined_ticket = Some(ticket.clone());
     } else {
-        descriptor.joined_ticket = stands_in_for;
+        descriptor.joined_ticket = fleet_role.stands_in_for();
     }
     let bootstrap = crate::node::NodeBootstrap {
         descriptor: descriptor.clone(),
@@ -2148,6 +2507,57 @@ fn wait_for_enter() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{apply_accepts_work, fleet_addresses_from, hosting_the_fleet};
+
+    #[test]
+    fn saying_yes_to_starting_work_here_allows_something_to_be_started() {
+        // The bug this closes: yes set one gate of two, the other stayed shut,
+        // and the machine refused every terminal while its own `p2pmux machines`
+        // reported that it accepts work. The only way to find out why was a
+        // refusal naming a command nobody had been told about.
+        let mut pairing = crate::pairing::Pairing::default();
+
+        apply_accepts_work(&mut pairing, true);
+
+        assert!(pairing.accepts_work);
+        assert_eq!(
+            pairing.work_decision(&[]),
+            crate::pairing::WorkDecision::Allow,
+            "a login shell is what the question asked about"
+        );
+    }
+
+    #[test]
+    fn saying_no_leaves_both_gates_shut() {
+        let mut pairing = crate::pairing::Pairing::default();
+
+        apply_accepts_work(&mut pairing, false);
+
+        assert!(!pairing.accepts_work);
+        assert_eq!(
+            pairing.work_decision(&[]),
+            crate::pairing::WorkDecision::Refuse
+        );
+    }
+
+    #[test]
+    fn re_pairing_never_widens_an_allowlist_somebody_narrowed() {
+        // A machine that was narrowed to one command has an answer on file.
+        // Widening it to a login shell because somebody typed `y` to a question
+        // about starting work at all would be a grant nobody made.
+        let mut pairing = crate::pairing::Pairing::default();
+        pairing.work.allow(&[String::from("claude")]);
+
+        apply_accepts_work(&mut pairing, true);
+
+        assert_eq!(pairing.work.allow, vec![String::from("claude")]);
+        assert_eq!(
+            pairing.work_decision(&[]),
+            crate::pairing::WorkDecision::Refuse,
+            "a login shell was never allowed here"
+        );
+    }
+
     #[test]
     fn create_uses_the_background_node_and_socket_client() {
         let source = include_str!("cli.rs");
@@ -2170,6 +2580,84 @@ mod tests {
     ///
     /// Pinned by order rather than by behaviour because the alternative is a
     /// test that waits out a real dial to a machine that is deliberately not
+    /// A live session here, as the store would describe it.
+    fn session(name: &str) -> crate::session_store::SessionDescriptor {
+        crate::session_store::SessionDescriptor::new(
+            format!("{:0>32}", name),
+            name.to_owned(),
+            std::path::PathBuf::from(format!("/tmp/p2pmux-{name}.sock")),
+            1,
+            crate::session_store::SessionRole::Coordinator,
+        )
+    }
+
+    #[test]
+    fn a_session_of_this_machines_own_is_not_the_one_bare_p2pmux_means() {
+        // The one place this command must never leave somebody: in a session
+        // their other machines are not in, looking at an inbox that seems to
+        // have lost them.
+        let mut home = session("warsaw");
+        home.hosts_fleet = true;
+        let side = session("philadelphia");
+
+        let found = hosting_the_fleet(&[side, home.clone()], None);
+
+        assert_eq!(
+            found.iter().map(|found| &found.name).collect::<Vec<_>>(),
+            vec![&home.name]
+        );
+    }
+
+    #[test]
+    fn a_session_started_before_this_release_is_still_recognised_by_its_ticket() {
+        // `hosts_fleet` is false on every session already running at the moment
+        // somebody upgrades. Without the ticket test, their first bare `p2pmux`
+        // would stand a second session up beside the one they are sitting in.
+        let mut coordinator = session("warsaw");
+        coordinator.ticket = Some(String::from("p2pmux-v3:TICKET"));
+        let mut member = session("philadelphia");
+        member.joined_ticket = Some(String::from("p2pmux-v3:TICKET"));
+
+        assert_eq!(
+            hosting_the_fleet(&[coordinator, member], Some("p2pmux-v3:TICKET")).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_published_address_is_tried_before_the_remembered_one() {
+        // The record is the only one that can be right about a fleet that has
+        // moved, which is the whole reason it exists.
+        assert_eq!(
+            fleet_addresses_from(Some(String::from("published")), Some("stored")),
+            vec![String::from("published"), String::from("stored")]
+        );
+    }
+
+    #[test]
+    fn the_remembered_address_answers_when_the_store_does_not() {
+        assert_eq!(
+            fleet_addresses_from(None, Some("stored")),
+            vec![String::from("stored")]
+        );
+    }
+
+    #[test]
+    fn one_address_is_never_dialled_twice() {
+        // The ordinary healthy case: the record says exactly what the file
+        // already said. Paying the rejoin window for it twice would be a
+        // five-second pause on every run that nobody could account for.
+        assert_eq!(
+            fleet_addresses_from(Some(String::from("same")), Some("same")),
+            vec![String::from("same")]
+        );
+    }
+
+    #[test]
+    fn a_machine_in_no_fleet_dials_nothing() {
+        assert!(fleet_addresses_from(None, None).is_empty());
+    }
+
     /// answering, and a half-minute of CI per run is a worse trade than this.
     #[test]
     fn bare_p2pmux_announces_the_rejoin_before_it_waits_on_one() {
@@ -2188,7 +2676,7 @@ mod tests {
             .find("rejoining the session this machine is paired with")
             .expect("open_home should say it is rejoining");
         let dial = body
-            .find("rejoin_paired_session(ticket, Some(5000))")
+            .find("rejoin_paired_session(&ticket, Some(5000))")
             .expect("open_home should rejoin");
         assert!(
             announcement < dial,
@@ -2216,7 +2704,7 @@ mod tests {
             .expect("background join")
             .0;
 
-        assert!(open_home.contains("rejoin_paired_session(ticket, Some(5000))"));
+        assert!(open_home.contains("rejoin_paired_session(&ticket, Some(5000))"));
         assert!(explicit_join.contains("connect_timeout_ms: None"));
     }
 

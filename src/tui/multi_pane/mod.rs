@@ -134,6 +134,9 @@ pub struct MultiPaneTui {
     /// record; a machine that is paired but not a session member is one you own
     /// that is not answering.
     pub(in crate::tui) paired_machines: Vec<PairedMachine>,
+    /// Whether this fleet predates fleet addresses, and so can only meet in the
+    /// one session it was paired around. See `crate::fleet`.
+    pub(in crate::tui) fleet_has_no_address: bool,
     /// This client's own peer id, so the machine list can mark which row is
     /// the machine you are sitting at.
     pub(in crate::tui) local_peer_id: Option<Vec<u8>>,
@@ -207,6 +210,7 @@ impl MultiPaneTui {
             home_page_size: crate::tui::home::HOME_PAGE_MAX,
             zoomed_pane: None,
             paired_machines: Vec::new(),
+            fleet_has_no_address: false,
             local_peer_id: None,
             detachable: false,
             resize_drag: None,

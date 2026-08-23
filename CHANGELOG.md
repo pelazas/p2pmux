@@ -13,6 +13,44 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
+**A fleet now has an address of its own, and stops being able to strand.** Until now a fleet *was*
+a session: `p2pmux pair` wrote one ticket into `pairing.toml` and every machine dialled it forever.
+That works exactly as long as the session it names is alive. When it ends, nothing updates the
+record — and the machine that is away cannot be told, because a member only learns about new
+sessions from announcements that travel inside a session it has already joined. A machine that
+cannot join hears nothing, and a machine that hears nothing cannot join. It did not recover slowly;
+it never recovered. Two healthy machines chased a session that had ended for four days, every
+attempt reporting a host it could not reach, and the only exit was a human re-running `p2pmux pair`.
+
+A fleet now holds 32 bytes minted once, which name one record in the same blind store the short
+join codes use. That record says which session the fleet is meeting in right now: whichever machine
+is hosting writes it, and a machine that cannot reach what it says publishes its own session over
+the top. So the address corrects itself at the moment it turns out to be wrong, and a machine that
+was switched off for a month rejoins on waking. The fleet agent gained the state this was all for —
+"nobody in this fleet is hosting" is now something it can know, and wait for, rather than
+something indistinguishable from chasing a corpse. It never invents a session to fill the gap.
+
+Enrolment tokens carry the fleet rather than a session, so one pasted into a machine image months
+ago no longer enrols a machine into nothing while reporting success. Failing to reach the fleet is
+no longer failing to enrol, either: the record is written first and the agent keeps looking.
+
+**Adding a machine is one command.** `p2pmux pair --token` prints the reusable invitation that
+`p2pmux enroll` used to, `--revoke` withdraws it, and `p2pmux pair <code-or-token>` accepts either
+form, told apart by shape. `p2pmux enroll` still works and is no longer in `--help`: it lives in
+cloud-init files written months before anything runs them. Pairing also mints a code of its own
+instead of reusing the session's join code — those were two credentials that happened to be one
+string, and handing a collaborator the second used to hand them the first.
+
+**Saying yes to letting your machines start work here now allows something to be started.** There
+were two gates, opened at two different times by two different commands, and pairing opened one; a
+machine paired with `--accept-work` refused every terminal while reporting that it accepts work.
+Yes now means a login shell, which the prompt says in those words, and `p2pmux work allow
+<command>` still narrows it afterwards. It never widens an allowlist somebody had narrowed.
+
+A fleet paired before this release keeps working and cannot be given an address quietly — the
+hand-off needs a channel only fleet members can read. `p2pmux machines` and the inbox now say so,
+and name the one command that fixes it.
+
 p2pmux now asks, once on first run, whether it may send one anonymous line a day: a random id, the
 version, the OS, how many sessions you started, whether anybody joined one. Enter means yes,
 nothing is sent before you answer, and `p2pmux telemetry show` prints the exact line at any time.
