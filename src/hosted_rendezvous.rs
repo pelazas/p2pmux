@@ -163,27 +163,76 @@ impl JoinCode {
         &self.0
     }
 
-    /// Where the sealed record lives. This is the only derivation the server ever sees.
-    pub fn index(&self) -> String {
-        let derived = blake3::derive_key(INDEX_CONTEXT, self.0.as_bytes());
-        derived[..INDEX_BYTES]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+    /// Where this code's record sits, and what opens it.
+    ///
+    /// A code is one way to name a record; it is no longer the only one. See
+    /// [`RecordLocator`], which is what the store actually deals in.
+    pub fn locator(&self) -> RecordLocator {
+        RecordLocator::derive(INDEX_CONTEXT, KEY_CONTEXT, self.0.as_bytes())
     }
 
+    /// Where the sealed record lives. This is the only derivation the server ever sees.
+    pub fn index(&self) -> String {
+        self.locator().index
+    }
+
+    #[cfg(test)]
     fn key(&self) -> [u8; 32] {
-        blake3::derive_key(KEY_CONTEXT, self.0.as_bytes())
+        self.locator().key
     }
 
     /// Seal a ticket for this code. The result is `nonce || ciphertext`.
     pub fn seal(&self, ticket: &str) -> Result<Vec<u8>, RecordError> {
+        self.locator().seal(ticket)
+    }
+
+    /// Recover the ticket a record was sealed with.
+    pub fn open(&self, record: &[u8]) -> Result<String, RecordError> {
+        self.locator().open(record)
+    }
+}
+
+/// One record in the blind store: where it sits, and the key that opens it.
+///
+/// Both halves come from the same secret through two domain-separated KDFs, which is what
+/// makes the store blind — see this file's header. It is a type of its own because a join
+/// code is no longer the only secret that names a record: a fleet key names the one that
+/// says where a fleet is meeting, and that record needs exactly these properties. Deriving
+/// them twice, in two places, is how the two would quietly stop agreeing.
+#[derive(Clone)]
+pub struct RecordLocator {
+    index: String,
+    key: [u8; 32],
+}
+
+impl RecordLocator {
+    /// Derive a locator from `material` under two domain-separated contexts.
+    ///
+    /// The contexts are what keep two kinds of secret from ever landing on the same index,
+    /// even in the impossible case that they carry the same bytes.
+    pub fn derive(index_context: &str, key_context: &str, material: &[u8]) -> Self {
+        let index = blake3::derive_key(index_context, material)[..INDEX_BYTES]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            index,
+            key: blake3::derive_key(key_context, material),
+        }
+    }
+
+    /// The lookup handle sent to the server, and the only part of this it ever sees.
+    pub fn index(&self) -> &str {
+        &self.index
+    }
+
+    /// Seal `plaintext` for this record. The result is `nonce || ciphertext`.
+    pub fn seal(&self, plaintext: &str) -> Result<Vec<u8>, RecordError> {
         let mut nonce = [0_u8; NONCE_BYTES];
         getrandom::fill(&mut nonce).map_err(|_| RecordError::Random)?;
-        let cipher =
-            Aes256Gcm::new_from_slice(&self.key()).map_err(|_| RecordError::Undecryptable)?;
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| RecordError::Undecryptable)?;
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), ticket.as_bytes())
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
             .map_err(|_| RecordError::Random)?;
         let mut record = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
         record.extend_from_slice(&nonce);
@@ -194,9 +243,9 @@ impl JoinCode {
         Ok(record)
     }
 
-    /// Recover the ticket a record was sealed with.
+    /// Recover what a record was sealed with.
     ///
-    /// A wrong code fails here rather than at the server, which is the point: the store
+    /// A wrong secret fails here rather than at the server, which is the point: the store
     /// cannot tell a legitimate reader from anyone else, so authentication happens against
     /// the AEAD tag once the blob is already in hand.
     pub fn open(&self, record: &[u8]) -> Result<String, RecordError> {
@@ -207,12 +256,18 @@ impl JoinCode {
             return Err(RecordError::Malformed);
         }
         let (nonce, ciphertext) = record.split_at(NONCE_BYTES);
-        let cipher =
-            Aes256Gcm::new_from_slice(&self.key()).map_err(|_| RecordError::Undecryptable)?;
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| RecordError::Undecryptable)?;
         let plaintext = cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| RecordError::Undecryptable)?;
         String::from_utf8(plaintext).map_err(|_| RecordError::Malformed)
+    }
+}
+
+/// Redacted for the reason [`JoinCode`]'s is: this is the material, not a handle to it.
+impl fmt::Debug for RecordLocator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecordLocator(<redacted>)")
     }
 }
 
@@ -326,8 +381,8 @@ impl HostedRendezvous {
         })
     }
 
-    fn record_url(&self, code: &JoinCode) -> String {
-        format!("{}/r/{}", self.endpoint, code.index())
+    fn record_url(&self, locator: &RecordLocator) -> String {
+        format!("{}/r/{}", self.endpoint, locator.index())
     }
 
     /// Seal `ticket` under a fresh code and store it. Returns the code to hand out.
@@ -338,15 +393,24 @@ impl HostedRendezvous {
     }
 
     /// Re-seal an existing code's record, resetting its TTL.
+    pub async fn republish(&self, code: &JoinCode, ticket: &str) -> Result<(), PublishError> {
+        self.publish_at(&code.locator(), ticket).await
+    }
+
+    /// Seal `plaintext` into the record `locator` names, resetting its TTL.
     ///
     /// This deliberately seals again rather than reusing the stored bytes: it is a fresh
     /// nonce every time, and the alternative would be a read-modify-write against a store
     /// that is allowed to lie about what it holds.
-    pub async fn republish(&self, code: &JoinCode, ticket: &str) -> Result<(), PublishError> {
-        let record = code.seal(ticket).map_err(PublishError::Record)?;
+    pub async fn publish_at(
+        &self,
+        locator: &RecordLocator,
+        plaintext: &str,
+    ) -> Result<(), PublishError> {
+        let record = locator.seal(plaintext).map_err(PublishError::Record)?;
         let response = self
             .http
-            .put(self.record_url(code))
+            .put(self.record_url(locator))
             .query(&[("ttl", RECORD_TTL.as_secs().to_string())])
             .header("content-type", "application/octet-stream")
             .body(record)
@@ -364,9 +428,14 @@ impl HostedRendezvous {
 
     /// Fetch and open the record a code points at.
     pub async fn resolve(&self, code: &JoinCode) -> Result<String, ResolveError> {
+        self.resolve_at(&code.locator()).await
+    }
+
+    /// Fetch and open the record `locator` names.
+    pub async fn resolve_at(&self, locator: &RecordLocator) -> Result<String, ResolveError> {
         let response = self
             .http
-            .get(self.record_url(code))
+            .get(self.record_url(locator))
             .send()
             .await
             .map_err(|error| ResolveError::Unreachable(strip_url(&error.to_string())))?;
@@ -383,13 +452,18 @@ impl HostedRendezvous {
             .bytes()
             .await
             .map_err(|error| ResolveError::Unreachable(strip_url(&error.to_string())))?;
-        code.open(&record).map_err(|_| ResolveError::WrongCode)
+        locator.open(&record).map_err(|_| ResolveError::WrongCode)
     }
 
     /// Best-effort removal on a clean exit. A failure here is covered by the TTL.
     pub async fn remove(&self, code: &JoinCode) -> Result<(), PublishError> {
+        self.remove_at(&code.locator()).await
+    }
+
+    /// Best-effort removal of the record `locator` names.
+    pub async fn remove_at(&self, locator: &RecordLocator) -> Result<(), PublishError> {
         self.http
-            .delete(self.record_url(code))
+            .delete(self.record_url(locator))
             .send()
             .await
             .map_err(|error| PublishError::Unreachable(strip_url(&error.to_string())))?;
@@ -599,6 +673,46 @@ mod tests {
             seen.len(),
             ALPHABET.len(),
             "some symbols never appeared in 20k draws"
+        );
+    }
+
+    #[test]
+    fn the_same_material_under_different_contexts_lands_on_different_records() {
+        // The one property the whole two-kinds-of-secret arrangement rests on. If the
+        // contexts did not separate them, a fleet key and a join code carrying the same
+        // bytes would collide — and worse, either would open the other's record.
+        let material = b"the same thirty-two bytes of secret";
+        let first = RecordLocator::derive("context one index", "context one key", material);
+        let second = RecordLocator::derive("context two index", "context two key", material);
+
+        assert_ne!(first.index(), second.index());
+        let record = first.seal("p2pmux-v3:TICKET").expect("record should seal");
+        assert_eq!(second.open(&record), Err(RecordError::Undecryptable));
+    }
+
+    #[test]
+    fn a_locator_round_trips_and_never_shows_its_key() {
+        let locator = RecordLocator::derive("index", "key", b"material");
+        let record = locator.seal("p2pmux-v3:TICKET").expect("record should seal");
+
+        assert_eq!(
+            locator.open(&record).expect("record should open"),
+            "p2pmux-v3:TICKET"
+        );
+        assert_eq!(format!("{locator:?}"), "RecordLocator(<redacted>)");
+    }
+
+    #[test]
+    fn a_code_and_its_locator_are_the_same_record() {
+        // `JoinCode` delegates to `RecordLocator` now. A drift here would strand every
+        // invite minted by one version and read by the other.
+        let code = JoinCode::mint().expect("code should mint");
+        let record = code.seal("p2pmux-v3:TICKET").expect("record should seal");
+
+        assert_eq!(code.index(), code.locator().index());
+        assert_eq!(
+            code.locator().open(&record).expect("record should open"),
+            "p2pmux-v3:TICKET"
         );
     }
 
