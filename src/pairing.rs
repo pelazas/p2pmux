@@ -1690,8 +1690,10 @@ mod tests {
         // visible, because it cannot be fixed quietly: handing the address over
         // needs a channel only fleet members can read, and the one two machines
         // share inside a session reaches the guests in it too.
-        let mut pairing = Pairing::default();
-        pairing.ticket = Some(String::from("p2pmux-v3:TICKET"));
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-v3:TICKET")),
+            ..Default::default()
+        };
         assert!(pairing.fleet_has_no_address());
 
         pairing.ensure_fleet_key().expect("should mint");
@@ -1710,8 +1712,10 @@ mod tests {
         // It addressed a fleet that no longer exists. Keeping it would leave
         // this machine reading and writing a record for nobody — and would put
         // it silently back in the old fleet if one of those machines returned.
-        let mut pairing = Pairing::default();
-        pairing.ticket = Some(String::from("p2pmux-v3:TICKET"));
+        let mut pairing = Pairing {
+            ticket: Some(String::from("p2pmux-v3:TICKET")),
+            ..Default::default()
+        };
         pairing.ensure_fleet_key().expect("should mint");
         pairing.remember("laptop", Some(String::from("id")), None);
 
