@@ -782,6 +782,30 @@ a machine with no network simply never shows the line. The answer is cached with
 fetched in `~/.config/p2pmux/update-check.json`, so ten sessions in a day make one request. Delete
 that file to ask again immediately.
 
+#### When two installs disagree
+
+Updating one channel does not update the others, and the shell runs whichever copy comes first on
+your PATH — not the one installed most recently. A Homebrew copy sitting ahead of a curl install is
+the usual shape, and while it lasts, every fix that ships looks unshipped.
+
+`p2pmux doctor` lists every `p2pmux` on your PATH, in the order the shell tries them, with the
+version each one reports and a mark on the one that runs:
+
+```
+p2pmux on PATH
+  /opt/homebrew/bin/p2pmux          0.1.11    <- runs as `p2pmux`
+  /usr/local/bin/p2pmux             0.1.13
+  /Users/you/.cargo/bin/p2pmux      unknown
+```
+
+`unknown` means that copy did not report a version — usually a build old enough to exit non-zero on
+`--version`. When the copy that runs is behind one that is installed, doctor says so and names the
+command that replaces *that* copy, which is not always the one that installed the newer file.
+
+The installer says the same thing at install time: if something else on your PATH will win, it
+names it before it finishes, and the install still succeeds. `P2PMUX_INSTALL_DIR` chooses where it
+writes if you would rather it wrote somewhere that wins.
+
 ## Performance logging
 
 Set `P2PMUX_PERF=1` to write optional local performance timing logs. By default they append to

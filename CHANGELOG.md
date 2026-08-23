@@ -28,6 +28,16 @@ Monday started a session on Thursday. The schema is eight columns in `services/m
 there is no field for a hostname or a path or anything typed, and the id is deliberately unrelated
 to the machine key that peers already see.
 
+A machine that holds p2pmux from two channels runs one of them, and until now nothing said which.
+The shell takes whichever copy comes first on PATH, which is not the one installed most recently —
+so a Homebrew copy two releases behind kept winning over a fresh curl install, and every fix that
+had shipped in between looked unshipped. `p2pmux doctor` now lists every `p2pmux` on PATH in the
+order the shell tries them, with each one's version and a mark on the one that runs, and says so
+when the winner is behind a copy installed elsewhere — naming the command that replaces *that*
+copy, which is not always the command that installed the newer one. The installer makes the same
+check after it copies the binary: if something else on your PATH will win, it names it, and the
+install still succeeds.
+
 Dimming the pane you are not typing into now reaches the terminal. The frame always asked for it,
 and on a terminal whose environment carries `NO_COLOR` the request was cancelled a byte before the
 text it applied to: crossterm answers that variable by writing a cell's colours as an SGR with no
