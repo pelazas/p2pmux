@@ -80,11 +80,11 @@ enum Command {
         /// hostname, which on a droplet is rarely what you want to read.
         #[arg(long)]
         name: Option<String>,
-        /// Answer the accepts-work question without being asked. The first of
-        /// two gates; `p2pmux work allow` here opens the second.
+        /// Let your other machines start a login shell here, without being
+        /// asked. `p2pmux work allow <command>` narrows it afterwards.
         #[arg(long = "accept-work")]
         accept_work: bool,
-        /// Refuse the accepts-work question without being asked.
+        /// Refuse, without being asked. This is the default.
         #[arg(long = "no-accept-work", conflicts_with = "accept_work")]
         no_accept_work: bool,
     },
@@ -812,14 +812,23 @@ fn find_live(name: &str) -> Result<crate::session_store::SessionDescriptor, Box<
         .ok_or_else(|| CliError("no live session with that name").into())
 }
 
-/// The accepts-work answer, asked once during pairing rather than left to a
-/// separate configuration step nobody would find.
+/// What this machine will let your other machines start, asked once.
 ///
-/// Default-deny, and the wording matters: it means *accepts work from me*,
+/// Default-deny, and the wording matters: it means *from my own machines*,
 /// never *from anyone in the session*. Otherwise a join code you hand to a
-/// colleague becomes remote code execution on your desktop. Saying yes here is
-/// consent to be asked; what may actually be started is the allowlist in the
-/// pairing file, which is empty until somebody writes in it.
+/// colleague becomes remote code execution on your desktop.
+///
+/// One question, where there used to be two gates opened at two different times
+/// by two different commands. Saying yes here set `accepts_work` and nothing
+/// else, and an empty allowlist permits nothing — so a machine paired with
+/// `--accept-work` refused every terminal, and the only way to find out why was
+/// to read a refusal that named a command nobody had been told about. Somebody
+/// who answers yes to "let your other machines start work here" has answered
+/// the question they were asked; this now writes down what that means.
+///
+/// A login shell, spelled out, because it is the honest answer to the question
+/// as posed and the one an unattended box wants. Anything narrower is
+/// `p2pmux work allow <command>`, which replaces this rather than adding to it.
 fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error>> {
     if accept {
         return Ok(true);
@@ -827,11 +836,31 @@ fn accepts_work_answer(accept: bool, refuse: bool) -> Result<bool, Box<dyn Error
     if refuse || !io::stdin().is_terminal() {
         return Ok(false);
     }
+    println!();
+    println!(
+        "Your other machines can start a terminal here. Yes allows a login shell —\n\
+         everything this user account can do. `p2pmux work allow <command>` narrows\n\
+         it later, and `p2pmux work off` closes it."
+    );
     print!("Let your other machines start work here? [y/N] ");
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Write down what the accepts-work answer meant.
+///
+/// Both gates or neither. The allowlist is left alone when it already says
+/// something: a machine that was narrowed to `claude` and is being re-paired
+/// has an answer on file, and widening it to a login shell because somebody
+/// typed `y` to a question about starting work at all would be a grant nobody
+/// made.
+fn apply_accepts_work(pairing: &mut crate::pairing::Pairing, accepts_work: bool) {
+    pairing.accepts_work = accepts_work;
+    if accepts_work && pairing.work.allow.is_empty() {
+        pairing.work.allow(&[]);
+    }
 }
 
 /// Offer to keep this machine in its fleet across reboots.
@@ -900,7 +929,7 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     ))?;
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket.clone());
-    pairing.accepts_work = accepts_work;
+    apply_accepts_work(&mut pairing, accepts_work);
     let fleet_key = pairing.ensure_fleet_key()?;
     // This machine's own session, offered to a machine that may never come for
     // it. What that costs when nobody does is `Pairing::rejoin_ticket`'s
@@ -938,11 +967,11 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
             )?;
         }
     }
-    writeln!(
-        stdout,
-        "\naccepts work from your machines: {}",
-        if accepts_work { "yes" } else { "no" }
-    )?;
+    // The policy itself rather than "accepts work: yes", which was true of a
+    // machine that went on to refuse everything. What somebody needs to read
+    // back is what they just allowed.
+    writeln!(stdout)?;
+    write!(stdout, "{}", work_policy_summary(&crate::pairing::load()?))?;
     drop(stdout);
     offer_fleet_daemon()?;
     Ok(())
@@ -1052,7 +1081,7 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     // succeeded.
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(ticket_text.clone());
-    pairing.accepts_work = accepts_work;
+    apply_accepts_work(&mut pairing, accepts_work);
     // Taking somebody else's fleet is joining it, so this one is replaced
     // rather than kept: `adopt_fleet_key` refuses to overwrite, which is right
     // for a key that arrives mid-session and wrong for a pairing a person just
@@ -1101,6 +1130,8 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
         }
     }
     writeln!(stdout, "\nFrom now on, bare `p2pmux` rejoins with no code.")?;
+    writeln!(stdout)?;
+    write!(stdout, "{}", work_policy_summary(&crate::pairing::load()?))?;
     drop(stdout);
     // Asked after the pairing is reported, not before: the machines are paired
     // either way, and this question is about what happens after a reboot.
@@ -1406,8 +1437,7 @@ async fn enroll_with_token(
         created_at: crate::pairing::now_unix(),
     });
     if accept_work {
-        pairing.accepts_work = true;
-        pairing.work.allow(&[]);
+        apply_accepts_work(&mut pairing, true);
     }
     // The window the classic flow opens by hand. The machine that minted the
     // token is about to write this one into its fleet on sight; this is the
@@ -2401,7 +2431,56 @@ fn wait_for_enter() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fleet_addresses_from, hosting_the_fleet};
+    use super::{apply_accepts_work, fleet_addresses_from, hosting_the_fleet};
+
+    #[test]
+    fn saying_yes_to_starting_work_here_allows_something_to_be_started() {
+        // The bug this closes: yes set one gate of two, the other stayed shut,
+        // and the machine refused every terminal while its own `p2pmux machines`
+        // reported that it accepts work. The only way to find out why was a
+        // refusal naming a command nobody had been told about.
+        let mut pairing = crate::pairing::Pairing::default();
+
+        apply_accepts_work(&mut pairing, true);
+
+        assert!(pairing.accepts_work);
+        assert_eq!(
+            pairing.work_decision(&[]),
+            crate::pairing::WorkDecision::Allow,
+            "a login shell is what the question asked about"
+        );
+    }
+
+    #[test]
+    fn saying_no_leaves_both_gates_shut() {
+        let mut pairing = crate::pairing::Pairing::default();
+
+        apply_accepts_work(&mut pairing, false);
+
+        assert!(!pairing.accepts_work);
+        assert_eq!(
+            pairing.work_decision(&[]),
+            crate::pairing::WorkDecision::Refuse
+        );
+    }
+
+    #[test]
+    fn re_pairing_never_widens_an_allowlist_somebody_narrowed() {
+        // A machine that was narrowed to one command has an answer on file.
+        // Widening it to a login shell because somebody typed `y` to a question
+        // about starting work at all would be a grant nobody made.
+        let mut pairing = crate::pairing::Pairing::default();
+        pairing.work.allow(&[String::from("claude")]);
+
+        apply_accepts_work(&mut pairing, true);
+
+        assert_eq!(pairing.work.allow, vec![String::from("claude")]);
+        assert_eq!(
+            pairing.work_decision(&[]),
+            crate::pairing::WorkDecision::Refuse,
+            "a login shell was never allowed here"
+        );
+    }
 
     #[test]
     fn create_uses_the_background_node_and_socket_client() {

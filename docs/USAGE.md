@@ -692,8 +692,9 @@ lists it under `IN THIS SESSION, NOT YOURS`, which is the difference the heading
 
 ### What your machines may start here
 
-Two gates, both closed until you open them: this machine has to accept work at all, and the exact
-command has to be on its allowlist. `p2pmux work` prints where both stand.
+Closed by default, and opened by answering one question. `p2pmux pair` asks whether your other
+machines may start work here; yes allows a login shell — everything this user account can do —
+and `p2pmux work` prints what stands.
 
 ```text
 p2pmux work                 # what this machine allows, and what to run to change it
@@ -709,9 +710,9 @@ decisions. There is no blocklist, because a blocklist on an interactive shell is
 against accidents and not a boundary: allow a shell and you have allowed everything that user can
 do, and the allowlist says so in those words rather than pretending otherwise.
 
-Granting anything turns `accepts_work` on with it — an allowlist behind a closed gate is a list
-nothing reads. When a machine refuses a terminal, the machine that asked is told the command that
-lifts it and where to run it:
+Underneath there are two records — whether this machine accepts work at all, and what it accepts —
+and every command here writes both, because either one alone permits nothing. When a machine
+refuses a terminal, the machine that asked is told the command that lifts it and where to run it:
 
 ```text
 droplet refused — run `p2pmux work allow` on droplet
