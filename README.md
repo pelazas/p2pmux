@@ -186,7 +186,7 @@ The line is, in full:
 ```json
 {
   "id": "a random id, generated on your machine when you say yes",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "os": "macos-aarch64",
   "sessions": 3,
   "peers": 1,

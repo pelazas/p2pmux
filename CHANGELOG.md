@@ -4,14 +4,18 @@ Newest first. Versions are the tags on [Releases](https://github.com/pelazas/p2p
 
 ## Compatibility
 
-**v0.1.8 through v0.1.13 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
-on any of the six can join the others. v0.1.7 and older cannot join any of them: that pin moved in
+**v0.1.8 through v0.1.14 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
+on any of the seven can join the others. v0.1.7 and older cannot join any of them: that pin moved in
 v0.1.8 — a machine now tells the session it has joined a fleet, and a joining machine can present an
 enrolment token — and a peer on the wrong side of it is refused rather than half-joining. From
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
-## Unreleased
+## v0.1.14 — 2026-08-23
+
+Four additions and three fixes, and no protocol change: a fleet gets an address that outlives the
+sessions it meets in, adding a machine becomes one command, p2pmux asks once whether it may send
+one anonymous line a day, and `doctor` names which of the copies on your PATH actually runs.
 
 **A fleet now has an address of its own, and stops being able to strand.** Until now a fleet *was*
 a session: `p2pmux pair` wrote one ticket into `pairing.toml` and every machine dialled it forever.

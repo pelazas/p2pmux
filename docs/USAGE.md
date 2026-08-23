@@ -773,7 +773,7 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.13 is out — you have 0.1.12. Update with `brew update && brew upgrade p2pmux`
+p2pmux 0.1.14 is out — you have 0.1.13. Update with `brew update && brew upgrade p2pmux`
 ```
 
 `p2pmux doctor` asks the same question and answers it either way, which is the one to run when you
@@ -801,7 +801,7 @@ version each one reports and a mark on the one that runs:
 ```
 p2pmux on PATH
   /opt/homebrew/bin/p2pmux          0.1.11    <- runs as `p2pmux`
-  /usr/local/bin/p2pmux             0.1.13
+  /usr/local/bin/p2pmux             0.1.14
   /Users/you/.cargo/bin/p2pmux      unknown
 ```
 
