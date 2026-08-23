@@ -25,6 +25,13 @@ REPO="pelazas/p2pmux"
 INSTALL_DIR="${P2PMUX_INSTALL_DIR:-/usr/local/bin}"
 TAG="${P2PMUX_VERSION:-latest}"
 
+# `/usr/local/bin/` and `/usr/local/bin` are the same directory, but only one of them
+# string-compares equal to the path the shadow check below reads back — so a trailing
+# slash would make the installer warn about the very copy it just wrote.
+while [ "$INSTALL_DIR" != "/" ] && [ "${INSTALL_DIR%/}" != "$INSTALL_DIR" ]; do
+  INSTALL_DIR="${INSTALL_DIR%/}"
+done
+
 say() { printf '%s\n' "$*" >&2; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
@@ -131,6 +138,25 @@ case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) say "NOTE: $INSTALL_DIR is not on your PATH." ;;
 esac
+
+# A machine can hold p2pmux from more than one channel — a curl install here, a
+# `brew install` or a `cargo install` somewhere earlier on PATH — and then typing
+# `p2pmux` keeps running the other one. Nothing about that is visible: this script
+# reports success, and every fix shipped since simply appears not to work. So resolve
+# what the shell will actually run and say so when it is not what was just written.
+#
+# Both the lookup and the version probe are allowed to fail without taking the install
+# with them (`set -e` is on): the whole reason a copy is worth warning about is that it
+# may be old enough to exit non-zero on `--version`.
+_winner="$(command -v p2pmux 2>/dev/null || true)"
+if [ -n "$_winner" ] && [ "$_winner" != "$INSTALL_DIR/p2pmux" ]; then
+  _winner_version="$("$_winner" --version 2>/dev/null || true)"
+  say ""
+  say "NOTE: typing \`p2pmux\` runs $_winner${_winner_version:+ ($_winner_version)},"
+  say "      not the copy just installed at $INSTALL_DIR/p2pmux."
+  say "      Remove that one, or put $INSTALL_DIR earlier on your PATH."
+fi
+
 say ""
 say "  p2pmux               you host; Ctrl+S shows the line to send"
 say "  p2pmux join <code>   them, on their own machine"
