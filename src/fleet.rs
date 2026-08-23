@@ -270,6 +270,140 @@ impl HostedFleet {
     }
 }
 
+/// How long after a failed publish it is worth trying again.
+///
+/// The node ticks this every couple of seconds, which is the right cadence for
+/// noticing that a session changed hands and quite the wrong one for hammering
+/// a store that just refused us.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Keeps the fleet's record pointing at the session this node is hosting.
+///
+/// Driven from the node's peer-scan tick, which is where the answer can change:
+/// a coordinator that steps down stops publishing, a member promoted in its
+/// place starts, and a machine paired while the node was already running
+/// acquires a fleet to publish to. Reading those off the session descriptor —
+/// which failover already keeps current — means this needs no notion of role
+/// changes of its own.
+///
+/// It never takes the record down. A step-down and a shutdown both look like a
+/// coordinator that has stopped refreshing, and in both cases another machine
+/// is about to publish its own session; a withdrawal racing that would leave
+/// the fleet with no address at all, which is the exact failure this module was
+/// written to end. Letting the record expire instead costs a member one dial
+/// that fails, after which it takes over. One is self-correcting and the other
+/// is not.
+pub struct FleetHost {
+    handle: tokio::runtime::Handle,
+    state: std::sync::Arc<std::sync::Mutex<Claim>>,
+}
+
+#[derive(Default)]
+struct Claim {
+    /// The fleet key and ticket last written to the store.
+    published: Option<(String, String)>,
+    written_at: Option<std::time::Instant>,
+    /// When a failed attempt may be repeated.
+    retry_at: Option<std::time::Instant>,
+    /// A publish is in the air. Without this the tick would start a second one
+    /// every two seconds for as long as the first was slow.
+    busy: bool,
+}
+
+impl FleetHost {
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
+        Self {
+            handle,
+            state: std::sync::Arc::new(std::sync::Mutex::new(Claim::default())),
+        }
+    }
+
+    /// What this node should be advertising, if anything.
+    ///
+    /// Three conditions, and every one of them has a session it is there to
+    /// exclude: `p2pmux create` (not the fleet's home), a member of the home
+    /// session (the coordinator publishes, not the room), and a machine with no
+    /// fleet to publish to.
+    fn wanted(descriptor: &crate::session_store::SessionDescriptor) -> Option<(FleetKey, String)> {
+        Self::wanted_with(descriptor, crate::pairing::load_or_empty().fleet_key())
+    }
+
+    /// The decision itself, with the pairing record handed in.
+    ///
+    /// Split from [`Self::wanted`] so it can be tested without a config
+    /// directory: pointing `XDG_CONFIG_HOME` at a temporary path is the kind of
+    /// setup that quietly stops applying and leaves a test passing against the
+    /// developer's own fleet.
+    fn wanted_with(
+        descriptor: &crate::session_store::SessionDescriptor,
+        key: Option<FleetKey>,
+    ) -> Option<(FleetKey, String)> {
+        if !descriptor.hosts_fleet
+            || descriptor.role != crate::session_store::SessionRole::Coordinator
+        {
+            return None;
+        }
+        Some((key?, descriptor.ticket.clone()?))
+    }
+
+    /// Called from the node's peer scan. Cheap unless something changed.
+    pub fn tick(&self, descriptor: &crate::session_store::SessionDescriptor) {
+        let Some((key, ticket)) = Self::wanted(descriptor) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.busy || state.retry_at.is_some_and(|retry| now < retry) {
+                return;
+            }
+            let current = (key.hex().to_owned(), ticket.clone());
+            let fresh = state.published.as_ref() == Some(&current)
+                && state.written_at.is_some_and(|at| {
+                    now.duration_since(at) < crate::hosted_rendezvous::REFRESH_INTERVAL
+                });
+            if fresh {
+                return;
+            }
+            state.busy = true;
+        }
+        let state = self.state.clone();
+        let record = FleetRecord {
+            ticket: ticket.clone(),
+            host: crate::machine_id::to_hex(&crate::machine_id::machine_id()),
+            published_at: crate::pairing::now_unix(),
+        };
+        self.handle.spawn(async move {
+            let outcome = publish(&key, &record).await;
+            let Ok(mut state) = state.lock() else {
+                return;
+            };
+            state.busy = false;
+            match outcome {
+                Ok(()) => {
+                    state.published = Some((key.hex().to_owned(), record.ticket));
+                    state.written_at = Some(std::time::Instant::now());
+                    state.retry_at = None;
+                }
+                // Said once rather than every tick. A fleet whose record is
+                // stale is not broken — members that cannot reach the old
+                // address publish their own over it — so this is a note, not
+                // an alarm.
+                Err(error) => {
+                    if state.retry_at.is_none() {
+                        eprintln!(
+                            "p2pmux node: could not say where this fleet is meeting: {error}"
+                        );
+                    }
+                    state.retry_at = Some(std::time::Instant::now() + RETRY_AFTER);
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +482,69 @@ mod tests {
         let sealed = key.locator().seal("{}").expect("record should seal");
 
         assert!(other.locator().open(&sealed).is_err());
+    }
+
+    /// A coordinator of the fleet's home session, which is the one shape that
+    /// should publish.
+    fn hosting_descriptor() -> crate::session_store::SessionDescriptor {
+        let mut descriptor = crate::session_store::SessionDescriptor::new(
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            "warsaw".to_owned(),
+            std::path::PathBuf::from("/tmp/p2pmux-test.sock"),
+            1,
+            crate::session_store::SessionRole::Coordinator,
+        );
+        descriptor.hosts_fleet = true;
+        descriptor.ticket = Some("p2pmux-v3:TICKET".to_owned());
+        descriptor
+    }
+
+    #[test]
+    fn the_coordinator_of_the_fleets_home_session_publishes_it() {
+        let key = FleetKey::mint().expect("key should mint");
+
+        assert_eq!(
+            FleetHost::wanted_with(&hosting_descriptor(), Some(key.clone())),
+            Some((key, "p2pmux-v3:TICKET".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_session_that_is_not_the_fleets_home_never_publishes_itself() {
+        // `p2pmux create`, or a guest's join. Publishing it would move the whole
+        // fleet into a session that was never meant to be one — and the machine
+        // that did it would be the only one that knew.
+        let key = FleetKey::mint().expect("key should mint");
+        let mut descriptor = hosting_descriptor();
+        descriptor.hosts_fleet = false;
+
+        assert_eq!(FleetHost::wanted_with(&descriptor, Some(key)), None);
+    }
+
+    #[test]
+    fn a_member_of_the_home_session_leaves_publishing_to_its_coordinator() {
+        let key = FleetKey::mint().expect("key should mint");
+        let mut descriptor = hosting_descriptor();
+        descriptor.role = crate::session_store::SessionRole::Member;
+
+        assert_eq!(FleetHost::wanted_with(&descriptor, Some(key)), None);
+    }
+
+    #[test]
+    fn a_machine_with_no_fleet_has_nowhere_to_publish() {
+        assert_eq!(FleetHost::wanted_with(&hosting_descriptor(), None), None);
+    }
+
+    #[test]
+    fn a_coordinator_without_a_ticket_yet_says_nothing_rather_than_something_empty() {
+        // There is a window during startup where the role is set and the ticket
+        // is not. Publishing an empty ticket there would point the fleet at
+        // nothing and look exactly like a fleet that is meeting somewhere.
+        let key = FleetKey::mint().expect("key should mint");
+        let mut descriptor = hosting_descriptor();
+        descriptor.ticket = None;
+
+        assert_eq!(FleetHost::wanted_with(&descriptor, Some(key)), None);
     }
 
     #[test]

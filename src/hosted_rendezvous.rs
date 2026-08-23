@@ -230,7 +230,8 @@ impl RecordLocator {
     pub fn seal(&self, plaintext: &str) -> Result<Vec<u8>, RecordError> {
         let mut nonce = [0_u8; NONCE_BYTES];
         getrandom::fill(&mut nonce).map_err(|_| RecordError::Random)?;
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| RecordError::Undecryptable)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| RecordError::Undecryptable)?;
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
             .map_err(|_| RecordError::Random)?;
@@ -256,7 +257,8 @@ impl RecordLocator {
             return Err(RecordError::Malformed);
         }
         let (nonce, ciphertext) = record.split_at(NONCE_BYTES);
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| RecordError::Undecryptable)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| RecordError::Undecryptable)?;
         let plaintext = cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| RecordError::Undecryptable)?;
@@ -693,7 +695,9 @@ mod tests {
     #[test]
     fn a_locator_round_trips_and_never_shows_its_key() {
         let locator = RecordLocator::derive("index", "key", b"material");
-        let record = locator.seal("p2pmux-v3:TICKET").expect("record should seal");
+        let record = locator
+            .seal("p2pmux-v3:TICKET")
+            .expect("record should seal");
 
         assert_eq!(
             locator.open(&record).expect("record should open"),

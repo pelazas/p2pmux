@@ -1624,7 +1624,9 @@ mod tests {
         assert!(pairing.fleet_key().is_none());
 
         let first = pairing.ensure_fleet_key().expect("should mint");
-        let second = pairing.ensure_fleet_key().expect("should return the same one");
+        let second = pairing
+            .ensure_fleet_key()
+            .expect("should return the same one");
 
         assert_eq!(first, second);
         assert_eq!(pairing.fleet_key(), Some(first));

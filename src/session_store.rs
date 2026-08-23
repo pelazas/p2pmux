@@ -162,6 +162,16 @@ pub struct SessionDescriptor {
     /// question as small as a status column.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<SessionPeer>,
+    /// Whether this session is where this machine meets its own machines.
+    ///
+    /// True for bare `p2pmux`, for the fleet agent's session, and for the one
+    /// `p2pmux pair` offers; false for `p2pmux create`, for a guest's `join`,
+    /// and for a second window. The node reads it to decide whether to publish
+    /// this session as the fleet's meeting place — see [`crate::fleet`] — and
+    /// it is a question the session's own ticket cannot answer, because a
+    /// session started here is a session started here either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosts_fleet: bool,
 }
 
 /// One machine in a live session, as the record describes it out of process.
@@ -203,6 +213,7 @@ impl SessionDescriptor {
             join_code: None,
             joined_ticket: None,
             peers: Vec::new(),
+            hosts_fleet: false,
         }
     }
 

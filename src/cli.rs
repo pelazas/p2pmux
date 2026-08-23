@@ -514,7 +514,11 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 // A session somebody typed `create` for outlives the terminal
                 // they typed it in. That is what the separate process is for.
                 crate::node::Tether::Detached,
-                None,
+                // `create` is a session of its own, however many of your own
+                // machines end up in it. Publishing it as the fleet's meeting
+                // place would move the whole fleet into a session that was
+                // never meant to be one.
+                FleetRole::Bystander,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -615,7 +619,8 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
                 crate::node::Tether::Detached,
-                None,
+                // Somebody else's session, reached with somebody else's code.
+                FleetRole::Bystander,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -852,7 +857,11 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let descriptor = match newest_live(&store.list_live()?) {
         Some(descriptor) => descriptor,
-        None => start_solo_session(None)?,
+        // The session this pairing is about to hand out is, by construction,
+        // the one the fleet will meet in.
+        None => start_solo_session(FleetRole::Home {
+            stands_in_for: None,
+        })?,
     };
     // The node publishes the code a moment after it starts, so a session
     // created two lines ago has not necessarily got one yet.
@@ -1460,7 +1469,9 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     // here was a race against those, lost on a machine where publishing the
     // role takes a moment longer than it does on a laptop, and losing it left
     // every later `p2pmux` paying the rejoin window again.
-    let descriptor = start_solo_session(failed_rejoin_ticket.map(str::to_owned))?;
+    let descriptor = start_solo_session(FleetRole::Home {
+        stands_in_for: failed_rejoin_ticket.map(str::to_owned),
+    })?;
     // The session screen, not the inbox. A session created a moment ago has one
     // pane and no agents in it, so Home would open on an empty list — the blank
     // screen a first run is least able to interpret. Rejoining a fleet session
@@ -1534,7 +1545,12 @@ async fn rejoin_paired_session(
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
         crate::node::Tether::Detached,
-        None,
+        // Reached by looking the fleet up, so this is the fleet's home session
+        // — and if this machine is later promoted to coordinate it, it is the
+        // one that has to keep saying where the fleet is.
+        FleetRole::Home {
+            stands_in_for: None,
+        },
     )
 }
 
@@ -1544,11 +1560,13 @@ async fn rejoin_paired_session(
 /// `create` and `pair` — the two commands that do that — both print it.
 /// Start a session of this machine's own.
 ///
-/// `stands_in_for` is the pairing ticket this session is the local answer to,
-/// when it is one -- see `open_home`. `None` for a session that is simply a
-/// session.
+/// `fleet_role` says whether this session is where this machine meets its own
+/// machines -- see `FleetRole`. Both of this function's callers are founding or
+/// re-founding a fleet home, but it is passed rather than assumed: a third
+/// caller that wanted an ordinary session would otherwise silently move the
+/// whole fleet into it.
 fn start_solo_session(
-    stands_in_for: Option<String>,
+    fleet_role: FleetRole,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let display_name = display_name_or_hostname()?;
     let (cols, rows) = terminal_size_or_default();
@@ -1561,7 +1579,7 @@ fn start_solo_session(
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Coordinator,
         crate::node::Tether::Detached,
-        stands_in_for,
+        fleet_role,
     )
 }
 
@@ -1740,12 +1758,49 @@ impl Drop for LaunchAttempt {
 
 /// Launches an isolated session owner. It has no terminal file descriptors and its own process
 /// group, so closing the initiating terminal cannot take the PTYs down with it.
+/// What a session is to the fleet on this machine.
+///
+/// Two different questions used to share one `Option<String>`, and only one of
+/// them was ever asked. `stands_in_for` says *which ticket this session is the
+/// local answer to*, which a brand-new fleet home has no answer for — there was
+/// no earlier ticket to stand in for. What the fleet record needs to know is the
+/// other thing: whether this session is where this machine meets its own
+/// machines, or a session that merely happens to be running here.
+///
+/// Getting that wrong in either direction is a bug somebody would report.
+/// `p2pmux create` publishing itself as the fleet's home would hijack the fleet
+/// from whatever session it was actually meeting in; bare `p2pmux` not
+/// publishing would leave the fleet with no address at all.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FleetRole {
+    /// A session of its own: `p2pmux create`, a guest's `join`, a second
+    /// window. It is not where the fleet meets and must never say it is.
+    #[default]
+    Bystander,
+    /// This machine's place in its fleet's home session — the thing bare
+    /// `p2pmux`, the fleet agent, and `pair` are all trying to reach.
+    Home {
+        /// The pairing ticket this session is the local answer to, when it is
+        /// answering one. `None` for a home this machine is founding.
+        stands_in_for: Option<String>,
+    },
+}
+
+impl FleetRole {
+    fn stands_in_for(self) -> Option<String> {
+        match self {
+            Self::Bystander => None,
+            Self::Home { stands_in_for } => stands_in_for,
+        }
+    }
+}
+
 pub(crate) fn launch_background_node(
     kind: crate::node::NodeBootstrapKind,
     name: String,
     role: crate::session_store::SessionRole,
     tether: crate::node::Tether,
-    stands_in_for: Option<String>,
+    fleet_role: FleetRole,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let id = crate::session_store::generate_id()?;
@@ -1763,10 +1818,11 @@ pub(crate) fn launch_background_node(
     // rather than by the caller once the node is up -- see the comment on
     // `open_home`. The `Join` arm keeps precedence: a real join's own ticket is
     // never a stand-in for something else.
+    descriptor.hosts_fleet = matches!(fleet_role, FleetRole::Home { .. });
     if let crate::node::NodeBootstrapKind::Join { ticket, .. } = &kind {
         descriptor.joined_ticket = Some(ticket.clone());
     } else {
-        descriptor.joined_ticket = stands_in_for;
+        descriptor.joined_ticket = fleet_role.stands_in_for();
     }
     let bootstrap = crate::node::NodeBootstrap {
         descriptor: descriptor.clone(),

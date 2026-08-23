@@ -303,7 +303,11 @@ pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
         tether,
-        None,
+        // An invitation from one of your own machines is the fleet saying where
+        // it moved to, so following it lands in the fleet's home session.
+        crate::cli::FleetRole::Home {
+            stands_in_for: None,
+        },
     )?;
     Ok(true)
 }
@@ -603,6 +607,10 @@ fn run_socket_loop(
     let mut last_known_peers: Vec<crate::session_store::SessionPeer> = Vec::new();
     let mut last_peer_scan: Option<Instant> = None;
     let mut last_self_check: Option<Instant> = None;
+    // Built here rather than passed in because it is this loop's own state, and
+    // because the answer it publishes is read off `descriptor` — which this loop
+    // is the thing that keeps current across a failover.
+    let fleet_host = crate::fleet::FleetHost::new(tokio::runtime::Handle::current());
     let mut warned_about_size = false;
     let mut last_work = Instant::now();
     loop {
@@ -833,6 +841,11 @@ fn run_socket_loop(
             // change here, and it is exactly the thing the fleet has to hear
             // about. See `exchange_fleet_invites`.
             node.runtime.exchange_fleet_invites();
+            // The out-of-session half of the same sentence. `exchange_fleet_invites`
+            // can only tell machines that are already here, which is why a machine
+            // that was switched off used to be told nothing, forever. This writes
+            // it where one can read it on waking. See `crate::fleet`.
+            fleet_host.tick(descriptor);
         }
         did_work |= changed;
         let mut detached = false;
