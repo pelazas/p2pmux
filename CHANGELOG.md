@@ -13,6 +13,21 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
+p2pmux now asks, once on first run, whether it may send one anonymous line a day: a random id, the
+version, the OS, how many sessions you started, whether anybody joined one. Enter means yes,
+nothing is sent before you answer, and `p2pmux telemetry show` prints the exact line at any time.
+`DO_NOT_TRACK` and `CI` are honoured without being asked, and a machine with no terminal to ask in
+is never asked and never sends.
+
+Most tools collect this quietly and offer a settings key to turn it off, which gets better numbers.
+That is the wrong trade for a tool whose whole claim is that your keys and processes stay on your
+machine, so the cost is paid on purpose: these numbers undercount real use by an unknown amount,
+permanently, and no p2pmux figure quoted anywhere should be read as a census. What it buys is the
+one question downloads and issue counts cannot answer — whether the person who installed p2pmux on
+Monday started a session on Thursday. The schema is eight columns in `services/metrics/schema.sql`,
+there is no field for a hostname or a path or anything typed, and the id is deliberately unrelated
+to the machine key that peers already see.
+
 Dimming the pane you are not typing into now reaches the terminal. The frame always asked for it,
 and on a terminal whose environment carries `NO_COLOR` the request was cancelled a byte before the
 text it applied to: crossterm answers that variable by writing a cell's colours as an SGR with no

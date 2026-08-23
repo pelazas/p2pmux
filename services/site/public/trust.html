@@ -82,13 +82,19 @@
         <td>Encrypted, peer to peer — or through an iroh relay when NAT blocks a direct path.
             A relay forwards encrypted bytes it cannot read.</td></tr>
     <tr><td>Tabs, panes, who is where</td><td>Between the peers in the session.</td></tr>
+    <tr><td>One anonymous count a day</td>
+        <td><code>m.p2pmux.com</code>, and only if you said yes when p2pmux asked.
+            A random id, the version, the OS, how many sessions and whether anybody joined
+            one. Run <code>p2pmux telemetry show</code> to see it.</td></tr>
   </table>
 
-  <h2>The one server we run</h2>
+  <h2>The two servers we run</h2>
   <p>
     Joining takes a ten-character code instead of a two-hundred-character ticket, and that
     convenience needs somewhere to look the code up. That is
-    <code>rv.p2pmux.com</code>, and it is the only thing we operate.
+    <code>rv.p2pmux.com</code>. The second is <code>m.p2pmux.com</code>, which counts how many
+    people use p2pmux, and is described further down. Neither is on the connectivity path and
+    neither ever sees a byte of your terminal.
   </p>
   <p>
     It cannot read what it stores. Your client turns the code into two separate values: an address
@@ -108,6 +114,44 @@
     We do not claim "no servers". iroh's public relays exist and carry encrypted traffic when a
     direct path cannot form, and the code lookup above is ours. What we claim is narrower and
     checkable: <em>your processes and your credential files stay on your machine.</em>
+  </p>
+
+  <h2>The count, and why we ask instead of assuming</h2>
+  <p>
+    p2pmux can send <strong>one line a day</strong> to <code>m.p2pmux.com</code>. It asks you
+    once, the first time you run it, with the whole thing on screen. Most developer tools collect
+    this quietly and let you opt out in a settings file. That would get better numbers and it is
+    the wrong trade for a tool whose entire claim is that your keys stay on your disk.
+  </p>
+  <p>The line is, in full:</p>
+  <ul>
+    <li>A random id, generated on your machine the moment you say yes. It is
+        <em>not</em> derived from your machine key — that one is announced to peers, and a
+        number tied to it would be a number tied to an identity other people have seen.</li>
+    <li>The p2pmux version and the OS, as <code>macos-aarch64</code>.</li>
+    <li>How many sessions you started, how many peers joined them, how many agent
+        notifications fired, and whether a session ever reached two members.</li>
+  </ul>
+  <p>
+    There is no field for a hostname, a directory, a session name, a command, or anything you
+    typed — and no setting that adds one, because the whole schema is
+    <a href="https://github.com/pelazas/p2pmux/blob/main/services/metrics/schema.sql">eight columns
+    in a file you can read</a>. Your IP reaches that server, the way one reaches every web
+    server; it rate limits writes and is never stored. "Not stored" is the honest claim, and
+    "not seen" would be a lie any traceroute disproves.
+  </p>
+  <div class="warn">
+    <p>
+      <code>p2pmux telemetry show</code> prints the exact line this machine would send.
+      <code>p2pmux telemetry off</code> stops it. <code>DO_NOT_TRACK=1</code> and <code>CI</code>
+      are honoured without being asked, and a machine with no terminal to ask in — a droplet
+      running the fleet agent — is never asked and never sends.
+    </p>
+  </div>
+  <p>
+    Because it is asked for rather than assumed, these numbers undercount real use by an unknown
+    amount, permanently. We would rather have a number we can explain than a bigger one we
+    cannot.
   </p>
 
   <h2>Limits worth knowing</h2>
