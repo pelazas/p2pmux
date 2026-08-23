@@ -12,9 +12,13 @@
 
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::{Duration, Instant},
 };
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 fn run(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_p2pmux"))
@@ -34,7 +38,8 @@ fn run(home: &Path, args: &[&str]) -> Output {
 }
 
 fn temporary_home(label: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!("p2pmux-telemetry-{label}-{}", std::process::id()));
+    let home =
+        std::env::temp_dir().join(format!("p2pmux-telemetry-{label}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&home);
     fs::create_dir_all(&home).expect("temporary home");
     home
@@ -97,7 +102,15 @@ fn show_prints_the_payload_and_says_whether_it_would_be_sent() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["activated", "agents", "id", "os", "peers", "sessions", "version"],
+        [
+            "activated",
+            "agents",
+            "id",
+            "os",
+            "peers",
+            "sessions",
+            "version"
+        ],
         "show must print the whole payload and nothing beyond it"
     );
     assert!(
@@ -120,7 +133,10 @@ fn consent_can_be_given_taken_back_and_given_again_without_becoming_a_new_instal
     assert_eq!(granted["consent"], "granted");
     let id = granted["id"].as_str().expect("an id").to_owned();
     assert_eq!(id.len(), 32, "{id}");
-    assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    assert!(
+        id.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    );
 
     assert!(run(&home, &["telemetry", "off"]).status.success());
     let denied = state(&home).expect("state written");
@@ -198,7 +214,11 @@ fn do_not_track_and_ci_stop_it_at_the_binary() {
     let home = temporary_home("switches");
     run(&home, &["telemetry", "on"]);
 
-    for (name, value) in [("DO_NOT_TRACK", "1"), ("CI", "true"), ("P2PMUX_TELEMETRY", "0")] {
+    for (name, value) in [
+        ("DO_NOT_TRACK", "1"),
+        ("CI", "true"),
+        ("P2PMUX_TELEMETRY", "0"),
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
             .args(["telemetry"])
             .env("HOME", &home)
@@ -216,6 +236,116 @@ fn do_not_track_and_ci_stop_it_at_the_binary() {
             "{name}={value} did not stop it: {said}"
         );
     }
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// Put a machine in the state the one-time question is gated on: it agreed, and
+/// somebody else has been in a session on it.
+fn already_activated(home: &Path) {
+    let directory = home.join(".config").join("p2pmux");
+    fs::create_dir_all(&directory).expect("config directory");
+    fs::write(
+        directory.join("telemetry.json"),
+        br#"{"consent":"granted","id":"0123456789abcdef0123456789abcdef","activated":true}"#,
+    )
+    .expect("state file");
+}
+
+/// Run p2pmux attached to a real terminal, and return everything it wrote.
+///
+/// The question only prints to a terminal, so a plain `Command` can prove it
+/// stays quiet and nothing else. This is the other half.
+fn run_on_a_terminal(home: &Path, args: &[&str]) -> String {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("a pty");
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_p2pmux"));
+    for argument in args {
+        command.arg(argument);
+    }
+    command.env("HOME", home);
+    command.env_remove("XDG_CONFIG_HOME");
+    command.env_remove("XDG_STATE_HOME");
+    command.env_remove("DO_NOT_TRACK");
+    command.env_remove("CI");
+    command.env_remove("P2PMUX_TELEMETRY");
+    let mut child = pty.slave.spawn_command(command).expect("spawn");
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().expect("reader");
+    let mut said = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut buffer = [0_u8; 4096];
+    while Instant::now() < deadline {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => said.push_str(&String::from_utf8_lossy(&buffer[..read])),
+            Err(_) => break,
+        }
+    }
+    let _ = child.wait();
+    said
+}
+
+/// The one thing p2pmux ever asks for unprompted. It has to be once, and it has
+/// to be after there is something to answer about — a question on install, when
+/// nobody has used it yet, is a question that trains people to skip the next one.
+#[test]
+fn the_one_question_is_asked_once_and_only_after_a_second_person_joined() {
+    let home = temporary_home("asked");
+
+    // Agreed to telemetry, but nobody has joined a session yet.
+    run(&home, &["telemetry", "on"]);
+    let early = run_on_a_terminal(&home, &["config", "get", "name"]);
+    assert!(
+        !early.contains("p2pmux.com/hi"),
+        "asked before there was anything to ask about: {early}"
+    );
+
+    already_activated(&home);
+    let asked = run_on_a_terminal(&home, &["config", "get", "name"]);
+    assert!(asked.contains("p2pmux.com/hi"), "{asked}");
+    assert!(
+        asked.contains("never again"),
+        "a question that does not promise to stop is one people brace for: {asked}"
+    );
+
+    let again = run_on_a_terminal(&home, &["config", "get", "name"]);
+    assert!(
+        !again.contains("p2pmux.com/hi"),
+        "asked twice, which is the whole thing it promised not to do: {again}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A pipe cannot answer a question, and must not burn the one chance to ask it.
+/// `p2pmux` inside a script or a CI job would otherwise spend it on nobody.
+#[test]
+fn a_pipe_is_never_asked_and_never_spends_the_ask() {
+    let home = temporary_home("unasked");
+    already_activated(&home);
+
+    let output = run(&home, &["config", "get", "name"]);
+    let said = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!said.contains("p2pmux.com/hi"), "{said}");
+    let stored = state(&home).expect("state survives");
+    assert!(
+        stored
+            .get("asked_for_a_word")
+            .is_none_or(|asked| asked == &serde_json::Value::Bool(false)),
+        "a run nobody saw must leave the question unasked: {stored}"
+    );
 
     let _ = fs::remove_dir_all(&home);
 }

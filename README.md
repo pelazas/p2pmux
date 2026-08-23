@@ -216,6 +216,11 @@ gets better numbers, and it is the wrong trade for a tool whose whole claim is t
 keys stay on your disk. The cost is real: these numbers undercount actual use by an
 unknown amount, permanently. Details in [`services/metrics/`](services/metrics/).
 
+Separately, and once in the life of a machine: after a session that had a second person in
+it, p2pmux prints one line asking what you were doing, with a link. Numbers say whether
+anybody came back; they cannot say what for. It is printed as the session closes, it takes
+no answer, and it never appears again.
+
 ## Install
 
 ### Install script

@@ -1,2 +1,7 @@
 # The install line in the README and the launch copy is the short form.
 /install /install.sh 301
+
+# The one question p2pmux ever asks, printed once after a session that had two
+# people in it. A redirect rather than a URL in the binary, so where it points
+# can move without shipping a release to everybody who already has one.
+/hi https://github.com/pelazas/p2pmux/issues/new?title=What+I+used+p2pmux+for&body=What+were+you+two+doing%3F+A+couple+of+lines+is+plenty. 302

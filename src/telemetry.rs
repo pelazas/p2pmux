@@ -128,6 +128,11 @@ struct Record {
     activated: bool,
     #[serde(default)]
     last_sent_unix_ms: u64,
+    /// Whether the one-time question below has been asked. Local only, and
+    /// deliberately not a payload field: what somebody was shown on their own
+    /// terminal is not something to report back.
+    #[serde(default)]
+    asked_for_a_word: bool,
 }
 
 /// Exactly what a ping contains, and exactly what `p2pmux telemetry show` prints.
@@ -461,6 +466,47 @@ pub fn payload() -> Option<Payload> {
     })
 }
 
+/// Where the one-time question sends people.
+///
+/// A redirect on the site rather than the destination itself, so the place it
+/// points can move — to a form, to a thread, to a mailbox — without shipping a
+/// new binary to everybody who already has one.
+const FEEDBACK_URL: &str = "https://p2pmux.com/hi";
+
+/// Ask, once ever, on a machine where somebody else has actually joined.
+///
+/// The only thing p2pmux ever asks for unprompted, and the timing is the whole
+/// point: after a session with a second person in it, printed as that session
+/// closes, when what happened is still in mind and nothing is waiting on the
+/// answer. Not in the inbox, where it would compete with work; not on install,
+/// when there is nothing to say yet.
+///
+/// Gated on telemetry consent, because `activated` is only recorded on machines
+/// that agreed — which also means the people who declined are not asked to go
+/// and fill anything in, and that is the right way round.
+pub fn ask_for_a_word() {
+    if suppressed() || consent() != Consent::Granted {
+        return;
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return;
+    }
+    let mut record = read_record();
+    if !record.activated || record.asked_for_a_word {
+        return;
+    }
+    record.asked_for_a_word = true;
+    write_record(&record);
+    use io::Write;
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "\nSomebody else has been in a session on this machine — the part of p2pmux\n\
+         nobody has written in about yet. What were you two doing?\n\n  \
+         {FEEDBACK_URL}\n\nAsked once, and never again."
+    );
+}
+
 /// The line this machine would send, whether or not it is sending.
 ///
 /// Separate from [`payload`] because the question `p2pmux telemetry show` answers
@@ -561,7 +607,10 @@ pub fn send_if_due() -> bool {
     let Ok(body) = serde_json::to_string(&payload) else {
         return false;
     };
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
         return false;
     };
     if !runtime.block_on(post(body)) {
@@ -652,7 +701,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["activated", "agents", "id", "os", "peers", "sessions", "version"],
+            [
+                "activated",
+                "agents",
+                "id",
+                "os",
+                "peers",
+                "sessions",
+                "version"
+            ],
             "the wire format changed; services/metrics must change with it"
         );
     }
@@ -665,7 +722,8 @@ mod tests {
         let id = new_id();
         assert_eq!(id.len(), 32, "{id}");
         assert!(
-            id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "{id}"
         );
         assert_ne!(id, new_id(), "two installs must not share an id");
@@ -713,7 +771,10 @@ mod tests {
         assert!(!suppressed_by(env(&[("DO_NOT_TRACK", "")])));
         assert!(!suppressed_by(env(&[("CI", "")])));
         assert!(!suppressed_by(env(&[("P2PMUX_TELEMETRY", "1")])));
-        assert!(!suppressed_by(env(&[])), "a clean environment suppresses nothing");
+        assert!(
+            !suppressed_by(env(&[])),
+            "a clean environment suppresses nothing"
+        );
     }
 
     /// A record round-trips through the file format the state path holds, and an

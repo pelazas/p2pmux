@@ -18,5 +18,12 @@ fn main() -> ExitCode {
         eprintln!("Error: {error}");
         return ExitCode::FAILURE;
     }
+    // Here rather than inside the client, because here is the one place every
+    // path has already put the terminal back: the alternate screen is gone, raw
+    // mode is off, and a line written now survives in the scrollback instead of
+    // being wiped by the teardown a moment later. It prints at most once in the
+    // life of a machine, and only on one that has had a second person in a
+    // session.
+    p2pmux::telemetry::ask_for_a_word();
     ExitCode::SUCCESS
 }
