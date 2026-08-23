@@ -46,6 +46,17 @@ use serde::{Deserialize, Serialize};
 /// Where a ping goes. See `services/metrics/` for what happens to it.
 const ENDPOINT: &str = "https://m.p2pmux.com/p";
 
+/// The endpoint, or a different one somebody chose.
+///
+/// Overridable because `services/metrics/` is thirty lines of Worker and one
+/// table, and a team that would rather send this to their own account should be
+/// able to without a fork. It is also how the live test reaches a staging copy
+/// rather than the real one. Not a security surface: anybody who can set this
+/// process's environment can already read everything it would have sent.
+fn endpoint() -> String {
+    std::env::var("P2PMUX_METRICS_URL").unwrap_or_else(|_| String::from(ENDPOINT))
+}
+
 /// How long a send stands before another is worth making.
 ///
 /// A day, matched to `update_check`, so a person who opens twenty sessions
@@ -342,30 +353,38 @@ pub fn set_consent(answer: Consent) {
 
 /// Add to a counter. A no-op on any machine that did not say yes.
 ///
-/// Cheap on purpose: an atomic add, and a file write at most every
-/// [`FLUSH_INTERVAL`]. This is called from the agent notification path, which
-/// fires on every tool call an agent makes.
+/// Two speeds, because the three counters have two very different shapes. A
+/// session start and a member joining happen a handful of times a day and are
+/// the numbers every decision rests on, so they are written through: a process
+/// that exits a second later still counted them. Agent notifications fire on
+/// every tool call an agent makes, so they accumulate in memory and reach the
+/// disk at most every [`FLUSH_INTERVAL`] — losing up to thirty seconds of a
+/// number nobody reads until tomorrow, in exchange for not putting a file write
+/// on a path that runs hundreds of times an hour.
 pub fn bump(counter: Counter, amount: u32) {
-    if consent() != Consent::Granted {
+    if amount == 0 || consent() != Consent::Granted {
         return;
     }
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    static SESSIONS: AtomicU32 = AtomicU32::new(0);
-    static PEERS: AtomicU32 = AtomicU32::new(0);
-    static AGENTS: AtomicU32 = AtomicU32::new(0);
-    static LAST_FLUSH: AtomicU64 = AtomicU64::new(0);
+    match counter {
+        Counter::Sessions => flush(amount, 0, 0, false),
+        Counter::Peers => flush(0, amount, 0, false),
+        Counter::Agents => bump_agents(amount),
+    }
+}
 
-    let pending = match counter {
-        Counter::Sessions => &SESSIONS,
-        Counter::Peers => &PEERS,
-        Counter::Agents => &AGENTS,
-    };
-    pending.fetch_add(amount, Ordering::Relaxed);
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// Agent notifications, counted in memory and written on a timer.
+static PENDING_AGENTS: AtomicU32 = AtomicU32::new(0);
+static LAST_FLUSH: AtomicU64 = AtomicU64::new(0);
+
+fn bump_agents(amount: u32) {
+    PENDING_AGENTS.fetch_add(amount, Ordering::Relaxed);
     let now = unix_ms_now();
     let last = LAST_FLUSH.load(Ordering::Relaxed);
-    // First call flushes immediately: a session that starts and is killed inside
-    // thirty seconds still happened, and the zero here would otherwise swallow it.
+    // The first one goes straight to disk. An agent that fired once and an agent
+    // that never fired are different facts, and thirty seconds of silence after
+    // the first is exactly when a short session ends.
     if last != 0 && now.saturating_sub(last) < FLUSH_INTERVAL.as_millis() as u64 {
         return;
     }
@@ -373,14 +392,21 @@ pub fn bump(counter: Counter, amount: u32) {
         .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
         .is_err()
     {
-        return; // Another thread is flushing this window.
+        return; // Another thread owns this window.
     }
-    flush(
-        SESSIONS.swap(0, Ordering::Relaxed),
-        PEERS.swap(0, Ordering::Relaxed),
-        AGENTS.swap(0, Ordering::Relaxed),
-        false,
-    );
+    flush(0, 0, PENDING_AGENTS.swap(0, Ordering::Relaxed), false);
+}
+
+/// Put whatever is still in memory on disk, whatever the timer says.
+///
+/// Called before a ping is built, so the line that goes out is the line that is
+/// true rather than the one that was true half a minute ago.
+fn flush_pending() {
+    let pending = PENDING_AGENTS.swap(0, Ordering::Relaxed);
+    if pending > 0 {
+        LAST_FLUSH.store(unix_ms_now(), Ordering::Relaxed);
+        flush(0, 0, pending, false);
+    }
 }
 
 /// Note that a session on this machine reached two members.
@@ -443,6 +469,9 @@ pub fn payload() -> Option<Payload> {
 /// not been asked has no id yet, and says so rather than inventing one it would
 /// then have to keep.
 pub fn would_send() -> Payload {
+    // Printing a number that is thirty seconds stale would make the one command
+    // written to be checkable the one command that is slightly wrong.
+    flush_pending();
     let record = read_record();
     Payload {
         id: record
@@ -488,7 +517,7 @@ async fn post(body: String) -> bool {
         return false;
     };
     client
-        .post(ENDPOINT)
+        .post(endpoint())
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -499,21 +528,26 @@ async fn post(body: String) -> bool {
 
 /// Send today's line if one is due, and zero the counters if it lands.
 ///
+/// Returns whether a line was accepted, which nothing in the product reads --
+/// the caller is a detached thread and there is no correct thing for it to do
+/// with a failure. The live test reads it.
+///
 /// Zeroed only on success, and by subtracting what was sent rather than by
 /// writing zero: the counters kept moving while the request was in flight, and a
 /// session started during those ten seconds belongs to tomorrow's line rather
 /// than to nobody's.
-fn send_if_due() {
+pub fn send_if_due() -> bool {
     if suppressed() || consent() != Consent::Granted {
-        return;
+        return false;
     }
+    flush_pending();
     let record = read_record();
     let now = unix_ms_now();
     if !due(&record, now) {
-        return;
+        return false;
     }
     let Some(id) = record.id.clone().filter(|id| id.len() == 32) else {
-        return;
+        return false;
     };
     let payload = Payload {
         id,
@@ -525,13 +559,13 @@ fn send_if_due() {
         activated: record.activated,
     };
     let Ok(body) = serde_json::to_string(&payload) else {
-        return;
+        return false;
     };
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-        return;
+        return false;
     };
     if !runtime.block_on(post(body)) {
-        return;
+        return false;
     }
     let mut latest = read_record();
     latest.sessions = latest.sessions.saturating_sub(payload.sessions);
@@ -539,6 +573,7 @@ fn send_if_due() {
     latest.agents = latest.agents.saturating_sub(payload.agents);
     latest.last_sent_unix_ms = now;
     write_record(&latest);
+    true
 }
 
 /// Start the send. Nothing waits for it and nothing hears about it.
@@ -546,7 +581,9 @@ pub fn spawn() {
     if suppressed() || consent() != Consent::Granted {
         return;
     }
-    std::thread::spawn(send_if_due);
+    std::thread::spawn(|| {
+        let _ = send_if_due();
+    });
 }
 
 #[cfg(test)]
