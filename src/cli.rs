@@ -1201,12 +1201,21 @@ fn print_enrolment_token() -> Result<(), Box<dyn Error>> {
         )
         .into());
     };
-    let minted = pairing.enrol.is_none();
+    let before = (pairing.enrol.clone(), pairing.fleet_key.clone());
     let secret = crate::pairing::enrolment_token(&mut pairing, crate::pairing::now_unix())?;
-    if minted {
+    // A fleet that predates addresses gets one here rather than staying without
+    // until somebody re-pairs. Handing out a token that carries only a session
+    // is how the machine on the other end of it enrols into nothing.
+    let fleet_key = pairing.ensure_fleet_key()?;
+    if before != (pairing.enrol.clone(), pairing.fleet_key.clone()) {
         crate::pairing::save(&pairing)?;
     }
-    let invite = crate::pairing::EnrolInvite { ticket, secret }.encode();
+    let invite = crate::pairing::EnrolInvite {
+        ticket,
+        secret,
+        fleet_key: Some(fleet_key.hex().to_owned()),
+    }
+    .encode();
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{TRUST_WARNING}\n")?;
     writeln!(
@@ -1242,6 +1251,7 @@ async fn enroll_with_token(
     }
     let mut pairing = crate::pairing::load()?;
     pairing.ticket = Some(invite.ticket.clone());
+    pairing.fleet_key = invite.fleet_key.clone();
     // The token names a session on the machine that minted it, which is the one
     // case where nobody is sitting here to notice it did not answer. Dialling
     // it on every boot until it does is the whole point of enrolling.
@@ -1260,8 +1270,34 @@ async fn enroll_with_token(
     pairing.open_pairing_window(crate::pairing::now_unix());
     crate::pairing::save(&pairing)?;
 
-    let descriptor = rejoin_paired_session(&invite.ticket, None).await?;
-    let peers = wait_for_peers(&descriptor).await;
+    // Where the fleet is *now*, before the ticket baked into the token, which
+    // is usually months old by the time a provisioning script reads it. That
+    // ticket naming a session that had ended was the whole of this command's
+    // failure mode: it reported "could not reach the session host … the invite
+    // may be out of date" from the new machine, which sends somebody to debug
+    // a network that was never the problem.
+    let mut joined = None;
+    for ticket in fleet_addresses(&pairing).await {
+        match rejoin_paired_session(&ticket, None).await {
+            Ok(descriptor) => {
+                joined = Some((descriptor, ticket));
+                break;
+            }
+            Err(error) => {
+                eprintln!("p2pmux: {error}");
+            }
+        }
+    }
+    // Not an error. The record is already written, the fleet agent will keep
+    // looking, and a provisioning run that failed here would tear down a
+    // machine that is enrolled and simply early.
+    let peers = match &joined {
+        Some((descriptor, ticket)) => {
+            remember_fleet_session(ticket);
+            wait_for_peers(descriptor).await
+        }
+        None => Vec::new(),
+    };
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
         pairing.remember(

@@ -1553,6 +1553,7 @@ mod tests {
         let invite = super::EnrolInvite {
             ticket: String::from("p2pmux-v3:abc"),
             secret: String::from("f00d"),
+            fleet_key: Some(String::from("ab").repeat(32)),
         };
         let encoded = invite.encode();
         assert!(encoded.starts_with(super::ENROL_PREFIX));
@@ -1574,11 +1575,13 @@ mod tests {
             &super::EnrolInvite {
                 ticket: String::new(),
                 secret: String::from("f00d"),
+                fleet_key: None,
             }
             .encode(),
             &super::EnrolInvite {
                 ticket: String::from("p2pmux-v3:abc"),
                 secret: String::new(),
+                fleet_key: None,
             }
             .encode(),
         ] {
@@ -1587,6 +1590,19 @@ mod tests {
                 "must refuse {refused:?}"
             );
         }
+
+        // A token minted before fleets had addresses still enrols a machine.
+        // It is the shape sitting in every machine image built last month, and
+        // refusing it would break a provisioning run on upgrade.
+        let older = super::EnrolInvite {
+            ticket: String::from("p2pmux-v3:abc"),
+            secret: String::from("f00d"),
+            fleet_key: None,
+        };
+        assert_eq!(
+            super::EnrolInvite::decode(&older.encode()).expect("decode"),
+            older
+        );
     }
 
     #[test]
@@ -1718,13 +1734,28 @@ mod tests {
 /// it can be recognized, base64 so it survives YAML.
 pub const ENROL_PREFIX: &str = "p2pmux-enrol-v1:";
 
-/// The two halves of an enrolment invitation, as they travel.
+/// What an enrolment invitation carries.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EnrolInvite {
-    /// The session every machine in this fleet rejoins.
+    /// Where the fleet was meeting when this was minted.
+    ///
+    /// Kept, but no longer the important half. A token pasted into a machine
+    /// image is read months after it was printed, by which time this names a
+    /// session that ended long ago — which is precisely how a machine used to
+    /// enrol into nothing and report success. It is now a first guess that the
+    /// address below corrects.
     pub ticket: String,
     /// The standing secret. See [`EnrolToken`].
     pub secret: String,
+    /// The fleet's permanent address. See [`crate::fleet`].
+    ///
+    /// Optional only so a token minted by an older build still parses. One
+    /// without it enrols a machine that has no way to find the fleet again once
+    /// the ticket above goes stale, so [`crate::fleet`]'s in-session hand-off is
+    /// what rescues it: the first session it shares with a machine that has an
+    /// address is where it gets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_key: Option<String>,
 }
 
 impl EnrolInvite {
