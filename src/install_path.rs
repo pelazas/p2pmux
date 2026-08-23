@@ -207,7 +207,7 @@ fn newer_than_the_winner(installs: &[Install]) -> Option<&Install> {
 }
 
 fn shadow_warning(winner: &Install, better: &Install) -> Vec<String> {
-    let fix = crate::update_check::upgrade_command(&winner.path);
+    let fix = update_command(&winner.path);
     let newer = better.version.as_deref().unwrap_or("another copy");
     // Reordering PATH is the other half of the fix, and only worth saying if
     // there is a directory to name — `better` always has a parent in practice,
@@ -225,7 +225,7 @@ fn shadow_warning(winner: &Install, better: &Install) -> Vec<String> {
             better.path.display(),
         ),
         None => format!(
-            "warning: `p2pmux` runs {}, which did not answer `--version`, while {newer} \
+            "warning: `p2pmux` runs {}, which did not report a version, while {newer} \
              is installed at {}. Update or remove the copy that runs \
              (`{fix}`){reorder}.",
             winner.path.display(),
@@ -233,6 +233,40 @@ fn shadow_warning(winner: &Install, better: &Install) -> Vec<String> {
         ),
     };
     wrapped(&body, "         ")
+}
+
+/// The command that replaces the copy at `path` — as opposed to one that
+/// installs p2pmux somewhere and leaves that copy exactly where it is.
+///
+/// Homebrew and cargo update a copy wherever they put it, so their commands
+/// stand. The installer does not: it writes `/usr/local/bin`, so telling
+/// someone whose winning copy is in `/usr/local/sbin` to pipe it into `sh`
+/// rewrites a file that was already newer and changes nothing about the one
+/// that runs. Pointing it at the directory that actually wins is the whole
+/// difference between advice and a command that does not work.
+fn update_command(path: &Path) -> String {
+    /// Where the installer writes when nothing tells it otherwise.
+    const INSTALLER_DEFAULT: &str = "/usr/local/bin";
+    let command = crate::update_check::upgrade_command(path);
+    // Compared rather than pattern-matched: this is the answer that module
+    // gives for a path no packaging channel owns, whatever it says today.
+    let unowned = command == crate::update_check::upgrade_command(Path::new("/"));
+    let directory = path.parent().unwrap_or(Path::new(INSTALLER_DEFAULT));
+    if !unowned || directory == Path::new(INSTALLER_DEFAULT) {
+        return command.to_owned();
+    }
+    // The variable has to reach `sh`, not `curl`, so it goes on the right of
+    // the pipe. If the command ever stops having one, the plain form is still
+    // better than a mangled one.
+    let piped = command.replace(
+        "| sh",
+        &format!("| P2PMUX_INSTALL_DIR={} sh", directory.display()),
+    );
+    if piped == command {
+        command.to_owned()
+    } else {
+        piped
+    }
 }
 
 /// `body` broken across terminal-width lines, every line after the first
@@ -401,8 +435,46 @@ mod tests {
             install("/home/x/.cargo/bin/p2pmux", None),
             install("/usr/local/bin/p2pmux", Some("0.1.13")),
         ]));
-        assert!(loud.contains("did not answer `--version`"), "{loud}");
+        assert!(loud.contains("did not report a version"), "{loud}");
         assert!(loud.contains("0.1.13 is installed"), "{loud}");
+    }
+
+    /// A command that installs p2pmux somewhere is not a command that replaces
+    /// the copy winning the PATH. The installer writes /usr/local/bin, so for a
+    /// winner anywhere else it has to be told where to write, or doctor is
+    /// handing out a command that rewrites a file nobody was running.
+    #[test]
+    fn the_offered_command_updates_the_copy_that_actually_runs() {
+        let unowned = unwrapped(&report(&[
+            install("/usr/local/sbin/p2pmux", Some("0.1.11")),
+            install("/usr/local/bin/p2pmux", Some("0.1.13")),
+        ]));
+        assert!(
+            unowned.contains("| P2PMUX_INSTALL_DIR=/usr/local/sbin sh"),
+            "{unowned}"
+        );
+
+        // Where the installer already writes, it needs no telling.
+        let owned = unwrapped(&report(&[
+            install("/usr/local/bin/p2pmux", Some("0.1.11")),
+            install("/home/x/.cargo/bin/p2pmux", Some("0.1.13")),
+        ]));
+        assert!(
+            owned.contains("`curl -fsSL https://p2pmux.com/install.sh | sh`"),
+            "{owned}"
+        );
+        assert!(!owned.contains("P2PMUX_INSTALL_DIR"), "{owned}");
+
+        // And a channel that does own its copy keeps its own command.
+        let brewed = unwrapped(&report(&[
+            install("/opt/homebrew/bin/p2pmux", Some("0.1.11")),
+            install("/usr/local/bin/p2pmux", Some("0.1.13")),
+        ]));
+        assert!(
+            brewed.contains("brew update && brew upgrade p2pmux"),
+            "{brewed}"
+        );
+        assert!(!brewed.contains("P2PMUX_INSTALL_DIR"), "{brewed}");
     }
 
     /// With nothing on PATH the hooks that invoke `p2pmux` by name never run,
