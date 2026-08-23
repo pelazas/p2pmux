@@ -128,20 +128,6 @@ terminal; `Ctrl+O` brings you back.
 timing. Run `p2pmux setup` once, and `p2pmux doctor` to check. An agent with no hooks
 says *state unknown — no hooks* on its own row rather than being guessed about.
 
-<p align="center">
-  <a href="docs/assets/workflow.mp4">
-    <img src="docs/assets/workflow.png" width="820"
-         alt="a laptop and two droplets in one session; an opencode agent running on each droplet, both listed in the laptop's inbox as needing a human">
-  </a>
-</p>
-
-<p align="center">
-  <em><a href="docs/assets/workflow.mp4">Ninety seconds, three machines</a>: a
-  MacBook and two DigitalOcean droplets share one session, an
-  <code>opencode</code> agent is started from the laptop on each droplet, and the
-  inbox says which of them is blocking a human.</em>
-</p>
-
 ### Your machines
 
 `p2pmux pair` on the new machine prints a code; `p2pmux pair <code>` on one you
