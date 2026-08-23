@@ -377,6 +377,9 @@ pub fn run_on(
     // already waiting by the first frame — and started here rather than in the
     // node, because the notice is for the person sitting at this terminal.
     let update_notices = crate::update_check::spawn();
+    // Same thread-and-forget shape, same place: opening the client is what
+    // "active today" means, and nothing here waits for either request.
+    crate::telemetry::spawn();
     let mut pending_focus = None;
     let mut pending_resync = BTreeSet::new();
     let mut history_refresh = BTreeSet::new();

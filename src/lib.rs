@@ -24,6 +24,7 @@ pub mod pty_host;
 pub mod screen;
 pub mod session;
 pub mod session_store;
+pub mod telemetry;
 pub mod ticket;
 pub mod transport;
 pub mod tui;

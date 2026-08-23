@@ -127,6 +127,16 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// See or change what p2pmux reports about its own use.
+    ///
+    /// With no subcommand, says whether anything is being sent and where the
+    /// answer is stored. `show` prints the exact line — a line you have already
+    /// been shown once, and which this reprints so that trusting it never
+    /// depends on remembering it.
+    Telemetry {
+        #[command(subcommand)]
+        command: Option<TelemetryCommand>,
+    },
     /// Put a machine you own in your fleet without anybody sitting at it.
     ///
     /// `p2pmux pair` is a code one human types on one machine within ten
@@ -215,6 +225,16 @@ enum DaemonCommand {
     Uninstall,
     /// Say whether it is installed, and where.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum TelemetryCommand {
+    /// Print the exact line this machine would send, and nothing else.
+    Show,
+    /// Start sending one line a day.
+    On,
+    /// Stop. Nothing further is sent, and the counters stop being kept.
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -349,8 +369,54 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
             None => crate::agent_setup::setup_all(false, false),
         }),
         Some(Command::Doctor) => Some(crate::agent_setup::doctor()),
+        // Reading and writing one small file. A user asking what is being sent
+        // about them wants the answer now, not after a thread pool starts.
+        Some(Command::Telemetry { command }) => Some(run_telemetry(command.as_ref())),
         _ => None,
     }
+}
+
+/// Answer, or change, what this machine reports about itself.
+///
+/// `show` prints the payload whether or not it would be sent, because the
+/// question people ask is "what would this send", and answering it with nothing
+/// on a machine that declined reads as evasion rather than as reassurance.
+fn run_telemetry(command: Option<&TelemetryCommand>) -> Result<(), Box<dyn Error>> {
+    use crate::telemetry::{self, Consent};
+    match command {
+        Some(TelemetryCommand::On) => {
+            telemetry::set_consent(Consent::Granted);
+            println!("On. One line a day; `p2pmux telemetry show` prints it.");
+        }
+        Some(TelemetryCommand::Off) => {
+            telemetry::set_consent(Consent::Denied);
+            println!("Off. Nothing further will be sent.");
+        }
+        Some(TelemetryCommand::Show) => {
+            let payload = telemetry::would_send();
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            if telemetry::consent() != Consent::Granted {
+                println!("\nNot sent — telemetry is off. This is what it would contain.");
+            }
+        }
+        None => {
+            let state = telemetry::state_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| String::from("<no config directory>"));
+            match telemetry::consent() {
+                Consent::Granted => println!(
+                    "On: one anonymous line a day.\n\n  p2pmux telemetry show    print it\n  p2pmux telemetry off     stop\n\nStored in {state}"
+                ),
+                Consent::Denied => println!(
+                    "Off: nothing is sent.\n\n  p2pmux telemetry show    print what it would contain\n  p2pmux telemetry on      start sending it\n\nStored in {state}"
+                ),
+                Consent::Unasked => println!(
+                    "Not asked yet, and nothing is sent until you answer.\n\n  p2pmux telemetry show    print what it would contain\n  p2pmux telemetry on      start sending it"
+                ),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The live sessions on this machine, as `ticket`, `code`, `attach`, `kill` and `rename` name them.
@@ -420,6 +486,12 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if let Some(result) = run_without_runtime(&cli) {
         return result;
     }
+    // Before anything opens the alternate screen, so the question is never
+    // competing with a TUI for the same rows, and after the commands above --
+    // `notify` fires on every agent tool call and must stay a socket write and
+    // an exit. It asks once, in a terminal, and returns immediately everywhere
+    // else.
+    crate::telemetry::ask_once();
     if cli.resume {
         return resume_picker(true);
     }
@@ -454,6 +526,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Command::Notify { .. })
         | Some(Command::List)
         | Some(Command::Setup { .. })
+        | Some(Command::Telemetry { .. })
         | Some(Command::Doctor) => Ok(()),
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
@@ -1747,6 +1820,9 @@ pub(crate) fn launch_background_node(
     tether: crate::node::Tether,
     stands_in_for: Option<String>,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    // Every session on this machine comes through here, hosted or joined, so
+    // this is the one place the count cannot drift from what actually ran.
+    crate::telemetry::bump(crate::telemetry::Counter::Sessions, 1);
     let store = crate::session_store::SessionStore::for_current_user()?;
     let id = crate::session_store::generate_id()?;
     let socket_path = store.socket_path(&id)?;

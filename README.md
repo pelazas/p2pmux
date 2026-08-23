@@ -175,6 +175,52 @@ production credentials out of shared panes.
 
 The longer version is at [p2pmux.com/trust](https://p2pmux.com/trust).
 
+## Telemetry
+
+p2pmux asks, once, on first run, whether it may send **one anonymous line a day**. Enter
+means yes. Nothing is sent before you answer, and nothing is sent if you say no.
+
+The line is, in full:
+
+```json
+{
+  "id": "a random id, generated on your machine when you say yes",
+  "version": "0.1.13",
+  "os": "macos-aarch64",
+  "sessions": 3,
+  "peers": 1,
+  "agents": 12,
+  "activated": true
+}
+```
+
+There is no field for a hostname, a directory, a session name, a command, or anything
+you typed, and no setting that adds one — the whole schema is
+[eight columns](services/metrics/schema.sql) in a file you can read. Terminal traffic
+never goes near it; that stays peer to peer. The id is **not** derived from your machine
+key, which is announced to peers — a number tied to that would be a number tied to an
+identity other people have seen.
+
+```sh
+p2pmux telemetry          # is anything being sent, and where the answer is stored
+p2pmux telemetry show     # print the exact line this machine would send
+p2pmux telemetry off      # stop
+```
+
+`DO_NOT_TRACK=1` and `CI` are honoured without being asked. A machine with no terminal to
+ask in — a droplet running `p2pmux daemon` — is never asked and never sends. The state
+lives in `~/.config/p2pmux/telemetry.json`; delete it and this machine is a new install.
+
+Most developer tools collect this quietly and let you opt out in a settings file. That
+gets better numbers, and it is the wrong trade for a tool whose whole claim is that your
+keys stay on your disk. The cost is real: these numbers undercount actual use by an
+unknown amount, permanently. Details in [`services/metrics/`](services/metrics/).
+
+Separately, and once in the life of a machine: after a session that had a second person in
+it, p2pmux prints one line asking what you were doing, with a link. Numbers say whether
+anybody came back; they cannot say what for. It is printed as the session closes, it takes
+no answer, and it never appears again.
+
 ## Install
 
 ### Install script
