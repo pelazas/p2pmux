@@ -1,0 +1,26 @@
+name = "p2pmux-metrics"
+main = "src/index.js"
+compatibility_date = "2026-08-23"
+workers_dev = false
+
+# Its own subdomain and its own Worker, separate from the rendezvous, so that
+# neither can take the other down and neither has a binding that reaches the
+# other's data. A metrics outage must never stop anyone joining a session.
+[[routes]]
+pattern = "m.p2pmux.com"
+custom_domain = true
+
+# One row per install per day. See schema.sql for why that shape and not events.
+[[d1_databases]]
+binding = "DB"
+database_name = "p2pmux-metrics"
+database_id = "9aff5fe9-ee76-4e08-9de4-aa8abc9c55f3"
+
+# Writes only — a read needs the stats key, which is a secret rather than a limit.
+[[ratelimits]]
+name = "WRITE_LIMIT"
+namespace_id = "1002"
+simple = { limit = 15, period = 60 }
+
+[observability]
+enabled = true

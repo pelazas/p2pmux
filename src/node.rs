@@ -642,6 +642,12 @@ fn run_socket_loop(
                             cwd,
                             message,
                         })) => {
+                            // Counted here rather than in `p2pmux notify`,
+                            // which is a separate process spawned by an agent
+                            // hook on every tool call: a file write there would
+                            // be a file write on the agent's critical path, and
+                            // this side already has the message.
+                            crate::telemetry::bump(crate::telemetry::Counter::Agents, 1);
                             did_work |=
                                 node.apply_agent_status(pane_id, &kind, &status, &cwd, &message);
                         }
