@@ -446,8 +446,12 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
     if states.iter().all(|wiring| **wiring == Wiring::Absent) {
         println!("\nNothing to wire up on this machine.");
     }
-    if !installed("p2pmux") {
-        println!("\nwarning: `p2pmux` is not on PATH — hooks invoke it by name and would not run.");
+    // Not just whether one is on PATH, but which one: a machine can hold p2pmux
+    // from two install channels, and the one that runs is whichever comes first
+    // — routinely the older. Nothing else on this machine will ever say so.
+    println!();
+    for line in crate::install_path::report(&crate::install_path::installs_on_path()) {
+        println!("{line}");
     }
     // Synchronous here, unlike the inbox's: `doctor` is a command whose whole
     // job is to answer questions about this install, and waiting a moment for
