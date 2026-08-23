@@ -235,13 +235,15 @@ def main() -> int:
             accepted.strip()[-300:],
         )
 
-        # The state a machine is in immediately after `pair --accept-work`, and
-        # the one that used to make this feature look broken: it accepts work
-        # and allows nothing, with no supported way to change that.
+        # The state a machine is in immediately after `pair --accept-work`.
+        # It used to be "accepts work, allows nothing" — a machine that refused
+        # every terminal while reporting that it accepts work, with the only
+        # explanation in a refusal naming a command nobody had been told about.
+        # Yes now means what it says.
         policy = droplet.cli("work")
         check(
-            "a freshly paired machine allows nothing, and says what to run",
-            "nothing yet" in policy and "p2pmux work allow" in policy,
+            "a machine paired with --accept-work allows a login shell",
+            "login shell" in policy,
             policy.strip()[-300:],
         )
 
@@ -280,10 +282,23 @@ def main() -> int:
         )
 
         # --- the refusal names the command that lifts it ----------------------
-        # The droplet accepts work and allows nothing, so this is refused, and
-        # the whole value of the refusal is the sentence it carries. One press,
-        # because a second while the first is outstanding is answered with
-        # `waiting for current pane reservation` and nothing else.
+        # A machine that has closed the door, which is now something you have to
+        # do on purpose rather than the state a pairing leaves you in. The whole
+        # value of the refusal is the sentence it carries. One press, because a
+        # second while the first is outstanding is answered with `waiting for
+        # current pane reservation` and nothing else.
+        droplet.cli("work off")
+        # Asserted rather than assumed. This check is about the sentence a
+        # refusal carries, so a droplet that quietly allowed the terminal makes
+        # it fail for a reason that has nothing to do with what it is testing --
+        # and the evidence for that is a screen full of box-drawing, which is
+        # the least legible failure there is.
+        closed = droplet.cli("work")
+        check(
+            "the droplet is closed to remote terminals",
+            "nothing" in closed,
+            closed.strip()[-200:],
+        )
         mac.send(b"\x1b")
         time.sleep(0.6)
         # The node the droplet ran while pairing was killed, and the coordinator
