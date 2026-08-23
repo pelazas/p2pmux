@@ -1414,22 +1414,32 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     let store = crate::session_store::SessionStore::for_current_user()?;
     let pairing = crate::pairing::load_or_empty();
     let mut failed_rejoin_ticket = None;
-    if let Some(ticket) = pairing.ticket.as_deref() {
-        // A node here is already in the fleet's session: use it rather than
-        // standing up a second one alongside it. Only while it is free — an
-        // occupied one falls through to a node of this terminal's own, which
-        // lands in the same shared session anyway.
-        if let Some(descriptor) = newest_live(&joined_to(&store.list_live()?, ticket))
-            && let Some(result) = attach_unless_busy(&descriptor, crate::client::StartScreen::Home)
-        {
-            return result;
-        }
+    // A node here is already in the fleet's session: use it rather than standing
+    // up a second one alongside it. Only while it is free — an occupied one
+    // falls through to a node of this terminal's own, which lands in the same
+    // shared session anyway.
+    //
+    // Asked before the fleet is looked up, and that order is the whole reason
+    // this stayed fast: the common case is a machine that already has p2pmux
+    // running, and making it wait on a network round trip to be told what it
+    // could see locally would put a visible pause on every bare `p2pmux`.
+    let live = store.list_live()?;
+    if let Some(descriptor) = newest_live(&hosting_the_fleet(&live, pairing.ticket.as_deref()))
+        && let Some(result) = attach_unless_busy(&descriptor, crate::client::StartScreen::Home)
+    {
+        return result;
     }
+    // Where the fleet says it is meeting, and then — if that is unreachable or
+    // unknown — the last place this machine saw it. Two addresses rather than
+    // one, because they fail in different ways: the record is right about a
+    // fleet that has moved and silent when the store is down, and the stored
+    // ticket is the reverse.
+    //
     // Which is a different question from whether there is a ticket at all: the
     // session offered to a machine that never came for it is still worth
     // attaching to while it is running here, and never worth dialling once it
     // is not. See `Pairing::rejoin_ticket`.
-    if let Some(ticket) = pairing.rejoin_ticket(crate::pairing::now_unix()) {
+    for ticket in fleet_addresses(&pairing).await {
         // Said before the dial, not after it. A sleeping paired machine still
         // makes the short rejoin window visible, where silence reads exactly
         // like a command that hung.
@@ -1442,8 +1452,13 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
             )?;
             stderr.flush()?;
         }
-        match rejoin_paired_session(ticket, Some(5000)).await {
+        match rejoin_paired_session(&ticket, Some(5000)).await {
             Ok(descriptor) => {
+                // The address that worked, kept for the next run. It is what
+                // gets dialled when the store cannot be reached, and a machine
+                // that has been in a fleet all week should not depend on a
+                // third party being up to find its own session.
+                remember_fleet_session(&ticket);
                 return crate::client::run_on(&descriptor, crate::client::StartScreen::Home);
             }
             // A paired machine that is asleep, or a session whose coordinator
@@ -1453,9 +1468,12 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
                 failed_rejoin_ticket = Some(ticket);
                 let mut stderr = io::stderr().lock();
                 writeln!(stderr, "could not rejoin the paired session: {error}")?;
-                writeln!(stderr, "starting a session on this machine instead")?;
             }
         }
+    }
+    if failed_rejoin_ticket.is_some() {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "starting a session on this machine instead")?;
     }
     // The fallback is this machine's answer to that ticket, and remembering it
     // is what lets the next bare command attach here instead of attempting the
@@ -1470,7 +1488,7 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     // role takes a moment longer than it does on a laptop, and losing it left
     // every later `p2pmux` paying the rejoin window again.
     let descriptor = start_solo_session(FleetRole::Home {
-        stands_in_for: failed_rejoin_ticket.map(str::to_owned),
+        stands_in_for: failed_rejoin_ticket,
     })?;
     // The session screen, not the inbox. A session created a moment ago has one
     // pane and no agents in it, so Home would open on an empty list — the blank
@@ -1495,25 +1513,99 @@ fn attach_unless_busy(
     }
 }
 
-/// The live sessions here that are the one the pairing recorded.
+/// The live sessions here that are this machine's place in its fleet.
 ///
-/// Matched by ticket rather than taken as "the newest", because a machine in a
-/// fleet also starts sessions of its own: attaching one of those for a bare
-/// `p2pmux` would put the user somewhere their other machines are not, which is
-/// the one place this command must never leave them. The coordinator that
-/// minted the pairing ticket holds it as `ticket`; every machine that joined
-/// holds the same string as `joined_ticket`.
-fn joined_to(
+/// Never "the newest", because a machine in a fleet also starts sessions of its
+/// own: attaching one of those for a bare `p2pmux` would put the user somewhere
+/// their other machines are not, which is the one place this command must never
+/// leave them.
+///
+/// `hosts_fleet` is the direct answer and is what every session started by this
+/// build carries. `stored_ticket` is how a session started by an older one is
+/// still recognised — a coordinator holds the ticket as `ticket` and a machine
+/// that joined holds the same string as `joined_ticket`. Dropping that second
+/// test would make the first `p2pmux` after an upgrade stand up a second
+/// session beside the one already running.
+fn hosting_the_fleet(
     live: &[crate::session_store::SessionDescriptor],
-    ticket: &str,
+    stored_ticket: Option<&str>,
 ) -> Vec<crate::session_store::SessionDescriptor> {
     live.iter()
         .filter(|descriptor| {
-            descriptor.joined_ticket.as_deref() == Some(ticket)
-                || descriptor.ticket.as_deref() == Some(ticket)
+            descriptor.hosts_fleet
+                || stored_ticket.is_some_and(|ticket| {
+                    descriptor.joined_ticket.as_deref() == Some(ticket)
+                        || descriptor.ticket.as_deref() == Some(ticket)
+                })
         })
         .cloned()
         .collect()
+}
+
+/// Every address worth dialling to reach this fleet, best first.
+///
+/// The record is asked first because it is the only one that can be *right*
+/// about a fleet that has moved. The stored ticket follows because it is the
+/// only one that answers when the store is unreachable — and a machine that has
+/// been in a fleet all week should not lose its own session to a third party
+/// being down.
+///
+/// Never the same address twice: the ordinary healthy case is a record that
+/// says exactly what the file already said, and paying the rejoin window twice
+/// for it would be a five-second pause nobody could explain.
+async fn fleet_addresses(pairing: &crate::pairing::Pairing) -> Vec<String> {
+    let mut published = None;
+    if let Some(key) = pairing.fleet_key() {
+        match crate::fleet::locate(&key).await {
+            Ok(record) => published = Some(record.ticket),
+            // Both are ordinary. Nobody hosting is what an idle fleet looks
+            // like, and an unreachable store is a network this machine may be
+            // about to get back. Neither is worth a line on stderr before the
+            // stored ticket has had its turn.
+            Err(error) => {
+                crate::perf::log(&format!("P2PMUX_FLEET locate failed: {error}"));
+            }
+        }
+    }
+    fleet_addresses_from(published, pairing.rejoin_ticket(crate::pairing::now_unix()))
+}
+
+/// The ordering itself, with the lookup already done.
+///
+/// Separated so the rule can be tested without a rendezvous service: what these
+/// two addresses are worth relative to each other is the decision, and reaching
+/// the network is only how one of them is obtained.
+fn fleet_addresses_from(published: Option<String>, stored: Option<&str>) -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Some(published) = published {
+        addresses.push(published);
+    }
+    if let Some(stored) = stored
+        && !addresses.iter().any(|known| known == stored)
+    {
+        addresses.push(stored.to_owned());
+    }
+    addresses
+}
+
+/// Keep the address that worked, so the next run has somewhere to go when the
+/// store does not answer.
+///
+/// Best effort and deliberately quiet: failing to write it costs one lookup
+/// later, and there is nothing a person reading a terminal could do about it.
+fn remember_fleet_session(ticket: &str) {
+    let Ok(mut pairing) = crate::pairing::load() else {
+        return;
+    };
+    if pairing.ticket.as_deref() == Some(ticket) {
+        return;
+    }
+    pairing.ticket = Some(ticket.to_owned());
+    // The ticket is somebody else's session now, whoever minted it. Saying
+    // otherwise would let `rejoin_ticket` decide this fleet is an invitation
+    // nobody accepted and stop dialling it.
+    pairing.offered_here = false;
+    let _ = crate::pairing::save(&pairing);
 }
 
 /// The most recently created live session, which is the one a bare command
@@ -2128,6 +2220,8 @@ fn wait_for_enter() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{fleet_addresses_from, hosting_the_fleet};
+
     #[test]
     fn create_uses_the_background_node_and_socket_client() {
         let source = include_str!("cli.rs");
@@ -2150,6 +2244,84 @@ mod tests {
     ///
     /// Pinned by order rather than by behaviour because the alternative is a
     /// test that waits out a real dial to a machine that is deliberately not
+    /// A live session here, as the store would describe it.
+    fn session(name: &str) -> crate::session_store::SessionDescriptor {
+        crate::session_store::SessionDescriptor::new(
+            format!("{:0>32}", name),
+            name.to_owned(),
+            std::path::PathBuf::from(format!("/tmp/p2pmux-{name}.sock")),
+            1,
+            crate::session_store::SessionRole::Coordinator,
+        )
+    }
+
+    #[test]
+    fn a_session_of_this_machines_own_is_not_the_one_bare_p2pmux_means() {
+        // The one place this command must never leave somebody: in a session
+        // their other machines are not in, looking at an inbox that seems to
+        // have lost them.
+        let mut home = session("warsaw");
+        home.hosts_fleet = true;
+        let side = session("philadelphia");
+
+        let found = hosting_the_fleet(&[side, home.clone()], None);
+
+        assert_eq!(
+            found.iter().map(|found| &found.name).collect::<Vec<_>>(),
+            vec![&home.name]
+        );
+    }
+
+    #[test]
+    fn a_session_started_before_this_release_is_still_recognised_by_its_ticket() {
+        // `hosts_fleet` is false on every session already running at the moment
+        // somebody upgrades. Without the ticket test, their first bare `p2pmux`
+        // would stand a second session up beside the one they are sitting in.
+        let mut coordinator = session("warsaw");
+        coordinator.ticket = Some(String::from("p2pmux-v3:TICKET"));
+        let mut member = session("philadelphia");
+        member.joined_ticket = Some(String::from("p2pmux-v3:TICKET"));
+
+        assert_eq!(
+            hosting_the_fleet(&[coordinator, member], Some("p2pmux-v3:TICKET")).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_published_address_is_tried_before_the_remembered_one() {
+        // The record is the only one that can be right about a fleet that has
+        // moved, which is the whole reason it exists.
+        assert_eq!(
+            fleet_addresses_from(Some(String::from("published")), Some("stored")),
+            vec![String::from("published"), String::from("stored")]
+        );
+    }
+
+    #[test]
+    fn the_remembered_address_answers_when_the_store_does_not() {
+        assert_eq!(
+            fleet_addresses_from(None, Some("stored")),
+            vec![String::from("stored")]
+        );
+    }
+
+    #[test]
+    fn one_address_is_never_dialled_twice() {
+        // The ordinary healthy case: the record says exactly what the file
+        // already said. Paying the rejoin window for it twice would be a
+        // five-second pause on every run that nobody could account for.
+        assert_eq!(
+            fleet_addresses_from(Some(String::from("same")), Some("same")),
+            vec![String::from("same")]
+        );
+    }
+
+    #[test]
+    fn a_machine_in_no_fleet_dials_nothing() {
+        assert!(fleet_addresses_from(None, None).is_empty());
+    }
+
     /// answering, and a half-minute of CI per run is a worse trade than this.
     #[test]
     fn bare_p2pmux_announces_the_rejoin_before_it_waits_on_one() {
@@ -2168,7 +2340,7 @@ mod tests {
             .find("rejoining the session this machine is paired with")
             .expect("open_home should say it is rejoining");
         let dial = body
-            .find("rejoin_paired_session(ticket, Some(5000))")
+            .find("rejoin_paired_session(&ticket, Some(5000))")
             .expect("open_home should rejoin");
         assert!(
             announcement < dial,
@@ -2196,7 +2368,7 @@ mod tests {
             .expect("background join")
             .0;
 
-        assert!(open_home.contains("rejoin_paired_session(ticket, Some(5000))"));
+        assert!(open_home.contains("rejoin_paired_session(&ticket, Some(5000))"));
         assert!(explicit_join.contains("connect_timeout_ms: None"));
     }
 

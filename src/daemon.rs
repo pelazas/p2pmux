@@ -45,6 +45,17 @@ const SUPERVISION_INTERVAL: Duration = Duration::from_secs(15);
 /// and every one of those fifty now cleans up after itself.
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// How often to ask where a quiet fleet is meeting.
+///
+/// Slower than [`SUPERVISION_INTERVAL`] because the question goes over the
+/// network to a shared service, and an idle fleet asking every fifteen seconds
+/// on every machine is a lot of traffic to establish that nothing has happened.
+/// Faster than [`MAX_RETRY_INTERVAL`] because this is not a failure being backed
+/// off: it is the ordinary state of a fleet whose other machines are asleep, and
+/// the promise at the top of this file is that this machine is *there* when one
+/// of them starts a session.
+const QUIET_FLEET_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How old a launch's leftover files must be before they are assumed to be
 /// litter rather than a launch still in progress.
 ///
@@ -471,17 +482,80 @@ pub enum Step {
     Follow(String),
     /// There is no fleet on this machine yet. Keep running and look again.
     WaitForPairing,
+    /// This machine is in a fleet, and no machine in it is hosting anything.
+    ///
+    /// Distinct from [`Self::WaitForPairing`], and the distinction is the whole
+    /// design: an idle fleet is a fleet whose other machines are switched off,
+    /// and the right thing to do about it is nothing. The agent must not create
+    /// a session to fill the gap — every unattended box in the fleet would do
+    /// the same thing at the same moment and the fleet would shatter into one
+    /// session per machine, each of them certain it was the meeting place.
+    /// Somebody starting `p2pmux` at a keyboard is what makes a home session.
+    FleetIsQuiet,
 }
 
-/// Read one tick's decision off the pairing record.
+/// Read one tick's decision off the pairing record and the fleet's own address.
 ///
-/// Split out so the loop below stays a loop and this stays a fact about the
-/// record: an agent with nothing to join waits, and only a ticket makes it act.
-pub fn next_step(pairing: &crate::pairing::Pairing) -> Step {
-    match pairing.ticket.as_deref() {
+/// Split out so the loop below stays a loop and this stays the decision. The
+/// two addresses are tried in the order [`crate::cli`] tries them and for the
+/// same reasons: the record is the only one that can be right about a fleet
+/// that has moved, and the stored ticket is the only one that answers when the
+/// store cannot be reached.
+pub async fn next_step(pairing: &crate::pairing::Pairing) -> Step {
+    let located = match pairing.fleet_key() {
+        Some(key) => Some(crate::fleet::locate(&key).await),
+        None => None,
+    };
+    step_for(located, pairing.ticket.as_deref())
+}
+
+/// The decision itself, with the lookup already done.
+///
+/// `located` is `None` for a machine with no fleet address at all — a fleet
+/// paired before they existed, which follows its ticket exactly as it always
+/// has and adopts an address the next time it shares a session with a machine
+/// that has one.
+///
+/// Separated from [`next_step`] so every branch can be tested without a
+/// rendezvous service. Pointing one at a fake through the environment would
+/// work exactly until two tests ran at once.
+pub fn step_for(
+    located: Option<Result<crate::fleet::FleetRecord, crate::fleet::LocateError>>,
+    stored_ticket: Option<&str>,
+) -> Step {
+    let follow_stored = || match stored_ticket {
         Some(ticket) => Step::Follow(ticket.to_owned()),
         None => Step::WaitForPairing,
+    };
+    match located {
+        None => follow_stored(),
+        Some(Ok(record)) => Step::Follow(record.ticket),
+        // Nobody is hosting, and this machine knows that for a fact. Dialling
+        // the address it remembers would be dialling a session the fleet has
+        // already left, which is the failure this replaced.
+        Some(Err(crate::fleet::LocateError::Nobody)) => Step::FleetIsQuiet,
+        // The store is down, or this machine's network is not up yet — so it
+        // knows nothing, rather than knowing nobody is there. The last address
+        // that worked is a far better guess than giving up, and on a box that
+        // has been in the same session for months it is usually still right.
+        Some(Err(crate::fleet::LocateError::Unreachable(_))) => match follow_stored() {
+            // With no stored ticket either there is nothing to dial, but this
+            // machine *is* paired: `WaitForPairing` would tell somebody reading
+            // the journal to run a command that is not the one they need.
+            Step::WaitForPairing => Step::FleetIsQuiet,
+            step => step,
+        },
     }
+}
+
+/// Which kind of nothing-to-do the agent is in, so it says each one once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Idle {
+    /// Not paired with anything. The fix is on this machine.
+    NoFleet,
+    /// Paired, and nobody is hosting. The fix is on another machine, or is
+    /// simply to wait for somebody to open a laptop.
+    QuietFleet,
 }
 
 /// Run the fleet agent in the foreground until told to stop.
@@ -503,7 +577,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut waiting = false;
+    // Which "nothing to do" this agent last said out loud, so it says each one
+    // once rather than on every tick. Two of them now, and they call for
+    // opposite things from whoever is reading the journal: pair this machine,
+    // or start p2pmux on one of the machines it is already paired with.
+    let mut idle: Option<Idle> = None;
     let mut backoff = Backoff::new(SUPERVISION_INTERVAL, MAX_RETRY_INTERVAL);
     // What the last attempt failed with, and how long the agent said it would
     // wait. Both are kept so the *next* failure can decide whether it is worth
@@ -524,11 +602,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         // Asked every tick rather than once at start, because both answers can
         // change under a service that outlives them: a machine paired after the
         // agent was installed, and one re-paired into a different session.
-        let delay = match next_step(&crate::pairing::load_or_empty()) {
+        let delay = match next_step(&crate::pairing::load_or_empty()).await {
             Step::Follow(ticket) => {
-                if waiting {
-                    println!("p2pmux fleet agent: paired — joining its home session");
-                    waiting = false;
+                if idle.take().is_some() {
+                    println!("p2pmux fleet agent: joining its home session");
                 }
                 match ensure_home_session(&ticket).await {
                     Ok(()) => {
@@ -569,12 +646,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             // whenever, pair whenever, and it starts working at the later of
             // the two.
             Step::WaitForPairing => {
-                if !waiting {
+                if idle != Some(Idle::NoFleet) {
                     println!(
                         "p2pmux fleet agent: this machine is not in a fleet yet — waiting for \
                          `p2pmux pair`"
                     );
-                    waiting = true;
+                    idle = Some(Idle::NoFleet);
                 }
                 // Nothing has failed, so nothing is backing off: an unpaired
                 // machine is idle, not broken, and should notice a `p2pmux pair`
@@ -582,6 +659,25 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 backoff.succeeded();
                 reported = None;
                 SUPERVISION_INTERVAL
+            }
+            // The state this whole redesign exists to make ordinary. Before the
+            // fleet had an address of its own, a machine with nowhere to go was
+            // indistinguishable from a machine dialling a session that had died
+            // days ago -- and it dialled anyway, forever, because there was
+            // nothing else it could do. Now there is: wait, and be told.
+            Step::FleetIsQuiet => {
+                if idle != Some(Idle::QuietFleet) {
+                    println!(
+                        "p2pmux fleet agent: no machine in this fleet is hosting a session — \
+                         waiting for one to start"
+                    );
+                    idle = Some(Idle::QuietFleet);
+                }
+                // Not a failure, so not backed off. Nothing is wrong with a
+                // fleet whose other machines are switched off.
+                backoff.succeeded();
+                reported = None;
+                QUIET_FLEET_INTERVAL
             }
         };
         tokio::select! {
@@ -655,7 +751,7 @@ mod tests {
 
     use super::{
         Backoff, MAX_RETRY_INTERVAL, MEMORY_HIGH_MB, MEMORY_MAX_MB, SERVICE_LABEL,
-        SUPERVISION_INTERVAL, ServiceUnit, Step, describe, next_step,
+        SUPERVISION_INTERVAL, ServiceUnit, Step, describe, step_for,
     };
 
     /// An upgrade replaces the binary under the running agent, and the old
@@ -864,15 +960,77 @@ mod tests {
     /// machine now rejoins its home session at boot".
     #[test]
     fn an_unpaired_machine_waits_instead_of_exiting() {
-        let mut pairing = crate::pairing::Pairing::default();
-        assert_eq!(next_step(&pairing), Step::WaitForPairing);
+        assert_eq!(step_for(None, None), Step::WaitForPairing);
 
         // And picks the fleet up when one appears, without being reinstalled.
-        pairing.ticket = Some(String::from("p2pmux-v3:whatever"));
         assert_eq!(
-            next_step(&pairing),
+            step_for(None, Some("p2pmux-v3:whatever")),
             Step::Follow(String::from("p2pmux-v3:whatever")),
             "a machine paired after the agent was installed is still its fleet"
+        );
+    }
+
+    /// A record for a ticket to follow.
+    fn record(ticket: &str) -> crate::fleet::FleetRecord {
+        crate::fleet::FleetRecord {
+            ticket: ticket.to_owned(),
+            host: String::new(),
+            published_at: 0,
+        }
+    }
+
+    #[test]
+    fn the_agent_follows_where_the_fleet_says_it_is_meeting() {
+        // Not the ticket in the file, which is the whole point: on 2026-08-16
+        // that ticket named a session that had been dead for days and the agent
+        // chased it every fifteen seconds for four of them.
+        assert_eq!(
+            step_for(Some(Ok(record("p2pmux-v3:NOW"))), Some("p2pmux-v3:THEN")),
+            Step::Follow(String::from("p2pmux-v3:NOW"))
+        );
+    }
+
+    #[test]
+    fn a_fleet_with_nobody_hosting_is_waited_on_rather_than_dialled() {
+        // The agent knows for a fact that there is nowhere to go. Falling back
+        // to the remembered address here would be dialling a session the fleet
+        // has already left — exactly the loop this replaced.
+        assert_eq!(
+            step_for(
+                Some(Err(crate::fleet::LocateError::Nobody)),
+                Some("p2pmux-v3:THEN")
+            ),
+            Step::FleetIsQuiet
+        );
+    }
+
+    #[test]
+    fn an_unreachable_directory_falls_back_to_the_address_that_last_worked() {
+        // A machine whose network is not up yet knows nothing, which is a
+        // different thing from knowing nobody is there.
+        assert_eq!(
+            step_for(
+                Some(Err(crate::fleet::LocateError::Unreachable(String::from(
+                    "dns"
+                )))),
+                Some("p2pmux-v3:THEN")
+            ),
+            Step::Follow(String::from("p2pmux-v3:THEN"))
+        );
+    }
+
+    #[test]
+    fn a_paired_machine_with_nothing_to_dial_is_never_told_to_pair() {
+        // It is already paired. Telling somebody reading the journal to run
+        // `p2pmux pair` would send them to fix a machine that is not broken.
+        assert_eq!(
+            step_for(
+                Some(Err(crate::fleet::LocateError::Unreachable(String::from(
+                    "dns"
+                )))),
+                None
+            ),
+            Step::FleetIsQuiet
         );
     }
 
