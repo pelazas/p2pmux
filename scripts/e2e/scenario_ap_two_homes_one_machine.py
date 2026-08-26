@@ -63,12 +63,21 @@ sleep 900
 """.strip()
 
 
+def is_row(line: str) -> bool:
+    """Whether this line is an inbox row rather than prose that names an agent.
+
+    The empty state says "Start claude, codex or opencode in any terminal",
+    which contains the agent kind. A row carries a status dot.
+    """
+    return AGENT_KIND in line and ("●" in line or "○" in line)
+
+
 def card_holding(screen: str, needle: str) -> list[str]:
-    """The three lines of the card whose location line matches."""
+    """The three lines of the card whose headline matches."""
     lines = screen.split("\n")
     for index, line in enumerate(lines):
-        if needle in line:
-            return lines[max(0, index - 2) : index + 1]
+        if needle in line and is_row(line):
+            return lines[index : index + 3]
     raise AssertionError(f"no card holding {needle!r} on screen:\n{screen}")
 
 
@@ -114,7 +123,9 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
 
         try:
             screen = mine.wait_until(
-                lambda s: AGENT_KIND in s, timeout=60, what="the other session's agent"
+                lambda s: any(is_row(line) for line in s.split("\n")),
+                timeout=60,
+                what="the other session's agent",
             )
         except DeadlineExceeded:
             check("the second session lists the first one's agent", False, mine.snapshot()[:600])
@@ -132,7 +143,8 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         except DeadlineExceeded:
             screen = mine.snapshot()
 
-        card = "\n".join(card_holding(screen, AGENT_KIND)) if AGENT_KIND in screen else ""
+        has_row = any(is_row(line) for line in screen.split("\n"))
+        card = "\n".join(card_holding(screen, AGENT_KIND)) if has_row else ""
         summary = " / ".join(line.strip() for line in card.split("\n"))[:220]
 
         check(

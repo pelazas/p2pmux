@@ -11,6 +11,37 @@ enrolment token — and a peer on the wrong side of it is refused rather than ha
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+Three fixes, and no protocol change that costs anything: one field is added to the agent roster,
+absent from older peers and degrading to what they already sent.
+
+**An agent in another session on your machine reads as one again.** The second session's inbox
+called a pane-hosted agent `running outside p2pmux` and offered to start a second copy of it. The
+two halves of that row come from different places: whether an agent sits in a p2pmux pane is read
+from the process table, which is machine-wide, while what that session is *called* comes from the
+session store, which lives under `HOME`. Two sessions started under two `HOME`s — an ad-hoc script
+with its own sandbox, a session started under `sudo`, another user of the same machine — see each
+other's processes and not each other's records, so the node was found, no name was found, and the
+label fell back to the one thing that was certainly untrue. The fact now travels separately from
+the name: without a name the row says `another p2pmux session · no record of it under this HOME`,
+and it is neither counted on the badge nor offered to Enter.
+
+**A pane that stopped repainting has a way out.** `Ctrl+P` then `Shift+R` redraws the whole screen.
+Frames carry only the cells that changed, which is what keeps a busy pane cheap and which fails
+whenever something else has written to the terminal — a cluster the terminal measures differently,
+a stray escape from a program in a pane, another multiplexer outside p2pmux. Until now the only cure
+was resizing the window, which people found by accident. Two narrower repairs ship with it: a keycap
+or a ZWJ emoji no longer reaches the terminal in a form it draws wider than the pane's grid reserved
+for it, and `p2pmux local` and the two legacy remote views repaint after a resize instead of
+diffing forever against a screen that moved.
+
+**Dimming the panes you are not in is now off by default, and narrower when it is on.** How faint
+reduced intensity renders is the terminal's decision rather than p2pmux's, and every mature
+implementation of it ships off for that reason. Turned on, it now means the panes nobody is
+reading: the pane under the pointer, one scrolled back through its own history, one a peer is
+driving, and one whose agent is working or waiting on you all stay at full strength.
+
 ## v0.1.14 — 2026-08-23
 
 Four additions and three fixes, and no protocol change: a fleet gets an address that outlives the

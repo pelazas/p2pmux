@@ -187,7 +187,13 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             except DeadlineExceeded:
                 screen = mine.snapshot()
 
-            rows = [line for line in screen.split("\n") if PANE_KIND in line]
+            # A status dot, so the empty state's "Start claude, codex or
+            # opencode in any terminal" is not read as a row.
+            rows = [
+                line
+                for line in screen.split("\n")
+                if PANE_KIND in line and ("●" in line or "○" in line)
+            ]
             summary = " / ".join(line.strip() for line in rows)[:200]
             check("the pane-hosted agent is on the observer's inbox", bool(rows), screen[:600])
             if not rows:

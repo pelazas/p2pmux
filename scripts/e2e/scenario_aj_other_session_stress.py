@@ -78,10 +78,17 @@ def open_inbox(peer, timeout: float = 30.0) -> None:
 
 
 def agent_row(screen: str) -> str | None:
-    """The inbox line mentioning the agent kind, plus the two lines under it."""
+    """The inbox line mentioning the agent kind, plus the two lines under it.
+
+    A row carries a status dot; the empty state carries the sentence "Start
+    claude, codex or opencode in any terminal", which contains the agent kind
+    and used to match here. An inbox with no rows on it therefore read as an
+    inbox with the right row on it, and every check below passed on a screen
+    that was telling the user it had found nothing.
+    """
     lines = screen.split("\n")
     for index, line in enumerate(lines):
-        if AGENT_KIND in line and "notify" not in line:
+        if AGENT_KIND in line and "notify" not in line and ("●" in line or "○" in line):
             return "\n".join(lines[index : index + 3])
     return None
 
