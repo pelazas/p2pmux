@@ -1540,6 +1540,7 @@ mod tests {
             controller: String::new(),
             message: String::from("permission: write to /etc/hosts"),
             session: String::new(),
+            in_another_session: false,
         };
         tui.set_agent_rows(vec![agent.clone()]);
         assert!(

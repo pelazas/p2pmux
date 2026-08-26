@@ -501,6 +501,16 @@ fn home_location(row: &AgentOverlayRow, cwd_already_shown: bool) -> String {
         // prefixed with the directory: the command is the payload, and a
         // narrow terminal truncates the tail, which would cut exactly the half
         // worth reading.
+        //
+        // Without a name there is no command to offer, and the reason is worth
+        // saying: a name comes from the session store and a store belongs to a
+        // `HOME`, so a session started under a different one is visible in the
+        // process table and absent from the records. Saying so beats both the
+        // old answer, which called a pane two windows over `running outside
+        // p2pmux`, and an `attach` line with a blank where the name goes.
+        if row.session.is_empty() {
+            return String::from("another p2pmux session · no record of it under this HOME");
+        }
         return format!("another p2pmux session · p2pmux attach {}", row.session);
     }
     let where_it_runs = if row.outside_p2pmux() {
@@ -1666,6 +1676,48 @@ mod tests {
         assert!(drawn.contains("tab 1 · pane 1"), "{drawn}");
     }
 
+    /// Issue #121: the same card, for a session this machine cannot name.
+    ///
+    /// A name comes from the session store and a store belongs to a `HOME`, so
+    /// two sessions started on one box under two of them — an ad-hoc script
+    /// with its own sandbox, a session started under `sudo` — see each other's
+    /// processes and not each other's records. The row used to read `running
+    /// outside p2pmux`, and offer a keypress that starts a *second* copy of an
+    /// agent already running two windows over.
+    #[test]
+    fn an_agent_in_a_session_this_home_cannot_name_still_says_which_it_is() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        let mut rows = tui.agent_rows.clone();
+        rows.push(crate::tui::AgentOverlayRow {
+            pane_id: 0,
+            process_pid: 985,
+            host: String::from("laptop"),
+            kind: String::from("claude"),
+            state: AgentRosterState::Pending,
+            // The node above it was found; the name for that node was not.
+            session: String::new(),
+            in_another_session: true,
+            ..agent_row(0, 0, 0)
+        });
+        tui.set_agent_rows(rows);
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(
+            drawn.contains("another p2pmux session · no record of it under this HOME"),
+            "the row says which of the two things it is, and why it can offer no command: {drawn}"
+        );
+        assert!(
+            !drawn.contains("running outside p2pmux"),
+            "and never claims a pane two windows over is not in p2pmux at all: {drawn}"
+        );
+        assert!(
+            !drawn.contains("p2pmux attach "),
+            "there is no name to attach to, so no attach line is offered: {drawn}"
+        );
+    }
+
     /// The card the click used to send the user nowhere. It has to say — before
     /// any keypress, and without needing one — which session that agent is in
     /// and what reaches it, and it has to look unlike the rows Enter opens.
@@ -1685,6 +1737,7 @@ mod tests {
             kind: String::from("claude"),
             state: AgentRosterState::Pending,
             session: String::from("dakar"),
+            in_another_session: true,
             ..agent_row(0, 0, 0)
         });
         tui.set_agent_rows(rows);

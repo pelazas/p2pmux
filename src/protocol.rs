@@ -886,8 +886,29 @@ pub struct AgentRosterEntry {
     ///
     /// Empty for an agent genuinely outside p2pmux, which is the shape this
     /// field was added around and the one older peers will always send.
+    ///
+    /// Empty is also what a machine sends for a session it cannot *name* --
+    /// see `in_another_session` below, which is the fact this one was standing
+    /// in for and could not always carry.
     #[prost(string, tag = "7")]
     pub session_name: String,
+    /// Whether the reporting machine found a p2pmux node above this agent's
+    /// process that is not the node reporting it.
+    ///
+    /// `session_name` was doing this job and could only do half of it. A name
+    /// comes from the session store, and a store belongs to a `HOME`: two
+    /// sessions started on one machine under two different `HOME`s -- an ad-hoc
+    /// probe script, a session started under `sudo`, anything with its own
+    /// sandbox -- can see each other's processes and not each other's records.
+    /// So the scan would find the node, correctly, have no name for it, and the
+    /// row fell back to the flat, wrong `running outside p2pmux` for an agent
+    /// sitting in a pane two windows over.
+    ///
+    /// This carries the half that does not depend on the store. False from an
+    /// older peer, which is the same degradation as before it existed: the name
+    /// still answers it whenever the name is there.
+    #[prost(bool, tag = "8")]
+    pub in_another_session: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]

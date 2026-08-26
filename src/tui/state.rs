@@ -149,8 +149,17 @@ pub struct AgentOverlayRow {
     pub message: String,
     /// The p2pmux session this agent's pane belongs to, when it is not this
     /// one. Empty for a pane of this session and for an agent genuinely under
-    /// no p2pmux at all.
+    /// no p2pmux at all -- and also for one whose session this machine cannot
+    /// name, which is what `in_another_session` is for.
     pub session: String,
+    /// Whether this agent is in another session's pane, name or no name.
+    ///
+    /// A name comes from the session store and a store belongs to a `HOME`, so
+    /// two sessions started on one machine under two `HOME`s see each other's
+    /// processes and not each other's records. The scan finds the node either
+    /// way; only the label depended on the store, and that is what made a pane
+    /// two windows over read as `running outside p2pmux`.
+    pub in_another_session: bool,
 }
 
 impl AgentOverlayRow {
@@ -184,7 +193,7 @@ impl AgentOverlayRow {
     /// client is not attached to, and that is a different thing from either of
     /// the two the inbox knew how to say.
     pub(in crate::tui) fn in_another_session(&self) -> bool {
-        self.outside_p2pmux() && !self.session.is_empty()
+        self.outside_p2pmux() && self.in_another_session
     }
 
     /// Whether Enter on this row can put the user in front of the conversation

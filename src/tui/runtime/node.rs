@@ -472,6 +472,12 @@ impl SharedLayoutRuntime {
                         sanitize_single_line(&agent.session),
                         crate::protocol::MAX_SESSION_NAME_BYTES,
                     ),
+                    // And the same fact without the name, which is the half
+                    // that survives a session whose records this machine's
+                    // `HOME` cannot see. The scan found a node above this
+                    // process; whether anything here can say what that session
+                    // is called is a separate question with a separate answer.
+                    in_another_session: agent.node_pid != 0,
                 }),
         );
         if entries == self.last_local_agent_entries && now < self.next_agent_roster_heartbeat {
@@ -638,6 +644,9 @@ impl SharedLayoutRuntime {
                         // no pane and nobody holding it, and the row says so
                         // with dashes rather than inventing a location.
                         let session = sanitize_single_line(&entry.session_name);
+                        // A name implies the session, so a peer too old to send
+                        // the flag still gets this right whenever it sent one.
+                        let in_another_session = entry.in_another_session || !session.is_empty();
                         AgentOverlayRow {
                             pane_id: 0,
                             process_pid: entry.process_pid,
@@ -646,10 +655,12 @@ impl SharedLayoutRuntime {
                             tab_label: String::from("—"),
                             // A pane of another session is still a pane, and
                             // this column used to swear otherwise.
-                            pane_label: if session.is_empty() {
-                                String::from("not in p2pmux")
-                            } else {
+                            pane_label: if !session.is_empty() {
                                 format!("session {session}")
+                            } else if in_another_session {
+                                String::from("another session")
+                            } else {
+                                String::from("not in p2pmux")
                             },
                             kind: sanitize_single_line(&entry.agent_kind),
                             cwd: sanitize_single_line(&entry.cwd),
@@ -674,6 +685,7 @@ impl SharedLayoutRuntime {
                                 .map(|agent| agent.message.clone())
                                 .unwrap_or_default(),
                             session,
+                            in_another_session,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -739,8 +751,9 @@ impl SharedLayoutRuntime {
                                 .map(|listed| listed.message)
                                 .unwrap_or_default(),
                             // A pane of this session. There is no other
-                            // session to send the user to.
+                            // session to send the user to, and none to be in.
                             session: String::new(),
+                            in_another_session: false,
                         })
                     })
                     .chain(loose)

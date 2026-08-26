@@ -267,9 +267,16 @@ pub struct AgentOverlaySnapshotRow {
     #[serde(default)]
     pub message: String,
     /// The p2pmux session an agent with no pane of ours is in, when the node
-    /// found one above its process. Empty for every pane row.
+    /// found one above its process *and* this machine's session store has a
+    /// name for it. Empty for every pane row.
     #[serde(default)]
     pub session: String,
+    /// Whether that agent is in another session's pane at all, which is the
+    /// half of the question above that does not need a name -- and so the half
+    /// that survives a session started under another `HOME`. See
+    /// [`crate::tui::AgentOverlayRow::in_another_session`].
+    #[serde(default)]
+    pub in_another_session: bool,
 }
 
 impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
@@ -285,6 +292,7 @@ impl From<&crate::tui::AgentOverlayRow> for AgentOverlaySnapshotRow {
             controller: row.controller.clone(),
             message: row.message.clone(),
             session: row.session.clone(),
+            in_another_session: row.in_another_session,
         }
     }
 }

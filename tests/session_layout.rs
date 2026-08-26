@@ -433,6 +433,7 @@ fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
             state: AgentRosterState::Working as i32,
             working_since_unix_ms: 0,
             session_name: String::new(),
+            in_another_session: false,
         }],
     };
     assert_eq!(coordinator.accept_agent_roster(&host_b(), forged), None);
@@ -451,6 +452,7 @@ fn agent_rosters_replace_per_host_and_reject_other_hosts_panes() {
                     state: AgentRosterState::Working as i32,
                     working_since_unix_ms: 0,
                     session_name: String::new(),
+                    in_another_session: false,
                 }],
             },
         )

@@ -5390,6 +5390,7 @@ mod control_queue_tests {
                     state: AgentRosterState::Working as i32,
                     working_since_unix_ms: 0,
                     session_name: String::new(),
+                    in_another_session: false,
                 }],
             }),
         )

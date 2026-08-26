@@ -1969,6 +1969,7 @@ mod tests {
             if row.pane_id == 0 {
                 row.host = String::from("laptop");
                 row.session = String::from("dakar");
+                row.in_another_session = true;
             }
         }
         tui.set_agent_rows(rows);
@@ -2009,6 +2010,44 @@ mod tests {
                 "the arrows walked onto a row Enter cannot open"
             );
         }
+    }
+
+    /// Issue #121: the same refusals for a session this machine cannot name.
+    ///
+    /// The name is read out of the session store, and a store belongs to a
+    /// `HOME`. Two sessions on one machine under two of them see each other's
+    /// processes and not each other's records — so `session` is empty while the
+    /// agent is every bit as unreachable as one whose session has a name. Every
+    /// refusal above has to hold on the fact rather than on the label.
+    #[test]
+    fn a_session_this_home_cannot_name_is_still_another_session() {
+        let mut tui = a_bot_in_a_session_of_its_own();
+        let mut rows = tui.agent_rows.clone();
+        for row in &mut rows {
+            if row.pane_id == 0 {
+                row.session = String::new();
+                row.state = AgentRosterState::Pending;
+            } else {
+                row.state = AgentRosterState::Pending;
+            }
+        }
+        tui.set_agent_rows(rows);
+        let detached = the_detached_agent(&tui);
+
+        assert_eq!(tui.home_rows().len(), 2, "it stays on the list either way");
+        for step in 0..6 {
+            tui.move_home_selection(step % 2 == 0);
+            assert_ne!(
+                tui.home_selected.as_ref(),
+                Some(&detached),
+                "the cursor walks past a row Enter cannot open, named or not"
+            );
+        }
+        assert_eq!(
+            tui.home_needs_you_count(),
+            1,
+            "and its summons is not one anybody here can answer"
+        );
     }
 
     /// The pointer is the one input that can reach any card on screen, and the

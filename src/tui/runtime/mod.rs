@@ -98,6 +98,10 @@ pub struct SharedLayoutRuntime {
     /// loose agent with no enclosing node is genuinely outside p2pmux or merely
     /// unrecognised. See `name_their_sessions`.
     pub(in crate::tui) session_records_loaded: bool,
+    /// When [`Self::session_records`] was last read from disk, so that an agent
+    /// whose node nothing here recognises can ask again without asking on every
+    /// frame. See `name_their_sessions`.
+    pub(in crate::tui) session_records_read_at: Option<Instant>,
     /// Whether this node has told the session it belongs to a fleet. See
     /// `announce_fleet_membership`.
     pub(in crate::tui) announced_fleet_membership: bool,
@@ -283,6 +287,7 @@ impl SharedLayoutRuntime {
             loose_agents: Vec::new(),
             session_records: HashMap::new(),
             session_records_loaded: false,
+            session_records_read_at: None,
             announced_fleet_membership: false,
             considered_fleet_invites: HashMap::new(),
             next_agent_roster_heartbeat: Instant::now(),
@@ -562,6 +567,7 @@ mod tests {
             cwd: String::from("/home/pelazas"),
             working_since_unix_ms: 0,
             session_name: String::new(),
+            in_another_session: false,
         };
         for (generation, peer) in [&host_id, &second_id].into_iter().enumerate() {
             runtime.agent_rosters.insert(
@@ -586,6 +592,54 @@ mod tests {
             "and it is attributed to the machine the rail draws, not to whichever \
              node happened to report it: {rows:#?}"
         );
+        assert!(
+            !rows[0].in_another_session(),
+            "a bot in no session at all is still in no session: {rows:#?}"
+        );
+
+        // Issue #121. The same bot, reported by a machine that found a p2pmux
+        // node above it and had no name to give: two sessions on one box under
+        // two `HOME`s see each other's processes and not each other's records.
+        // Without a name this row used to read `running outside p2pmux`, which
+        // is the one thing it certainly was not.
+        let mut nameless = bot(4243);
+        nameless.in_another_session = true;
+        // And the shape an older peer sends: a name, and no flag to go with it.
+        let mut older_peer = bot(4244);
+        older_peer.session_name = String::from("dakar");
+        for (generation, peer) in [&host_id, &second_id].into_iter().enumerate() {
+            runtime.agent_rosters.insert(
+                peer.clone(),
+                AgentRoster {
+                    host_peer_id: peer.clone(),
+                    generation: generation as u64 + 3,
+                    entries: vec![bot(4242), nameless.clone(), older_peer.clone()],
+                },
+            );
+        }
+
+        let rows = runtime.agent_overlay_rows();
+        let row_for = |pid: u32| {
+            rows.iter()
+                .find(|row| row.process_pid == pid)
+                .unwrap_or_else(|| panic!("no row for {pid}: {rows:#?}"))
+        };
+        assert!(
+            row_for(4243).in_another_session(),
+            "a session with no name here is still a session: {rows:#?}"
+        );
+        assert_eq!(
+            row_for(4243).pane_label,
+            "another session",
+            "and the column that says where it is says so too"
+        );
+        assert!(
+            row_for(4244).in_another_session(),
+            "and a name still answers it on its own, for a peer too old to send the flag"
+        );
+        assert_eq!(row_for(4244).pane_label, "session dakar");
+        assert!(!row_for(4242).in_another_session());
+        assert_eq!(row_for(4242).pane_label, "not in p2pmux");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

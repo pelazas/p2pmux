@@ -1,6 +1,11 @@
 //! The terminal loop: poll events, apply them, drain panes, draw a frame.
 
-use std::{collections::BTreeMap, error::Error, io, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    io,
+    time::{Duration, Instant},
+};
 
 use crossterm::{
     event::{
@@ -606,26 +611,17 @@ impl SharedLayoutRuntime {
     /// twice: once where Enter reaches it, and once as an unreachable row whose
     /// way in was `p2pmux attach` naming the session already on screen.
     fn name_their_sessions(&mut self, loose: &mut Vec<crate::agent_detect::LooseAgent>) {
-        let unknown = loose.iter().any(|agent| {
-            agent.node_pid != 0 && !self.session_records.contains_key(&agent.node_pid)
-        });
-        // …and once, unconditionally, as soon as there is any loose agent at
-        // all. `unknown` alone cannot ask for this: it is keyed on `node_pid !=
-        // 0`, so an agent whose enclosing node was *not* identified never
-        // triggers a re-read, and the map it would have been found in is never
-        // loaded. That is the difference between a row that is briefly wrong
-        // and one that says `running outside p2pmux` for the life of the
-        // session about an agent sitting in a pane two windows over.
-        //
-        // Reading it also gives the next pass its `known_nodes`, which is what
-        // lets that failed walk succeed the second time round.
-        let never_loaded = !self.session_records_loaded && !loose.is_empty();
-        if (unknown || never_loaded)
-            && let Ok(store) = crate::session_store::SessionStore::for_current_user()
+        if session_records_are_worth_rereading(
+            loose,
+            &self.session_records,
+            self.session_records_loaded,
+            self.session_records_read_at.map(|read| read.elapsed()),
+        ) && let Ok(store) = crate::session_store::SessionStore::for_current_user()
             && let Ok(sessions) = store.sessions_by_node_pid()
         {
             self.session_records = sessions;
             self.session_records_loaded = true;
+            self.session_records_read_at = Some(Instant::now());
         }
         let ours = std::process::id();
         // Cloned rather than borrowed: the retain below reads the same map, and
@@ -653,5 +649,164 @@ impl SharedLayoutRuntime {
 
     pub(in crate::tui) fn spawn_remote_shutdown(&self, pane: GuestPane) {
         self.runtime.spawn(async move { pane.shutdown().await });
+    }
+}
+
+/// How long a session map that could not answer stands before it is asked again.
+///
+/// Long enough that a bot under systemd -- which is permanently unrecognised
+/// and permanently correct about it -- does not put a directory read on the
+/// redraw path, short enough that a node that appeared a moment ago is named
+/// while the person is still looking at the row.
+const SESSION_RECORDS_RETRY: Duration = Duration::from_secs(5);
+
+/// Whether the node-pid → session map should be read off disk again.
+///
+/// It is cached because this runs on a redraw path and the store is on disk.
+/// What decides a re-read is a loose agent the map cannot account for, and
+/// there are three ways to be one:
+///
+/// - its node is known and the map has never heard of it. That is a session
+///   that started after the last read, and it is asked for immediately: the
+///   answer is certainly there.
+/// - the map has never been read at all. The first loose agent asks, because an
+///   empty map means both "no other sessions" and "never looked", and the two
+///   have to be told apart before a row can call anything `running outside
+///   p2pmux`.
+/// - its node was *not* identified. This one is the reason the function exists.
+///   The walk that identifies a node reads a command line out of a process
+///   sampler, and a sampler that returns nothing for a process leaves the agent
+///   looking like it is in no session at all -- which used to trigger nothing,
+///   because "unknown node" was keyed on the node having been identified. So
+///   one failed walk was not a flicker, it was a row that stayed wrong for the
+///   life of the session. Reading the map is also what supplies the *next*
+///   pass's `known_nodes`, which is what lets that walk succeed the second time
+///   round -- so this is the retry, and it needs a rate limit rather than a
+///   condition, because an agent genuinely outside p2pmux never stops asking.
+fn session_records_are_worth_rereading(
+    loose: &[crate::agent_detect::LooseAgent],
+    records: &HashMap<u32, crate::session_store::LocalSession>,
+    loaded: bool,
+    since_last_read: Option<Duration>,
+) -> bool {
+    if loose.is_empty() {
+        return false;
+    }
+    if !loaded {
+        return true;
+    }
+    if loose
+        .iter()
+        .any(|agent| agent.node_pid != 0 && !records.contains_key(&agent.node_pid))
+    {
+        return true;
+    }
+    loose.iter().any(|agent| agent.node_pid == 0)
+        && since_last_read.is_none_or(|elapsed| elapsed >= SESSION_RECORDS_RETRY)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, time::Duration};
+
+    use crate::{
+        agent_detect::{AgentKind, AgentState, LooseAgent},
+        session_store::LocalSession,
+    };
+
+    use super::{SESSION_RECORDS_RETRY, session_records_are_worth_rereading};
+
+    fn agent(pid: u32, node_pid: u32) -> LooseAgent {
+        LooseAgent {
+            kind: AgentKind::Claude,
+            pid,
+            cwd: String::new(),
+            start_time: None,
+            node_pid,
+            session: String::new(),
+            state: AgentState::Unknown,
+            message: String::new(),
+            working_since_unix_ms: 0,
+        }
+    }
+
+    fn named(node_pid: u32) -> HashMap<u32, LocalSession> {
+        HashMap::from([(
+            node_pid,
+            LocalSession {
+                name: String::from("dakar"),
+                tickets: Vec::new(),
+            },
+        )])
+    }
+
+    #[test]
+    fn a_machine_with_no_loose_agent_never_touches_the_disk() {
+        assert!(!session_records_are_worth_rereading(
+            &[],
+            &HashMap::new(),
+            true,
+            None
+        ));
+        assert!(
+            !session_records_are_worth_rereading(&[], &HashMap::new(), false, None),
+            "not even the first time: there is nothing to name"
+        );
+    }
+
+    #[test]
+    fn the_first_loose_agent_reads_the_map_once() {
+        assert!(session_records_are_worth_rereading(
+            &[agent(10, 0)],
+            &HashMap::new(),
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_node_the_map_has_never_heard_of_is_asked_about_at_once() {
+        assert!(
+            session_records_are_worth_rereading(
+                &[agent(10, 50)],
+                &named(60),
+                true,
+                Some(Duration::from_millis(1))
+            ),
+            "a session that started since the last read is certainly on disk now"
+        );
+        assert!(
+            !session_records_are_worth_rereading(&[agent(10, 50)], &named(50), true, None),
+            "and one the map already names asks for nothing"
+        );
+    }
+
+    /// Issue #121's other half: an agent whose node was never identified.
+    ///
+    /// The map is where the identification would come from -- it supplies the
+    /// next pass's `known_nodes` -- so refusing to re-read for exactly these
+    /// agents is what turned one failed walk into a permanently wrong row. It
+    /// is rate-limited rather than conditional because a bot under systemd is
+    /// unrecognised forever and correctly so, and it must not put a directory
+    /// read on every frame.
+    #[test]
+    fn an_agent_with_no_node_asks_again_but_not_on_every_frame() {
+        let loose = [agent(10, 0)];
+        assert!(
+            session_records_are_worth_rereading(&loose, &HashMap::new(), true, None),
+            "the map has been read, but never since this agent turned up"
+        );
+        assert!(!session_records_are_worth_rereading(
+            &loose,
+            &HashMap::new(),
+            true,
+            Some(SESSION_RECORDS_RETRY / 2)
+        ));
+        assert!(session_records_are_worth_rereading(
+            &loose,
+            &HashMap::new(),
+            true,
+            Some(SESSION_RECORDS_RETRY)
+        ));
     }
 }

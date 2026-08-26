@@ -92,6 +92,7 @@ pub(in crate::tui) fn agent_row(
         host: String::from("Host"),
         controller: String::from("free"),
         session: String::new(),
+        in_another_session: false,
     }
 }
 

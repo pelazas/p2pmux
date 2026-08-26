@@ -233,6 +233,7 @@ async fn agent_roster_relays_to_members_and_bootstraps_late_joiners() {
                 state: AgentRosterState::Working as i32,
                 working_since_unix_ms: 0,
                 session_name: String::new(),
+                in_another_session: false,
             }],
         })
         .expect("first publishes roster");
