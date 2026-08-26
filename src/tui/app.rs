@@ -153,7 +153,15 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
                     let bytes = encode_paste(&text, parser.screen().bracketed_paste());
                     host.write_input(&bytes)?;
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => {
+                    // The grid here is fixed at startup and a resize does not
+                    // change it -- but it does disturb the screen the frame is
+                    // drawn on, and ratatui writes only what differs from the
+                    // screen it believes is up. Believing wrongly is permanent, so
+                    // the next frame is drawn in full. #120.
+                    reset_outer_pending = true;
+                    dirty = true;
+                }
                 _ => {}
             }
         }
@@ -338,7 +346,15 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
                         | LeaseDecision::RejectActiveController => {}
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => {
+                    // The grid here is fixed at startup and a resize does not
+                    // change it -- but it does disturb the screen the frame is
+                    // drawn on, and ratatui writes only what differs from the
+                    // screen it believes is up. Believing wrongly is permanent, so
+                    // the next frame is drawn in full. #120.
+                    reset_outer_pending = true;
+                    dirty = true;
+                }
                 _ => {}
             }
         }
@@ -375,6 +391,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     let mut pending_control = false;
     let mut held_input = Vec::new();
     let mut dirty = true;
+    let mut repaint_pending = false;
     let mut last_draw: Option<Instant> = None;
 
     loop {
@@ -448,6 +465,10 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
         }
 
         if dirty && frame_due(last_draw) {
+            if repaint_pending {
+                clear_before_first_frame(&mut terminal, Rect::new(0, 0, cols, rows))?;
+                repaint_pending = false;
+            }
             begin_synchronized_output()?;
             terminal.draw(|frame| {
                 if let Some(screen) = remote.screen() {
@@ -537,7 +558,15 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => {
+                    // The grid here is fixed at startup and a resize does not
+                    // change it -- but it does disturb the screen the frame is
+                    // drawn on, and ratatui writes only what differs from the
+                    // screen it believes is up. Believing wrongly is permanent, so
+                    // the next frame is drawn in full. #120.
+                    repaint_pending = true;
+                    dirty = true;
+                }
                 _ => {}
             }
         }

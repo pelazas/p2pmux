@@ -104,6 +104,32 @@ const NORMAL_FOOTER_TIERS: &[&[FooterSegment]] = &[
     NORMAL_FOOTER_KEYS_ONLY,
     &[],
 ];
+const PANE_FOOTER_WITH_REDRAW: &[FooterSegment] = &[
+    FooterSegment::Text("  <"),
+    FooterSegment::Key("←↓↑→"),
+    FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("e"),
+    FooterSegment::Text("> RENAME   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("r/l/d/u"),
+    FooterSegment::Text("> SPLIT   <"),
+    FooterSegment::Key("z"),
+    FooterSegment::Text("> ZOOM   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("k"),
+    FooterSegment::Text("> LOCK   <"),
+    FooterSegment::Key("L"),
+    FooterSegment::Text("> SESSION   <"),
+    FooterSegment::Key("R"),
+    FooterSegment::Text("> REDRAW   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
+];
+/// Redraw is the first thing to go, and it is on the bar at all only so that
+/// somebody looking at a screen full of stale glyphs can find it without
+/// leaving the program. It is the rescue key, not a key anyone plans to press.
 const PANE_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
     FooterSegment::Key("←↓↑→"),
@@ -147,7 +173,11 @@ const PANE_FOOTER_NO_SESSION_LOCK: &[FooterSegment] = &[
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
-const PANE_FOOTER_TIERS: &[&[FooterSegment]] = &[PANE_FOOTER_FULL, PANE_FOOTER_NO_SESSION_LOCK];
+const PANE_FOOTER_TIERS: &[&[FooterSegment]] = &[
+    PANE_FOOTER_WITH_REDRAW,
+    PANE_FOOTER_FULL,
+    PANE_FOOTER_NO_SESSION_LOCK,
+];
 const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
     FooterSegment::Key("←→"),

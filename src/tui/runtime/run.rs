@@ -193,6 +193,12 @@ impl SharedLayoutRuntime {
                 terminal.resize(Rect::new(0, 0, cols, rows))?;
                 dirty = true;
             }
+            // The redraw chord, answered on the same path a pane's own reset
+            // takes. See `MultiPaneTui::take_repaint_request`.
+            if self.tui.take_repaint_request() {
+                reset_outer_pending = true;
+                dirty = true;
+            }
             if dirty && frame_due(last_draw) {
                 for (pane_id, pane) in &self.local {
                     let screen = pane.screen.current_frame();

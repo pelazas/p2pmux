@@ -52,6 +52,10 @@ pub struct MultiPaneTui {
     pub(in crate::tui) current_tab: TabId,
     pub(in crate::tui) focused_pane: PaneId,
     pub(in crate::tui) hovered_pane: Option<PaneId>,
+    /// Set by the redraw chord, cleared by the run loop that acts on it.
+    ///
+    /// See [`Self::take_repaint_request`] for what it is for.
+    pub(in crate::tui) repaint_requested: bool,
     pub(in crate::tui) chord_mode: ChordMode,
     pub(in crate::tui) chord_last_activity: Option<Instant>,
     pub(in crate::tui) pane_views: BTreeMap<PaneId, PaneViewState>,
@@ -166,6 +170,22 @@ impl MultiPaneTui {
         self.dim_unfocused_panes = dim;
     }
 
+    /// Whether the user has asked for the whole screen to be painted again.
+    ///
+    /// Ratatui writes only the cells that differ from the screen it believes is
+    /// up, so anything that makes that belief wrong is permanent: the cells it
+    /// thinks are already correct are never written again, and the stale glyphs
+    /// stay until something resets the back buffer. This program can model the
+    /// widths it emits and does, but it cannot model the terminal -- a stray
+    /// sequence from a program in a pane, a multiplexer outside it, a terminal
+    /// with its own ideas about a cluster's width -- and there was no way out of
+    /// that state short of resizing the window, which people found by accident.
+    ///
+    /// tmux has had `prefix + r` for this for a decade, for the same reason.
+    pub fn take_repaint_request(&mut self) -> bool {
+        std::mem::take(&mut self.repaint_requested)
+    }
+
     pub fn with_theme(snapshot: LayoutSnapshot, theme: UiTheme) -> Result<Self, LayoutError> {
         crate::layout::SessionState::validate_snapshot(&snapshot)?;
         let current_tab = snapshot.tabs[0].tab_id;
@@ -187,6 +207,7 @@ impl MultiPaneTui {
             current_tab,
             focused_pane,
             hovered_pane: None,
+            repaint_requested: false,
             chord_mode: ChordMode::None,
             chord_last_activity: None,
             pane_views,

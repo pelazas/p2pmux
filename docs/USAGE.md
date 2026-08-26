@@ -206,6 +206,14 @@ arrow never leaves sideways when there is somewhere it should have gone.
   never mistaken for a tab with one pane in it. Moving focus stands the zoom down, since looking
   elsewhere and hiding elsewhere cannot both be what you meant. Nothing to zoom on a tab that is
   already one pane, so the key does nothing there.
+- `Ctrl+P`, then `Shift+R` — repaint the whole screen. Nothing else in p2pmux asks for this: the
+  client draws only the cells that changed since the last frame, which is what keeps a busy pane
+  cheap, and it works because the client knows what is on your screen. When something else has
+  written there — a terminal that measures an emoji differently, a stray escape from a program in a
+  pane, another multiplexer outside p2pmux — that knowledge is wrong and the cells it believes are
+  already right are never written again, so the stale glyphs stay. This throws that belief away.
+  Purely local, like zoom: no peer sees anything happen. Resizing the window by a column has the
+  same effect, which is how people used to find their way out.
 - `Ctrl+P`, then arrows — move focus.
 - `Ctrl+T`, then `N` — create a tab with a local PTY on the requester's machine.
 - `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
@@ -236,7 +244,7 @@ to switch tabs without claiming control or sending input.
 The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   <↑↓←→> FOCUS    type to claim when free`;
 pane mode is
-`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <L> SESSION   <Esc> BACK`, dropping `<L> SESSION` on a terminal too narrow to hold it whole rather than clipping the bar mid-word;
+`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <L> SESSION   <R> REDRAW   <Esc> BACK`, dropping `<R> REDRAW` and then `<L> SESSION` on a terminal too narrow to hold them whole rather than clipping the bar mid-word;
 tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 ## Presence

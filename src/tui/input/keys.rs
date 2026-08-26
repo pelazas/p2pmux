@@ -110,6 +110,7 @@ pub(in crate::tui) fn is_chord_command(mode: ChordMode, key: KeyEvent) -> bool {
                 | KeyCode::Char('z')
                 | KeyCode::Char('k')
                 | KeyCode::Char('L')
+                | KeyCode::Char('R')
                 | KeyCode::Char('i')
                 | KeyCode::Left
                 | KeyCode::Right

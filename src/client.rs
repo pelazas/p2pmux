@@ -758,6 +758,14 @@ pub fn run_on(
                 dirty |= tui.follow_selection_autoscroll(terminal.size()?.into());
             }
         }
+        // The redraw chord, answered on the same path a pane's own reset takes:
+        // clear the viewport, drop the back buffer, and draw the next frame in
+        // full. Nothing else in this loop ever resets that belief, which is why
+        // resizing the window by a column used to be the only cure.
+        if tui.as_mut().is_some_and(MultiPaneTui::take_repaint_request) {
+            reset_outer_pending = true;
+            dirty = true;
+        }
         if dirty {
             if let Some(tui) = tui.as_ref() {
                 if reset_outer_pending {

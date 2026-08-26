@@ -251,6 +251,13 @@ impl MultiPaneTui {
                     pane_id: self.focused_pane,
                     locked: !pane.locked,
                 }),
+            // Shift+R rather than `r`, which has split-to-the-right. The
+            // capital is not a hierarchy, it is what was free next to the
+            // letter tmux users will reach for first.
+            KeyCode::Char('R') => {
+                self.repaint_requested = true;
+                None
+            }
             // Shift+L, deliberately a different key from the lowercase `k` pane lock:
             // locking one pane and locking the front door are very different acts to
             // perform by accident.
@@ -400,6 +407,49 @@ mod tests {
     };
 
     use super::CHORD_IDLE_TIMEOUT;
+
+    /// Issue #120: the way out of a screen ratatui has stopped repainting.
+    ///
+    /// Everything else in this program answers "what should the frame contain".
+    /// This one answers "throw away what you believe is on the screen", which
+    /// nothing else here can ask for -- and until it existed, the only thing
+    /// that did was resizing the terminal window, which people found by
+    /// accident.
+    #[test]
+    fn the_redraw_chord_asks_for_the_screen_to_be_painted_again() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert!(!tui.take_repaint_request(), "nothing has asked yet");
+
+        assert_eq!(
+            tui.handle_key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                area,
+            ),
+            KeyHandling::Consumed(vec![])
+        );
+        // Shift is how a capital is typed, not a modifier the user added.
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), area,),
+            KeyHandling::Consumed(vec![]),
+            "the chord is consumed here and never forwarded to the pane"
+        );
+        assert_eq!(
+            tui.chord_mode(),
+            ChordMode::None,
+            "a command ends the chord, like every other one"
+        );
+
+        assert!(
+            tui.take_repaint_request(),
+            "the run loop is told to repaint"
+        );
+        assert!(
+            !tui.take_repaint_request(),
+            "and told once: a repaint every frame would be every frame drawn in full"
+        );
+    }
 
     #[test]
     fn pane_chord_consumes_commands_and_uses_focused_rect_aspect() {

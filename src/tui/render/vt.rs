@@ -1,11 +1,11 @@
 //! Drawing a `vt100` screen — and the two legacy fixed-grid views — into a
 //! ratatui buffer.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, num::NonZeroU16};
 
 use ratatui::{
     Frame,
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::Rect,
     style::{Color, Modifier, Style},
     widgets::Widget,
@@ -100,7 +100,19 @@ impl Widget for VtScreen<'_> {
                 }
                 let target = &mut buf[(area.x + col, area.y + row)];
                 let contents = source.contents();
+                let reserved = if source.is_wide() { 2 } else { 1 };
                 target.set_symbol(&fitted_symbol(contents, source.is_wide()));
+                // vt100's grid is the wire format the whole session shares, so
+                // it is the authority on how many columns this cell occupies.
+                // The symbol above is chosen to measure exactly that many, and
+                // this says so outright rather than leaving ratatui to measure
+                // it again with a table that does not always agree: a cell whose
+                // width ratatui gets wrong is not one wrong cell, it is every
+                // cell after it on the row, for as long as the back buffer keeps
+                // believing it.
+                target.set_diff_option(CellDiffOption::ForcedWidth(
+                    NonZeroU16::new(reserved).expect("1 and 2 are both nonzero"),
+                ));
                 let style = if self.selection.is_some_and(|selection| {
                     selection.contains(ScreenCell { row, col }, self.scrollback)
                 }) {
@@ -141,19 +153,27 @@ impl Widget for VtScreen<'_> {
 /// width the grid reserved. Anything still too wide falls back to its base
 /// character, and then to a space, because a cell that cannot be drawn at the
 /// right width is better blank than shifted.
+///
+/// The measurement is not the whole test. `unicode-width` scores a cluster from
+/// its characters; a terminal renders one and advances by what it drew. The two
+/// part company over the sequences that ask for emoji presentation by
+/// *composition* rather than by codepoint -- a keycap `1\u{fe0f}\u{20e3}`, a
+/// ZWJ family -- where the table says one column and every terminal draws two.
+/// Those are rejected here even when the arithmetic checks out. See
+/// [`composes_an_emoji`].
 fn fitted_symbol(contents: &str, wide: bool) -> Cow<'_, str> {
     let reserved = if wide { 2 } else { 1 };
     if contents.is_empty() {
         return Cow::Borrowed(" ");
     }
-    if UnicodeWidthStr::width(contents) == reserved {
+    if fits(contents, reserved) {
         return Cow::Borrowed(contents);
     }
     let trimmed: String = contents
         .chars()
         .filter(|character| !matches!(character, '\u{fe0e}' | '\u{fe0f}'))
         .collect();
-    if UnicodeWidthStr::width(trimmed.as_str()) == reserved {
+    if fits(&trimmed, reserved) {
         return Cow::Owned(trimmed);
     }
     match trimmed.chars().next() {
@@ -162,6 +182,35 @@ fn fitted_symbol(contents: &str, wide: bool) -> Cow<'_, str> {
         }
         _ => Cow::Borrowed(" "),
     }
+}
+
+/// Whether this cluster measures `reserved` columns *and* will be drawn in
+/// `reserved` columns.
+fn fits(cluster: &str, reserved: usize) -> bool {
+    UnicodeWidthStr::width(cluster) == reserved && !composes_an_emoji(cluster)
+}
+
+/// Whether the terminal will read this cluster as an emoji however wide the
+/// width table thinks it is.
+///
+/// The variation selector is the famous half of this and the easy half: it is a
+/// codepoint, and `unicode-width` knows what it does. The other half composes:
+/// a digit followed by a combining enclosing keycap is a keycap emoji, and
+/// anything joined by a zero-width joiner is one glyph made of several. The
+/// table scores both by their parts -- one column for `1\u{20e3}`, two for the
+/// leading person of a family -- and the terminal draws one emoji, two columns
+/// wide, having consumed a cluster the grid gave one or six columns to.
+///
+/// So they are refused, and the base character is drawn instead. A keycap loses
+/// its box and a family loses everybody after the first joiner, which is the
+/// same bargain the presentation selectors already strike here: a pane is a
+/// fixed grid, the grid is shared with peers over the wire, and a glyph drawn at
+/// the wrong width does not cost one cell, it costs every cell after it on that
+/// row until something forces a full repaint.
+fn composes_an_emoji(cluster: &str) -> bool {
+    cluster
+        .chars()
+        .any(|character| matches!(character, '\u{20e3}' | '\u{200d}'))
 }
 
 fn vt_style(cell: &vt100::Cell) -> Style {
@@ -227,7 +276,9 @@ mod tests {
 
     use ratatui::{
         Terminal,
-        backend::TestBackend,
+        backend::{Backend, CrosstermBackend, TestBackend},
+        buffer::Buffer,
+        layout::Rect,
         style::{Color, Modifier},
     };
     use unicode_width::UnicodeWidthStr;
@@ -237,7 +288,7 @@ mod tests {
         tui::{PaneTextSelection, ScreenCell, SelectionPoint},
     };
 
-    use super::{VtScreen, render_guest_screen, viewed_screen};
+    use super::{VtScreen, fitted_symbol, render_guest_screen, viewed_screen};
 
     #[test]
     fn remote_renderer_keeps_host_grid_fixed_and_draws_a_footer() {
@@ -449,14 +500,15 @@ mod tests {
         assert_eq!(buffer[(2, 0)].symbol(), "\u{597d}");
     }
 
+    /// A row of what an agent pane actually prints, with the four ways a cluster
+    /// can claim more columns than the grid gave it: a presentation selector, a
+    /// keycap, a zero-width joiner, and an honest wide character.
+    const A_BUSY_ROW: &str = "\u{2733}\u{fe0f} \u{26a0}\u{fe0f}ok 1\u{fe0f}\u{20e3}          \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{2705} \u{2570} e\u{0301} \u{4f60}";
+
     #[test]
     fn every_symbol_matches_the_columns_its_cell_reserved() {
-        // A row of what an agent pane actually prints.
         let mut parser = vt100::Parser::new(1, 40, 0);
-        parser.process(
-            "\u{2733}\u{fe0f} \u{25cf} \u{23f5}\u{23f5} \u{2705} \u{2570} e\u{0301} \u{4f60}"
-                .as_bytes(),
-        );
+        parser.process(A_BUSY_ROW.as_bytes());
         let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("test terminal");
 
         terminal
@@ -475,6 +527,77 @@ mod tests {
                 UnicodeWidthStr::width(symbol),
                 reserved,
                 "column {col} symbol {symbol:?} does not fit the columns its cell reserved"
+            );
+        }
+    }
+
+    /// The same claim one layer down: the bytes that reach the terminal.
+    ///
+    /// Issue #120. A cell whose width the frame gets wrong is not one wrong
+    /// cell. `CrosstermBackend` writes a run of adjacent cells with no
+    /// re-anchoring cursor move, so the first cluster the terminal draws two
+    /// columns wide pushes the rest of that row one column right of where the
+    /// back buffer records it -- and the back buffer is what the next frame
+    /// diffs against, so every cell it believes is already correct is never
+    /// written again. That is a pane that stops repainting until something
+    /// forces a full redraw, which is why resizing the window by one column was
+    /// the accidental cure.
+    ///
+    /// Replaying the bytes through `vt100` is a fair model of the terminal here
+    /// only because of the second assertion: nothing this renderer emits still
+    /// carries a selector, a keycap or a joiner, so the width table `vt100`
+    /// applies and the one a terminal applies cannot disagree about it. Without
+    /// that, a regression would put `\u{fe0f}` back on the wire and this replay
+    /// would keep agreeing with itself while real terminals drifted.
+    #[test]
+    fn the_bytes_a_pane_writes_leave_the_row_where_the_grid_put_it() {
+        let mut parser = vt100::Parser::new(1, 40, 0);
+        parser.process(A_BUSY_ROW.as_bytes());
+        let area = Rect::new(0, 0, 40, 1);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(parser.screen()), frame.area()))
+            .expect("render");
+
+        // What `Terminal::flush` does with that frame: the difference against
+        // the screen ratatui believes is up, handed to the backend the client
+        // really uses. Going through the diff is the point -- it is the diff
+        // that decides which cells are written and which are assumed correct.
+        let drawn = terminal.backend().buffer().clone();
+        let mut written: Vec<u8> = Vec::new();
+        CrosstermBackend::new(&mut written)
+            .draw(Buffer::empty(area).diff(&drawn).into_iter())
+            .expect("write the frame");
+
+        let mut terminal_side = vt100::Parser::new(1, 40, 0);
+        terminal_side.process(&written);
+        for col in 0..40_u16 {
+            let sent = parser.screen().cell(0, col).expect("source cell");
+            if sent.is_wide_continuation() {
+                continue;
+            }
+            let drawn = terminal_side.screen().cell(0, col).expect("drawn cell");
+            // A cell nobody wrote reads as empty rather than as a space: the
+            // frame and the screen it is drawn on already agreed about it.
+            let drawn = if drawn.contents().is_empty() {
+                String::from(" ")
+            } else {
+                drawn.contents().to_string()
+            };
+            assert_eq!(
+                drawn,
+                fitted_symbol(sent.contents(), sent.is_wide()),
+                "column {col} landed somewhere else on the terminal's screen"
+            );
+        }
+
+        let text = String::from_utf8(written).expect("ansi is utf-8");
+        for trigger in ['\u{fe0f}', '\u{fe0e}', '\u{20e3}', '\u{200d}'] {
+            assert!(
+                !text.contains(trigger),
+                "{trigger:?} reached the terminal, which draws it wider than the grid"
             );
         }
     }

@@ -69,7 +69,6 @@ pub struct UiConfig {
     pub dim_unfocused_panes: bool,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiTheme {
     pub footer_background: Color,
