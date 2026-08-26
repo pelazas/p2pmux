@@ -78,7 +78,10 @@ def install_agent(home: Path, name: str, body: str) -> str:
     bindir.mkdir(parents=True, exist_ok=True)
     script = bindir / f"{name}.sh"
     script.write_text(body.format(binary=BINARY, blocked_on=BLOCKED_ON) + "\n")
-    return f"/bin/sh -c 'exec -a claude /bin/sh {script}'"
+    # `bash -c`, not `sh -c`: `exec -a` is a bashism, and on Linux /bin/sh is
+    # dash, where the whole command is a syntax error and the agent never
+    # starts. The script itself stays POSIX.
+    return f"/bin/bash -c 'exec -a claude /bin/sh {script}'"
 
 
 # A release nobody could be running, so the notice is unambiguous when it shows.

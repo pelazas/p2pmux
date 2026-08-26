@@ -77,7 +77,10 @@ def start_loose_agent(root: Path, name: str, body: str) -> int:
         pid_file.unlink()
     subprocess.run(
         [
-            "/bin/sh",
+            # `bash`, not `sh`: `exec -a` is a bashism, and on Linux /bin/sh is
+            # dash, where this is a syntax error and the agent never starts.
+            # The script it launches stays POSIX.
+            "/bin/bash",
             "-c",
             f"(exec -a claude /bin/sh {script} {pid_file} {BINARY} &) "
             f"</dev/null >/dev/null 2>&1",
