@@ -17,7 +17,7 @@ use crate::{
     config::UiTheme,
     layout::PaneId,
     tui::{
-        ChordMode, ModalState, MultiPaneTui, ShareView,
+        ChordMode, ModalState, MultiPaneTui, PaneViewState, ShareView,
         app::{member_color, member_initial},
         geometry::{fixed_grid_viewport, pane_content_rect, visible_leaf_panes},
         member_label,
@@ -219,6 +219,49 @@ pub(in crate::tui) fn pane_border_color(
             member_color(peer_id, members, theme).unwrap_or(theme.pane_border_remote_control)
         }
     }
+}
+/// Whether this pane should be drawn at reduced intensity.
+///
+/// `dim_unfocused_panes` is off unless a config asked for it, so the first
+/// question is settled by the user. The second is which panes it means, and
+/// `!focused` is the wrong answer: the pane you are *reading* is very often not
+/// the pane you are typing into. So a pane still stands at full strength when
+///
+/// - the pointer is on it. The wheel is aimed by the pointer and not by focus,
+///   which is a ruling this program already made; scrolling an unfocused pane
+///   to read it and having it fade is that ruling contradicted.
+/// - it is parked in its own scrollback. Nobody scrolls back through a pane
+///   they are not reading.
+/// - *another* peer is driving it. Watching a pane on somebody else's machine
+///   is what p2pmux is for, and a spectated pane is by definition unfocused.
+///   Our own hold on a lease says nothing: this client takes one to type, so
+///   reading it as "somebody is driving this" would exempt every pane the user
+///   has ever typed into.
+/// - its agent is working, blocked on a human, or has failed. That is the one
+///   thing on the screen that must catch the eye, and it lives in a pane the
+///   user is not typing into almost by definition.
+///
+/// What is left is a pane nobody is reading, which is what the setting is for.
+/// An exited pane is among them: it is not where the keystrokes are going
+/// either, and its border already says it is finished.
+fn pane_recedes(
+    tui: &MultiPaneTui,
+    pane_id: PaneId,
+    view: &PaneViewState,
+    focused: bool,
+    scrollback: usize,
+) -> bool {
+    if !tui.dim_unfocused_panes || focused {
+        return false;
+    }
+    let driven_by_a_peer = view
+        .controller_peer_id
+        .as_deref()
+        .is_some_and(|controller| {
+            !controller.is_empty() && tui.local_peer_id.as_deref() != Some(controller)
+        });
+    let being_read = tui.hovered_pane == Some(pane_id) || scrollback != 0 || driven_by_a_peer;
+    !being_read && !tui.pane_holds_a_live_agent(pane_id)
 }
 /// Renders layout chrome plus any currently available fixed-size VT screens.
 pub fn render_multi_pane(
@@ -625,11 +668,7 @@ pub(in crate::tui) fn render_shared_multi_pane(
                             .filter(|selection| selection.pane_id == pane_id),
                     )
                     .at_scrollback(scrollback)
-                    // The pane the user is typing into stays at full strength
-                    // and every other one steps back. An exited pane is dimmed
-                    // like any other: it is not where the keystrokes are going
-                    // either, and its border already says it is finished.
-                    .dimmed(tui.dim_unfocused_panes && !focused),
+                    .dimmed(pane_recedes(tui, pane_id, &view, focused, scrollback)),
                 viewport,
             );
             let (row, col) = screen.cursor_position();
@@ -1306,7 +1345,7 @@ mod tests {
     /// looking at. What they are looking at is three screenfuls of text that
     /// were all exactly as bright as each other.
     #[test]
-    fn only_the_focused_panes_text_is_drawn_at_full_strength() {
+    fn a_pane_nobody_is_reading_is_drawn_at_reduced_strength() {
         let mut left = vt100::Parser::new(1, 4, 0);
         left.process(b"LEFT");
         let mut right = vt100::Parser::new(1, 4, 0);
@@ -1357,8 +1396,15 @@ mod tests {
         tui.select_pane(1, 1, "test");
         assert_eq!(
             dim_of(&tui),
+            (false, false),
+            "off unless the config asked: how faint SGR 2 renders is the terminal's choice"
+        );
+
+        tui.set_dim_unfocused_panes(true);
+        assert_eq!(
+            dim_of(&tui),
             (false, true),
-            "focus is on the left pane, so the right one steps back"
+            "asked for, focus is on the left pane, so the right one steps back"
         );
 
         tui.select_pane(1, 2, "test");
@@ -1368,13 +1414,144 @@ mod tests {
             "and it swaps the moment focus does"
         );
 
-        // The escape hatch, for a terminal that renders reduced intensity so
-        // faintly that watching an unfocused build scroll past is a strain.
         tui.set_dim_unfocused_panes(false);
         assert_eq!(
             dim_of(&tui),
             (false, false),
             "`dim_unfocused_panes = false` puts every pane back at full strength"
+        );
+    }
+
+    /// The panes the dimming must leave alone even when it is on.
+    ///
+    /// Each of these means "somebody is reading this", and each is already
+    /// modelled somewhere else in this program: the pointer aims the wheel, a
+    /// non-zero scrollback offset is a pane somebody scrolled back through, a
+    /// controller is a peer driving it from another machine, and an agent that
+    /// is working or blocked is the one thing on the screen that has to catch
+    /// the eye. Dimming any of them is the complaint in #119.
+    #[test]
+    fn the_panes_somebody_is_reading_are_never_dimmed() {
+        let mut left = vt100::Parser::new(1, 4, 0);
+        left.process(b"LEFT");
+        let mut right = vt100::Parser::new(1, 4, 0);
+        right.process(b"RGHT");
+        let snapshot = layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Split {
+                    axis: Axis::LeftRight,
+                    first_share_bps: crate::layout::DEFAULT_FIRST_SHARE_BPS,
+                    first: Box::new(Node::Leaf { pane_id: 1 }),
+                    second: Box::new(Node::Leaf { pane_id: 2 }),
+                },
+                title: None,
+            }],
+            &[(1, 1, 4), (2, 1, 4)],
+        );
+        let mut tui = MultiPaneTui::new(snapshot).expect("valid layout");
+        tui.set_dim_unfocused_panes(true);
+        for pane_id in [1, 2] {
+            tui.set_pane_view(
+                pane_id,
+                PaneViewState {
+                    ready: true,
+                    controller_peer_id: Some(Vec::new()),
+                    controller_active: false,
+                    scrollback: 0,
+                },
+            );
+        }
+        let screens = BTreeMap::from([(1, left.screen()), (2, right.screen())]);
+        tui.select_pane(1, 1, "test");
+
+        let right_is_dim = |tui: &MultiPaneTui| {
+            let mut terminal = Terminal::new(TestBackend::new(24, 5)).expect("test terminal");
+            terminal
+                .draw(|frame| render_multi_pane(frame, tui, &screens))
+                .expect("render");
+            let buffer = terminal.backend().buffer().clone();
+            (0..24)
+                .flat_map(|x| (0..5).map(move |y| (x, y)))
+                .find(|position| buffer[*position].symbol() == "R")
+                .map(|position| buffer[position].modifier.contains(Modifier::DIM))
+                .expect("the right pane drew its text")
+        };
+
+        assert!(right_is_dim(&tui), "nobody is reading pane 2 yet");
+
+        tui.hovered_pane = Some(2);
+        assert!(
+            !right_is_dim(&tui),
+            "the wheel is aimed by the pointer, so the pane under it is being read"
+        );
+        tui.hovered_pane = None;
+
+        tui.set_pane_scrollback_offset(2, 3);
+        assert!(
+            !right_is_dim(&tui),
+            "a pane parked in its own history is one somebody scrolled back through"
+        );
+        tui.set_pane_scrollback_offset(2, 0);
+
+        tui.set_pane_view(
+            2,
+            PaneViewState {
+                ready: true,
+                controller_peer_id: Some(b"peer".to_vec()),
+                controller_active: true,
+                scrollback: 0,
+            },
+        );
+        assert!(
+            !right_is_dim(&tui),
+            "watching a peer drive a pane is what this program is for"
+        );
+
+        tui.local_peer_id = Some(b"peer".to_vec());
+        assert!(
+            right_is_dim(&tui),
+            "but our own lease is not somebody else reading it -- typing takes one"
+        );
+        tui.local_peer_id = None;
+        tui.set_pane_view(
+            2,
+            PaneViewState {
+                ready: true,
+                controller_peer_id: Some(Vec::new()),
+                controller_active: false,
+                scrollback: 0,
+            },
+        );
+        assert!(right_is_dim(&tui), "and it goes back once they let go");
+
+        let mut agent = crate::tui::AgentOverlayRow {
+            pane_id: 2,
+            process_pid: 0,
+            tab_ordinal: 1,
+            pane_ordinal: 2,
+            tab_label: String::from("Tab #1"),
+            pane_label: String::from("Pane #2"),
+            kind: String::from("claude"),
+            cwd: String::new(),
+            state: crate::protocol::AgentRosterState::Pending,
+            working_since_unix_ms: 0,
+            host: String::from("host"),
+            controller: String::new(),
+            message: String::from("permission: write to /etc/hosts"),
+            session: String::new(),
+        };
+        tui.set_agent_rows(vec![agent.clone()]);
+        assert!(
+            !right_is_dim(&tui),
+            "an agent blocked on a human is the last thing that should fade"
+        );
+
+        agent.state = crate::protocol::AgentRosterState::Idle;
+        tui.set_agent_rows(vec![agent]);
+        assert!(
+            right_is_dim(&tui),
+            "an idle agent is not a reason to keep a pane nobody is reading at full strength"
         );
     }
 

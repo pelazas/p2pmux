@@ -51,10 +51,16 @@ MANIFEST_PATH = Path(
 # The remote peer must never inherit a saved display name, for the same reason the local
 # sandbox HOME must not: `create`/`join` block on a name prompt when one is missing, and
 # a blocked peer looks exactly like a connectivity failure.
+#
+# `P2PMUX_TELEMETRY=0` for a second reason: with a fresh HOME nothing has been
+# asked yet, so the binary asks -- on stderr, before the TUI takes the screen --
+# and the first thing a scenario types is swallowed by that prompt rather than
+# reaching the pane. A harness is not a user and has no answer to give.
 BASE_ENV = {
     "TERM": "xterm-256color",
     "SHELL": "/bin/sh",
     "PS1": "$ ",
+    "P2PMUX_TELEMETRY": "0",
 }
 
 

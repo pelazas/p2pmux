@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue #111 by eye, on a real terminal: are unfocused panes actually dimmer?
+"""Issue #111 by eye, on a real terminal: are the panes nobody reads dimmer?
 
 The unit test asserts `Modifier::DIM` lands on the right cells of a ratatui test
 buffer. That is not the same claim as "a real p2pmux, on a real PTY, emits SGR 2
@@ -16,6 +16,10 @@ full reset -- immediately after ratatui asked for faint and immediately before
 the glyph. Every attribute in the frame died there, and only a terminal whose
 environment carried `NO_COLOR` ever saw it, which is why the first run was green
 on the machine that shipped the feature.
+
+Issue #119 made the setting opt-in and narrowed which panes it means, so this
+writes a config that asks for it. Pane 1 here is a pane nobody is reading: no
+pointer on it, no scrollback, no peer driving it, no agent in it.
 
 Run: python3 scripts/e2e/check_dim_panes.py
 """
@@ -66,6 +70,12 @@ def split_and_read(label: str, env: dict[str, str]) -> str:
     Pane 1 holds AAAAA and loses focus to pane 2, which holds BBBBB.
     """
     with Harness(f"dim-panes-{label}") as harness:
+        # Issue #119 turned this off by default: how faint SGR 2 renders is the
+        # terminal's decision, so p2pmux no longer makes it for everybody. What
+        # is checked here is what the people who ask for it get, so ask for it.
+        (harness.home / ".config" / "p2pmux" / "config.toml").write_text(
+            "[ui]\ndim_unfocused_panes = true\n"
+        )
         peer = harness.spawn(
             "solo", ["create", "--name", "dim", "--session-name", "dim"],
             cols=COLS, rows=ROWS, env=env,

@@ -161,7 +161,7 @@ impl MultiPaneTui {
         Self::with_theme(snapshot, UiTheme::default())
     }
 
-    /// Turn the unfocused-pane dimming off, for a client whose config asked.
+    /// Turn the dimming of unread panes on, for a client whose config asked.
     pub fn set_dim_unfocused_panes(&mut self, dim: bool) {
         self.dim_unfocused_panes = dim;
     }
@@ -178,7 +178,11 @@ impl MultiPaneTui {
         Ok(Self {
             title: TOP_BAR_BRAND.into(),
             theme,
-            dim_unfocused_panes: true,
+            // Off unless a config says otherwise, which is the same answer
+            // `UiConfig` gives. A client sets it from there; the run loops that
+            // build a view without one get the default rather than chrome
+            // nobody asked for.
+            dim_unfocused_panes: false,
             snapshot,
             current_tab,
             focused_pane,

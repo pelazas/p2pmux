@@ -92,6 +92,31 @@ impl MultiPaneTui {
         asking && self.answered_agent_panes.insert(focused)
     }
 
+    /// Whether this pane holds an agent doing something a person would want to
+    /// see happen.
+    ///
+    /// Read by the dimming, which is the one piece of chrome that touches every
+    /// cell of a pane. Whatever else fading unfocused panes is for, it must not
+    /// take the red error and the blocked permission prompt down with it and
+    /// leave the idle shell prompt you happen to be pointed at as the brightest
+    /// thing on the screen.
+    ///
+    /// `unread_agent_panes` is included because it is the same claim held over
+    /// time: it marks a pane that arrived at a state wanting a human while the
+    /// user was looking elsewhere, and it is cleared by going there.
+    pub(in crate::tui) fn pane_holds_a_live_agent(&self, pane_id: PaneId) -> bool {
+        self.unread_agent_panes.contains(&pane_id)
+            || self.agent_rows.iter().any(|row| {
+                row.pane_id == pane_id
+                    && matches!(
+                        row.state,
+                        AgentRosterState::Working
+                            | AgentRosterState::Pending
+                            | AgentRosterState::Error
+                    )
+            })
+    }
+
     /// Drop the marks whose questions are over, so the next one counts.
     ///
     /// A pane whose agent has stopped needing a human, and a pane that is no

@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n#\n# Telemetry is not configured here. It is one file and one command, so that\n# revoking it is one thing to delete rather than a key to find:\n#   p2pmux telemetry show    print the exact line this machine would send\n#   p2pmux telemetry off     stop sending it\n# The answer lives beside this file, in telemetry.json.\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui]\n# Panes you are not typing into are drawn dimmed, so a glance finds the one you are.\n# Turn it off if your terminal renders reduced intensity too hard to read.\n# dim_unfocused_panes = true\n\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane,\n# and coloring the border of any pane that member is driving.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#ff6a13\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n#\n# Telemetry is not configured here. It is one file and one command, so that\n# revoking it is one thing to delete rather than a key to find:\n#   p2pmux telemetry show    print the exact line this machine would send\n#   p2pmux telemetry off     stop sending it\n# The answer lives beside this file, in telemetry.json.\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui]\n# Draw the panes nobody is reading dimmed, so a glance finds the one you are in.\n# Off by default: how faint SGR 2 renders is your terminal's choice, not ours.\n# The pane under the pointer, one scrolled back, one a peer is driving and one\n# whose agent wants you are never dimmed -- those are panes somebody is reading.\n# dim_unfocused_panes = false\n\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane,\n# and coloring the border of any pane that member is driving.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#ff6a13\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -46,30 +46,29 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UiConfig {
     pub theme: UiTheme,
-    /// Whether panes that do not have focus are drawn dimmed.
+    /// Whether panes nobody is reading are drawn dimmed.
     ///
-    /// On by default: with four panes open the question a glance has to answer
-    /// is "which one am I typing into", and a border color a few cells wide is
-    /// a poor answer next to three screenfuls of equally bright text.
+    /// Off by default, and opt-in is what every mature implementation of this
+    /// ships: kitty's `inactive_text_alpha` is 1.0, tmux leaves
+    /// `window-active-style` unset, Neovim leaves `NormalNC` unstyled. The
+    /// reason is the same in all four places. Reduced intensity is SGR 2, whose
+    /// strength belongs to the terminal and not to us -- Ghostty, iTerm2,
+    /// Alacritty and Terminal.app each pick their own, and on the ones that
+    /// lean into it a pane is genuinely hard to read while you are watching it
+    /// work. It also stacks: grey log lines and muted TUI chrome are already
+    /// low-contrast, and faint on top of faint is where reading breaks.
     ///
-    /// A setting rather than a constant because it is the one piece of chrome
-    /// that touches every cell a user reads. Terminals disagree about how hard
-    /// they render reduced intensity, and on the ones that lean into it a busy
-    /// pane can end up genuinely hard to read while you are watching it work.
+    /// Turning it on dims only the panes nobody is reading -- see
+    /// [`crate::tui::render::panes`] for which panes that leaves out -- because
+    /// the pane you are watching is very often not the pane you are typing
+    /// into, and watching a pane on someone else's machine is what this program
+    /// is for.
     pub dim_unfocused_panes: bool,
 }
 
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            theme: UiTheme::default(),
-            dim_unfocused_panes: true,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiTheme {
@@ -351,7 +350,7 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         display_name,
         ui: UiConfig {
             theme,
-            dim_unfocused_panes: config.ui.dim_unfocused_panes.unwrap_or(true),
+            dim_unfocused_panes: config.ui.dim_unfocused_panes.unwrap_or(false),
         },
     })
 }

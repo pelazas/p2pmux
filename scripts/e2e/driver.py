@@ -596,6 +596,14 @@ class Harness:
             "SHELL": "/bin/sh",
             # Keep the child shell's prompt boring so assertions are stable.
             "PS1": "$ ",
+            # A harness is not a user and cannot answer a question. Every run
+            # gets a fresh HOME, so nothing has been asked in it yet, and the
+            # consent prompt goes to stderr *before* the TUI takes the screen:
+            # `wait_ready` sees that prompt as the first non-blank frame and the
+            # first line a scenario types is answered into it instead of reaching
+            # the pane. Costs one check in check_dim_panes.py; would cost any
+            # scenario whose first keystroke matters.
+            "P2PMUX_TELEMETRY": "0",
             **(env or {}),
         }
         peer = Peer(

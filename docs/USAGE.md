@@ -730,11 +730,15 @@ overwrite an existing file.
 
 ### Dimming
 
-Panes you are not typing into are drawn at reduced intensity, so a glance across a split finds the
-focused one without reading the border colors. Set `dim_unfocused_panes = false` under `[ui]` to
-turn it off — worth doing if your terminal renders faint text so faint that watching an unfocused
-build scroll past is a strain. Like the theme below, it is client-local: which pane *you* are in is
-not a fact about the session, and no peer sees your setting.
+Set `dim_unfocused_panes = true` under `[ui]` to draw the panes nobody is reading at reduced
+intensity, so a glance across a split finds the one you are in without reading the border colors.
+It is off by default, because reduced intensity is SGR 2 and how hard that renders is your
+terminal's decision rather than p2pmux's.
+
+"Nobody is reading" is narrower than "not focused", and deliberately: the pane under the pointer,
+a pane scrolled back through its own history, a pane a peer is driving, and a pane whose agent is
+working or waiting on you all stay at full strength. Like the theme below, the setting is
+client-local: which pane *you* are in is not a fact about the session, and no peer sees it.
 
 ### Theme
 
