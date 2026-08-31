@@ -14,7 +14,11 @@
 //! same events — a completion chime on `Stop`, say — survive both, because this
 //! module never has to guess which entries were its own.
 
-use std::{error::Error, fs, io, path::PathBuf};
+use std::{
+    error::Error,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use serde_json::{Map, Value};
 
@@ -449,26 +453,167 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
     // Not just whether one is on PATH, but which one: a machine can hold p2pmux
     // from two install channels, and the one that runs is whichever comes first
     // — routinely the older. Nothing else on this machine will ever say so.
+    let installs = crate::install_path::installs_on_path();
     println!();
-    for line in crate::install_path::report(&crate::install_path::installs_on_path()) {
+    for line in crate::install_path::report(&installs) {
         println!("{line}");
     }
     // Synchronous here, unlike the inbox's: `doctor` is a command whose whole
     // job is to answer questions about this install, and waiting a moment for
     // one of the answers is what its reader is here for.
-    match crate::update_check::check() {
-        Some(notice) => println!("\n{}", notice.line()),
-        None => println!(
-            "\np2pmux {} — the latest release, as far as this machine could tell.",
-            env!("CARGO_PKG_VERSION")
-        ),
+    let status = crate::update_check::status();
+    match status {
+        crate::update_check::Check::Newer(notice) => println!("\n{}", notice.line()),
+        status => {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let lines = doctor_release_epilogue(env!("CARGO_PKG_VERSION"), &exe, &installs, status);
+            println!("\n{}", lines.join("\n"));
+        }
     }
     Ok(())
+}
+
+/// The release account for the binary that ran `doctor`, not an arbitrary PATH copy.
+pub fn doctor_release_epilogue(
+    version: &str,
+    exe: &Path,
+    installs: &[crate::install_path::Install],
+    status: crate::update_check::Check,
+) -> Vec<String> {
+    let mut lines = vec![format!("This binary: {} {version}", exe.display())];
+    match status {
+        crate::update_check::Check::Current { latest } => {
+            lines.push(format!(
+                "This version matches GitHub's latest tag {latest}."
+            ));
+        }
+        crate::update_check::Check::Unknown => lines.push(
+            "Could not tell what GitHub's latest tag is, as far as this machine could tell."
+                .to_owned(),
+        ),
+        crate::update_check::Check::Newer(notice) => lines.push(notice.line()),
+    }
+    if let Some(winner) = installs
+        .first()
+        .filter(|winner| !same_binary(exe, &winner.path))
+    {
+        let version = winner.version.as_deref().unwrap_or("unknown");
+        lines.push(format!(
+            "`p2pmux` on PATH would still run {} {version}; see the list above.",
+            winner.path.display()
+        ));
+    }
+    lines
+}
+
+fn same_binary(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn install(path: &str, version: Option<&str>) -> crate::install_path::Install {
+        crate::install_path::Install {
+            path: PathBuf::from(path),
+            version: version.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn doctor_names_the_binary_that_ran_when_it_is_the_path_winner() {
+        let exe = Path::new("/tmp/p2pmux-doctor-this");
+        let lines = doctor_release_epilogue(
+            "0.1.14",
+            exe,
+            &[install("/tmp/p2pmux-doctor-this", Some("0.1.14"))],
+            crate::update_check::Check::Current {
+                latest: "v0.1.14".to_owned(),
+            },
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/tmp/p2pmux-doctor-this 0.1.14"))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("the latest release, as far as this machine could tell"))
+        );
+    }
+
+    #[test]
+    fn doctor_names_the_path_winner_when_it_is_not_this_binary() {
+        let lines = doctor_release_epilogue(
+            "0.1.14",
+            Path::new("/tmp/p2pmux-doctor-this"),
+            &[install("/tmp/p2pmux-doctor-path", Some("0.1.13"))],
+            crate::update_check::Check::Current {
+                latest: "v0.1.14".to_owned(),
+            },
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/tmp/p2pmux-doctor-this"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/tmp/p2pmux-doctor-path"))
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_call_an_unknown_release_the_latest() {
+        let lines = doctor_release_epilogue(
+            "0.1.14",
+            Path::new("/tmp/p2pmux-doctor-this"),
+            &[],
+            crate::update_check::Check::Unknown,
+        );
+
+        assert!(!lines.iter().any(|line| line.contains("the latest release")));
+    }
+
+    #[test]
+    fn doctor_handles_an_empty_path_report() {
+        let lines = doctor_release_epilogue(
+            "0.1.14",
+            Path::new("/tmp/p2pmux-doctor-this"),
+            &[],
+            crate::update_check::Check::Current {
+                latest: "v0.1.14".to_owned(),
+            },
+        );
+
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn doctor_compares_unresolvable_paths_by_their_spelling() {
+        let lines = doctor_release_epilogue(
+            "0.1.14",
+            Path::new("/tmp/p2pmux-doctor-this"),
+            &[install("/tmp/p2pmux-doctor-other", Some("0.1.14"))],
+            crate::update_check::Check::Current {
+                latest: "v0.1.14".to_owned(),
+            },
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/tmp/p2pmux-doctor-other"))
+        );
+    }
 
     /// Registrations from before the marker existed are still installed on real
     /// machines and still reporting. Calling them "not wired" sends someone to

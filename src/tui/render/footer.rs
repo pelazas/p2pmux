@@ -127,10 +127,9 @@ const PANE_FOOTER_WITH_REDRAW: &[FooterSegment] = &[
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
-/// Redraw is the first thing to go, and it is on the bar at all only so that
-/// somebody looking at a screen full of stale glyphs can find it without
-/// leaving the program. It is the rescue key, not a key anyone plans to press.
-const PANE_FOOTER_FULL: &[FooterSegment] = &[
+/// Session and lock are the first things to go when the bar will not fit: both
+/// are rare, while Redraw and Back are how somebody recovers the screen itself.
+const PANE_FOOTER_NO_SESSION: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
     FooterSegment::Key("←↓↑→"),
     FooterSegment::Text("> FOCUS   <"),
@@ -146,14 +145,11 @@ const PANE_FOOTER_FULL: &[FooterSegment] = &[
     FooterSegment::Text("> CLOSE   <"),
     FooterSegment::Key("k"),
     FooterSegment::Text("> LOCK   <"),
-    FooterSegment::Key("L"),
-    FooterSegment::Text("> SESSION   <"),
+    FooterSegment::Key("R"),
+    FooterSegment::Text("> REDRAW   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
-/// The session lock is the first thing to go when the bar will not fit: it is
-/// the rarest of these keys and the only one with a modal of its own to explain
-/// itself. Everything else here is a per-pane action taken constantly.
 const PANE_FOOTER_NO_SESSION_LOCK: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
     FooterSegment::Key("←↓↑→"),
@@ -168,15 +164,64 @@ const PANE_FOOTER_NO_SESSION_LOCK: &[FooterSegment] = &[
     FooterSegment::Text("> ZOOM   <"),
     FooterSegment::Key("x"),
     FooterSegment::Text("> CLOSE   <"),
-    FooterSegment::Key("k"),
-    FooterSegment::Text("> LOCK   <"),
+    FooterSegment::Key("R"),
+    FooterSegment::Text("> REDRAW   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
+];
+const PANE_FOOTER_NO_RENAME: &[FooterSegment] = &[
+    FooterSegment::Text("  <"),
+    FooterSegment::Key("←↓↑→"),
+    FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("r/l/d/u"),
+    FooterSegment::Text("> SPLIT   <"),
+    FooterSegment::Key("z"),
+    FooterSegment::Text("> ZOOM   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("R"),
+    FooterSegment::Text("> REDRAW   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
+];
+const PANE_FOOTER_NO_ZOOM: &[FooterSegment] = &[
+    FooterSegment::Text("  <"),
+    FooterSegment::Key("←↓↑→"),
+    FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("r/l/d/u"),
+    FooterSegment::Text("> SPLIT   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("R"),
+    FooterSegment::Text("> REDRAW   <"),
+    FooterSegment::Key("Esc"),
+    FooterSegment::Text("> BACK"),
+];
+const PANE_FOOTER_NO_SPLIT: &[FooterSegment] = &[
+    FooterSegment::Text("  <"),
+    FooterSegment::Key("←↓↑→"),
+    FooterSegment::Text("> FOCUS   <"),
+    FooterSegment::Key("n"),
+    FooterSegment::Text("> NEW   <"),
+    FooterSegment::Key("x"),
+    FooterSegment::Text("> CLOSE   <"),
+    FooterSegment::Key("R"),
+    FooterSegment::Text("> REDRAW   <"),
     FooterSegment::Key("Esc"),
     FooterSegment::Text("> BACK"),
 ];
 const PANE_FOOTER_TIERS: &[&[FooterSegment]] = &[
     PANE_FOOTER_WITH_REDRAW,
-    PANE_FOOTER_FULL,
+    PANE_FOOTER_NO_SESSION,
     PANE_FOOTER_NO_SESSION_LOCK,
+    PANE_FOOTER_NO_RENAME,
+    PANE_FOOTER_NO_ZOOM,
+    PANE_FOOTER_NO_SPLIT,
+    &[],
 ];
 const TAB_FOOTER: &[FooterSegment] = &[
     FooterSegment::Text("  <"),
@@ -296,7 +341,7 @@ pub(in crate::tui) fn contextual_footer(
 ) -> &'static [FooterSegment] {
     match chord_mode {
         // The last tier is empty and therefore always fits, so the `unwrap_or`
-        // the other arms need is unreachable here by construction.
+        // calls are unreachable here by construction.
         ChordMode::None => NORMAL_FOOTER_TIERS
             .iter()
             .copied()
@@ -306,7 +351,7 @@ pub(in crate::tui) fn contextual_footer(
             .iter()
             .copied()
             .find(|tier| footer_segments_width(tier) <= width)
-            .unwrap_or(PANE_FOOTER_NO_SESSION_LOCK),
+            .unwrap_or(&[]),
         ChordMode::Tab => TAB_FOOTER,
     }
 }
@@ -715,6 +760,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pane_help_never_renders_a_tier_too_wide_for_its_span() {
+        for width in 1u16..=200 {
+            let badge_width =
+                chord_footer_badge(ChordMode::Pane, width).map_or(0, crate::tui::text::text_width);
+            let available = width.saturating_sub(badge_width);
+            let chosen = contextual_footer(ChordMode::Pane, available);
+            assert!(
+                footer_segments_width(chosen) <= available,
+                "width {width}: tier needs {} columns and has {available}",
+                footer_segments_width(chosen),
+            );
+        }
+    }
+
+    #[test]
+    fn pane_footer_keeps_redraw_and_back_at_a_hundred_columns() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 2, 2)],
+        ))
+        .expect("valid layout");
+        tui.chord_mode = ChordMode::Pane;
+        let mut terminal = Terminal::new(TestBackend::new(100, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &BTreeMap::new()))
+            .expect("render");
+        let footer = (0..100)
+            .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+            .collect::<String>();
+
+        assert!(footer.contains("REDRAW"), "footer: {footer}");
+        assert!(footer.contains("BACK"), "footer: {footer}");
+        assert!(footer.contains("Esc"), "footer: {footer}");
+        assert!(
+            !footer.contains("SESSIO") || footer.contains("SESSION"),
+            "footer: {footer}"
+        );
+        assert!(
+            !footer.contains("REDRA") || footer.contains("REDRAW"),
+            "footer: {footer}"
+        );
+    }
+
     /// The reported geometry, drawn: a 99-column terminal carrying a notice too
     /// long to leave room for even the narrowest tier.
     ///
@@ -828,10 +921,10 @@ mod tests {
                 "Ctrl+ <p> PANE   <t> TAB   <o> INBOX   <s> SHARE   <q> QUIT   <↑↓←→> FOCUS",
             ),
             (
-                // 120 columns cannot hold the session lock as well, so the tier
-                // below it is what renders here. See `contextual_footer`.
+                // 120 columns cannot hold the session or lock, but keeps the
+                // screen's recovery keys. See `contextual_footer`.
                 ChordMode::Pane,
-                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <Esc> BACK",
+                "PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <R> REDRAW   <Esc> BACK",
             ),
             (
                 ChordMode::Tab,
@@ -845,10 +938,7 @@ mod tests {
             let footer = (0..120)
                 .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
                 .collect::<String>();
-            assert!(
-                footer.starts_with(expected),
-                "mode: {mode:?}, footer: {footer}"
-            );
+            assert_eq!(footer.trim_end(), expected, "mode: {mode:?}");
         }
     }
 

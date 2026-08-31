@@ -119,6 +119,14 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
 PANE_ENV = ("P2PMUX_PANE_ID", "P2PMUX_SOCK")
 
 
+def session_store_dirs_for(home: Path) -> list[Path]:
+    """The only session stores a harness may read under its scratch HOME."""
+    return [
+        home / "Library" / "Application Support" / "p2pmux" / "sessions",
+        home / ".local" / "state" / "p2pmux" / "sessions",
+    ]
+
+
 def sandbox_environ() -> dict[str, str]:
     """This process's environment with any live pane's markers taken out.
 
@@ -130,7 +138,13 @@ def sandbox_environ() -> dict[str, str]:
     machine while passing in a bare shell. Scenarios that want these set pass
     them explicitly.
     """
-    return {key: value for key, value in os.environ.items() if key not in PANE_ENV}
+    # Linux p2pmux honours XDG_STATE_HOME. Letting a harness follow a developer's
+    # state directory out of its scratch HOME could make teardown kill their live session.
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in (*PANE_ENV, "XDG_STATE_HOME")
+    }
 
 
 @dataclass
@@ -675,14 +689,24 @@ class Harness:
 
     def session_descriptors(self) -> list[dict]:
         """The session records p2pmux wrote inside this sandbox HOME."""
-        store = self.home / "Library" / "Application Support" / "p2pmux" / "sessions"
         found = []
-        for path in sorted(store.glob("*.json")):
-            try:
-                found.append(json.loads(path.read_text()))
-            except (OSError, json.JSONDecodeError):
-                continue
+        seen: set[tuple[int, int]] = set()
+        for store in self.session_store_dirs():
+            for path in sorted(store.glob("*.json")):
+                try:
+                    stat = path.stat()
+                    identity = (stat.st_dev, stat.st_ino)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    found.append(json.loads(path.read_text()))
+                except (OSError, json.JSONDecodeError):
+                    continue
         return found
+
+    def session_store_dirs(self) -> list[Path]:
+        """The session stores that belong to this harness's scratch HOME."""
+        return session_store_dirs_for(self.home)
 
     def node_pids(self) -> dict[str, int]:
         """{session_id: pid} for the detached `__node` workers owned by this sandbox.
@@ -724,15 +748,21 @@ class Harness:
         Every peer runs with `HOME=self.home`, so this store lists exactly the sessions
         this run is responsible for, and each descriptor records its detached node's pid.
         """
-        store = self.home / "Library" / "Application Support" / "p2pmux" / "sessions"
         pids: set[int] = set()
-        for path in store.glob("*.json"):
-            try:
-                node_pid = json.loads(path.read_text()).get("node_pid")
-            except (OSError, ValueError):
-                continue  # a descriptor being written right now is not worth failing on
-            if isinstance(node_pid, int) and node_pid > 0:
-                pids.add(node_pid)
+        seen: set[tuple[int, int]] = set()
+        for store in self.session_store_dirs():
+            for path in store.glob("*.json"):
+                try:
+                    stat = path.stat()
+                    identity = (stat.st_dev, stat.st_ino)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    node_pid = json.loads(path.read_text()).get("node_pid")
+                except (OSError, ValueError):
+                    continue  # a descriptor being written right now is not worth failing on
+                if isinstance(node_pid, int) and node_pid > 0:
+                    pids.add(node_pid)
         return pids
 
     def __exit__(self, exc_type, exc, tb) -> bool:

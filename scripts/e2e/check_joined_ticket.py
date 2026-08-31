@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from driver import Harness, orphans_after, p2pmux_pids  # noqa: E402
+from driver import Harness, orphans_after, p2pmux_pids, session_store_dirs_for  # noqa: E402
 
 COLS, ROWS = 100, 30
 TICKET = "p2pmux-test-ticket-for-issue-108"
@@ -35,13 +35,8 @@ WATCH_SECONDS = 25
 
 def session_files(home: Path) -> list[Path]:
     """Every session record in this sandbox HOME, on either platform's path."""
-    roots = [
-        home / ".local" / "state" / "p2pmux" / "sessions",
-        home / "Library" / "Application Support" / "p2pmux" / "sessions",
-        home / ".p2pmux" / "sessions",
-    ]
     found: list[Path] = []
-    for root in roots:
+    for root in session_store_dirs_for(home):
         if root.is_dir():
             found.extend(sorted(root.glob("*.json")))
     return found

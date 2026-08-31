@@ -13,13 +13,26 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
-Four fixes, and no protocol change that costs anything: one field is added to the agent roster,
+Eight fixes, and no protocol change that costs anything: one field is added to the agent roster,
 absent from older peers and degrading to what they already sent.
 
 **Closing a p2pmux window now ends its local session.** A session stays available only after
 `Ctrl+Q` then `d` (Enter still chooses detach). Closing the terminal, losing SSH, or killing the
 client no longer leaves its node and panes running on this machine. Fleet-agent nodes and sleep
 behavior are unchanged.
+
+**A Linux e2e run can see the session it just wrote.** Its scratch home now covers the state path
+Linux uses as well as the macOS one, so its cleanup stays inside the run rather than following a
+developer's XDG setting toward a live session.
+
+**Pane mode still says how to redraw at 100 columns.** SESSION and LOCK make room first, while
+REDRAW and Esc BACK stay together; narrower terminals lose whole hints instead of a clipped word.
+
+**A detached member comes back to its existing session.** Joining its ticket reattaches to that
+member instead of minting a second one and turning the badge into two members.
+
+**Doctor identifies the binary you ran.** It no longer calls it the latest release when PATH would
+still run another copy, or when GitHub could not be asked what the latest tag is.
 
 **An agent in another session on your machine reads as one again.** The second session's inbox
 called a pane-hosted agent `running outside p2pmux` and offered to start a second copy of it. The

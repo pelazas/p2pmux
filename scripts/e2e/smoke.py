@@ -25,6 +25,7 @@ from driver import (  # noqa: E402
     p2pmux_pids,
     orphans_after,
     rss_kb,
+    session_store_dirs_for,
 )
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -100,8 +101,12 @@ def smoke_create_and_cleanup() -> None:
             check("create publishes a ticket", False, f"screen:\n{screen[:600]}")
 
         # Sandboxed HOME really is where state landed.
-        store = harness.home / "Library" / "Application Support" / "p2pmux" / "sessions"
-        check("state stays in the sandbox HOME", store.exists(), f"store={store.exists()}")
+        stores = session_store_dirs_for(harness.home)
+        check(
+            "state stays in the sandbox HOME",
+            any(store.exists() for store in stores),
+            f"stores={[str(store) for store in stores]}",
+        )
 
         spawned = p2pmux_pids() - baseline
         check("background node was forked", len(spawned) >= 2, f"{len(spawned)} new pids")
