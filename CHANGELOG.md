@@ -13,7 +13,7 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
-Three fixes, and no protocol change that costs anything: one field is added to the agent roster,
+Four fixes, and no protocol change that costs anything: one field is added to the agent roster,
 absent from older peers and degrading to what they already sent.
 
 **Closing a p2pmux window now ends its local session.** A session stays available only after
