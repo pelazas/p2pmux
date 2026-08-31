@@ -21,6 +21,8 @@ use crate::{
     transport::Transport,
 };
 
+const BARE_FLEET_BUDGET: Duration = Duration::from_millis(750);
+
 /// The temporary p2pmux command-line interface.
 #[derive(Debug, Parser)]
 #[command(
@@ -612,6 +614,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 // place would move the whole fleet into a session that was
                 // never meant to be one.
                 FleetRole::Bystander,
+                None,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -714,6 +717,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 crate::node::Tether::UntilFirstAttach,
                 // Somebody else's session, reached with somebody else's code.
                 FleetRole::Bystander,
+                None,
             )?;
             if std::env::var_os("P2PMUX_LEGACY_FOREGROUND").is_none() {
                 return crate::client::run(&descriptor);
@@ -1171,8 +1175,13 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     pairing.offered_here = false;
     crate::pairing::save(&pairing)?;
 
-    let descriptor =
-        rejoin_paired_session(&ticket_text, None, crate::node::Tether::UntilFirstAttach).await?;
+    let descriptor = rejoin_paired_session(
+        &ticket_text,
+        None,
+        crate::node::Tether::UntilFirstAttach,
+        None,
+    )
+    .await?;
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
@@ -1528,7 +1537,7 @@ async fn enroll_with_token(
     // a network that was never the problem.
     let mut joined = None;
     for ticket in fleet_addresses(&pairing).await {
-        match rejoin_paired_session(&ticket, None, crate::node::Tether::Detached).await {
+        match rejoin_paired_session(&ticket, None, crate::node::Tether::Detached, None).await {
             Ok(descriptor) => {
                 joined = Some((descriptor, ticket));
                 break;
@@ -1725,6 +1734,7 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     // session offered to a machine that never came for it is still worth
     // attaching to while it is running here, and never worth dialling once it
     // is not. See `Pairing::rejoin_ticket`.
+    let bare_deadline = Instant::now() + BARE_FLEET_BUDGET;
     for ticket in fleet_addresses(&pairing).await {
         // Said before the dial, not after it. A sleeping paired machine still
         // makes the short rejoin window visible, where silence reads exactly
@@ -1738,8 +1748,17 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
             )?;
             stderr.flush()?;
         }
-        match rejoin_paired_session(&ticket, Some(5000), crate::node::Tether::UntilFirstAttach)
-            .await
+        let remaining = bare_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rejoin_paired_session(
+            &ticket,
+            Some(remaining.as_millis().try_into().unwrap_or(u64::MAX)),
+            crate::node::Tether::UntilFirstAttach,
+            Some(bare_deadline),
+        )
+        .await
         {
             Ok(descriptor) => {
                 // The address that worked, kept for the next run. It is what
@@ -1914,6 +1933,7 @@ async fn rejoin_paired_session(
     ticket: &str,
     connect_timeout_ms: Option<u64>,
     tether: crate::node::Tether,
+    ready_deadline: Option<Instant>,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let ticket = resolve_join_ticket(ticket).await?;
     let display_name = display_name_or_hostname()?;
@@ -1935,6 +1955,7 @@ async fn rejoin_paired_session(
         FleetRole::Home {
             stands_in_for: None,
         },
+        ready_deadline,
     )
 }
 
@@ -1965,6 +1986,7 @@ fn start_solo_session(
         crate::session_store::SessionRole::Coordinator,
         tether,
         fleet_role,
+        None,
     )
 }
 
@@ -2186,6 +2208,7 @@ pub(crate) fn launch_background_node(
     role: crate::session_store::SessionRole,
     tether: crate::node::Tether,
     fleet_role: FleetRole,
+    ready_deadline: Option<Instant>,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     // Every session on this machine comes through here, hosted or joined, so
     // this is the one place the count cannot drift from what actually ran.
@@ -2268,7 +2291,7 @@ pub(crate) fn launch_background_node(
     // never the thing the user read. The cap is now past that dial, and the loop leaves
     // early the moment the node resolves either way, so a session that starts normally
     // is not slowed by it.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = ready_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
     let take_node_error = || -> Option<String> {
         let message = std::fs::read_to_string(&error_path).ok()?;
         let message = message.trim().to_owned();
@@ -2688,7 +2711,7 @@ mod tests {
             .find("rejoining the session this machine is paired with")
             .expect("open_home should say it is rejoining");
         let dial = body
-            .find("rejoin_paired_session(&ticket, Some(5000))")
+            .find("match rejoin_paired_session(")
             .expect("open_home should rejoin");
         assert!(
             announcement < dial,
@@ -2716,7 +2739,8 @@ mod tests {
             .expect("background join")
             .0;
 
-        assert!(open_home.contains("rejoin_paired_session(&ticket, Some(5000))"));
+        assert!(open_home.contains("BARE_FLEET_BUDGET"));
+        assert!(open_home.contains("Some(bare_deadline)"));
         assert!(explicit_join.contains("connect_timeout_ms: None"));
     }
 

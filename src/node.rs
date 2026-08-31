@@ -309,6 +309,7 @@ pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn
         crate::cli::FleetRole::Home {
             stands_in_for: None,
         },
+        None,
     )?;
     Ok(true)
 }
