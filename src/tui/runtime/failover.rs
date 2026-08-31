@@ -30,7 +30,7 @@ use crate::{
     tui::pane::control::SharedControl,
 };
 
-use super::SharedLayoutRuntime;
+use super::{PublishedInvite, SharedLayoutRuntime};
 
 /// How long to leave between attempts to reach a coordinator that is not answering.
 ///
@@ -255,6 +255,33 @@ impl SharedLayoutRuntime {
         self.swap_accept_loop(false);
     }
 
+    /// Publish a fresh session only after its local socket is serving. Discovery
+    /// runs in this task so a slow rendezvous path never delays attachment.
+    pub fn publish_initial_code_after_online(&mut self) {
+        let SharedControl::Host(host) = &self.control else {
+            return;
+        };
+        let mut host = host.clone();
+        let ticket = host.ticket().clone();
+        let sender = self.code_tx.clone();
+        self.runtime.spawn(async move {
+            let ticket = host
+                .refresh_ticket_after_online()
+                .await
+                .ok()
+                .flatten()
+                .map_or(ticket, |ticket| ticket);
+            if let Ok(published) =
+                crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string()).await
+            {
+                let invite = PublishedInvite { ticket, published };
+                if let Err(error) = sender.send(invite) {
+                    error.0.published.retire().await;
+                }
+            }
+        });
+    }
+
     /// Put a fresh short code in front of the new ticket.
     ///
     /// The code a session was created with is sealed under a secret only its creator holds,
@@ -270,8 +297,14 @@ impl SharedLayoutRuntime {
         self.retire_published_code();
         let sender = self.code_tx.clone();
         self.runtime.spawn(async move {
-            if let Ok(published) = crate::hosted_rendezvous::PublishedCode::publish(ticket).await {
-                let _ = sender.send(published);
+            if let Ok(ticket) = ticket.parse::<JoinTicket>()
+                && let Ok(published) =
+                    crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string()).await
+            {
+                let invite = PublishedInvite { ticket, published };
+                if let Err(error) = sender.send(invite) {
+                    error.0.published.retire().await;
+                }
             }
         });
     }
@@ -285,13 +318,17 @@ impl SharedLayoutRuntime {
     /// Adopt a code whose publish finished, if this node is still the one coordinating.
     fn drain_published_codes(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(published) = self.code_rx.try_recv() {
+        while let Ok(PublishedInvite { ticket, published }) = self.code_rx.try_recv() {
             if !matches!(self.control, SharedControl::Host(_)) {
                 // Stepped back down while the request was in flight. Publishing a code for a
                 // ticket nobody will answer is worse than having none.
                 self.runtime.spawn(async move { published.retire().await });
                 continue;
             }
+            if let SharedControl::Host(host) = &mut self.control {
+                host.set_ticket(ticket.clone());
+            }
+            self.invite.ticket = Some(ticket.to_string());
             let code = published.code().printable();
             self.invite.code = Some(code.clone());
             self.pending_role_persist = Some(super::RolePersist {

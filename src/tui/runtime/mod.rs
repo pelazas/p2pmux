@@ -25,6 +25,7 @@ use crate::{
         GuestPane, PaneLayoutReconciler, PaneServer, SharedLayoutHost, SharedLayoutMember,
         layout_snapshot_from_state,
     },
+    ticket::JoinTicket,
     transport::Transport,
     tui::{
         Invite, MultiPaneTui,
@@ -153,10 +154,8 @@ pub struct SharedLayoutRuntime {
     /// The one a session starts with belongs to whoever created it; this is the replacement,
     /// and holding it here is what lets it be retired when this node stops.
     pub(in crate::tui) published_code: Option<crate::hosted_rendezvous::PublishedCode>,
-    pub(in crate::tui) code_tx:
-        tokio::sync::mpsc::UnboundedSender<crate::hosted_rendezvous::PublishedCode>,
-    pub(in crate::tui) code_rx:
-        tokio::sync::mpsc::UnboundedReceiver<crate::hosted_rendezvous::PublishedCode>,
+    pub(in crate::tui) code_tx: tokio::sync::mpsc::UnboundedSender<PublishedInvite>,
+    pub(in crate::tui) code_rx: tokio::sync::mpsc::UnboundedReceiver<PublishedInvite>,
     /// A role change the durable session record has not caught up with yet.
     ///
     /// `p2pmux ls` and `p2pmux ticket <name>` read that record out of process, so a takeover
@@ -171,6 +170,13 @@ pub struct RolePersist {
     pub coordinating: bool,
     pub ticket: Option<String>,
     pub join_code: Option<String>,
+}
+
+/// A published short code and the ticket it resolves. They travel together so
+/// a ticket refreshed after discovery reaches the share panel atomically.
+pub(in crate::tui) struct PublishedInvite {
+    pub ticket: JoinTicket,
+    pub published: crate::hosted_rendezvous::PublishedCode,
 }
 impl SharedLayoutRuntime {
     pub fn host(

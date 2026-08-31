@@ -22,7 +22,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    hosted_rendezvous::PublishedCode,
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
@@ -404,7 +403,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
         // place in its own fleet.
         crate::layout::MemberKind::Unspecified
     });
-    let (mut node, published_code) = match bootstrap.kind {
+    let mut node = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -442,25 +441,17 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             // the attaching client both read it from there rather than minting their own.
             let ticket = host.ticket().to_string();
             descriptor.ticket = Some(ticket.clone());
-            // The short code is a convenience layered on the ticket, so a rendezvous outage
-            // degrades the invite rather than failing the session: the ticket still works,
-            // and the share panel says there is no code instead of showing a dead one.
-            let published_code = PublishedCode::publish(ticket.clone()).await.ok();
-            let code = published_code
-                .as_ref()
-                .map(|published| published.code().printable());
-            descriptor.join_code = code.clone();
             let session_id = host.ticket().session_id().to_vec();
             let handle = tokio::runtime::Handle::current();
             let mut runtime = crate::tui::SharedLayoutRuntime::host(
-                host, panes, layout, initial, ticket, code, handle,
+                host, panes, layout, initial, ticket, None, handle,
             )?;
             runtime.set_session_id(session_id);
             // The runtime owns the accept loop from here: losing every member is one of the
             // shapes a coordinator's own failover takes, and stepping down means this
             // endpoint has to stop answering joins and start behaving like a member.
             runtime.set_accept_task(dispatcher_task);
-            (SharedLayoutNode::new(runtime), published_code)
+            SharedLayoutNode::new(runtime)
         }
         NodeBootstrapKind::Join {
             ticket,
@@ -529,7 +520,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             // Handed over for the same reason as on the coordinator, in the other direction:
             // a member that gets promoted has to start answering joins on this endpoint.
             runtime.set_accept_task(dispatcher_task);
-            (SharedLayoutNode::new(runtime), None)
+            SharedLayoutNode::new(runtime)
         }
     };
     let store = SessionStore::for_current_user()?;
@@ -537,6 +528,9 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     let listener = UnixListener::bind(&descriptor.socket_path)?;
     listener.set_nonblocking(true)?;
     store.write(&descriptor)?;
+    // The local session is now attachable. Discovery and rendezvous publication
+    // are deliberately asynchronous so neither delays a first shell.
+    node.publish_initial_code_after_online();
     let result = run_socket_loop(
         &mut node,
         listener,
@@ -548,9 +542,6 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
     // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
     tokio::task::block_in_place(|| node.shutdown());
-    if let Some(published) = published_code {
-        published.retire().await;
-    }
     let _ = fs::remove_file(&descriptor.socket_path);
     let _ = store.remove(&descriptor.id);
     result.map_err(Into::into)
@@ -2071,6 +2062,10 @@ impl SharedLayoutNode {
         self.runtime.take_role_persist()
     }
 
+    pub fn publish_initial_code_after_online(&mut self) {
+        self.runtime.publish_initial_code_after_online();
+    }
+
     pub fn shutdown(self) {
         self.runtime.shutdown_node();
     }
@@ -3056,6 +3051,29 @@ mod tests {
             .0;
 
         assert!(invite.contains("connect_timeout_ms: None"));
+    }
+
+    #[test]
+    fn a_new_session_serves_locally_before_it_publishes_a_short_code() {
+        let source = include_str!("node.rs");
+        let create = source
+            .split_once("NodeBootstrapKind::Create {")
+            .expect("create arm")
+            .1
+            .split_once("NodeBootstrapKind::Join {")
+            .expect("join arm")
+            .0;
+        assert!(
+            !create.contains("PublishedCode::publish"),
+            "a rendezvous request must not delay the create arm"
+        );
+        let socket = source
+            .find("let listener = UnixListener::bind")
+            .expect("socket bind");
+        let publish = source
+            .find("node.publish_initial_code_after_online()")
+            .expect("asynchronous publish");
+        assert!(socket < publish, "the local socket must be ready first");
     }
 
     /// Issue #107: a machine that was switched off must not decide it is still

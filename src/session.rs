@@ -2221,12 +2221,21 @@ impl HostSession {
 
     pub async fn create_with_session_name(session_name: String) -> Result<Self, SessionError> {
         let transport = Transport::bind().await?;
-        let address_ready = transport.wait_until_online().await;
-        let ticket = JoinTicket::mint(transport.endpoint_addr()).map_err(SessionError::Ticket)?;
+        let ticket = match JoinTicket::mint(transport.endpoint_addr()) {
+            Ok(ticket) => ticket,
+            // A just-bound endpoint normally has a direct address immediately.
+            // Only the narrow no-address case waits for discovery before the
+            // initial ticket can be minted.
+            Err(TicketError::MissingAddresses) => {
+                transport.wait_until_online().await;
+                JoinTicket::mint(transport.endpoint_addr()).map_err(SessionError::Ticket)?
+            }
+            Err(error) => return Err(SessionError::Ticket(error)),
+        };
         Ok(Self {
             transport,
             ticket,
-            address_ready,
+            address_ready: true,
             session_name,
             coordinator_epoch: 0,
         })
@@ -2284,6 +2293,27 @@ impl HostSession {
 
     pub fn address_ready(&self) -> bool {
         self.address_ready
+    }
+
+    /// Wait for discovery after the local session is already usable, then keep
+    /// its existing secret while replacing a changed endpoint address.
+    pub async fn refresh_ticket_after_online(
+        &mut self,
+    ) -> Result<Option<JoinTicket>, SessionError> {
+        if !self.transport.wait_until_online().await {
+            return Ok(None);
+        }
+        self.address_ready = true;
+        let ticket = JoinTicket::from_parts(
+            self.ticket.session_id().to_vec(),
+            self.transport.endpoint_addr(),
+        )
+        .map_err(SessionError::Ticket)?;
+        if ticket.endpoint_addr() == self.ticket.endpoint_addr() {
+            return Ok(None);
+        }
+        self.ticket = ticket.clone();
+        Ok(Some(ticket))
     }
 
     pub async fn accept_incoming(&self) -> Result<Incoming, SessionError> {
@@ -3129,6 +3159,37 @@ impl SharedLayoutHost {
 
     pub fn ticket(&self) -> &JoinTicket {
         self.host.ticket()
+    }
+
+    /// Adopt an address refresh that this host already committed to the
+    /// coordinator state from its asynchronous discovery task.
+    pub fn set_ticket(&mut self, ticket: JoinTicket) {
+        self.host.ticket = ticket;
+    }
+
+    /// Refresh the initial invitation after discovery without making clients
+    /// wait for it. The coordinator's own member entry changes with the ticket
+    /// so a later snapshot never advertises the stale endpoint.
+    pub async fn refresh_ticket_after_online(
+        &mut self,
+    ) -> Result<Option<JoinTicket>, SessionError> {
+        let Some(ticket) = self.host.refresh_ticket_after_online().await? else {
+            return Ok(None);
+        };
+        let peer_id = ticket.endpoint_addr().id.as_bytes().to_vec();
+        let change = self
+            .coordinator
+            .lock()
+            .map_err(|_| SessionError::PeerTask)?
+            .update_member_endpoint(&peer_id, ticket.endpoint_addr().clone())?;
+        broadcast_envelope(
+            &self.peers,
+            coordinator_envelope(&peer_id, envelope::Body::LayoutCommit(change.commit)),
+        );
+        if let Some(reject) = change.invalidated_reservation {
+            deliver_reject(&self.peers, &peer_id, &self.own_rejects, reject);
+        }
+        Ok(Some(ticket))
     }
 
     /// How many takeovers this session has been through, this one included.
