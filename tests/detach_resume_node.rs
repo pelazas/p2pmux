@@ -11,7 +11,7 @@ use std::{
 use p2pmux::{
     client,
     local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
-    node::{NodeBootstrap, NodeBootstrapKind, write_bootstrap},
+    node::{NodeBootstrap, NodeBootstrapKind, Supervisor, Tether, write_bootstrap},
     session_store::{SessionDescriptor, SessionRole, SessionStore, generate_id},
 };
 
@@ -102,9 +102,10 @@ fn detached_node_serves_real_snapshots_and_accepts_a_new_attachment() {
                 cols: 80,
                 rows: 24,
             },
-            // Untethered: detach and resume is the behaviour of a session
-            // somebody started by hand, which outlives whatever started it.
-            supervisor: None,
+            // A fleet node remains supervised by its agent, but an interactive
+            // attach and explicit detach must not make it stop with the TUI.
+            tether: Tether::ToLauncher,
+            supervisor: Supervisor::current(),
         },
     )
     .unwrap();

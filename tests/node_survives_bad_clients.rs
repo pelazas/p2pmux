@@ -21,7 +21,7 @@ use std::{
 use p2pmux::{
     client,
     local_ipc::{ClientMessage, NodeMessage},
-    node::{NodeBootstrap, NodeBootstrapKind, write_bootstrap},
+    node::{NodeBootstrap, NodeBootstrapKind, Supervisor, Tether, write_bootstrap},
     session_store::{SessionDescriptor, SessionRole, SessionStore, generate_id},
 };
 
@@ -53,6 +53,10 @@ impl Fixture {
     /// is 104 bytes on macOS, and a temp directory under the target directory
     /// would not fit.
     fn start(name: &str) -> Self {
+        Self::start_with(name, Tether::Detached, None)
+    }
+
+    fn start_with(name: &str, tether: Tether, supervisor: Option<Supervisor>) -> Self {
         let root = PathBuf::from(format!("/tmp/p2pmux-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
@@ -74,8 +78,9 @@ impl Fixture {
                     cols: 80,
                     rows: 24,
                 },
+                tether,
                 // Untethered: this node stands in for one a person started.
-                supervisor: None,
+                supervisor,
             },
         )
         .unwrap();
@@ -109,6 +114,63 @@ impl Fixture {
     fn running(&mut self) -> bool {
         self.node.try_wait().unwrap().is_none()
     }
+}
+
+#[test]
+fn an_unattached_interactive_node_stops_with_its_launcher() {
+    let mut launcher = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let supervisor = Supervisor {
+        pid: launcher.id(),
+        started_at: p2pmux::agent_detect::process_start_time(launcher.id()).unwrap(),
+    };
+    let mut fixture = Fixture::start_with(
+        "until-first-attach",
+        Tether::UntilFirstAttach,
+        Some(supervisor),
+    );
+
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    while fixture.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !fixture.running(),
+        "the unattached node outlived its launcher"
+    );
+    assert!(
+        !fixture.socket.exists(),
+        "the stopped node left its socket behind"
+    );
+}
+
+#[test]
+fn a_lost_accepted_client_stops_its_node() {
+    let mut fixture = Fixture::start("lost-accepted-client");
+    let (stream, mut reader, _) = attach(&fixture.socket);
+    receive_until_snapshot(&mut reader);
+    drop(reader);
+    drop(stream);
+
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    while fixture.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !fixture.running(),
+        "the node outlived an accepted client that closed without detaching"
+    );
+    assert!(
+        !fixture.socket.exists(),
+        "the stopped node left its socket behind"
+    );
 }
 
 #[test]

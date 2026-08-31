@@ -13,8 +13,13 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
-Seven fixes, and no protocol change that costs anything: one field is added to the agent roster,
+Eight fixes, and no protocol change that costs anything: one field is added to the agent roster,
 absent from older peers and degrading to what they already sent.
+
+**Closing a p2pmux window now ends its local session.** A session stays available only after
+`Ctrl+Q` then `d` (Enter still chooses detach). Closing the terminal, losing SSH, or killing the
+client no longer leaves its node and panes running on this machine. Fleet-agent nodes and sleep
+behavior are unchanged.
 
 **A Linux e2e run can see the session it just wrote.** Its scratch home now covers the state path
 Linux uses as well as the macOS one, so its cleanup stays inside the run rather than following a

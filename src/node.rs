@@ -22,7 +22,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    hosted_rendezvous::PublishedCode,
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
@@ -169,15 +168,9 @@ pub enum NodeBootstrapKind {
     },
 }
 
-/// Whether a launched node should outlive the process that started it.
+/// The lifetime a launched node has relative to the process that started it.
 ///
-/// `p2pmux create` and `p2pmux join` are typed by a person at a terminal, and
-/// the entire reason the node is a separate process is that closing that
-/// terminal must not take the session down. tmux and zellij daemonise their
-/// servers for the same reason, and a node that died with its client would be a
-/// multiplexer that does not multiplex.
-///
-/// The fleet agent is the opposite case. Its node is the machine's presence in
+/// The fleet agent's node is the machine's presence in
 /// the fleet, rebuilt within a tick of the agent coming back, and nobody is
 /// sitting in front of it. A node that survives its agent is not a rescued
 /// session — it is a process nothing is watching, which is precisely what nine
@@ -190,12 +183,19 @@ pub enum Tether {
     Detached,
     /// Stops when its launcher does, however the launcher goes.
     ToLauncher,
+    /// Stops if its launching interactive client goes away before the first
+    /// successful attachment. Afterwards the client protocol owns its lifetime.
+    UntilFirstAttach,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeBootstrap {
     pub descriptor: SessionDescriptor,
     pub kind: NodeBootstrapKind,
+    /// A supervisor alone cannot distinguish a persistent fleet node from an
+    /// interactive launch that is only waiting for its first client.
+    #[serde(default)]
+    pub tether: Tether,
     /// The process this node is tethered to, if it is tethered to one.
     ///
     /// Checked by the node rather than enforced by the launcher, because the
@@ -308,6 +308,7 @@ pub fn follow_fleet_invite(ticket: &str, tether: Tether) -> Result<bool, Box<dyn
         crate::cli::FleetRole::Home {
             stands_in_for: None,
         },
+        None,
     )?;
     Ok(true)
 }
@@ -402,7 +403,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
         // place in its own fleet.
         crate::layout::MemberKind::Unspecified
     });
-    let (mut node, published_code) = match bootstrap.kind {
+    let mut node = match bootstrap.kind {
         NodeBootstrapKind::Create {
             display_name,
             cols,
@@ -440,25 +441,17 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             // the attaching client both read it from there rather than minting their own.
             let ticket = host.ticket().to_string();
             descriptor.ticket = Some(ticket.clone());
-            // The short code is a convenience layered on the ticket, so a rendezvous outage
-            // degrades the invite rather than failing the session: the ticket still works,
-            // and the share panel says there is no code instead of showing a dead one.
-            let published_code = PublishedCode::publish(ticket.clone()).await.ok();
-            let code = published_code
-                .as_ref()
-                .map(|published| published.code().printable());
-            descriptor.join_code = code.clone();
             let session_id = host.ticket().session_id().to_vec();
             let handle = tokio::runtime::Handle::current();
             let mut runtime = crate::tui::SharedLayoutRuntime::host(
-                host, panes, layout, initial, ticket, code, handle,
+                host, panes, layout, initial, ticket, None, handle,
             )?;
             runtime.set_session_id(session_id);
             // The runtime owns the accept loop from here: losing every member is one of the
             // shapes a coordinator's own failover takes, and stepping down means this
             // endpoint has to stop answering joins and start behaving like a member.
             runtime.set_accept_task(dispatcher_task);
-            (SharedLayoutNode::new(runtime), published_code)
+            SharedLayoutNode::new(runtime)
         }
         NodeBootstrapKind::Join {
             ticket,
@@ -527,7 +520,7 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
             // Handed over for the same reason as on the coordinator, in the other direction:
             // a member that gets promoted has to start answering joins on this endpoint.
             runtime.set_accept_task(dispatcher_task);
-            (SharedLayoutNode::new(runtime), None)
+            SharedLayoutNode::new(runtime)
         }
     };
     let store = SessionStore::for_current_user()?;
@@ -535,19 +528,20 @@ pub async fn run_background(bootstrap: NodeBootstrap) -> Result<(), Box<dyn Erro
     let listener = UnixListener::bind(&descriptor.socket_path)?;
     listener.set_nonblocking(true)?;
     store.write(&descriptor)?;
+    // The local session is now attachable. Discovery and rendezvous publication
+    // are deliberately asynchronous so neither delays a first shell.
+    node.publish_initial_code_after_online();
     let result = run_socket_loop(
         &mut node,
         listener,
         &mut descriptor,
         &store,
         bootstrap.supervisor,
+        bootstrap.tether,
     );
     // `SharedLayoutRuntime` owns a Tokio handle for its asynchronous pane/control cleanup.
     // The node itself runs on this runtime, so perform that blocking teardown outside its worker.
     tokio::task::block_in_place(|| node.shutdown());
-    if let Some(published) = published_code {
-        published.retire().await;
-    }
     let _ = fs::remove_file(&descriptor.socket_path);
     let _ = store.remove(&descriptor.id);
     result.map_err(Into::into)
@@ -595,6 +589,7 @@ fn run_socket_loop(
     descriptor: &mut SessionDescriptor,
     store: &SessionStore,
     supervisor: Option<Supervisor>,
+    mut tether: Tether,
 ) -> io::Result<()> {
     let gate = AttachmentGate::default();
     let mut client: Option<AttachedClient> = None;
@@ -616,6 +611,19 @@ fn run_socket_loop(
     loop {
         let mut shutdown = false;
         let mut did_work = false;
+        // This belongs on the socket loop rather than the slow self-check: an
+        // interactive launcher that dies before attaching has no session to
+        // leave behind.
+        if client.is_none()
+            && tether == Tether::UntilFirstAttach
+            && let Some(supervisor) = supervisor
+            && !supervisor.is_alive()
+        {
+            eprintln!(
+                "p2pmux node: the interactive launcher left before its first attachment — stopping"
+            );
+            shutdown = true;
+        }
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -672,6 +680,9 @@ fn run_socket_loop(
                             match attach_client(reader, generation, cols, rows, descriptor, node) {
                                 Ok(attached) => {
                                     client = Some(attached);
+                                    if tether == Tether::UntilFirstAttach {
+                                        tether = Tether::Detached;
+                                    }
                                     // Only now is anybody looking. Until this,
                                     // this node had no location to broadcast.
                                     node.runtime.set_client_attached(true);
@@ -777,7 +788,8 @@ fn run_socket_loop(
         if self_check_due(last_self_check, drain_started) {
             last_self_check = Some(drain_started);
             // A tethered node outlives nothing.
-            if let Some(supervisor) = supervisor
+            if tether == Tether::ToLauncher
+                && let Some(supervisor) = supervisor
                 && !supervisor.is_alive()
             {
                 // Said out loud. A node that vanished without a word is how the
@@ -787,7 +799,7 @@ fn run_socket_loop(
             }
             if let Some(held) = crate::agent_detect::process_memory(std::process::id()) {
                 let megabytes = held / (1024 * 1024);
-                if supervisor.is_some() && held > TETHERED_MEMORY_CEILING {
+                if tether == Tether::ToLauncher && held > TETHERED_MEMORY_CEILING {
                     eprintln!(
                         "p2pmux node: holding {megabytes}MB, past the {}MB a fleet node is \
                          allowed — stopping. The agent starts a fresh one.",
@@ -1062,8 +1074,11 @@ fn run_socket_loop(
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
                         || error.kind() == io::ErrorKind::TimedOut => {}
-                Ok(None) => detached = true,
-                Err(_) => detached = true,
+                // An accepted interactive client owns this node unless it
+                // completed the detach handshake. EOF is a closed window,
+                // dropped SSH connection, or dead client process — none leave
+                // a session behind.
+                Ok(None) | Err(_) => shutdown = !client.close_after_ack,
             }
             did_work |= changed;
             if !detached && !client.close_after_ack && !client.shutdown_after_ack {
@@ -1089,7 +1104,7 @@ fn run_socket_loop(
                     Ok(published) => did_work |= published,
                     Err(error) => {
                         eprintln!("p2pmux node: failed to write local update: {error}");
-                        detached = true;
+                        shutdown = !client.close_after_ack;
                     }
                 }
             }
@@ -2047,6 +2062,10 @@ impl SharedLayoutNode {
         self.runtime.take_role_persist()
     }
 
+    pub fn publish_initial_code_after_online(&mut self) {
+        self.runtime.publish_initial_code_after_online();
+    }
+
     pub fn shutdown(self) {
         self.runtime.shutdown_node();
     }
@@ -2074,7 +2093,7 @@ mod tests {
             .expect("the tests, which are not the loop")
             .0;
         assert!(
-            loop_source.contains("supervisor.is_some() && held > TETHERED_MEMORY_CEILING"),
+            loop_source.contains("tether == Tether::ToLauncher && held > TETHERED_MEMORY_CEILING"),
             "only a node nobody is sitting in front of may be stopped for its size"
         );
 
@@ -2170,11 +2189,10 @@ mod tests {
         );
     }
 
-    /// Only the agent's nodes are tethered. A session somebody typed `create`
-    /// for has to survive the terminal it was typed in -- that is the entire
-    /// reason the node is a separate process.
+    /// An interactive node belongs to the launcher's first client, not merely
+    /// to the launcher process that gave it a socket.
     #[test]
-    fn an_interactive_session_is_not_tethered_to_the_command_that_started_it() {
+    fn an_interactive_session_waits_only_for_its_first_client() {
         let source = include_str!("cli.rs");
         let interactive = source
             .split_once("Some(Command::Create {")
@@ -2184,8 +2202,8 @@ mod tests {
             .expect("the create arm's tether")
             .1;
         assert!(
-            interactive.starts_with("Detached"),
-            "`create` must outlive its terminal"
+            interactive.starts_with("UntilFirstAttach"),
+            "`create` must not survive a terminal that never attached"
         );
 
         let agent = include_str!("daemon.rs");
@@ -2971,6 +2989,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                 },
+                tether: Tether::Detached,
                 supervisor: None,
             },
         )
@@ -2981,6 +3000,22 @@ mod tests {
         );
         assert_eq!(read_bootstrap(&path).unwrap().descriptor, descriptor);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn old_bootstrap_defaults_to_a_detached_lifecycle() {
+        let bootstrap: NodeBootstrap = serde_json::from_value(serde_json::json!({
+            "descriptor": SessionDescriptor::new(
+                "0123456789abcdef0123456789abcdef".into(),
+                "lisbon".into(),
+                "/tmp/p2pmux-test.sock".into(),
+                1,
+                SessionRole::Coordinator,
+            ),
+            "kind": { "Create": { "display_name": "A", "cols": 80, "rows": 24 } }
+        }))
+        .expect("an old bootstrap parses");
+        assert_eq!(bootstrap.tether, Tether::Detached);
     }
 
     #[test]
@@ -3016,6 +3051,29 @@ mod tests {
             .0;
 
         assert!(invite.contains("connect_timeout_ms: None"));
+    }
+
+    #[test]
+    fn a_new_session_serves_locally_before_it_publishes_a_short_code() {
+        let source = include_str!("node.rs");
+        let create = source
+            .split_once("NodeBootstrapKind::Create {")
+            .expect("create arm")
+            .1
+            .split_once("NodeBootstrapKind::Join {")
+            .expect("join arm")
+            .0;
+        assert!(
+            !create.contains("PublishedCode::publish"),
+            "a rendezvous request must not delay the create arm"
+        );
+        let socket = source
+            .find("let listener = UnixListener::bind")
+            .expect("socket bind");
+        let publish = source
+            .find("node.publish_initial_code_after_online()")
+            .expect("asynchronous publish");
+        assert!(socket < publish, "the local socket must be ready first");
     }
 
     /// Issue #107: a machine that was switched off must not decide it is still
