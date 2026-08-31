@@ -152,6 +152,28 @@ fn an_unattached_interactive_node_stops_with_its_launcher() {
 }
 
 #[test]
+fn a_lost_accepted_client_stops_its_node() {
+    let mut fixture = Fixture::start("lost-accepted-client");
+    let (stream, mut reader, _) = attach(&fixture.socket);
+    receive_until_snapshot(&mut reader);
+    drop(reader);
+    drop(stream);
+
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    while fixture.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !fixture.running(),
+        "the node outlived an accepted client that closed without detaching"
+    );
+    assert!(
+        !fixture.socket.exists(),
+        "the stopped node left its socket behind"
+    );
+}
+
+#[test]
 fn a_session_outlives_every_kind_of_bad_local_client() {
     let mut fixture = Fixture::start("rude");
 

@@ -41,6 +41,7 @@ use crate::{
 };
 
 const IPC_BATCH_PER_WAKE: usize = 32;
+const DETACH_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct HistoryCache {
@@ -370,7 +371,8 @@ pub fn run_on(
     let mut dirty = false;
     let mut node_ended = false;
     let mut attach_error = None;
-    let mut detach_sent = false;
+    let mut detach_requested_at: Option<Instant> = None;
+    let mut detach_acknowledged = false;
     let mut killed = false;
     let mut last_agent_overlay_animation = Instant::now();
     // Started before the attach rather than after it, so the answer is usually
@@ -415,6 +417,9 @@ pub fn run_on(
     let mut last_size_check: Option<Instant> = None;
 
     'attached: loop {
+        if detach_requested_at.is_some_and(|sent| sent.elapsed() >= DETACH_ACK_TIMEOUT) {
+            break;
+        }
         for _ in 0..IPC_BATCH_PER_WAKE {
             let wake = pending_wake
                 .take()
@@ -422,6 +427,12 @@ pub fn run_on(
                 .unwrap_or_else(|| wakes.try_recv());
             match wake {
                 Ok(WakeEvent::Ipc(ReaderEvent::Message(message))) => match *message {
+                    NodeMessage::DetachAck { generation: ack }
+                        if detach_requested_at.is_some() && ack == generation =>
+                    {
+                        detach_acknowledged = true;
+                        break 'attached;
+                    }
                     NodeMessage::Snapshot {
                         room_name,
                         layout,
@@ -876,8 +887,7 @@ pub fn run_on(
                 match tui.handle_key(key, terminal.size()?.into()) {
                     KeyHandling::Quit(QuitAction::Detach) => {
                         write_message(&mut stream, &ClientMessage::Detach { generation })?;
-                        detach_sent = true;
-                        break;
+                        detach_requested_at = Some(Instant::now());
                     }
                     // The node stops, so its panes stop with it. The record is
                     // removed here rather than left for the finder to reap, so
@@ -885,7 +895,6 @@ pub fn run_on(
                     // — the same order `p2pmux kill` uses.
                     KeyHandling::Quit(QuitAction::Kill) => {
                         write_message(&mut stream, &ClientMessage::Shutdown { generation })?;
-                        detach_sent = true;
                         killed = true;
                         break;
                     }
@@ -1089,8 +1098,11 @@ pub fn run_on(
             desired_scroll.clear();
         }
     }
-    if !node_ended && !detach_sent {
-        let _ = write_message(&mut stream, &ClientMessage::Detach { generation });
+    if !node_ended && !killed && detach_requested_at.is_none() {
+        // This is not a detach: terminal failure and every other implicit exit
+        // end the local session. A requested detach that timed out merely
+        // closes the socket, letting the node distinguish it from an acked one.
+        let _ = write_message(&mut stream, &ClientMessage::Shutdown { generation });
     }
     let _ = stream.shutdown(Shutdown::Both);
     terminal_stop.store(true, Ordering::Release);
@@ -1109,11 +1121,13 @@ pub fn run_on(
             Some(reason) => println!("p2pmux node ended: {reason}"),
             None => println!("p2pmux node ended"),
         }
-    } else {
+    } else if detach_acknowledged {
         println!(
             "Detached. Resume: p2pmux --resume  |  Attach: p2pmux attach {}  |  Kill: p2pmux kill {}",
             descriptor.name, descriptor.name
         );
+    } else {
+        println!("p2pmux node ended");
     }
     Ok(())
 }

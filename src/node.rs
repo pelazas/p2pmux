@@ -1082,8 +1082,11 @@ fn run_socket_loop(
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
                         || error.kind() == io::ErrorKind::TimedOut => {}
-                Ok(None) => detached = true,
-                Err(_) => detached = true,
+                // An accepted interactive client owns this node unless it
+                // completed the detach handshake. EOF is a closed window,
+                // dropped SSH connection, or dead client process — none leave
+                // a session behind.
+                Ok(None) | Err(_) => shutdown = !client.close_after_ack,
             }
             did_work |= changed;
             if !detached && !client.close_after_ack && !client.shutdown_after_ack {
@@ -1109,7 +1112,7 @@ fn run_socket_loop(
                     Ok(published) => did_work |= published,
                     Err(error) => {
                         eprintln!("p2pmux node: failed to write local update: {error}");
-                        detached = true;
+                        shutdown = !client.close_after_ack;
                     }
                 }
             }
