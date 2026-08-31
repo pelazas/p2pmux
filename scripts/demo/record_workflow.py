@@ -641,7 +641,7 @@ def build_scene(harness: Harness, cards: dict[str, Machine], hosts: list[RemoteH
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="docs/assets/workflow.mp4")
+    parser.add_argument("--out", default="assets/workflow.mp4")
     parser.add_argument("--still", action="store_true", help="one PNG of the layout, no session")
     parser.add_argument("--replay", metavar="CAPTURE.pkl", help="re-render a previous capture")
     parser.add_argument("--frames-dir", default=None)

@@ -4,7 +4,7 @@ Every peer in a scenario is a real `target/release/p2pmux ...` process on its ow
 Nothing here mocks p2pmux: we write bytes into a master fd and read the bytes the real
 binary rendered back out.
 
-Design rules (non-negotiable, see docs/e2e-stress-log.md):
+Design rules (non-negotiable):
   * every read has a deadline -- no unbounded blocking anywhere;
   * every spawned process gets a hard kill (SIGTERM then SIGKILL) on scenario exit;
   * `Harness` is a context manager that reaps *everything*, including the detached
@@ -822,7 +822,7 @@ def agent_panel(screen: str) -> str:
 
     Note the panel prints the lowercase kind (`claude`, `codex`), not the display label:
     `AgentKind::display_label` is no longer what the overlay renders. The panel drawing
-    in docs/USAGE.md is the reference.
+    in USAGE.md is the reference.
 
     Home draws the agents down the left of a vertical divider with the machines
     list on the right, under a plain `Agents` heading -- not inside a box. This

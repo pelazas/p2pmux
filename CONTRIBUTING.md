@@ -51,9 +51,7 @@ alone before assuming your change caused it.
 Small, focused PRs. One behaviour change per PR, with the reasoning in the description — not just
 what changed but what was wrong before.
 
-Before writing anything substantial, open an issue and describe the approach. p2pmux has a
-[locked MVP design](./docs/MVP_DESIGN.md), and a change that cuts against it needs a conversation
-first, not a review comment on 600 lines of finished work.
+Before writing anything substantial, open an issue and describe the approach.
 
 Docs, error messages, and anything that makes a failure mode legible are always welcome and need no
 issue first.
@@ -62,8 +60,6 @@ issue first.
 
 Things p2pmux is not going to become: a cloud VM, a remote box everyone's processes run on, an
 agent orchestration platform, or a sandbox around the shell it hands you.
-[docs/PRODUCT.md](./docs/PRODUCT.md) has the full is/isn't list. Reading it will save you a
-rejected PR.
 
 ## Cutting a release
 

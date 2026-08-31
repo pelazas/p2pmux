@@ -148,7 +148,7 @@ ON CONFLICT (id, day) DO UPDATE SET
 `;
 
 /**
- * The four numbers docs/METRICS.md cannot get from GitHub, plus the series behind
+ * The four numbers GitHub cannot provide, plus the series behind
  * them.
  *
  * Retention is measured on a cohort that has had time to churn: installs first

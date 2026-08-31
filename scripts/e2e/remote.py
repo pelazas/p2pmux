@@ -1,8 +1,7 @@
 """Drive a p2pmux peer on a second, real machine over ssh.
 
-Everything in driver.py assumes both peers are on this Mac, which is exactly the
-limitation docs/e2e-stress-log.md flags as its standing caveat: localhost proves the
-protocol, never the network. This module removes that caveat by running one peer on a
+Everything in driver.py assumes both peers are on this Mac. Localhost proves the
+protocol, never the network. This module addresses that limitation by running one peer on a
 DigitalOcean droplet and driving it through the same `Peer` PTY machinery.
 
 A `RemoteHost` reaches its droplet either through an `~/.ssh/config` alias (the original

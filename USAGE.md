@@ -1,7 +1,7 @@
 # Using p2pmux
 
-Everything the README does not need to say on first read. Start with
-[the README](../README.md) if you have not installed p2pmux yet.
+For details beyond the README, start with [the README](./README.md) if you have not
+installed p2pmux yet.
 
 ## Sessions
 
@@ -12,12 +12,12 @@ the shell. A session someone is already sitting in is passed over rather than fo
 second window on the same machine gets its own terminal instead of an error. The commands below
 are for naming a specific session out loud.
 
-`p2pmux attach` is the way back to a session already running here — with a name, or with none at
+`p2pmux attach` returns to a session already running here, with a name or with none at
 all for the one started most recently.
 
 `create` and `join` start a session-scoped background node, then attach the local TUI client.
 Ctrl+Q asks which leaving you meant: `d` detaches that client without stopping shells, Iroh, or
-hosted panes, and `k` ends the session on this machine — its panes die with it, and a session
+hosted panes, and `k` ends the session on this machine. Its panes die with it, and a session
 nobody is left hosting a pane in is over. Enter is `d` and Esc backs out, so a reflex press never
 destroys work. Detaching prints the exact `--resume`, `attach`, and `kill` commands needed to
 return. Use `p2pmux --resume` for the
@@ -25,7 +25,7 @@ live-session picker, `p2pmux attach [name]` to attach directly, `p2pmux rename <
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
 for confirmation; use `--yes` for non-interactive scripts.
 
-`p2pmux list` prints the live sessions on this machine — the names every one of those commands takes:
+`p2pmux list` prints the live sessions on this machine and the names each command takes:
 
 ```text
 NAME       ROLE         CODE         UP
@@ -46,21 +46,21 @@ the same way.
 
 There is one local client per session: a second attach is refused rather than taking over. The
 finder descriptor is the only durable session data, under `~/Library/Application Support/p2pmux/`
-on macOS and `$XDG_STATE_HOME/p2pmux/` — `~/.local/state/p2pmux/` unless you set it — on Linux.
+on macOS and `$XDG_STATE_HOME/p2pmux/` (`~/.local/state/p2pmux/` unless you set it) on Linux.
 The Unix socket is under `$XDG_RUNTIME_DIR/p2pmux/` where Linux provides one, and `/tmp/p2pmux-$UID/`
 otherwise, which is also where macOS keeps it. Screens, PTYs, tickets, layout state, and focus are
 never restored from disk. The node survives terminal closure. It is not managed by launchd or systemd
-itself — the *fleet agent* is, and only if you asked for it: `p2pmux daemon install` writes a
+itself. The *fleet agent* is managed that way, only if you asked for it: `p2pmux daemon install` writes a
 launchd agent on macOS or a systemd user unit on Linux, so a paired machine rejoins its home
 session at boot and can be invited into sessions you start later. `p2pmux pair` offers to install
 it, and remembers a no. Local IPC is intentionally versioned as an implementation detail, so restart an existing
 session after upgrading when attach protocol changes are present.
 
 Everyone in a session runs the same wire protocol. It is pinned per release and never negotiated
-down, so a peer on a different one fails its join — reported as an unsupported protocol version,
-naming both numbers and saying which machine is the old one — rather than entering a session it
+down, so a peer on a different one fails its join. It reports an unsupported protocol version,
+naming both numbers and saying which machine is old, rather than entering a session it
 only half understands. Which releases share a pin, and where it last moved, is in
-[CHANGELOG.md](../CHANGELOG.md#compatibility). When two of your own machines will not talk to each
+[CHANGELOG.md](./CHANGELOG.md#compatibility). When two of your own machines will not talk to each
 other, `p2pmux --version` on both is the first thing to check.
 
 To dogfood the shared layout on one machine:
@@ -83,13 +83,13 @@ p2pmux join 4KP7Q-M2XRW
 ```
 
 That is the whole invite. Ten characters, good for 6 hours, and it resolves from any machine on
-any network — your guest needs nothing else, and nothing about your setup.
+any network. Your guest needs nothing else, and nothing about your setup.
 
 Treat it like a password: it grants full shared-shell access to the session, to anyone who runs
 it, for as long as the session lives. Only a coordinator can invite; a guest is told so.
 
-It is also available from a shell, printed to stdout alone so `p2pmux code | pbcopy` — or
-`| wl-copy`, or `| xclip -selection clipboard` — gives you something directly pasteable:
+It is also available from a shell and printed to stdout alone. `p2pmux code | pbcopy`,
+`| wl-copy`, or `| xclip -selection clipboard` gives you something directly pasteable:
 
 ```text
 p2pmux code              # the one session hosted on this machine
@@ -101,18 +101,18 @@ p2pmux code <name>       # when several are; the name is the one p2pmux list sho
 The code is not a second credential. It *is* a ticket, stored where your guest can fetch it. Your
 machine derives two independent values from the code: an index to store the record at, and a key
 to seal it with. Only the index reaches `rv.p2pmux.com`, so the service holds an opaque handle and
-a sealed blob and has nothing that would let it join. Terminal traffic never goes near it — that
+a sealed blob and has nothing that would let it join. Terminal traffic never goes near it. That
 is peer to peer, or over an iroh relay when NAT requires it.
 
 You deal with the ticket directly in one case: the rendezvous being unreachable when your session
-starts, which leaves no code to mint. The share panel says so and offers the ticket instead — some
+starts, which leaves no code to mint. The share panel says so and offers the ticket instead: some
 170 characters, never expires, contacts no service at all. `t` copies it, `p2pmux ticket <name>`
 prints it, and `p2pmux join <ticket>` works the same way from the other end. That fallback is why
 an outage in a service we run cannot stop you sharing a session.
 
 Tickets are emitted as `p2pmux-v3:`, which carries 32 independent random bytes as the join
 credential. `join` still parses `p2pmux-v1:` and `p2pmux-v2:` tickets, in which the credential
-*was* the coordinator's endpoint public key — a value published to discovery, so those tickets
+*was* the coordinator's endpoint public key, a value published to discovery. Those tickets
 grant a session no secret ever protected.
 
 ## When the coordinator goes away
@@ -120,23 +120,23 @@ grant a session no secret ever protected.
 The coordinator is the member that orders layout changes, admits joiners, and seals the ledger.
 Losing it does not end the session: every pane runs on the machine hosting it, control leases are
 settled there, and screen data travels peer to peer, so panes keep running and keep taking input.
-What stops is everything structural — splits, new tabs, renames, deletes, and new joiners — and
-the footer says so rather than leaving a request to hang.
+What stops is everything structural: splits, new tabs, renames, deletes, and new joiners. The
+footer says so rather than leaving a request to hang.
 
 After five minutes without the coordinator, the earliest-joined survivor takes the role over and
 structure works again. Members further down the join order wait an extra three seconds each and
 follow the first takeover they see instead of starting their own, so a room settles on one
-coordinator without anyone voting. A coordinator that merely blinked — a relay hiccup, a lid
-closed for a minute — keeps the role, and one peer reattaching cancels the clock. A coordinator
+coordinator without anyone voting. A coordinator that merely blinked, from a relay hiccup or a lid
+closed for a minute, keeps the role, and one peer reattaching cancels the clock. A coordinator
 that comes back after the grace window rejoins as an ordinary member; it does not reclaim the
 role.
 
 Two consequences worth knowing before you need them:
 
-- **The join code changes.** The old code is sealed under a secret only the session's creator
-  holds, so the successor mints a fresh ticket and a fresh code. An invite already pasted into a
-  chat stops working — press `Ctrl+S` on the new coordinator for the current one.
-- **The departed machine's panes stay put**, as unavailable placeholders. They are not reaped on
+- The join code changes. The old code is sealed under a secret only the session's creator holds,
+  so the successor mints a fresh ticket and a fresh code. An invite already pasted into a chat
+  stops working. Press `Ctrl+S` on the new coordinator for the current one.
+- The departed machine's panes stay put as unavailable placeholders. They are not reaped on
   a timer, because removing them would rearrange the grid under people mid-sentence.
 
 `P2PMUX_FAILOVER_GRACE_SECS` overrides the five-minute window for a session, which is mostly of
@@ -146,8 +146,8 @@ interest to the end-to-end tests.
 
 A session that stops while you are in it drops you back to your shell with `p2pmux node ended`,
 followed by whatever the node had to say for itself. The node has no terminal of its own, so it
-keeps a log beside its socket — `/tmp/p2pmux-$(id -u)/<id>.log` on macOS, `$XDG_RUNTIME_DIR`
-otherwise — and that is where a longer story is. A session you end yourself takes the log with
+keeps a log beside its socket: `/tmp/p2pmux-$(id -u)/<id>.log` on macOS and `$XDG_RUNTIME_DIR`
+otherwise. That is where a longer story is. A session you end yourself takes the log with
 it; one that ended on its own leaves it for you.
 
 Nothing else on the machine can end a session for you. `p2pmux list`, `attach`, `ticket` and
@@ -158,7 +158,7 @@ sandbox `HOME` cannot delete a running session's record or unlink its socket.
 
 ## Control
 
-Only one peer controls a pane while they are actively typing. After about thirty seconds without
+Only one peer controls a pane while they are actively typing. After 30 seconds without
 activity, the host clears the controller and the pane becomes free. The next member's ordinary key
 claims the free pane and is delivered as its first input; active typing is protected, so there is
 no forced takeover. A pane's host owns its PTY, not its control lease: newly created split and tab
@@ -168,58 +168,58 @@ local control leases; F9 and F10 continue through to the focused PTY.
 Shared-layout commands are sticky local mux modes and never reach a PTY. `Ctrl+P` or `Ctrl+T`
 enters its mode; use the listed command repeatedly, press `Esc` to cancel, or type any normal key
 to leave the mode and send that key to the focused PTY. A key held with Ctrl or Option passes
-through to the PTY without ending the mode — `Ctrl+F` is `forward-char` and `Ctrl+C` is an
-interrupt, neither aimed at the mux — and the mode still clears itself two seconds after the last
+through to the PTY without ending the mode. `Ctrl+F` is `forward-char` and `Ctrl+C` is an
+interrupt, neither aimed at the mux. The mode still clears itself two seconds after the last
 command.
 
 ## Keys
 
-- `Ctrl+` arrows — move focus to the neighbouring pane in that direction in the current tab.
-- `Option+` `<shift>` + arrows — the same thing. Kept for the muscle memory it built; some
+- `Ctrl+` arrows: move focus to the neighbouring pane in that direction in the current tab.
+- `Option+` `<shift>` + arrows: the same thing. Kept for the muscle memory it built; some
   terminals need Shift with Option for horizontal arrows.
-- `Ctrl+Alt+` arrows — *not* a focus key. Forwarded to the pane untouched, which is how you still
+- `Ctrl+Alt+` arrows: *not* a focus key. Forwarded to the pane untouched, which is how you still
   send a readline word-jump now that `Ctrl+` arrows stop at p2pmux. `Ctrl+P` then an arrow is the
   other way round it.
 
 A pane is a neighbour if it is past this pane's edge in that direction and its span overlaps this
 one's. Panes that only sit past a corner are used just when nothing is properly beside you, so an
 arrow never leaves sideways when there is somewhere it should have gone.
-- `Ctrl+P`, then `n` — split the focused pane using its current aspect-ratio axis. The new PTY
+- `Ctrl+P`, then `n`: split the focused pane using its current aspect-ratio axis. The new PTY
   runs on the requester's machine and inherits the target pane's cwd when that pane is hosted
   locally by the requester and its cwd is available; otherwise it starts in the p2pmux process cwd.
-- `Ctrl+P`, then `r` / `l` / `d` / `u` — create the new pane right / left / down / up of the
+- `Ctrl+P`, then `r` / `l` / `d` / `u`: create the new pane right / left / down / up of the
   focused pane. Its local PTY inherits the target pane's cwd under the same conditions.
-- `Ctrl+P`, then `X` — delete the focused pane. Only that pane's host may delete it.
-- `Ctrl+P`, then `i` — copy this session's full join ticket to the clipboard, for inviting someone
+- `Ctrl+P`, then `X`: delete the focused pane. Only that pane's host may delete it.
+- `Ctrl+P`, then `i`: copy this session's full join ticket to the clipboard, for inviting someone
   on another machine. Coordinator only.
-- `Ctrl+P`, then `k` — lock the focused pane. A locked pane accepts input only from its own host,
+- `Ctrl+P`, then `k`: lock the focused pane. A locked pane accepts input only from its own host,
   and its header reads `locked by <name>` for everyone else.
-- `Ctrl+P`, then `Shift+L` — lock the whole session. The coordinator then refuses any peer that
+- `Ctrl+P`, then `Shift+L`: lock the whole session. The coordinator then refuses any peer that
   has never joined it, telling them the session is locked rather than just dropping them. Peers
   already inside are untouched, and one that reconnects after a drop is still let back in. The tab
   bar reads `locked` while it holds. Coordinator only; a guest is told so.
-- `Ctrl+P`, then `e` — rename the focused pane for every admitted member. Enter saves; Esc
+- `Ctrl+P`, then `e`: rename the focused pane for every admitted member. Enter saves; Esc
   cancels; a blank title restores `Pane #N`.
-- `Ctrl+P`, then `z` — zoom the focused pane to the whole content area, and again to give the
+- `Ctrl+P`, then `z`: zoom the focused pane to the whole content area, and again to give the
   siblings their space back. Purely a local view choice: the pane keeps the grid the session gave
   it, no other member sees anything happen, and its bottom border reads `zoom` so a zoomed pane is
   never mistaken for a tab with one pane in it. Moving focus stands the zoom down, since looking
   elsewhere and hiding elsewhere cannot both be what you meant. Nothing to zoom on a tab that is
   already one pane, so the key does nothing there.
-- `Ctrl+P`, then `Shift+R` — repaint the whole screen. Nothing else in p2pmux asks for this: the
+- `Ctrl+P`, then `Shift+R`: repaint the whole screen. Nothing else in p2pmux asks for this: the
   client draws only the cells that changed since the last frame, which is what keeps a busy pane
   cheap, and it works because the client knows what is on your screen. When something else has
-  written there — a terminal that measures an emoji differently, a stray escape from a program in a
-  pane, another multiplexer outside p2pmux — that knowledge is wrong and the cells it believes are
+  written there, such as a terminal that measures an emoji differently, a stray escape from a program in a
+  pane, or another multiplexer outside p2pmux, that knowledge is wrong and the cells it believes are
   already right are never written again, so the stale glyphs stay. This throws that belief away.
   Purely local, like zoom: no peer sees anything happen. Resizing the window by a column has the
   same effect, which is how people used to find their way out.
-- `Ctrl+P`, then arrows — move focus.
-- `Ctrl+T`, then `N` — create a tab with a local PTY on the requester's machine.
-- `Ctrl+T`, then `X` — delete the current tab only when the requester hosts every pane in it.
-- `Ctrl+T`, then `e` — rename the current tab for every admitted member. Enter saves; Esc cancels;
+- `Ctrl+P`, then arrows: move focus.
+- `Ctrl+T`, then `N`: create a tab with a local PTY on the requester's machine.
+- `Ctrl+T`, then `X`: delete the current tab only when the requester hosts every pane in it.
+- `Ctrl+T`, then `e`: rename the current tab for every admitted member. Enter saves; Esc cancels;
   a blank title restores `Tab #N`.
-- `Ctrl+T`, then left/right — switch tabs.
+- `Ctrl+T`, then left/right: switch tabs.
 
 The final pane in a tab must be removed by deleting its tab; the final tab cannot be deleted. When
 a pane shell exits, p2pmux preserves its final screen and marks the pane exited for everyone.
@@ -230,12 +230,12 @@ then `X`.
 
 The tab bar's right edge reports the session's connectivity: `direct 55ms` when traffic is
 peer-to-peer, `relayed 120ms` when it is going through a relay server, and `×N` when more than one
-peer is connected — the number shown is always the worst path, since one peer stuck on a relay is
+peer is connected. The number shown is always the worst path, since one peer stuck on a relay is
 the thing worth noticing. `locked · direct 55ms` when the session is locked.
 
 Nested ratio-controlled splits go four deep, at most 8 panes per tab and at most 9 tabs. Each pane
 title shows `Pane #N host: <name> control: free|<name>|…`. A pane being driven by a member is
-drawn in that member's own color — the same color as their tab dot — so the border says who
+drawn in that member's own color, the same color as their tab dot, so the border says who
 holds it, and every member sees that pane the same color. A free pane you are focused on is
 white; red-orange is left for a controller who has since dropped out of the session. Pane mode
 gives the locally focused pane a red border; Tab mode dims inactive tab labels. Click tab labels
@@ -252,7 +252,7 @@ tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc
 Presence shows where every other member is looking. Each member gets a color from their slot in
 the session's member list, and that color identifies them everywhere: a dot per member on each tab
 they are on, their initial on the bottom border of the pane they are watching, the border of any
-pane they are driving. Watching is not controlling — a watcher only ever leaves an initial on the bottom
+pane they are driving. Watching is not controlling. A watcher only ever leaves an initial on the bottom
 border, and the member holding the control lease is drawn as a reversed chip.
 
 Presence is silent when nobody moves. A member publishes their focus only when it changes, the
@@ -266,7 +266,7 @@ inside Zellij, Zellij may swallow mouse events; try Zellij with mouse mode disab
 passthrough configuration.
 
 Drag inside a pane's terminal content to select text; releasing the mouse copies it to the system
-clipboard — `pbcopy` on macOS, and `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed.
+clipboard: `pbcopy` on macOS, and `wl-copy`, `xclip` or `xsel` on Linux, whichever is installed.
 Over `ssh` or in a bare TTY, where none of those exist, p2pmux asks the terminal emulator itself
 via OSC 52; terminals that do not implement it drop the request silently, so a copy can be
 reported that did not land.
@@ -274,15 +274,15 @@ reported that did not land.
 Dragging out through the top or the bottom of a pane scrolls it, and keeps scrolling while you hold
 the pointer there, so a selection is not limited to what fits on screen. Both ends stay on the lines
 they were placed on rather than on the rows they happened to land on, so what you copy is every line
-between them — including the ones that scrolled past on the way. Out through a *side* scrolls
+between them, including the ones that scrolled past on the way. Out through a *side* scrolls
 nothing: that is reaching for the pane next door.
 
 Drag a shared pane border to resize its split. Corner drags lock to one axis after a
 short motion threshold, preview locally, and commit one shared ratio on release. The affected pane
 hosts then resize their own PTY and VT screen and publish their local grids.
 
-When the focused pane's program turns on xterm mouse reporting — an editor, a pager, or a coding
-agent's input box — clicks, drags, and the wheel go to that program instead, so clicking moves its
+When the focused pane's program turns on xterm mouse reporting, such as an editor, a pager, or a coding
+agent's input box, clicks, drags, and the wheel go to that program instead, so clicking moves its
 text cursor. Hold `Shift` to select and copy as usual. The mux keeps every event such a program
 should not see: presses on borders, tab labels, and the footer, presses on a pane that is not yet
 focused (which focus it instead), and anything over a pane scrolled into history. A plain shell
@@ -294,8 +294,8 @@ For locally hosted panes, mouse-wheel scrollback is loaded from the host on dema
 scroll up, then cached while you browse it. Starting a scroll freezes a host-authored viewport for
 that browse session, so output can continue at the live edge without changing what is being read.
 
-A resize, a split, a zoom or a reconnect ends that browse session — a reflow rewrites the grid the
-frozen window was taken against — but it does not touch the pane's history. The next notch of the
+A resize, a split, a zoom or a reconnect ends that browse session because a reflow rewrites the grid the
+frozen window was taken against. It does not touch the pane's history. The next notch of the
 wheel starts a fresh browse session over the rows that were always there. Retained rows keep the
 width they were written at, so a pane that got narrower clips them rather than losing them.
 
@@ -304,7 +304,7 @@ an empty scrollback window in this v1 implementation.
 
 A pane being browsed shows no cursor: it is not displaying where its program's cursor is, and a
 caret left blinking on a row of history says otherwise. Typing returns the pane to its live edge
-and the cursor with it, and so does anything that ends the browse session — a resize, or a node
+and the cursor with it, and so does anything that ends the browse session, such as a resize or a node
 answering that the rows are gone.
 
 Slow viewers may receive coalesced screen deltas and then a fresh snapshot to recover. Resizing an
@@ -314,7 +314,7 @@ changed host-owned grids. Guests only receive the resulting commit and screen sn
 ## What a pane's terminal answers
 
 A pane is a real PTY, and programs interrogate the terminal behind one. A query is a blocking
-round trip — the program writes it and reads until an answer arrives — so an unanswered query does
+round trip: the program writes it and reads until an answer arrives. An unanswered query does
 not degrade a program, it stops it. A pane answers:
 
 | Query | Answer |
@@ -326,21 +326,21 @@ not degrade a program, it stops it. A pane answers:
 | `CSI c`, `CSI > c` (device attributes) | a VT100 with the advanced video option |
 
 The answers come from the machine hosting the pane, so a pane on another member's laptop is
-answered by their node, about their grid — which is the only correct answer.
+answered by their node, about their grid. That is the only correct answer.
 
 That covers the common way a program measures its terminal: park the cursor far past the end with
 `CSI 999 ; 999 f` and ask where it landed. p2pmux treats `f` (HVP) as the `H` (CUP) it is, so the
 cursor really moves and the reported size is the pane's own.
 
-**Colour queries are not answered.** `OSC 10` and `OSC 11` ask for the terminal's foreground and
-background, and no p2pmux process can see the terminal you are looking at — a pane hosted
+p2pmux does not answer colour queries. `OSC 10` and `OSC 11` ask for the terminal's foreground and
+background, and no p2pmux process can see the terminal you are looking at. A pane hosted
 elsewhere has no single such terminal at all. An invented answer would make an application pick a
 palette against the wrong background, so these stay silent. Programs that use them for light/dark
 detection fall back to their default.
 
 ## The inbox
 
-`Ctrl+O` opens the inbox — and so does bare `p2pmux`, whenever it rejoins a session that already
+`Ctrl+O` opens the inbox. So does bare `p2pmux` whenever it rejoins a session that already
 exists rather than creating one. It is one screen listing every supported coding agent
 running on every machine in the session, sorted by which one is blocking you. Supported agents
 are Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv), Pi
@@ -372,7 +372,7 @@ is in and the tab and pane `Enter` will put you on. Cards sort blocked → done 
 agent that needs you never appears below one that does not, and that is the point of the screen.
 
 The list is paged rather than scrolled, at most eight agents to a page, and the count beside the
-title is of the whole list — so a page you cannot see is never hiding something that needs you.
+title is of the whole list, so a page you cannot see is never hiding something that needs you.
 A terminal too short for cards drops the location line, and then falls back to one line per agent.
 
 Opening a row puts you on the tab that agent lives on, focused on its pane, with the rest of that
@@ -391,7 +391,7 @@ if you want the agent alone on screen.
 | `h` `l` | Turn the page, when there is more than one |
 | `q` | Quit |
 
-`Esc` is deliberately **not** the way back. Claude Code interrupts on it and vim needs it
+`Esc` is deliberately not the way back. Claude Code interrupts on it and vim needs it
 constantly, so swallowing it would break the terminal you just opened. Inside a pane every
 unmodified key belongs to the program running there.
 
@@ -416,11 +416,11 @@ it. Its last line carries the way in instead:
 
 What it is doing is read from this machine, not from the session it is in: its hooks leave a
 record next to the session sockets, and every p2pmux you run reads that back. So the state is as
-true here as it is over there. An agent with no hooks installed still says `state unknown — no
+true here as it is over there. An agent with no hooks installed still says `state unknown: no
 hooks`, in that session and in this one alike.
 
 Run that from a terminal, not from a pane in here. Reaching it from inside would mean a whole
-second p2pmux nested in a pane of this one — which takes the prefix key from the mux around it
+second p2pmux nested in a pane of this one. That takes the prefix key from the mux around it
 and, on a session that already has a terminal, ends at `already attached` and leaves an empty
 shell. The row stays on the list because it is the only record of where that agent went.
 
@@ -436,7 +436,7 @@ running. A machine that is paired but not in the session is one you own that is 
 it says `asleep` rather than disappearing.
 
 The rail takes width the agents were not using. A terminal too narrow for it puts the same table
-under the agents instead, and one too narrow for that falls back to a line of names and ticks —
+under the agents instead, and one too narrow for that falls back to a line of names and ticks,
 which still answers "is my fleet up", which is what earns it the space.
 
 `a` adds one, without leaving the screen:
@@ -464,7 +464,7 @@ invite `Ctrl+S` hands out, so it carries the same warning: anyone who runs that 
 shell on this machine. Only the machine hosting the session can offer one; a member is told so.
 
 It records the session's ticket in `pairing.toml`, which is what makes bare `p2pmux` rejoin on
-both machines afterwards. It does not answer the accepts-work question — that is asked once, by
+both machines afterwards. It does not answer the accepts-work question. That is asked once, by
 `p2pmux pair`, and its answer is default-deny.
 
 `m` moves the cursor into the rail, and the arrow keys walk it from there; `m` again or `Esc`
@@ -474,7 +474,7 @@ process and the row is about the box.
 
 The `inbox` badge in the tab bar carries the count of agents blocked on a human, in amber, so it
 stays visible while you are deep inside a terminal. It never shows a zero: absence is quieter and
-means the same thing. Going to an agent's pane answers its summons and drops it from the count —
+means the same thing. Going to an agent's pane answers its summons and drops it from the count.
 the badge means "somebody is waiting on you and you have not been", so standing in front of the
 question answers it. The next question from that pane counts again: answering one is not muting
 the pane. An agent that blocks in a pane you left focused and walked away from still counts, which
@@ -486,8 +486,8 @@ model, so do not use a session with people who should not see repository paths. 
 everyone holding the ticket. A row for a pane hosted by another member shows their agent's state
 but never its words.
 
-**Known gap.** That makes a remote row read `needs you` with nothing after it, so you have to
-press Enter to find out what the agent wants — on exactly the rows where knowing first would save
+Known gap: a remote row reads `needs you` with nothing after it, so you have to press Enter to
+find out what the agent wants, on exactly the rows where knowing first would save
 the trip. The fix is not to broadcast the words to the session, which would hand them to any human
 collaborator holding the code; it is to send them only to machines you have *paired* with, which
 is a distinction the wire cannot currently draw. Until it can, the inbox stays quiet rather than
@@ -500,7 +500,7 @@ pane had been quiet, and that could not work: silence looks identical whether an
 waiting on a permission prompt, or finished. The guess fired completions mid-task and could never
 once report `needs you`, the state that actually costs you time.
 
-So the process scan answers one question — *which* agent is running in a pane — and the agent's own
+The process scan answers one question, *which* agent is running in a pane, and the agent's own
 hooks answer the rest. Watching processes may report `running` or `idle` and nothing else; only a
 hook may ever say `needs you`. Until a hook reports, the row says so in its own description column:
 
@@ -521,7 +521,7 @@ about what an agent did would defeat the entire point of not reading the termina
 This holds for an agent p2pmux never started, too. A `claude` you left running in another terminal
 has no pane to report for and no node socket to report over, so its hooks leave one small record in
 your private runtime directory instead, named after the agent's own process; the same scan that
-found the process reads it back. Nothing else expires those records — a loose agent *is* its
+found the process reads it back. Nothing else expires those records. A loose agent *is* its
 process, so a `needs you` from one that has been waiting an hour is still waiting, and the row goes
 when the process does.
 
@@ -535,13 +535,13 @@ p2pmux setup opencode --uninstall
 ```
 
 Two agents have a hook surface today: Claude Code and OpenCode. `setup` with no agent named wires
-both, and reports each on its own line — that is the form the inbox's nudge tells you to run, and a
+both and reports each on its own line. That is the form the inbox's nudge tells you to run, and a
 machine whose agents are unreported should not then have to pick which of them to fix. One agent
 failing does not stop the other.
 
 #### Claude Code
 
-`setup` writes six marker-owned entries into `~/.claude/settings.json` — one per lifecycle event —
+`setup` writes six marker-owned entries into `~/.claude/settings.json`, one per lifecycle event,
 through a temporary file and a rename. Every entry it writes carries `"owner": "p2pmux"`, so
 installing replaces exactly its own entries and removing takes exactly those: your own hooks on the
 same events (a completion chime on `Stop`, say) survive both untouched. Running it twice is the same
@@ -561,7 +561,7 @@ it.
 #### OpenCode
 
 `p2pmux setup opencode` writes one file, `~/.config/opencode/plugin/p2pmux.js`, and uninstalling
-deletes it. OpenCode has no hook list to merge into — a plugin is a file it imports — so ownership
+deletes it. OpenCode has no hook list to merge into. A plugin is a file it imports, so ownership
 is a line inside the file rather than a marker on an entry: a `p2pmux.js` p2pmux did not write is
 refused rather than overwritten or deleted.
 
@@ -598,8 +598,8 @@ On your laptop:       p2pmux pair 4KP7Q-M2XRW
                       → paired: desktop
 ```
 
-Both machines need a p2pmux that shares a protocol pin — `p2pmux --version` on each, and
-[CHANGELOG.md](../CHANGELOG.md#compatibility) for which releases go together. The code is good for
+Both machines need a p2pmux that shares a protocol pin. Run `p2pmux --version` on each, and use
+[CHANGELOG.md](./CHANGELOG.md#compatibility) for which releases go together. The code is good for
 ten minutes, and it admits exactly one machine: the window closes on the first arrival and expires
 on its own, so a second machine needs a second `p2pmux pair`.
 
@@ -613,7 +613,7 @@ oldbox       asleep   —              —
 ```
 
 A machine is `ready` when it is in a live session here and `asleep` when it is paired but not
-answering — off, sleeping, or without a node running. `p2pmux unpair <name>` forgets one.
+answering: off, sleeping, or without a node running. `p2pmux unpair <name>` forgets one.
 
 This machine is always in the list, so a fresh install shows a fleet of one rather than an empty
 table, with the pairing nudge under it:
@@ -626,7 +626,7 @@ No other machines paired yet. Run `p2pmux pair` to add one.
 ```
 
 `accepts work` is asked once, during pairing, and defaults to no. It means *accepts work from your
-other machines*, never *from anyone with the join code* — otherwise handing out a code would be
+other machines*, never *from anyone with the join code*. Otherwise handing out a code would be
 handing out remote code execution. It reads `—` for a machine that has never answered the question,
 because the answer is given on the machine it is about and there is no channel back; printing `no`
 would show a refusal nobody made.
@@ -638,19 +638,19 @@ and the names of the paired machines, and no keys of its own.
 
 In the order they actually happen:
 
-- **`could not reach the session host`, but both machines are up and on the network.** Check
+- If `could not reach the session host` appears while both machines are up and on the network, check
   `p2pmux --version` on each. Two p2pmux on different sides of a protocol pin cannot share a
   session; a recent one says so outright, an older one reports it as a reachability failure
   because the refusal arrives in a protocol it cannot read.
-- **The code was typed more than ten minutes after it was printed**, or another machine used it
+- If the code was typed more than ten minutes after it was printed, or another machine used it
   first. Print a fresh one with `p2pmux pair` and type it within the window.
-- **`p2pmux pair --token` says this machine is not in a fleet.** A token is an invitation to a fleet
+- If `p2pmux pair --token` says this machine is not in a fleet, a token is an invitation to a fleet
   that already exists, and a fleet begins with one human pairing two machines. Run `p2pmux pair`
   between two of yours first; use a token for the third and every one after it.
-- **A machine that paired is `asleep` in `p2pmux machines`.** It is paired but nothing is running
-  on it. A box with somebody at it rejoins with bare `p2pmux`; one without needs the fleet agent —
+- If a machine that paired is `asleep` in `p2pmux machines`, it is paired but nothing is running
+  on it. A box with somebody at it rejoins with bare `p2pmux`; one without needs the fleet agent:
   `p2pmux daemon install` on that machine, once.
-- **A machine of yours keeps dragging you somewhere unexpected.** Your machines invite each other
+- If a machine of yours keeps dragging you somewhere unexpected, your machines invite each other
   into every session they are coordinating, and a session left running on a box nobody looks at
   goes on inviting for as long as it is up. `p2pmux list` on that machine says what it is running,
   and `p2pmux kill <name>` ends it.
@@ -658,7 +658,7 @@ In the order they actually happen:
 ### Adding a machine nobody is sitting at
 
 `p2pmux pair` is a code one human types on one machine within ten minutes. That is right for two
-laptops and unusable from a provisioning script, so a VM gets a token instead — the same command
+laptops and unusable from a provisioning script, so a VM gets a token instead, using the same command
 with `--token`. It needs a fleet to invite the machine *into*, so pair two machines by hand first;
 a token cannot create one.
 
@@ -676,7 +676,7 @@ works. `p2pmux pair --revoke` withdraws it; machines already in the fleet stay, 
 is how one leaves.
 
 `p2pmux enroll` is what `p2pmux pair --token` used to be called, and still works: those tokens live
-in machine images written months before anything runs them. It is no longer in `--help` — there is
+in machine images written months before anything runs them. It is no longer in `--help`. There is
 one command for adding a machine, and this is the flag that says whether a person is there to type
 it.
 
@@ -693,15 +693,15 @@ machine is there to be invited into sessions you start later. `p2pmux daemon sta
 it is installed, and `p2pmux daemon uninstall` removes it.
 
 It is a credential, and worth being plain about: anyone holding it can put a machine in your fleet
-until you revoke it. What that buys them is *membership*, which starts nothing on its own — see
-below. A machine that presents a withdrawn token can still **join the session**, because the ticket
+until you revoke it. What that buys them is *membership*, which starts nothing on its own. A
+machine that presents a withdrawn token can still join the session, because the ticket
 inside it is a session invitation and revoking an enrolment is not revoking that; `p2pmux machines`
 lists it under `IN THIS SESSION, NOT YOURS`, which is the difference the heading exists for.
 
 ### What your machines may start here
 
 Closed by default, and opened by answering one question. `p2pmux pair` asks whether your other
-machines may start work here; yes allows a login shell — everything this user account can do —
+machines may start work here; yes allows a login shell, everything this user account can do.
 and `p2pmux work` prints what stands.
 
 ```text
@@ -718,7 +718,7 @@ decisions. There is no blocklist, because a blocklist on an interactive shell is
 against accidents and not a boundary: allow a shell and you have allowed everything that user can
 do, and the allowlist says so in those words rather than pretending otherwise.
 
-Underneath there are two records — whether this machine accepts work at all, and what it accepts —
+Underneath there are two records, whether this machine accepts work at all and what it accepts,
 and every command here writes both, because either one alone permits nothing. When a machine
 refuses a terminal, the machine that asked is told the command that lifts it and where to run it:
 
@@ -762,14 +762,14 @@ overriding their answer is not p2pmux's call. Set the theme keys above to shape 
 
 `member_colors` under `[ui.theme]` is a list of up to eight colors, one per member slot in join
 order, used for the presence dots and chips. Listing fewer than eight overrides from the front and
-leaves the rest at their built-in color. The first slot — the session host — defaults to a vivid
+leaves the rest at their built-in color. The first slot, the session host, defaults to a vivid
 red-orange so the host is easy to pick out; the rest are cool hues on purpose, because the
 remaining warm colors are reserved for the active tab, for a chord-armed pane, and for a pane whose
 controller has left, so a member tinted like any of those would read as an alert.
 
 ### Notifications
 
-A pane is marked unread — the `*` on its title and its tab — when its agent arrives at a state that
+A pane is marked unread, the `*` on its title and its tab, when its agent arrives at a state that
 wants you: `done`, `needs you`, or `error`, reported by a hook, while you are looking somewhere
 else. Focusing the pane clears the mark, and that does not re-arm it for work you have already seen.
 
@@ -792,7 +792,7 @@ p2pmux 0.1.14 is out — you have 0.1.13. Update with `brew update && brew upgra
 want to know now.
 
 What it does not do is install anything. Replacing the binary you are running, under whichever
-package manager put it there, is not a thing to do behind a `y/n` prompt at startup — so it names
+package manager put it there, is not a thing to do behind a `y/n` prompt at startup. It names
 the command and leaves it to you.
 
 The check is a `HEAD` request to `github.com/pelazas/p2pmux/releases/latest`, whose redirect names
@@ -804,7 +804,7 @@ that file to ask again immediately.
 #### When two installs disagree
 
 Updating one channel does not update the others, and the shell runs whichever copy comes first on
-your PATH — not the one installed most recently. A Homebrew copy sitting ahead of a curl install is
+your PATH, not the one installed most recently. A Homebrew copy sitting ahead of a curl install is
 the usual shape, and while it lasts, every fix that ships looks unshipped.
 
 `p2pmux doctor` lists every `p2pmux` on your PATH, in the order the shell tries them, with the
@@ -817,7 +817,7 @@ p2pmux on PATH
   /Users/you/.cargo/bin/p2pmux      unknown
 ```
 
-`unknown` means that copy did not report a version — usually a build old enough to exit non-zero on
+`unknown` means that copy did not report a version, usually a build old enough to exit non-zero on
 `--version`. When the copy that runs is behind one that is installed, doctor says so and names the
 command that replaces *that* copy, which is not always the one that installed the newer file.
 

@@ -9,7 +9,7 @@ sends a ping works exactly the same as one that does.
 
 ## Why this exists
 
-Every number in `docs/METRICS.md` is a proxy. Downloads say a tarball was fetched — by a
+Every number here is a proxy. Downloads say a tarball was fetched — by a
 person, a mirror, or CI, and nothing distinguishes them. Stranger-opened issues say
 somebody was annoyed enough to type, which is real but slow and heavily filtered. Neither
 tells you whether the person who installed p2pmux on Monday started a session on Thursday,

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Prints this week's row for docs/METRICS.md.
+# Prints this week's metrics row.
 #
 # Four numbers, and the reason each one is here rather than the obvious ones:
 #
@@ -10,13 +10,13 @@
 #                number the roadmap turns on.
 #   visitors     top of funnel. GitHub only keeps 14 days, so this must be recorded
 #                weekly or it is gone.
-#   escalations  whether v2 exists at all. Not derivable from GitHub — kept by hand in
-#                docs/ESCALATIONS.md and counted here.
+#   escalations  whether v2 exists at all. Not derivable from GitHub. It is `n/a` when
+#                no local escalation file is available.
 #
 # Deliberately absent: stars (vanity) and clone counts. 1170 clones from 334 uniques is
 # mirrors, package scanners and CI, not people. Reporting it to anyone would be lying.
 #
-# Usage:  sh scripts/metrics.sh        then paste the row into docs/METRICS.md
+# Usage:  sh scripts/metrics.sh
 set -eu
 
 REPO="${P2PMUX_METRICS_REPO:-pelazas/p2pmux}"
@@ -37,7 +37,7 @@ issues=$(gh issue list --repo "$REPO" --state all --limit 200 --json author \
 
 views=$(gh api "repos/$REPO/traffic/views" --jq '.uniques')
 
-esc_file="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/docs/ESCALATIONS.md"
+esc_file="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/ESCALATIONS.md"
 if [ -f "$esc_file" ]; then
   # One escalation per `## ` heading, counting only below the entries marker — the
   # copy-paste template above it also starts with `## ` and would report a phantom event.

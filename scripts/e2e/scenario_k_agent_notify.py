@@ -209,7 +209,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
         # Scoped to the panel: the pane underneath is running `exec -a claude ...`, so
         # searching the whole screen would match the shell's own command line and pass
         # whether or not detection fired. The overlay prints the lowercase kind, not the
-        # display label -- see the panel drawing in docs/USAGE.md.
+        # display label. See the panel drawing in USAGE.md.
         overlay = host.snapshot()
         panel = agent_panel(overlay)
         check(

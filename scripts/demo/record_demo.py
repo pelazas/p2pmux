@@ -411,7 +411,7 @@ def render_gif(frames: list[dict], output: Path, frames_dir: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--still", action="store_true", help="render two PNGs, no GIF")
-    parser.add_argument("--out", default="docs/assets/demo.gif")
+    parser.add_argument("--out", default="assets/demo.gif")
     parser.add_argument("--frames-dir", default=None)
     parser.add_argument(
         "--replay",

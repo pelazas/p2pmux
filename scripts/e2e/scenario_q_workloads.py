@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Category D: real full-screen programs in a shared pane, driven from the other peer.
 
-docs/e2e-stress-log.md lists this as never touched -- terminal fidelity was proven with
-`less` and nothing else. vim and top are what a pair of developers actually put in a
+Terminal fidelity was proven with `less` and nothing else. vim and top are what a pair of developers actually put in a
 shared pane on day one, and they stress different things than a pager does: vim owns the
 alternate screen *and* takes input that changes the buffer, and top repaints on its own
 timer whether anyone is typing or not.
