@@ -270,7 +270,7 @@ impl SharedLayoutRuntime {
                 .await
                 .ok()
                 .flatten()
-                .map_or(ticket, |ticket| ticket);
+                .unwrap_or(ticket);
             if let Ok(published) =
                 crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string()).await
             {

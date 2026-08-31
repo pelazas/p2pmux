@@ -2778,8 +2778,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_bare_budget_never_starts_a_directory_request() {
-        let mut pairing = crate::pairing::Pairing::default();
-        pairing.fleet_key = Some(crate::fleet::FleetKey::mint().unwrap().hex().to_owned());
+        let pairing = crate::pairing::Pairing {
+            fleet_key: Some(crate::fleet::FleetKey::mint().unwrap().hex().to_owned()),
+            ..Default::default()
+        };
         let outcome = locate_bare_fleet(&pairing, Instant::now()).await;
         assert_eq!(outcome, BareFleetLookup::Unreachable);
     }
