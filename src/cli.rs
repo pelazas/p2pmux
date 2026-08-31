@@ -701,6 +701,10 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 stdout.flush()?;
             }
             let ticket = resolve_join_ticket(&ticket).await?;
+            let live = crate::session_store::SessionStore::for_current_user()?.list_live()?;
+            if let Some(descriptor) = live_session_matching_ticket(&live, &ticket.to_string()) {
+                return crate::client::run(descriptor);
+            }
             let display_name = resolve_display_name(name)?;
             let (cols, rows) = crossterm::terminal::size()?;
             let descriptor = launch_background_node(
@@ -1903,6 +1907,20 @@ fn newest_live(
         .cloned()
 }
 
+/// The live member this ticket already names on this machine, if any.
+///
+/// Reuse the live member this machine already is, not the coordinator this
+/// machine is hosting. The newest is the one a later join reached, so it is
+/// the least surprising one to attach when they remain.
+fn live_session_matching_ticket<'a>(
+    live: &'a [crate::session_store::SessionDescriptor],
+    ticket: &str,
+) -> Option<&'a crate::session_store::SessionDescriptor> {
+    live.iter()
+        .filter(|descriptor| descriptor.joined_ticket.as_deref() == Some(ticket))
+        .max_by_key(|descriptor| descriptor.created_at)
+}
+
 async fn rejoin_paired_session(
     ticket: &str,
     connect_timeout_ms: Option<u64>,
@@ -2507,7 +2525,9 @@ fn wait_for_enter() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_accepts_work, fleet_addresses_from, hosting_the_fleet};
+    use super::{
+        apply_accepts_work, fleet_addresses_from, hosting_the_fleet, live_session_matching_ticket,
+    };
 
     #[test]
     fn saying_yes_to_starting_work_here_allows_something_to_be_started() {
@@ -2621,6 +2641,46 @@ mod tests {
         assert_eq!(
             hosting_the_fleet(&[coordinator, member], Some("p2pmux-v3:TICKET")).len(),
             2
+        );
+    }
+
+    #[test]
+    fn a_join_attaches_to_the_live_session_its_ticket_already_names() {
+        let ticket = "p2pmux-v3:TICKET";
+
+        let mut coordinator = session("coordinator");
+        coordinator.ticket = Some(ticket.to_owned());
+        assert!(live_session_matching_ticket(&[coordinator], ticket).is_none());
+
+        let mut member = session("member");
+        member.joined_ticket = Some(ticket.to_owned());
+        assert_eq!(
+            live_session_matching_ticket(&[member], ticket).map(|session| session.name.as_str()),
+            Some("member")
+        );
+
+        let mut older = session("older");
+        older.joined_ticket = Some(ticket.to_owned());
+        older.created_at = 1;
+        let mut newest = session("newest");
+        newest.joined_ticket = Some(ticket.to_owned());
+        newest.created_at = 2;
+        assert_eq!(
+            live_session_matching_ticket(&[older, newest], ticket)
+                .map(|session| session.name.as_str()),
+            Some("newest")
+        );
+
+        let mut coordinator = session("coordinator");
+        coordinator.ticket = Some(ticket.to_owned());
+        coordinator.created_at = 2;
+        let mut member = session("member");
+        member.joined_ticket = Some(ticket.to_owned());
+        member.created_at = 1;
+        assert_eq!(
+            live_session_matching_ticket(&[coordinator, member], ticket)
+                .map(|session| session.name.as_str()),
+            Some("member")
         );
     }
 

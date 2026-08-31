@@ -15,7 +15,9 @@ are for naming a specific session out loud.
 `p2pmux attach` returns to a session already running here, with a name or with none at
 all for the one started most recently.
 
-`create` and `join` start a session-scoped background node, then attach the local TUI client.
+`create` starts a session-scoped background node, then attaches the local TUI client. `join` does
+the same unless its ticket names a live member this machine already has, in which case it attaches
+to that member.
 Ctrl+Q asks which leaving you meant: `d` detaches that client without stopping shells, Iroh, or
 hosted panes, and `k` ends the session on this machine. Its panes die with it, and a session
 nobody is left hosting a pane in is over. Enter is `d` and Esc backs out, so a reflex press never
@@ -244,7 +246,7 @@ to switch tabs without claiming control or sending input.
 The dark contextual footer uses red key accents: normal mode is
 `Ctrl+ <p> PANE   <t> TAB   <q> QUIT   <↑↓←→> FOCUS    type to claim when free`;
 pane mode is
-`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <L> SESSION   <R> REDRAW   <Esc> BACK`, dropping `<R> REDRAW` and then `<L> SESSION` on a terminal too narrow to hold them whole rather than clipping the bar mid-word;
+`PANE MODE  <←↓↑→> FOCUS   <e> RENAME   <n> NEW   <r/l/d/u> SPLIT   <z> ZOOM   <x> CLOSE   <k> LOCK   <L> SESSION   <R> REDRAW   <Esc> BACK`, dropping SESSION and LOCK first, then longer pane actions, while REDRAW and BACK stay named at a typical 100-column terminal. The bar sheds whole clauses rather than clipping mid-word, and below its floor the hints vanish;
 tab mode is `TAB MODE  <←→> SWITCH   <e> RENAME   <n> NEW   <x> CLOSE   <Esc> BACK`.
 
 ## Presence

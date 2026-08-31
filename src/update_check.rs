@@ -56,6 +56,14 @@ pub struct UpdateNotice {
     pub command: &'static str,
 }
 
+/// What one update check learned about the release this binary is running.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Check {
+    Newer(UpdateNotice),
+    Current { latest: String },
+    Unknown,
+}
+
 impl UpdateNotice {
     /// The one line the inbox shows.
     pub fn line(&self) -> String {
@@ -225,11 +233,24 @@ pub fn spawn() -> Receiver<UpdateNotice> {
 /// The check itself, run on the calling thread. `None` when this is the latest
 /// release, or when nothing could be learned.
 pub fn check() -> Option<UpdateNotice> {
-    let latest = latest_version()?;
-    is_newer(env!("CARGO_PKG_VERSION"), &latest).then(|| UpdateNotice {
-        version: latest.trim_start_matches('v').to_owned(),
-        command: upgrade_command(&std::env::current_exe().unwrap_or_default()),
-    })
+    match status() {
+        Check::Newer(notice) => Some(notice),
+        Check::Current { .. } | Check::Unknown => None,
+    }
+}
+
+/// The check itself, with a distinction between a current release and no answer.
+pub fn status() -> Check {
+    let Some(latest) = latest_version() else {
+        return Check::Unknown;
+    };
+    if is_newer(env!("CARGO_PKG_VERSION"), &latest) {
+        return Check::Newer(UpdateNotice {
+            version: latest.trim_start_matches('v').to_owned(),
+            command: upgrade_command(&std::env::current_exe().unwrap_or_default()),
+        });
+    }
+    Check::Current { latest }
 }
 
 #[cfg(test)]
