@@ -49,7 +49,8 @@ finder descriptor is the only durable session data, under `~/Library/Application
 on macOS and `$XDG_STATE_HOME/p2pmux/` (`~/.local/state/p2pmux/` unless you set it) on Linux.
 The Unix socket is under `$XDG_RUNTIME_DIR/p2pmux/` where Linux provides one, and `/tmp/p2pmux-$UID/`
 otherwise, which is also where macOS keeps it. Screens, PTYs, tickets, layout state, and focus are
-never restored from disk. The node survives terminal closure. It is not managed by launchd or systemd
+never restored from disk. The node survives an explicit Ctrl+Q, then `d`, detach; closing the terminal ends it.
+It is not managed by launchd or systemd
 itself. The *fleet agent* is managed that way, only if you asked for it: `p2pmux daemon install` writes a
 launchd agent on macOS or a systemd user unit on Linux, so a paired machine rejoins its home
 session at boot and can be invited into sessions you start later. `p2pmux pair` offers to install

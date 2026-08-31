@@ -116,7 +116,7 @@ The join code lasts six hours. If rendezvous is down, `Ctrl+S` offers a ticket t
 | `Ctrl+T` | Tab mode |
 | `Ctrl+S` | Copy the join line |
 | `Ctrl+O` | Inbox |
-| `Ctrl+Q` | Detach or end the session |
+| `Ctrl+Q` | `d` detaches; closing the window ends the session |
 
 Keys, mouse, scrollback, pairing, agent hooks, and config: [USAGE.md](./USAGE.md).
 

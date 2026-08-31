@@ -16,6 +16,11 @@ old one; older peers still report it as a host they could not reach.
 Three fixes, and no protocol change that costs anything: one field is added to the agent roster,
 absent from older peers and degrading to what they already sent.
 
+**Closing a p2pmux window now ends its local session.** A session stays available only after
+`Ctrl+Q` then `d` (Enter still chooses detach). Closing the terminal, losing SSH, or killing the
+client no longer leaves its node and panes running on this machine. Fleet-agent nodes and sleep
+behavior are unchanged.
+
 **An agent in another session on your machine reads as one again.** The second session's inbox
 called a pane-hosted agent `running outside p2pmux` and offered to start a second copy of it. The
 two halves of that row come from different places: whether an agent sits in a p2pmux pane is read
