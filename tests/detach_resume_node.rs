@@ -102,6 +102,7 @@ fn detached_node_serves_real_snapshots_and_accepts_a_new_attachment() {
                 cols: 80,
                 rows: 24,
             },
+            tether: p2pmux::node::Tether::Detached,
             // Untethered: detach and resume is the behaviour of a session
             // somebody started by hand, which outlives whatever started it.
             supervisor: None,

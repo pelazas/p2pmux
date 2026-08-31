@@ -606,9 +606,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     .map(Ok)
                     .unwrap_or_else(crate::session_store::generate_name)?,
                 crate::session_store::SessionRole::Coordinator,
-                // A session somebody typed `create` for outlives the terminal
-                // they typed it in. That is what the separate process is for.
-                crate::node::Tether::Detached,
+                crate::node::Tether::UntilFirstAttach,
                 // `create` is a session of its own, however many of your own
                 // machines end up in it. Publishing it as the fleet's meeting
                 // place would move the whole fleet into a session that was
@@ -713,7 +711,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 },
                 crate::session_store::generate_name()?,
                 crate::session_store::SessionRole::Member,
-                crate::node::Tether::Detached,
+                crate::node::Tether::UntilFirstAttach,
                 // Somebody else's session, reached with somebody else's code.
                 FleetRole::Bystander,
             )?;
@@ -990,9 +988,12 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
         Some(descriptor) => descriptor,
         // The session this pairing is about to hand out is, by construction,
         // the one the fleet will meet in.
-        None => start_solo_session(FleetRole::Home {
-            stands_in_for: None,
-        })?,
+        None => start_solo_session(
+            FleetRole::Home {
+                stands_in_for: None,
+            },
+            crate::node::Tether::Detached,
+        )?,
     };
     // The node publishes the code a moment after it starts, so a session
     // created two lines ago has not necessarily got one yet.
@@ -1170,7 +1171,8 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     pairing.offered_here = false;
     crate::pairing::save(&pairing)?;
 
-    let descriptor = rejoin_paired_session(&ticket_text, None).await?;
+    let descriptor =
+        rejoin_paired_session(&ticket_text, None, crate::node::Tether::UntilFirstAttach).await?;
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
@@ -1526,7 +1528,7 @@ async fn enroll_with_token(
     // a network that was never the problem.
     let mut joined = None;
     for ticket in fleet_addresses(&pairing).await {
-        match rejoin_paired_session(&ticket, None).await {
+        match rejoin_paired_session(&ticket, None, crate::node::Tether::Detached).await {
             Ok(descriptor) => {
                 joined = Some((descriptor, ticket));
                 break;
@@ -1736,7 +1738,9 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
             )?;
             stderr.flush()?;
         }
-        match rejoin_paired_session(&ticket, Some(5000)).await {
+        match rejoin_paired_session(&ticket, Some(5000), crate::node::Tether::UntilFirstAttach)
+            .await
+        {
             Ok(descriptor) => {
                 // The address that worked, kept for the next run. It is what
                 // gets dialled when the store cannot be reached, and a machine
@@ -1771,9 +1775,12 @@ async fn open_home() -> Result<(), Box<dyn Error>> {
     // here was a race against those, lost on a machine where publishing the
     // role takes a moment longer than it does on a laptop, and losing it left
     // every later `p2pmux` paying the rejoin window again.
-    let descriptor = start_solo_session(FleetRole::Home {
-        stands_in_for: failed_rejoin_ticket,
-    })?;
+    let descriptor = start_solo_session(
+        FleetRole::Home {
+            stands_in_for: failed_rejoin_ticket,
+        },
+        crate::node::Tether::UntilFirstAttach,
+    )?;
     // The session screen, not the inbox. A session created a moment ago has one
     // pane and no agents in it, so Home would open on an empty list — the blank
     // screen a first run is least able to interpret. Rejoining a fleet session
@@ -1906,6 +1913,7 @@ fn newest_live(
 async fn rejoin_paired_session(
     ticket: &str,
     connect_timeout_ms: Option<u64>,
+    tether: crate::node::Tether,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let ticket = resolve_join_ticket(ticket).await?;
     let display_name = display_name_or_hostname()?;
@@ -1920,7 +1928,7 @@ async fn rejoin_paired_session(
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Member,
-        crate::node::Tether::Detached,
+        tether,
         // Reached by looking the fleet up, so this is the fleet's home session
         // — and if this machine is later promoted to coordinate it, it is the
         // one that has to keep saying where the fleet is.
@@ -1943,6 +1951,7 @@ async fn rejoin_paired_session(
 /// whole fleet into it.
 fn start_solo_session(
     fleet_role: FleetRole,
+    tether: crate::node::Tether,
 ) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
     let display_name = display_name_or_hostname()?;
     let (cols, rows) = terminal_size_or_default();
@@ -1954,7 +1963,7 @@ fn start_solo_session(
         },
         crate::session_store::generate_name()?,
         crate::session_store::SessionRole::Coordinator,
-        crate::node::Tether::Detached,
+        tether,
         fleet_role,
     )
 }
@@ -2208,9 +2217,12 @@ pub(crate) fn launch_background_node(
         kind,
         // Resolved here rather than in the node, which cannot ask "who launched
         // me" once its parent has already gone -- the case the tether exists for.
+        tether,
         supervisor: match tether {
             crate::node::Tether::Detached => None,
-            crate::node::Tether::ToLauncher => crate::node::Supervisor::current(),
+            crate::node::Tether::ToLauncher | crate::node::Tether::UntilFirstAttach => {
+                crate::node::Supervisor::current()
+            }
         },
     };
     let bootstrap_path = descriptor.socket_path.with_extension("bootstrap");
