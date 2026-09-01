@@ -282,15 +282,8 @@ pub fn consent() -> Consent {
 /// by reflex, and the honest way to raise a yes rate is to make the ask small
 /// and the reason plain, not to skip it.
 pub const PROMPT: &str = "\
-p2pmux can send one anonymous line a day: a random id, the version, the OS, how
-many sessions you started, whether anybody joined one, and nothing else. No
-hostnames, no directories, no session names, nothing you typed. Terminal traffic
-never goes near it — that stays peer to peer.
-
-It is how a project with no analytics finds out whether anyone came back.
-
-  p2pmux telemetry show    print the exact line this machine would send
-  p2pmux telemetry off     stop sending it, any time
+p2pmux can send anonymous usage information to help improve the product.
+Terminal traffic is never sent, that stays peer to peer.
 
 Send it? [Y/n] ";
 
@@ -336,7 +329,7 @@ pub fn ask_once() {
         stderr,
         "{}\n",
         match answer {
-            Consent::Granted => "Thanks — one line a day. `p2pmux telemetry off` stops it.",
+            Consent::Granted => "p2pmux telemetry off stops it.",
             _ => "Nothing will be sent.",
         }
     );
