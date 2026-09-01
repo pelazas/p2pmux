@@ -271,13 +271,14 @@ impl SharedLayoutRuntime {
                 .ok()
                 .flatten()
                 .unwrap_or(ticket);
-            if let Ok(published) =
-                crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string()).await
+            let published = crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string())
+                .await
+                .ok();
+            let invite = PublishedInvite { ticket, published };
+            if let Err(error) = sender.send(invite)
+                && let Some(published) = error.0.published
             {
-                let invite = PublishedInvite { ticket, published };
-                if let Err(error) = sender.send(invite) {
-                    error.0.published.retire().await;
-                }
+                published.retire().await;
             }
         });
     }
@@ -297,13 +298,16 @@ impl SharedLayoutRuntime {
         self.retire_published_code();
         let sender = self.code_tx.clone();
         self.runtime.spawn(async move {
-            if let Ok(ticket) = ticket.parse::<JoinTicket>()
-                && let Ok(published) =
-                    crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string()).await
-            {
+            if let Ok(ticket) = ticket.parse::<JoinTicket>() {
+                let published =
+                    crate::hosted_rendezvous::PublishedCode::publish(ticket.to_string())
+                        .await
+                        .ok();
                 let invite = PublishedInvite { ticket, published };
-                if let Err(error) = sender.send(invite) {
-                    error.0.published.retire().await;
+                if let Err(error) = sender.send(invite)
+                    && let Some(published) = error.0.published
+                {
+                    published.retire().await;
                 }
             }
         });
@@ -316,27 +320,38 @@ impl SharedLayoutRuntime {
     }
 
     /// Adopt a code whose publish finished, if this node is still the one coordinating.
-    fn drain_published_codes(&mut self) -> bool {
+    pub(in crate::tui) fn drain_published_codes(&mut self) -> bool {
         let mut changed = false;
         while let Ok(PublishedInvite { ticket, published }) = self.code_rx.try_recv() {
             if !matches!(self.control, SharedControl::Host(_)) {
                 // Stepped back down while the request was in flight. Publishing a code for a
                 // ticket nobody will answer is worse than having none.
-                self.runtime.spawn(async move { published.retire().await });
+                if let Some(published) = published {
+                    self.runtime.spawn(async move { published.retire().await });
+                }
                 continue;
             }
             if let SharedControl::Host(host) = &mut self.control {
                 host.set_ticket(ticket.clone());
             }
             self.invite.ticket = Some(ticket.to_string());
-            let code = published.code().printable();
-            self.invite.code = Some(code.clone());
             self.pending_role_persist = Some(super::RolePersist {
                 coordinating: true,
                 ticket: self.invite.ticket.clone(),
-                join_code: Some(code),
+                join_code: None,
             });
-            self.published_code = Some(published);
+            if let Some(published) = published {
+                let code = published.code().printable();
+                self.invite.code = Some(code.clone());
+                self.pending_role_persist = Some(super::RolePersist {
+                    coordinating: true,
+                    ticket: self.invite.ticket.clone(),
+                    join_code: Some(code),
+                });
+                self.published_code = Some(published);
+            } else {
+                self.invite.code = None;
+            }
             changed = true;
         }
         changed

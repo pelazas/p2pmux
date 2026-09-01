@@ -170,10 +170,16 @@ fn a_detached_node_outlives_its_launcher_before_any_attachment() {
     launcher.wait().unwrap();
     let deadline = Instant::now() + RECEIVE_TIMEOUT;
     while Instant::now() < deadline {
-        assert!(fixture.running(), "the detached node stopped with its launcher");
+        assert!(
+            fixture.running(),
+            "the detached node stopped with its launcher"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(fixture.running(), "the detached node stopped with its launcher");
+    assert!(
+        fixture.running(),
+        "the detached node stopped with its launcher"
+    );
 }
 
 #[test]

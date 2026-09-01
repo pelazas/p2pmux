@@ -61,7 +61,9 @@ fn replay_early_key(
     pending_wake: &mut Option<WakeEvent>,
     queued: &mut VecDeque<crossterm::event::KeyEvent>,
 ) {
-    if pending_wake.is_none() && let Some(key) = queued.pop_front() {
+    if pending_wake.is_none()
+        && let Some(key) = queued.pop_front()
+    {
         *pending_wake = Some(WakeEvent::Terminal(Event::Key(key)));
     }
 }

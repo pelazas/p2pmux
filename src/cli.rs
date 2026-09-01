@@ -1006,7 +1006,7 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     // The node publishes the code a moment after it starts, so a session
     // created two lines ago has not necessarily got one yet.
     let descriptor = wait_for_invite(&store, &descriptor.id).await?;
-    let ticket = descriptor.ticket.clone().ok_or(CliError(
+    let mut ticket = descriptor.ticket.clone().ok_or(CliError(
         "this machine is not hosting the session; pair from the machine that is",
     ))?;
     let mut pairing = crate::pairing::load()?;
@@ -1025,6 +1025,20 @@ async fn offer_pairing(accepts_work: bool) -> Result<(), Box<dyn Error>> {
     // guest used to end up in the fleet.
     pairing.open_pairing_window(crate::pairing::now_unix());
     crate::pairing::save(&pairing)?;
+
+    // Best-effort freshness, not an atomic handshake with discovery: a refresh
+    // can still land after this read, but do not knowingly mint the old ticket.
+    if let Some(live_ticket) = store
+        .list_live()?
+        .into_iter()
+        .find(|live| live.id == descriptor.id)
+        .and_then(|live| live.ticket)
+        && live_ticket != ticket
+    {
+        ticket = live_ticket;
+        pairing.ticket = Some(ticket.clone());
+        crate::pairing::save(&pairing)?;
+    }
 
     let mut stdout = io::stdout().lock();
     match mint_pairing_code(&ticket, &fleet_key).await {
@@ -1179,13 +1193,8 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     pairing.offered_here = false;
     crate::pairing::save(&pairing)?;
 
-    let descriptor = rejoin_paired_session(
-        &ticket_text,
-        None,
-        crate::node::Tether::Detached,
-        None,
-    )
-    .await?;
+    let descriptor =
+        rejoin_paired_session(&ticket_text, None, crate::node::Tether::Detached, None).await?;
     let peers = wait_for_peers(&descriptor).await;
     let mut pairing = crate::pairing::load()?;
     for peer in &peers {
