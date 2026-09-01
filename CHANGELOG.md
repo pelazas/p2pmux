@@ -4,16 +4,16 @@ Newest first. Versions are the tags on [Releases](https://github.com/pelazas/p2p
 
 ## Compatibility
 
-**v0.1.8 through v0.1.14 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
-on any of the seven can join the others. v0.1.7 and older cannot join any of them: that pin moved in
+**v0.1.8 through v0.1.15 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
+on any of the eight can join the others. v0.1.7 and older cannot join any of them: that pin moved in
 v0.1.8 — a machine now tells the session it has joined a fleet, and a joining machine can present an
 enrolment token — and a peer on the wrong side of it is refused rather than half-joining. From
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
-## Unreleased
+## v0.1.15 — 2026-09-01
 
-Ten fixes, and no protocol change that costs anything: one field is added to the agent roster,
+Ten fixes and a shorter first-run telemetry ask, and no protocol change that costs anything: one field is added to the agent roster,
 absent from older peers and degrading to what they already sent.
 
 **Closing a p2pmux window now ends its local session.** A session stays available only after
@@ -65,6 +65,8 @@ reduced intensity renders is the terminal's decision rather than p2pmux's, and e
 implementation of it ships off for that reason. Turned on, it now means the panes nobody is
 reading: the pane under the pointer, one scrolled back through its own history, one a peer is
 driving, and one whose agent is working or waiting on you all stay at full strength.
+
+**The first-run telemetry ask is shorter.** It still asks once and still sends nothing until you answer. The prompt is two lines; the confirmation names `p2pmux telemetry off` as the way to stop it. Collection itself is unchanged.
 
 ## v0.1.14 — 2026-08-23
 
