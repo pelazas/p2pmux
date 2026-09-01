@@ -1182,7 +1182,7 @@ async fn pair_with_code(code: &str, accepts_work: bool) -> Result<(), Box<dyn Er
     let descriptor = rejoin_paired_session(
         &ticket_text,
         None,
-        crate::node::Tether::UntilFirstAttach,
+        crate::node::Tether::Detached,
         None,
     )
     .await?;
@@ -2638,6 +2638,22 @@ mod tests {
             .0;
         assert!(create_arm.contains("launch_background_node("));
         assert!(create_arm.contains("crate::client::run(&descriptor)"));
+    }
+
+    #[test]
+    fn pairing_with_a_code_leaves_its_node_running() {
+        let source = include_str!("cli.rs");
+        let pair = source
+            .split_once("async fn pair_with_code(")
+            .expect("pair command")
+            .1
+            .split_once("async fn offer_pairing(")
+            .expect("next command")
+            .0;
+        assert!(
+            pair.contains("crate::node::Tether::Detached"),
+            "pair is a persistent machine join, not an interactive session"
+        );
     }
 
     /// Bare `p2pmux` says it is dialling *before* it dials.
