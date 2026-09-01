@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -42,6 +42,29 @@ use crate::{
 
 const IPC_BATCH_PER_WAKE: usize = 32;
 const DETACH_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+const EARLY_KEY_CAPACITY: usize = 8;
+
+fn queue_early_key(queued: &mut VecDeque<crossterm::event::KeyEvent>, event: Event) {
+    let Event::Key(key) = event else {
+        return;
+    };
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return;
+    }
+    if queued.len() == EARLY_KEY_CAPACITY {
+        queued.pop_front();
+    }
+    queued.push_back(key);
+}
+
+fn replay_early_key(
+    pending_wake: &mut Option<WakeEvent>,
+    queued: &mut VecDeque<crossterm::event::KeyEvent>,
+) {
+    if pending_wake.is_none() && let Some(key) = queued.pop_front() {
+        *pending_wake = Some(WakeEvent::Terminal(Event::Key(key)));
+    }
+}
 
 #[derive(Default)]
 struct HistoryCache {
@@ -404,6 +427,7 @@ pub fn run_on(
     let mut share_code: Option<String> = None;
     let mut share_notice: Option<String> = None;
     let mut pending_wake = None;
+    let mut early_keys = VecDeque::new();
     let mut next_perf_id = 1_u64;
     let mut draw_perf_id = None;
     // The viewport is fixed, so what is drawn only follows the window because
@@ -838,6 +862,9 @@ pub fn run_on(
             }
             dirty = false;
         }
+        if tui.is_some() {
+            replay_early_key(&mut pending_wake, &mut early_keys);
+        }
         if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
             last_size_check = Some(Instant::now());
             if let Some((cols, rows)) = stale_node_size(
@@ -866,6 +893,7 @@ pub fn run_on(
             },
         };
         let Some(tui) = tui.as_mut() else {
+            queue_early_key(&mut early_keys, event);
             continue;
         };
         // Zoom lives entirely in this client -- it never becomes a layout
@@ -1811,6 +1839,32 @@ mod tests {
             &mut pending_focus,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn ctrl_s_before_the_first_snapshot_opens_share() {
+        let mut tui = None;
+        let mut early_keys = VecDeque::new();
+        queue_early_key(
+            &mut early_keys,
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        );
+        assert!(tui.is_none());
+
+        apply_rows(&mut tui, &[1], vec![]);
+
+        let mut pending_wake = None;
+        replay_early_key(&mut pending_wake, &mut early_keys);
+        let event = match pending_wake.take() {
+            Some(WakeEvent::Terminal(event)) => event,
+            _ => panic!("the queued key replays through the terminal event path"),
+        };
+        let Event::Key(key) = event else {
+            panic!("the queued event is a key");
+        };
+        let tui = tui.as_mut().expect("the snapshot built the tui");
+        let _ = tui.handle_key(key, Rect::new(0, 0, 80, 24));
+        assert!(tui.share_open());
     }
 
     fn apply_focus_snapshot(
