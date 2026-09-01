@@ -3691,6 +3691,19 @@ impl SharedLayoutHost {
                     eprintln!("p2pmux node: failed to record an enrolled machine: {error}");
                 }
             }
+            if receipt.identity.kind.declared_machine() {
+                let identity = receipt
+                    .identity
+                    .clone()
+                    .verified_for(&receipt.admitted_peer_id);
+                if let Err(error) = crate::pairing::pin_peers(&[crate::pairing::SeenMachine {
+                    name: receipt.display_name.clone(),
+                    machine_id: crate::machine_id::to_hex(&identity.machine_id),
+                    kind: receipt.identity.kind,
+                }]) {
+                    eprintln!("p2pmux node: failed to pin an admitted machine: {error}");
+                }
+            }
             admitted_peer_id = Some(receipt.admitted_peer_id.clone());
 
             let (writer, reader) = self.transport_open_control(&connection).await?;
@@ -5271,6 +5284,26 @@ mod control_queue_tests {
     use super::*;
     use crate::protocol::{AgentRosterEntry, AgentRosterState};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn admission_pins_a_verified_machine_identity() {
+        let source = include_str!("session.rs");
+        let admission = source
+            .split_once("coordinator_guard.remember_admitted")
+            .expect("admission")
+            .1
+            .split_once("admitted_peer_id = Some")
+            .expect("end of admission")
+            .0;
+        assert!(
+            admission.contains(".verified_for(&receipt.admitted_peer_id)"),
+            "an admitted machine's id must be verified against its peer"
+        );
+        assert!(
+            admission.contains("crate::pairing::pin_peers(&[crate::pairing::SeenMachine {"),
+            "an admitted machine must be pinned immediately"
+        );
+    }
 
     /// The coordinator is usually the machine you are sitting at, so this is
     /// the common path and not an edge: it asks for a terminal on a droplet,

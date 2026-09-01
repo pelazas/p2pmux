@@ -152,6 +152,37 @@ fn an_unattached_interactive_node_stops_with_its_launcher() {
 }
 
 #[test]
+fn a_detached_node_outlives_its_launcher_before_any_attachment() {
+    let mut launcher = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let supervisor = Supervisor {
+        pid: launcher.id(),
+        started_at: p2pmux::agent_detect::process_start_time(launcher.id()).unwrap(),
+    };
+    let mut fixture = Fixture::start_with("detached", Tether::Detached, Some(supervisor));
+
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    while Instant::now() < deadline {
+        assert!(
+            fixture.running(),
+            "the detached node stopped with its launcher"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fixture.running(),
+        "the detached node stopped with its launcher"
+    );
+}
+
+#[test]
 fn a_lost_accepted_client_stops_its_node() {
     let mut fixture = Fixture::start("lost-accepted-client");
     let (stream, mut reader, _) = attach(&fixture.socket);

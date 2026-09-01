@@ -172,11 +172,10 @@ pub struct RolePersist {
     pub join_code: Option<String>,
 }
 
-/// A published short code and the ticket it resolves. They travel together so
-/// a ticket refreshed after discovery reaches the share panel atomically.
+/// A ticket refreshed after discovery and its optional short code.
 pub(in crate::tui) struct PublishedInvite {
     pub ticket: JoinTicket,
-    pub published: crate::hosted_rendezvous::PublishedCode,
+    pub published: Option<crate::hosted_rendezvous::PublishedCode>,
 }
 impl SharedLayoutRuntime {
     pub fn host(
@@ -472,7 +471,7 @@ mod tests {
         tui::{UiIntent, pane::local::SharedLocalPane},
     };
 
-    use super::SharedLayoutRuntime;
+    use super::{PublishedInvite, RolePersist, SharedLayoutRuntime};
 
     async fn loopback_transport() -> Transport {
         let endpoint = Endpoint::builder(presets::Minimal)
@@ -485,6 +484,82 @@ mod tests {
             .await
             .expect("loopback endpoint");
         Transport::from_endpoint(endpoint)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ticket_only_publication_refreshes_the_host_invite() {
+        let host = SharedLayoutHost::new(
+            HostSession::from_transport(loopback_transport().await).expect("host session"),
+            2,
+            8,
+        )
+        .expect("shared host");
+        let ticket = host.ticket().clone();
+        let ticket_text = ticket.to_string();
+        let pane_server = host.pane_server();
+        let host_id = host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        let initial = SharedLocalPane::spawn(1, 2, 8, host_id.clone()).expect("initial pty");
+        pane_server
+            .register_local_pane(
+                PaneDescriptor {
+                    pane_id: 1,
+                    host_peer_id: host_id,
+                    grid_rows: 2,
+                    grid_cols: 8,
+                    title: None,
+                    locked: false,
+                    exited: false,
+                },
+                initial.channels(),
+            )
+            .expect("initial pane registered");
+        let state = host
+            .session_snapshot()
+            .expect("snapshot")
+            .state
+            .expect("layout state");
+        let snapshot = layout_snapshot_from_state(&state).expect("render layout");
+        let mut runtime = SharedLayoutRuntime::host(
+            host,
+            pane_server,
+            snapshot,
+            initial,
+            ticket_text.clone(),
+            Some(String::from("STALE")),
+            tokio::runtime::Handle::current(),
+        )
+        .expect("runtime");
+
+        if runtime
+            .code_tx
+            .send(PublishedInvite {
+                ticket: ticket.clone(),
+                published: None,
+            })
+            .is_err()
+        {
+            panic!("ticket-only publication queued");
+        }
+        assert!(runtime.drain_published_codes());
+
+        let crate::tui::pane::control::SharedControl::Host(host) = &runtime.control else {
+            panic!("the runtime is still hosting");
+        };
+        assert_eq!(
+            host.ticket(),
+            &ticket,
+            "the live host has the refreshed ticket"
+        );
+        assert_eq!(runtime.invite.ticket.as_deref(), Some(ticket_text.as_str()));
+        assert_eq!(runtime.invite.code, None, "a stale code is cleared");
+        assert_eq!(
+            runtime.pending_role_persist,
+            Some(RolePersist {
+                coordinating: true,
+                ticket: Some(ticket_text),
+                join_code: None,
+            })
+        );
     }
 
     /// One bot on one machine is one row, however many p2pmux that machine has

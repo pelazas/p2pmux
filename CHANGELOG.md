@@ -13,7 +13,7 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
-Eight fixes, and no protocol change that costs anything: one field is added to the agent roster,
+Ten fixes, and no protocol change that costs anything: one field is added to the agent roster,
 absent from older peers and degrading to what they already sent.
 
 **Closing a p2pmux window now ends its local session.** A session stays available only after
@@ -30,6 +30,12 @@ REDRAW and Esc BACK stay together; narrower terminals lose whole hints instead o
 
 **A detached member comes back to its existing session.** Joining its ticket reattaches to that
 member instead of minting a second one and turning the badge into two members.
+
+**Pairing a machine keeps it there.** `p2pmux pair <code>` no longer drops that machine's node when
+the command exits, and the host records it when it joins instead of waiting for a later scan.
+
+**Share still opens before there is a short code.** `Ctrl+S` opens the panel with its ticket even if
+the key arrived before the first snapshot; a rendezvous outage still leaves that ticket working.
 
 **Doctor identifies the binary you ran.** It no longer calls it the latest release when PATH would
 still run another copy, or when GitHub could not be asked what the latest tag is.
