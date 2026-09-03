@@ -302,6 +302,14 @@ pub fn setup_cursor(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
     let Some(path) = cursor_hooks_path() else {
         return Err(Box::from("cannot locate $HOME"));
     };
+    setup_cursor_at_path(&path, uninstall, dry_run)
+}
+
+fn setup_cursor_at_path(
+    path: &PathBuf,
+    uninstall: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
     let mut settings = read_cursor_hooks(&path)?;
     match settings.get("version") {
         Some(Value::Number(_)) => {}
@@ -980,6 +988,129 @@ mod tests {
         assert!(read_settings(&path).expect("missing is fresh").is_empty());
 
         fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    fn cursor_hooks_fixture_path(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "p2pmux-cursor-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        directory.join(".cursor").join("hooks.json")
+    }
+
+    #[test]
+    fn cursor_hooks_path_returns_home_dot_cursor() {
+        let home = std::env::var_os("HOME").expect("HOME is set for tests");
+        assert_eq!(
+            cursor_hooks_path(),
+            Some(PathBuf::from(home).join(".cursor").join("hooks.json"))
+        );
+    }
+
+    #[test]
+    fn installing_cursor_hooks_is_idempotent() {
+        let path = cursor_hooks_fixture_path("idempotent");
+        setup_cursor_at_path(&path, false, false).expect("first install");
+        setup_cursor_at_path(&path, false, false).expect("second install");
+
+        let settings = read_cursor_hooks(&path).expect("hooks parse");
+        for (event, ..) in CURSOR_HOOKS {
+            let entries = settings["hooks"][*event].as_array().expect("event entries");
+            assert_eq!(
+                entries.iter().filter(|entry| is_ours_cursor(entry)).count(),
+                1,
+                "{event} has one p2pmux hook"
+            );
+        }
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn uninstalling_cursor_leaves_user_hooks() {
+        let path = cursor_hooks_fixture_path("user-hooks");
+        fs::create_dir_all(path.parent().expect(".cursor directory")).expect("create .cursor");
+        fs::write(
+            &path,
+            r#"{"version": 1, "hooks": {"stop": [{"command": "afplay done.aiff"}]}}"#,
+        )
+        .expect("write user hook");
+
+        setup_cursor_at_path(&path, false, false).expect("install");
+        setup_cursor_at_path(&path, true, false).expect("uninstall");
+
+        let settings = read_cursor_hooks(&path).expect("hooks parse");
+        let stop = settings["hooks"]["stop"].as_array().expect("stop entries");
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["command"], "afplay done.aiff");
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn cursor_hooks_json_with_bad_version_is_refused() {
+        let path = cursor_hooks_fixture_path("bad-version");
+        fs::create_dir_all(path.parent().expect(".cursor directory")).expect("create .cursor");
+        let body = b"{\"version\": \"one\", \"hooks\": {}}";
+        fs::write(&path, body).expect("write bad version");
+
+        let error = setup_cursor_at_path(&path, false, false).expect_err("must refuse");
+        assert!(error.to_string().contains("version"));
+        assert_eq!(fs::read(&path).expect("still there"), body);
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn cursor_hooks_json_with_non_object_hooks_is_refused() {
+        let path = cursor_hooks_fixture_path("bad-hooks");
+        fs::create_dir_all(path.parent().expect(".cursor directory")).expect("create .cursor");
+        let body = b"{\"version\": 1, \"hooks\": []}";
+        fs::write(&path, body).expect("write bad hooks");
+
+        let error = setup_cursor_at_path(&path, false, false).expect_err("must refuse");
+        assert!(error.to_string().contains("hooks"));
+        assert_eq!(fs::read(&path).expect("still there"), body);
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn cursor_is_ours_structural_match() {
+        assert!(is_ours_cursor(&serde_json::json!({
+            "command": "p2pmux notify cursor --status done"
+        })));
+        assert!(!is_ours_cursor(&serde_json::json!({
+            "command": "echo p2pmux notify cursor --status done"
+        })));
     }
 
     #[test]
