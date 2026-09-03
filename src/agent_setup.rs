@@ -310,7 +310,7 @@ fn setup_cursor_at_path(
     uninstall: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let mut settings = read_cursor_hooks(&path)?;
+    let mut settings = read_cursor_hooks(path)?;
     match settings.get("version") {
         Some(Value::Number(_)) => {}
         Some(_) => {
@@ -356,7 +356,7 @@ fn setup_cursor_at_path(
             );
             return Ok(());
         }
-        write_settings(&path, &settings)?;
+        write_settings(path, &settings)?;
         println!("cursor: removed the p2pmux hooks from {}", path.display());
         return Ok(());
     }
@@ -382,7 +382,7 @@ fn setup_cursor_at_path(
         };
         entries.push(cursor_hook_entry(status, *matcher));
     }
-    write_settings(&path, &settings)?;
+    write_settings(path, &settings)?;
     println!(
         "cursor: wrote {} p2pmux hooks to {}",
         CURSOR_HOOKS.len(),
