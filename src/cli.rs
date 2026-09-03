@@ -226,6 +226,15 @@ enum SetupAgent {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+    /// Cursor, via entries in ~/.cursor/hooks.json.
+    Cursor {
+        /// Remove the hooks p2pmux installed, leaving your own alone.
+        #[arg(long)]
+        uninstall: bool,
+        /// Say what would change without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
     /// OpenCode, via a plugin at ~/.config/opencode/plugin/p2pmux.js.
     #[command(name = "opencode")]
     OpenCode {
@@ -389,6 +398,9 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
         Some(Command::Setup { agent }) => Some(match agent {
             Some(SetupAgent::Claude { uninstall, dry_run }) => {
                 crate::agent_setup::setup_claude(*uninstall, *dry_run)
+            }
+            Some(SetupAgent::Cursor { uninstall, dry_run }) => {
+                crate::agent_setup::setup_cursor(*uninstall, *dry_run)
             }
             Some(SetupAgent::OpenCode { uninstall, dry_run }) => {
                 crate::agent_setup::setup_opencode(*uninstall, *dry_run)

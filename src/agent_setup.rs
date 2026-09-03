@@ -43,6 +43,14 @@ const CLAUDE_HOOKS: &[(&str, &str, bool)] = &[
     ("SessionEnd", "idle", false),
 ];
 
+const CURSOR_HOOKS: &[(&str, &str, Option<&str>)] = &[
+    ("sessionStart", "running", None),
+    ("preToolUse", "running", Some(".*")),
+    ("postToolUse", "running", Some(".*")),
+    ("stop", "done", None),
+    ("sessionEnd", "idle", None),
+];
+
 /// What `doctor` found for one agent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Wiring {
@@ -66,6 +74,10 @@ impl Wiring {
 
 pub fn claude_settings_path() -> Option<PathBuf> {
     Some(home()?.join(".claude").join("settings.json"))
+}
+
+pub fn cursor_hooks_path() -> Option<PathBuf> {
+    Some(home()?.join(".cursor").join("hooks.json"))
 }
 
 fn home() -> Option<PathBuf> {
@@ -192,6 +204,184 @@ fn strip_ours(settings: &mut Map<String, Value>) -> bool {
         settings.remove("hooks");
     }
     removed
+}
+
+fn is_ours_cursor(entry: &Value) -> bool {
+    if entry.get("owner").and_then(Value::as_str) == Some(MARKER) {
+        return true;
+    }
+    let Some(command) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    (program == "p2pmux" || (program.starts_with('/') && program.ends_with("/p2pmux")))
+        && words.next() == Some("notify")
+        && words.next() == Some("cursor")
+}
+
+fn strip_ours_cursor(hooks: &mut Map<String, Value>) -> bool {
+    let mut removed = false;
+    for entries in hooks.values_mut() {
+        if let Value::Array(entries) = entries {
+            let before = entries.len();
+            entries.retain(|entry| !is_ours_cursor(entry));
+            removed |= entries.len() != before;
+        }
+    }
+    removed
+}
+
+fn cursor_hook_entry(status: &str, matcher: Option<&str>) -> Value {
+    let mut entry = Map::new();
+    entry.insert(
+        "command".into(),
+        Value::String(format!("p2pmux notify cursor --status {status}")),
+    );
+    entry.insert("timeout".into(), Value::Number(5.into()));
+    entry.insert("owner".into(), Value::String(MARKER.into()));
+    if let Some(matcher) = matcher {
+        entry.insert("matcher".into(), Value::String(matcher.into()));
+    }
+    Value::Object(entry)
+}
+
+fn read_cursor_hooks(path: &PathBuf) -> Result<Map<String, Value>, Box<dyn Error>> {
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(settings)) => Ok(settings),
+            Ok(_) => Err(Box::from(format!(
+                "{} is not a JSON object — refusing to rewrite it",
+                path.display()
+            ))),
+            Err(error) if bytes.iter().all(u8::is_ascii_whitespace) => {
+                let _ = error;
+                Ok(Map::new())
+            }
+            Err(error) => Err(Box::from(format!(
+                "{} is not valid JSON ({error}) — refusing to rewrite it",
+                path.display()
+            ))),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+pub fn cursor_wiring() -> Wiring {
+    let Some(path) = cursor_hooks_path() else {
+        return Wiring::Absent;
+    };
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Wiring::Absent;
+    }
+    let Ok(settings) = read_cursor_hooks(&path) else {
+        return Wiring::Unwired;
+    };
+    if settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|hooks| {
+            hooks.values().any(|entries| {
+                entries
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().any(is_ours_cursor))
+            })
+        })
+    {
+        Wiring::Wired
+    } else {
+        Wiring::Unwired
+    }
+}
+
+/// Install (or remove) the Cursor hooks. Idempotent in both directions.
+pub fn setup_cursor(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>> {
+    let Some(path) = cursor_hooks_path() else {
+        return Err(Box::from("cannot locate $HOME"));
+    };
+    let mut settings = read_cursor_hooks(&path)?;
+    match settings.get("version") {
+        Some(Value::Number(_)) => {}
+        Some(_) => {
+            return Err(Box::from(format!(
+                "the `version` key in {} is not a number — refusing to rewrite it",
+                path.display()
+            )));
+        }
+        None => {
+            settings.insert("version".into(), Value::Number(1.into()));
+        }
+    }
+    if settings
+        .get("hooks")
+        .is_some_and(|hooks| !hooks.is_object())
+    {
+        return Err(Box::from(format!(
+            "the `hooks` key in {} is not an object — refusing to rewrite it",
+            path.display()
+        )));
+    }
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(hooks) = hooks else {
+        unreachable!("the hooks object was validated above");
+    };
+    let had_ours = strip_ours_cursor(hooks);
+
+    if uninstall {
+        if !had_ours {
+            println!(
+                "cursor: already removed (no p2pmux hooks in {})",
+                path.display()
+            );
+            return Ok(());
+        }
+        if dry_run {
+            println!(
+                "cursor: would remove {} p2pmux hooks from {} (dry run)",
+                CURSOR_HOOKS.len(),
+                path.display()
+            );
+            return Ok(());
+        }
+        write_settings(&path, &settings)?;
+        println!("cursor: removed the p2pmux hooks from {}", path.display());
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "cursor: would write {} p2pmux hooks to {} (dry run)",
+            CURSOR_HOOKS.len(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    for (event, status, matcher) in CURSOR_HOOKS {
+        let entries = hooks
+            .entry((*event).to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(entries) = entries else {
+            return Err(Box::from(format!(
+                "hooks.{event} in {} is not an array — refusing to rewrite it",
+                path.display()
+            )));
+        };
+        entries.push(cursor_hook_entry(status, *matcher));
+    }
+    write_settings(&path, &settings)?;
+    println!(
+        "cursor: wrote {} p2pmux hooks to {}",
+        CURSOR_HOOKS.len(),
+        path.display()
+    );
+    println!("cursor: new Cursor sessions pick this up; restart any that are running");
+    Ok(())
 }
 
 pub fn claude_wiring() -> Wiring {
