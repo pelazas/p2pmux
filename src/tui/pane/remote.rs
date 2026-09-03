@@ -118,6 +118,7 @@ impl SharedRemotePane {
                 .as_ref()
                 .is_some_and(|lease| !lease.is_idle_at(Instant::now())),
             scrollback: 0,
+            origin: Default::default(),
         }
     }
 

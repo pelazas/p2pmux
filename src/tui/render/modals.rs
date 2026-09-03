@@ -560,6 +560,7 @@ mod tests {
                 controller_peer_id: None,
                 controller_active: false,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         tui.modal = modal;

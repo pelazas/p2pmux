@@ -13,9 +13,8 @@ use crate::{
         MouseHandling, MultiPaneTui, PaneMouseProtocol, PaneTextSelection, ScreenCell,
         SelectionPoint, UiIntent,
         geometry::{
-            ResizeDrag, clamp_to_viewport, fixed_grid_viewport, mouse_to_screen_cell,
-            nearest_split_for_pane, pane_at, pane_content_rect, rect_contains, resize_border_hit,
-            resize_proposed_share,
+            ResizeDrag, clamp_to_viewport, mouse_to_screen_cell, nearest_split_for_pane, pane_at,
+            pane_content_rect, rect_contains, resize_border_hit, resize_proposed_share,
         },
         input::mouse::encode_mouse,
         selection::selection_text,
@@ -182,14 +181,17 @@ impl MultiPaneTui {
         let scrollback = self.scrollback_offset(aim.pane_id);
         let point = SelectionPoint {
             scrollback,
-            cell: ScreenCell {
-                row: if aim.up {
-                    0
-                } else {
-                    viewport.height.saturating_sub(1)
+            cell: self.source_cell(
+                aim.pane_id,
+                ScreenCell {
+                    row: if aim.up {
+                        0
+                    } else {
+                        viewport.height.saturating_sub(1)
+                    },
+                    col: aim.column,
                 },
-                col: aim.column,
-            },
+            ),
         };
         let Some(selection) = self.selection.as_mut() else {
             return false;
@@ -205,11 +207,11 @@ impl MultiPaneTui {
     fn pane_screen_viewport(&self, pane_id: PaneId, area: Rect) -> Option<Rect> {
         let rect = *self.geometry(area).panes.get(&pane_id)?;
         let pane = self.snapshot.panes.get(&pane_id)?;
-        Some(fixed_grid_viewport(
+        self.pane_grid_viewport(
+            pane_id,
             pane_content_rect(rect),
-            pane.grid_rows,
-            pane.grid_cols,
-        ))
+            (pane.grid_rows, pane.grid_cols),
+        )
     }
 
     pub(in crate::tui) fn end_selection_drag(&mut self) -> bool {
@@ -362,9 +364,13 @@ impl MultiPaneTui {
             rect_contains(*rect, column, row).then_some((*pane_id, *rect))
         })?;
         let pane = self.snapshot.panes.get(&pane_id)?;
-        let viewport =
-            fixed_grid_viewport(pane_content_rect(pane_rect), pane.grid_rows, pane.grid_cols);
-        mouse_to_screen_cell(viewport, column, row).map(|cell| (pane_id, cell))
+        let viewport = self.pane_grid_viewport(
+            pane_id,
+            pane_content_rect(pane_rect),
+            (pane.grid_rows, pane.grid_cols),
+        )?;
+        mouse_to_screen_cell(viewport, column, row)
+            .map(|cell| (pane_id, self.source_cell(pane_id, cell)))
     }
 
     pub(in crate::tui) fn pane_at_or_focused(&self, column: u16, row: u16, area: Rect) -> PaneId {
@@ -537,7 +543,12 @@ impl MultiPaneTui {
         }
         let viewport = self.pane_screen_viewport(pane_id, area)?;
         let cell = mouse_to_screen_cell(viewport, mouse.column, mouse.row)?;
-        encode_mouse(mouse.kind, mouse.modifiers, cell, protocol)
+        encode_mouse(
+            mouse.kind,
+            mouse.modifiers,
+            self.source_cell(pane_id, cell),
+            protocol,
+        )
     }
 
     /// Hands a mouse event to the focused pane's child when that child asked for
@@ -592,7 +603,12 @@ impl MultiPaneTui {
             _ => mouse_to_screen_cell(viewport, mouse.column, mouse.row)?,
         };
         Some(MouseHandling {
-            forward_bytes: encode_mouse(mouse.kind, mouse.modifiers, cell, protocol),
+            forward_bytes: encode_mouse(
+                mouse.kind,
+                mouse.modifiers,
+                self.source_cell(self.focused_pane, cell),
+                protocol,
+            ),
             ..MouseHandling::default()
         })
     }
@@ -1187,7 +1203,7 @@ mod tests {
 
                 title: None,
             }],
-            &[(1, 19, 78)],
+            &[(1, 30, 100)],
         ))
         .expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -1196,6 +1212,35 @@ mod tests {
         assert_eq!(
             tui.screen_cell_at(1, 2, area),
             Some((1, ScreenCell { row: 0, col: 0 }))
+        );
+    }
+
+    #[test]
+    fn selection_hit_testing_translates_the_local_viewport_origin() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 30, 100)],
+        ))
+        .expect("valid layout");
+        let area = Rect::new(0, 0, 80, 24);
+        tui.pane_view(1)
+            .expect("pane view")
+            .origin
+            .set(ScreenCell { row: 5, col: 7 });
+
+        assert_eq!(
+            tui.screen_cell_at(4, 6, area),
+            Some((1, ScreenCell { row: 9, col: 10 }))
+        );
+        assert!(tui.begin_selection_at(4, 6, area));
+        assert!(tui.extend_selection_at(5, 6, area));
+        assert_eq!(
+            tui.selection().expect("selection").anchor.cell,
+            ScreenCell { row: 9, col: 10 },
         );
     }
 

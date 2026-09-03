@@ -23,11 +23,12 @@ use crate::{
     protocol::AgentRosterState,
     tui::{
         AgentOverlayRow, ChordMode, ModalState, PairedMachine, PaneGeometry, PaneTextSelection,
-        PaneViewState, ShareCopy,
+        PaneViewState, ScreenCell, ShareCopy,
         debug_log::ui_debug_log,
         geometry::{
-            ResizeDrag, ResizePreview, allocate_node_with_preview, contains_leaf, first_leaf,
-            fixed_grid_viewport, pane_content_rect, visible_leaf_panes,
+            ResizeDrag, ResizePreview, allocate_node_with_preview, clamp_grid_origin,
+            contains_leaf, first_leaf, fixed_grid_viewport, nudge_grid_origin, pane_content_rect,
+            visible_leaf_panes,
         },
         render::panes::{
             TAB_BAR_SEPARATOR, TOP_BAR_BRAND, TOP_BAR_BRAND_SEPARATOR, TOP_BAR_TITLE_MAX_WIDTH,
@@ -372,9 +373,63 @@ impl MultiPaneTui {
         self.pane_views.get(&pane_id)
     }
 
+    /// The physical rectangle and local camera for one fixed shared grid.
+    pub(in crate::tui) fn pane_grid_viewport(
+        &self,
+        pane_id: PaneId,
+        inner: Rect,
+        grid: (u16, u16),
+    ) -> Option<Rect> {
+        let viewport = fixed_grid_viewport(inner, grid.0, grid.1);
+        let view = self.pane_views.get(&pane_id)?;
+        view.origin.set(clamp_grid_origin(
+            view.origin.get(),
+            grid,
+            (viewport.height, viewport.width),
+        ));
+        Some(viewport)
+    }
+
+    /// Moves a pane's local camera just enough to retain its visible cursor.
+    pub(in crate::tui) fn nudge_pane_origin(
+        &self,
+        pane_id: PaneId,
+        grid: (u16, u16),
+        viewport: Rect,
+        cursor: ScreenCell,
+        follow: bool,
+    ) -> Option<ScreenCell> {
+        let view = self.pane_views.get(&pane_id)?;
+        let origin = nudge_grid_origin(
+            view.origin.get(),
+            grid,
+            (viewport.height, viewport.width),
+            cursor,
+            follow,
+        );
+        view.origin.set(origin);
+        Some(origin)
+    }
+
+    pub(in crate::tui) fn source_cell(&self, pane_id: PaneId, cell: ScreenCell) -> ScreenCell {
+        let origin = self
+            .pane_views
+            .get(&pane_id)
+            .map_or(ScreenCell::default(), |view| view.origin.get());
+        ScreenCell {
+            row: origin.row.saturating_add(cell.row),
+            col: origin.col.saturating_add(cell.col),
+        }
+    }
+
     pub fn set_pane_view(&mut self, pane_id: PaneId, mut state: PaneViewState) -> bool {
         if self.snapshot.panes.contains_key(&pane_id) {
             state.scrollback = self.scrollback_offset(pane_id);
+            state.origin.set(
+                self.pane_views
+                    .get(&pane_id)
+                    .map_or(ScreenCell::default(), |view| view.origin.get()),
+            );
             if self.pane_views.get(&pane_id) == Some(&state) {
                 return false;
             }
@@ -621,11 +676,11 @@ impl MultiPaneTui {
         let geometry = self.geometry(area);
         let pane_rect = geometry.panes.get(&self.focused_pane)?;
         let pane = self.snapshot.panes.get(&self.focused_pane)?;
-        Some(fixed_grid_viewport(
+        self.pane_grid_viewport(
+            self.focused_pane,
             pane_content_rect(*pane_rect),
-            pane.grid_rows,
-            pane.grid_cols,
-        ))
+            (pane.grid_rows, pane.grid_cols),
+        )
     }
 
     /// Aligns a reattached client's local selection with the node-owned focus.
@@ -753,7 +808,7 @@ mod tests {
     use crate::{
         layout::{LayoutError, Node, Tab},
         tui::{
-            MultiPaneTui, PaneViewState,
+            MultiPaneTui, PaneViewState, ScreenCell,
             test_support::{layout, split_layout},
         },
     };
@@ -816,6 +871,7 @@ mod tests {
             controller_peer_id: Some(b"controller".to_vec()),
             controller_active: true,
             scrollback: 0,
+            origin: Default::default(),
         };
         assert!(tui.set_pane_view(1, active.clone()));
         assert!(!tui.set_pane_view(1, active));
@@ -826,6 +882,31 @@ mod tests {
                 ..tui.pane_view(1).expect("pane view").clone()
             },
         ));
+    }
+
+    #[test]
+    fn pane_view_refresh_preserves_the_local_viewport_origin() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        ))
+        .expect("layout");
+        tui.pane_views
+            .get(&1)
+            .expect("pane view")
+            .origin
+            .set(ScreenCell { row: 4, col: 9 });
+
+        tui.set_pane_view(1, PaneViewState::from_chrome(true, None, false));
+
+        assert_eq!(
+            tui.pane_view(1).expect("pane view").origin.get(),
+            ScreenCell { row: 4, col: 9 },
+        );
     }
 
     #[test]

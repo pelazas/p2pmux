@@ -1,7 +1,7 @@
 //! The value types the multi-pane UI keeps: chord and modal state, per-pane
 //! view state, the intents a keystroke turns into, and text selection.
 
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap};
 
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,8 @@ pub struct PaneViewState {
     pub controller_peer_id: Option<Vec<u8>>,
     pub controller_active: bool,
     pub(in crate::tui) scrollback: usize,
+    /// The top-left cell of this terminal's local view into the shared grid.
+    pub(in crate::tui) origin: Cell<ScreenCell>,
 }
 impl PaneViewState {
     pub fn from_chrome(
@@ -38,6 +40,7 @@ impl PaneViewState {
             controller_peer_id,
             controller_active,
             scrollback: 0,
+            origin: Cell::new(ScreenCell::default()),
         }
     }
 }
@@ -376,7 +379,7 @@ pub struct PaneGeometry {
     pub panes: BTreeMap<PaneId, Rect>,
 }
 /// One cell in a pane's fixed VT grid.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::tui) struct ScreenCell {
     pub(in crate::tui) row: u16,
     pub(in crate::tui) col: u16,
