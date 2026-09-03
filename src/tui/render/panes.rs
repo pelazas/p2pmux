@@ -98,6 +98,47 @@ pub(in crate::tui) fn tab_presence_width(watchers: usize) -> u16 {
 
 pub(in crate::tui) const PRESENCE_WATCHING: &str = "●";
 
+fn render_clip_indicators(
+    frame: &mut Frame<'_>,
+    rect: ratatui::layout::Rect,
+    viewport: ratatui::layout::Rect,
+    grid: (u16, u16),
+    origin: ScreenCell,
+    style: Style,
+    bottom_chrome: bool,
+) {
+    if bottom_chrome
+        || rect.width < 8
+        || rect.height < 3
+        || viewport.width == 0
+        || viewport.height == 0
+    {
+        return;
+    }
+    let mut left = String::new();
+    if origin.col > 0 {
+        left.push('<');
+    }
+    if origin.row > 0 {
+        left.push('^');
+    }
+    let mut right = String::new();
+    if origin.row.saturating_add(viewport.height) < grid.0 {
+        right.push('v');
+    }
+    if origin.col.saturating_add(viewport.width) < grid.1 {
+        right.push('>');
+    }
+    let buffer = frame.buffer_mut();
+    let bottom = rect.bottom().saturating_sub(1);
+    if !left.is_empty() {
+        buffer.set_string(rect.x.saturating_add(1), bottom, left, style);
+    }
+    if !right.is_empty() {
+        buffer.set_string(rect.right().saturating_sub(3), bottom, right, style);
+    }
+}
+
 /// Right-aligned chips for the members watching a pane, one initial each.
 ///
 /// This lives on the bottom border because the top one is already carrying
@@ -631,19 +672,22 @@ pub(in crate::tui) fn render_shared_multi_pane(
         // hidden or were never there. Bottom-left, because the top border is
         // already carrying the metadata and a right-aligned lock badge, and a
         // pane can be locked and zoomed at once.
-        if tui.zoomed_pane() == Some(pane_id) {
+        let zoomed = tui.zoomed_pane() == Some(pane_id);
+        if zoomed {
             block = block.title_bottom(
                 Line::styled(" zoom ", Style::default().fg(theme.footer_accent))
                     .alignment(Alignment::Left),
             );
         }
-        if let Some(chips) = pane_presence_chips(
+        let chips = pane_presence_chips(
             &tui.pane_watchers(pane_id),
             view.controller_peer_id.as_deref(),
             &tui.snapshot.members,
             theme,
             title_width,
-        ) {
+        );
+        let bottom_chrome = zoomed || chips.is_some();
+        if let Some(chips) = chips {
             block = block.title_bottom(chips);
         }
         let content = pane_content_rect(rect);
@@ -683,6 +727,15 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     .at_scrollback(scrollback)
                     .dimmed(pane_recedes(tui, pane_id, &view, focused, scrollback)),
                 viewport,
+            );
+            render_clip_indicators(
+                frame,
+                rect,
+                viewport,
+                (grid_rows, grid_cols),
+                origin,
+                Style::default().fg(border_color),
+                bottom_chrome,
             );
             // `scrollback`, not the screen's own offset: a client keeps no
             // scrollback of its own and renders history by swapping in a
@@ -1614,7 +1667,7 @@ mod tests {
     fn focused_pane_crops_to_the_cursor_and_places_its_cursor_locally() {
         let mut parser = vt100::Parser::new(3, 5, 0);
         parser.process(b"abcde\r\nfghij\r\nklmno\x1b[3;5H");
-        let tui = MultiPaneTui::new(layout(
+        let mut tui = MultiPaneTui::new(layout(
             vec![Tab {
                 tab_id: 1,
                 root: Node::Leaf { pane_id: 1 },
@@ -1623,6 +1676,7 @@ mod tests {
             &[(1, 3, 5)],
         ))
         .expect("valid layout");
+        tui.set_pane_view(1, PaneViewState::from_chrome(true, None, false));
         let screens = BTreeMap::from([(1, parser.screen())]);
         let mut terminal = Terminal::new(TestBackend::new(5, 5)).expect("test terminal");
 
@@ -1638,12 +1692,43 @@ mod tests {
         terminal.backend_mut().assert_cursor_position((3, 2));
     }
 
+    #[test]
+    fn cropped_pane_marks_each_hidden_grid_edge() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"\x1b[?25l");
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 3, 10)],
+        ))
+        .expect("valid layout");
+        tui.pane_view(1)
+            .expect("pane view")
+            .origin
+            .set(ScreenCell { row: 1, col: 1 });
+        let screens = BTreeMap::from([(1, parser.screen())]);
+        let mut terminal = Terminal::new(TestBackend::new(10, 5)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &screens))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 3)].symbol(), "<");
+        assert_eq!(buffer[(2, 3)].symbol(), "^");
+        assert_eq!(buffer[(7, 3)].symbol(), "v");
+        assert_eq!(buffer[(8, 3)].symbol(), ">");
+    }
+
     /// Clipped means "outside the pane it is drawn in", not "outside the grid
     /// the layout last recorded" — the screen's own size is what the viewport
     /// follows, so a descriptor lagging behind a reflow no longer hides a cursor
     /// that is plainly on screen. A cursor past the pane's own border still is.
     #[test]
-    fn focused_pane_never_draws_a_hidden_or_clipped_vt_cursor() {
+    fn focused_pane_hides_a_hidden_cursor_and_follows_a_visible_one() {
         for sequence in [b"\x1b[?25l".as_slice(), b"abcdefgh".as_slice()] {
             let mut parser = vt100::Parser::new(1, 9, 0);
             parser.process(sequence);
@@ -1674,7 +1759,12 @@ mod tests {
                 .draw(|frame| render_multi_pane(frame, &tui, &screens))
                 .expect("render");
 
-            assert!(!terminal.backend().cursor_visible());
+            if parser.screen().hide_cursor() {
+                assert!(!terminal.backend().cursor_visible());
+            } else {
+                assert!(terminal.backend().cursor_visible());
+                assert_eq!(tui.pane_view(1).expect("pane view").origin.get().col, 2,);
+            }
         }
     }
 

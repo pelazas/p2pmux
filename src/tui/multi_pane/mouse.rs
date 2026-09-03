@@ -1203,7 +1203,7 @@ mod tests {
 
                 title: None,
             }],
-            &[(1, 19, 78)],
+            &[(1, 30, 100)],
         ))
         .expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -1223,7 +1223,7 @@ mod tests {
                 root: Node::Leaf { pane_id: 1 },
                 title: None,
             }],
-            &[(1, 19, 78)],
+            &[(1, 30, 100)],
         ))
         .expect("valid layout");
         let area = Rect::new(0, 0, 80, 24);
@@ -1237,6 +1237,7 @@ mod tests {
             Some((1, ScreenCell { row: 9, col: 10 }))
         );
         assert!(tui.begin_selection_at(4, 6, area));
+        assert!(tui.extend_selection_at(5, 6, area));
         assert_eq!(
             tui.selection().expect("selection").anchor.cell,
             ScreenCell { row: 9, col: 10 },
