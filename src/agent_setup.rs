@@ -590,6 +590,7 @@ fn warn_if_not_on_path(agent: &str) {
 pub fn setup_all(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>> {
     let results = [
         setup_claude(uninstall, dry_run),
+        setup_cursor(uninstall, dry_run),
         setup_opencode(uninstall, dry_run),
     ];
     let mut failures = Vec::new();
@@ -623,10 +624,18 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
         ),
+        (
+            "cursor",
+            cursor_wiring(),
+            cursor_hooks_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
     ];
     for (agent, wiring, path) in &rows {
         println!("{agent:<9} {:<14} {path}", wiring.label());
     }
+    println!("cursor cannot report `needs you` — Cursor has no permission-request hook.");
     let states: Vec<&Wiring> = rows.iter().map(|(_, wiring, _)| wiring).collect();
     if states.iter().any(|wiring| **wiring == Wiring::Wired) {
         println!("\nThe inbox reads agent state from these hooks.");
