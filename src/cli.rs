@@ -308,6 +308,12 @@ enum NotifyAgent {
         #[arg(long)]
         status: Option<String>,
     },
+    /// Read a Cursor hook payload on stdin.
+    Cursor {
+        /// The status this hook reports (`running`, `done`, `idle`).
+        #[arg(long)]
+        status: Option<String>,
+    },
     /// Read an OpenCode plugin payload on stdin.
     #[command(name = "opencode")]
     OpenCode {
@@ -367,6 +373,9 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
         Some(Command::Notify { agent }) => Some(match agent {
             NotifyAgent::Claude { status } => {
                 crate::agent_notify::run(crate::agent_detect::AgentKind::Claude, status.as_deref())
+            }
+            NotifyAgent::Cursor { status } => {
+                crate::agent_notify::run(crate::agent_detect::AgentKind::Cursor, status.as_deref())
             }
             NotifyAgent::OpenCode { status } => crate::agent_notify::run(
                 crate::agent_detect::AgentKind::OpenCode,
