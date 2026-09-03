@@ -43,6 +43,14 @@ const CLAUDE_HOOKS: &[(&str, &str, bool)] = &[
     ("SessionEnd", "idle", false),
 ];
 
+const CURSOR_HOOKS: &[(&str, &str, Option<&str>)] = &[
+    ("sessionStart", "running", None),
+    ("preToolUse", "running", Some(".*")),
+    ("postToolUse", "running", Some(".*")),
+    ("stop", "done", None),
+    ("sessionEnd", "idle", None),
+];
+
 /// What `doctor` found for one agent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Wiring {
@@ -66,6 +74,10 @@ impl Wiring {
 
 pub fn claude_settings_path() -> Option<PathBuf> {
     Some(home()?.join(".claude").join("settings.json"))
+}
+
+pub fn cursor_hooks_path() -> Option<PathBuf> {
+    Some(home()?.join(".cursor").join("hooks.json"))
 }
 
 fn home() -> Option<PathBuf> {
@@ -192,6 +204,192 @@ fn strip_ours(settings: &mut Map<String, Value>) -> bool {
         settings.remove("hooks");
     }
     removed
+}
+
+fn is_ours_cursor(entry: &Value) -> bool {
+    if entry.get("owner").and_then(Value::as_str) == Some(MARKER) {
+        return true;
+    }
+    let Some(command) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    (program == "p2pmux" || (program.starts_with('/') && program.ends_with("/p2pmux")))
+        && words.next() == Some("notify")
+        && words.next() == Some("cursor")
+}
+
+fn strip_ours_cursor(hooks: &mut Map<String, Value>) -> bool {
+    let mut removed = false;
+    for entries in hooks.values_mut() {
+        if let Value::Array(entries) = entries {
+            let before = entries.len();
+            entries.retain(|entry| !is_ours_cursor(entry));
+            removed |= entries.len() != before;
+        }
+    }
+    removed
+}
+
+fn cursor_hook_entry(status: &str, matcher: Option<&str>) -> Value {
+    let mut entry = Map::new();
+    entry.insert(
+        "command".into(),
+        Value::String(format!("p2pmux notify cursor --status {status}")),
+    );
+    entry.insert("timeout".into(), Value::Number(5.into()));
+    entry.insert("owner".into(), Value::String(MARKER.into()));
+    if let Some(matcher) = matcher {
+        entry.insert("matcher".into(), Value::String(matcher.into()));
+    }
+    Value::Object(entry)
+}
+
+fn read_cursor_hooks(path: &PathBuf) -> Result<Map<String, Value>, Box<dyn Error>> {
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(settings)) => Ok(settings),
+            Ok(_) => Err(Box::from(format!(
+                "{} is not a JSON object — refusing to rewrite it",
+                path.display()
+            ))),
+            Err(error) if bytes.iter().all(u8::is_ascii_whitespace) => {
+                let _ = error;
+                Ok(Map::new())
+            }
+            Err(error) => Err(Box::from(format!(
+                "{} is not valid JSON ({error}) — refusing to rewrite it",
+                path.display()
+            ))),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+pub fn cursor_wiring() -> Wiring {
+    let Some(path) = cursor_hooks_path() else {
+        return Wiring::Absent;
+    };
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Wiring::Absent;
+    }
+    let Ok(settings) = read_cursor_hooks(&path) else {
+        return Wiring::Unwired;
+    };
+    if settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|hooks| {
+            hooks.values().any(|entries| {
+                entries
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().any(is_ours_cursor))
+            })
+        })
+    {
+        Wiring::Wired
+    } else {
+        Wiring::Unwired
+    }
+}
+
+/// Install (or remove) the Cursor hooks. Idempotent in both directions.
+pub fn setup_cursor(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>> {
+    let Some(path) = cursor_hooks_path() else {
+        return Err(Box::from("cannot locate $HOME"));
+    };
+    setup_cursor_at_path(&path, uninstall, dry_run)
+}
+
+fn setup_cursor_at_path(
+    path: &PathBuf,
+    uninstall: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut settings = read_cursor_hooks(path)?;
+    match settings.get("version") {
+        Some(Value::Number(_)) => {}
+        Some(_) => {
+            return Err(Box::from(format!(
+                "the `version` key in {} is not a number — refusing to rewrite it",
+                path.display()
+            )));
+        }
+        None => {
+            settings.insert("version".into(), Value::Number(1.into()));
+        }
+    }
+    if settings
+        .get("hooks")
+        .is_some_and(|hooks| !hooks.is_object())
+    {
+        return Err(Box::from(format!(
+            "the `hooks` key in {} is not an object — refusing to rewrite it",
+            path.display()
+        )));
+    }
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(hooks) = hooks else {
+        unreachable!("the hooks object was validated above");
+    };
+    let had_ours = strip_ours_cursor(hooks);
+
+    if uninstall {
+        if !had_ours {
+            println!(
+                "cursor: already removed (no p2pmux hooks in {})",
+                path.display()
+            );
+            return Ok(());
+        }
+        if dry_run {
+            println!(
+                "cursor: would remove {} p2pmux hooks from {} (dry run)",
+                CURSOR_HOOKS.len(),
+                path.display()
+            );
+            return Ok(());
+        }
+        write_settings(path, &settings)?;
+        println!("cursor: removed the p2pmux hooks from {}", path.display());
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "cursor: would write {} p2pmux hooks to {} (dry run)",
+            CURSOR_HOOKS.len(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    for (event, status, matcher) in CURSOR_HOOKS {
+        let entries = hooks
+            .entry((*event).to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(entries) = entries else {
+            return Err(Box::from(format!(
+                "hooks.{event} in {} is not an array — refusing to rewrite it",
+                path.display()
+            )));
+        };
+        entries.push(cursor_hook_entry(status, *matcher));
+    }
+    write_settings(path, &settings)?;
+    println!(
+        "cursor: wrote {} p2pmux hooks to {}",
+        CURSOR_HOOKS.len(),
+        path.display()
+    );
+    println!("cursor: new Cursor sessions pick this up; restart any that are running");
+    Ok(())
 }
 
 pub fn claude_wiring() -> Wiring {
@@ -400,6 +598,7 @@ fn warn_if_not_on_path(agent: &str) {
 pub fn setup_all(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>> {
     let results = [
         setup_claude(uninstall, dry_run),
+        setup_cursor(uninstall, dry_run),
         setup_opencode(uninstall, dry_run),
     ];
     let mut failures = Vec::new();
@@ -433,10 +632,18 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
         ),
+        (
+            "cursor",
+            cursor_wiring(),
+            cursor_hooks_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
     ];
     for (agent, wiring, path) in &rows {
         println!("{agent:<9} {:<14} {path}", wiring.label());
     }
+    println!("cursor cannot report `needs you` — Cursor has no permission-request hook.");
     let states: Vec<&Wiring> = rows.iter().map(|(_, wiring, _)| wiring).collect();
     if states.iter().any(|wiring| **wiring == Wiring::Wired) {
         println!("\nThe inbox reads agent state from these hooks.");
@@ -781,6 +988,129 @@ mod tests {
         assert!(read_settings(&path).expect("missing is fresh").is_empty());
 
         fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    fn cursor_hooks_fixture_path(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "p2pmux-cursor-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        directory.join(".cursor").join("hooks.json")
+    }
+
+    #[test]
+    fn cursor_hooks_path_returns_home_dot_cursor() {
+        let home = std::env::var_os("HOME").expect("HOME is set for tests");
+        assert_eq!(
+            cursor_hooks_path(),
+            Some(PathBuf::from(home).join(".cursor").join("hooks.json"))
+        );
+    }
+
+    #[test]
+    fn installing_cursor_hooks_is_idempotent() {
+        let path = cursor_hooks_fixture_path("idempotent");
+        setup_cursor_at_path(&path, false, false).expect("first install");
+        setup_cursor_at_path(&path, false, false).expect("second install");
+
+        let settings = read_cursor_hooks(&path).expect("hooks parse");
+        for (event, ..) in CURSOR_HOOKS {
+            let entries = settings["hooks"][*event].as_array().expect("event entries");
+            assert_eq!(
+                entries.iter().filter(|entry| is_ours_cursor(entry)).count(),
+                1,
+                "{event} has one p2pmux hook"
+            );
+        }
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn uninstalling_cursor_leaves_user_hooks() {
+        let path = cursor_hooks_fixture_path("user-hooks");
+        fs::create_dir_all(path.parent().expect(".cursor directory")).expect("create .cursor");
+        fs::write(
+            &path,
+            r#"{"version": 1, "hooks": {"stop": [{"command": "afplay done.aiff"}]}}"#,
+        )
+        .expect("write user hook");
+
+        setup_cursor_at_path(&path, false, false).expect("install");
+        setup_cursor_at_path(&path, true, false).expect("uninstall");
+
+        let settings = read_cursor_hooks(&path).expect("hooks parse");
+        let stop = settings["hooks"]["stop"].as_array().expect("stop entries");
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["command"], "afplay done.aiff");
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn cursor_hooks_json_with_bad_version_is_refused() {
+        let path = cursor_hooks_fixture_path("bad-version");
+        fs::create_dir_all(path.parent().expect(".cursor directory")).expect("create .cursor");
+        let body = b"{\"version\": \"one\", \"hooks\": {}}";
+        fs::write(&path, body).expect("write bad version");
+
+        let error = setup_cursor_at_path(&path, false, false).expect_err("must refuse");
+        assert!(error.to_string().contains("version"));
+        assert_eq!(fs::read(&path).expect("still there"), body);
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn cursor_hooks_json_with_non_object_hooks_is_refused() {
+        let path = cursor_hooks_fixture_path("bad-hooks");
+        fs::create_dir_all(path.parent().expect(".cursor directory")).expect("create .cursor");
+        let body = b"{\"version\": 1, \"hooks\": []}";
+        fs::write(&path, body).expect("write bad hooks");
+
+        let error = setup_cursor_at_path(&path, false, false).expect_err("must refuse");
+        assert!(error.to_string().contains("hooks"));
+        assert_eq!(fs::read(&path).expect("still there"), body);
+
+        fs::remove_dir_all(
+            path.parent()
+                .expect(".cursor directory")
+                .parent()
+                .expect("fixture directory"),
+        )
+        .expect("cleanup");
+    }
+
+    #[test]
+    fn cursor_is_ours_structural_match() {
+        assert!(is_ours_cursor(&serde_json::json!({
+            "command": "p2pmux notify cursor --status done"
+        })));
+        assert!(!is_ours_cursor(&serde_json::json!({
+            "command": "echo p2pmux notify cursor --status done"
+        })));
     }
 
     #[test]
