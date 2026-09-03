@@ -375,6 +375,10 @@ impl MultiPaneTui {
     pub fn set_pane_view(&mut self, pane_id: PaneId, mut state: PaneViewState) -> bool {
         if self.snapshot.panes.contains_key(&pane_id) {
             state.scrollback = self.scrollback_offset(pane_id);
+            state.origin = self
+                .pane_views
+                .get(&pane_id)
+                .map_or_default(|view| view.origin);
             if self.pane_views.get(&pane_id) == Some(&state) {
                 return false;
             }
@@ -816,6 +820,7 @@ mod tests {
             controller_peer_id: Some(b"controller".to_vec()),
             controller_active: true,
             scrollback: 0,
+            origin: ScreenCell::default(),
         };
         assert!(tui.set_pane_view(1, active.clone()));
         assert!(!tui.set_pane_view(1, active));
@@ -826,6 +831,27 @@ mod tests {
                 ..tui.pane_view(1).expect("pane view").clone()
             },
         ));
+    }
+
+    #[test]
+    fn pane_view_refresh_preserves_the_local_viewport_origin() {
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 1, 1)],
+        ))
+        .expect("layout");
+        tui.pane_views.get_mut(&1).expect("pane view").origin = ScreenCell { row: 4, col: 9 };
+
+        tui.set_pane_view(1, PaneViewState::from_chrome(true, None, false));
+
+        assert_eq!(
+            tui.pane_view(1).expect("pane view").origin,
+            ScreenCell { row: 4, col: 9 },
+        );
     }
 
     #[test]

@@ -393,6 +393,42 @@ pub(in crate::tui) fn fixed_grid_viewport(inner: Rect, rows: u16, cols: u16) -> 
     let height = inner.height.min(rows);
     Rect::new(inner.x, inner.y, width, height)
 }
+/// Keeps a local view's origin within the shared fixed grid.
+pub(in crate::tui) fn clamp_grid_origin(
+    origin: ScreenCell,
+    grid: (u16, u16),
+    view: (u16, u16),
+) -> ScreenCell {
+    ScreenCell {
+        row: origin.row.min(grid.0.saturating_sub(view.0)),
+        col: origin.col.min(grid.1.saturating_sub(view.1)),
+    }
+}
+
+/// Follows the visible cursor with the smallest possible local camera move.
+pub(in crate::tui) fn nudge_grid_origin(
+    prior: ScreenCell,
+    grid: (u16, u16),
+    view: (u16, u16),
+    cursor: ScreenCell,
+    follow: bool,
+) -> ScreenCell {
+    let mut origin = clamp_grid_origin(prior, grid, view);
+    if !follow || view.0 == 0 || view.1 == 0 {
+        return origin;
+    }
+    if cursor.row < origin.row {
+        origin.row = cursor.row;
+    } else if cursor.row >= origin.row.saturating_add(view.0) {
+        origin.row = cursor.row.saturating_add(1).saturating_sub(view.0);
+    }
+    if cursor.col < origin.col {
+        origin.col = cursor.col;
+    } else if cursor.col >= origin.col.saturating_add(view.1) {
+        origin.col = cursor.col.saturating_add(1).saturating_sub(view.1);
+    }
+    clamp_grid_origin(origin, grid, view)
+}
 pub(in crate::tui) fn pane_content_rect(pane_rect: Rect) -> Rect {
     Block::bordered().inner(pane_rect)
 }
@@ -512,8 +548,9 @@ mod tests {
 
     use super::{
         RESIZE_RECHECK_INTERVAL, allocate_node_with_preview, area_from_terminal_size,
-        grid_for_pane, initial_root_pane_grid, missed_resize, mouse_to_screen_cell,
-        nearest_in_direction, resize_recheck_due, stale_node_size,
+        clamp_grid_origin, grid_for_pane, initial_root_pane_grid, missed_resize,
+        mouse_to_screen_cell, nearest_in_direction, nudge_grid_origin, resize_recheck_due,
+        stale_node_size,
     };
     use crate::layout::PaneId;
     use crossterm::event::KeyCode;
@@ -523,6 +560,67 @@ mod tests {
         assert_eq!(
             area_from_terminal_size(Err(io::Error::from(io::ErrorKind::WouldBlock))),
             None
+        );
+    }
+
+    #[test]
+    fn grid_origin_follows_only_far_enough_to_reveal_the_cursor() {
+        assert_eq!(
+            nudge_grid_origin(
+                ScreenCell::default(),
+                (40, 120),
+                (10, 30),
+                ScreenCell { row: 39, col: 119 },
+                true,
+            ),
+            ScreenCell { row: 30, col: 90 },
+        );
+        assert_eq!(
+            nudge_grid_origin(
+                ScreenCell { row: 30, col: 90 },
+                (40, 120),
+                (10, 30),
+                ScreenCell::default(),
+                true,
+            ),
+            ScreenCell::default(),
+        );
+    }
+
+    #[test]
+    fn grid_origin_clamps_at_the_grid_edges() {
+        assert_eq!(
+            clamp_grid_origin(ScreenCell { row: 99, col: 99 }, (40, 120), (10, 30)),
+            ScreenCell { row: 30, col: 90 },
+        );
+        assert_eq!(
+            clamp_grid_origin(ScreenCell { row: 7, col: 8 }, (4, 5), (10, 30)),
+            ScreenCell::default(),
+        );
+    }
+
+    #[test]
+    fn grid_origin_stays_put_when_following_is_unneeded_or_disabled() {
+        let prior = ScreenCell { row: 5, col: 7 };
+        assert_eq!(
+            nudge_grid_origin(
+                prior,
+                (40, 120),
+                (10, 30),
+                ScreenCell { row: 8, col: 9 },
+                true
+            ),
+            prior,
+        );
+        assert_eq!(
+            nudge_grid_origin(
+                prior,
+                (40, 120),
+                (10, 30),
+                ScreenCell { row: 39, col: 119 },
+                false,
+            ),
+            prior,
         );
     }
 

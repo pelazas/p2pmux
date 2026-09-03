@@ -1287,6 +1287,7 @@ mod tests {
                 controller_peer_id: Some(b"peer".to_vec()),
                 controller_active: true,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(36, 6)).expect("test terminal");
@@ -1324,6 +1325,7 @@ mod tests {
                 controller_peer_id: None,
                 controller_active: false,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("test terminal");
@@ -1372,6 +1374,7 @@ mod tests {
                     controller_peer_id: None,
                     controller_active: false,
                     scrollback: 0,
+                    origin: Default::default(),
                 },
             );
         }
@@ -1459,6 +1462,7 @@ mod tests {
                     controller_peer_id: Some(Vec::new()),
                     controller_active: false,
                     scrollback: 0,
+                    origin: Default::default(),
                 },
             );
         }
@@ -1501,6 +1505,7 @@ mod tests {
                 controller_peer_id: Some(b"peer".to_vec()),
                 controller_active: true,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         assert!(
@@ -1521,6 +1526,7 @@ mod tests {
                 controller_peer_id: Some(Vec::new()),
                 controller_active: false,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         assert!(right_is_dim(&tui), "and it goes back once they let go");
@@ -1577,6 +1583,7 @@ mod tests {
                 controller_peer_id: None,
                 controller_active: false,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         let screens = BTreeMap::from([(1, parser.screen())]);
@@ -1615,6 +1622,7 @@ mod tests {
                     controller_peer_id: None,
                     controller_active: false,
                     scrollback: 0,
+                    origin: Default::default(),
                 },
             );
             let screens = BTreeMap::from([(1, parser.screen())]);
@@ -1664,6 +1672,7 @@ mod tests {
                     controller_peer_id: None,
                     controller_active: false,
                     scrollback: 0,
+                    origin: Default::default(),
                 },
             );
             assert!(tui.set_pane_scrollback_offset(1, 2));
@@ -1700,6 +1709,7 @@ mod tests {
                 controller_peer_id: None,
                 controller_active: false,
                 scrollback: 0,
+                origin: Default::default(),
             },
         );
         assert!(tui.set_pane_scrollback_offset(1, 2));

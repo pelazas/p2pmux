@@ -156,6 +156,7 @@ impl SharedLocalPane {
             controller_peer_id: Some(self.lease.state().controller_peer_id.clone()),
             controller_active: !self.lease.state().is_idle_at(Instant::now()),
             scrollback: 0,
+            origin: Default::default(),
         }
     }
 
