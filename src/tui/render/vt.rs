@@ -26,6 +26,7 @@ pub(in crate::tui) struct VtScreen<'a> {
     scrollback: usize,
     /// Whether this pane is one the user is not typing into.
     dimmed: bool,
+    origin: ScreenCell,
 }
 impl<'a> VtScreen<'a> {
     pub(in crate::tui) fn new(screen: &'a vt100::Screen) -> Self {
@@ -34,6 +35,7 @@ impl<'a> VtScreen<'a> {
             selection: None,
             scrollback: 0,
             dimmed: false,
+            origin: ScreenCell::default(),
         }
     }
 
@@ -63,6 +65,11 @@ impl<'a> VtScreen<'a> {
         self.scrollback = scrollback;
         self
     }
+
+    pub(in crate::tui) fn at_origin(mut self, origin: ScreenCell) -> Self {
+        self.origin = origin;
+        self
+    }
 }
 /// The screen as seen from `scrollback` rows back, copying only when it has to.
 ///
@@ -90,12 +97,21 @@ pub(in crate::tui) fn available_scrollback(screen: &vt100::Screen) -> usize {
 impl Widget for VtScreen<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (rows, cols) = self.screen.size();
-        for row in 0..rows.min(area.height) {
-            for col in 0..cols.min(area.width) {
-                let Some(source) = self.screen.cell(row, col) else {
+        for row in 0..area.height.min(rows.saturating_sub(self.origin.row)) {
+            for col in 0..area.width.min(cols.saturating_sub(self.origin.col)) {
+                let source_row = self.origin.row.saturating_add(row);
+                let source_col = self.origin.col.saturating_add(col);
+                let Some(source) = self.screen.cell(source_row, source_col) else {
                     continue;
                 };
                 if source.is_wide_continuation() {
+                    if col == 0 {
+                        buf[(area.x + col, area.y + row)].reset();
+                    }
+                    continue;
+                }
+                if source.is_wide() && col.saturating_add(1) >= area.width {
+                    buf[(area.x + col, area.y + row)].reset();
                     continue;
                 }
                 let target = &mut buf[(area.x + col, area.y + row)];
@@ -114,7 +130,13 @@ impl Widget for VtScreen<'_> {
                     NonZeroU16::new(reserved).expect("1 and 2 are both nonzero"),
                 ));
                 let style = if self.selection.is_some_and(|selection| {
-                    selection.contains(ScreenCell { row, col }, self.scrollback)
+                    selection.contains(
+                        ScreenCell {
+                            row: source_row,
+                            col: source_col,
+                        },
+                        self.scrollback,
+                    )
                 }) {
                     // Never dimmed. A selection is something the user made a
                     // moment ago and is about to copy, and it can perfectly
@@ -391,6 +413,41 @@ mod tests {
     }
 
     #[test]
+    fn renderer_crops_selection_in_source_coordinates() {
+        let mut parser = vt100::Parser::new(3, 4, 0);
+        parser.process(b"abcd\r\nefgh\r\nijkl");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: SelectionPoint {
+                scrollback: 0,
+                cell: ScreenCell { row: 1, col: 2 },
+            },
+            cursor: SelectionPoint {
+                scrollback: 0,
+                cell: ScreenCell { row: 1, col: 3 },
+            },
+        };
+        let mut terminal = Terminal::new(TestBackend::new(2, 2)).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    VtScreen::new(parser.screen())
+                        .at_origin(ScreenCell { row: 1, col: 1 })
+                        .with_selection(Some(selection)),
+                    frame.area(),
+                )
+            })
+            .expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "f");
+        assert_eq!(buffer[(1, 0)].symbol(), "g");
+        assert_eq!(buffer[(1, 0)].bg, Color::DarkGray);
+        assert_eq!(buffer[(0, 1)].symbol(), "j");
+    }
+
+    #[test]
     fn renderer_keeps_the_parser_grid_fixed() {
         let mut parser = vt100::Parser::new(2, 3, 0);
         parser.process(b"abc\r\ndef");
@@ -498,6 +555,28 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "\u{4f60}");
         assert_eq!(buffer[(2, 0)].symbol(), "\u{597d}");
+    }
+
+    #[test]
+    fn renderer_blanks_wide_glyphs_cut_by_a_viewport_edge() {
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process("你a".as_bytes());
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("test terminal");
+
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(parser.screen()), frame.area()))
+            .expect("render");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    VtScreen::new(parser.screen()).at_origin(ScreenCell { row: 0, col: 1 }),
+                    frame.area(),
+                )
+            })
+            .expect("render");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
     }
 
     /// A row of what an agent pane actually prints, with the four ways a cluster

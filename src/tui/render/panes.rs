@@ -17,9 +17,9 @@ use crate::{
     config::UiTheme,
     layout::PaneId,
     tui::{
-        ChordMode, ModalState, MultiPaneTui, PaneViewState, ShareView,
+        ChordMode, ModalState, MultiPaneTui, PaneViewState, ScreenCell, ShareView,
         app::{member_color, member_initial},
-        geometry::{fixed_grid_viewport, pane_content_rect, visible_leaf_panes},
+        geometry::{pane_content_rect, visible_leaf_panes},
         member_label,
         render::{
             footer::render_contextual_footer,
@@ -658,11 +658,24 @@ pub(in crate::tui) fn render_shared_multi_pane(
             // the descriptor letterboxes a pane that has already grown -- which is
             // most visible on a zoom, where the pane doubles in size in one frame.
             let (grid_rows, grid_cols) = screen.size();
-            let viewport = fixed_grid_viewport(content, grid_rows, grid_cols);
             let scrollback = tui.scrollback_offset(pane_id);
             let screen = viewed_screen(screen, scrollback);
+            let viewport = tui
+                .pane_grid_viewport(pane_id, content, (grid_rows, grid_cols))
+                .expect("visible pane has a local view");
+            let (row, col) = screen.cursor_position();
+            let origin = tui
+                .nudge_pane_origin(
+                    pane_id,
+                    (grid_rows, grid_cols),
+                    viewport,
+                    ScreenCell { row, col },
+                    scrollback == 0 && !screen.hide_cursor(),
+                )
+                .expect("visible pane has a local view");
             frame.render_widget(
                 VtScreen::new(screen.as_ref())
+                    .at_origin(origin)
                     .with_selection(
                         tui.selection()
                             .filter(|selection| selection.pane_id == pane_id),
@@ -671,7 +684,6 @@ pub(in crate::tui) fn render_shared_multi_pane(
                     .dimmed(pane_recedes(tui, pane_id, &view, focused, scrollback)),
                 viewport,
             );
-            let (row, col) = screen.cursor_position();
             // `scrollback`, not the screen's own offset: a client keeps no
             // scrollback of its own and renders history by swapping in a
             // viewport the node built, whose retained-row count -- and so whose
@@ -688,12 +700,14 @@ pub(in crate::tui) fn render_shared_multi_pane(
                 && scrollback == 0
                 && !screen.hide_cursor()
                 && !pane.exited
-                && row < viewport.height
-                && col < viewport.width
+                && row >= origin.row
+                && col >= origin.col
+                && row.saturating_sub(origin.row) < viewport.height
+                && col.saturating_sub(origin.col) < viewport.width
             {
                 frame.set_cursor_position((
-                    viewport.x.saturating_add(col),
-                    viewport.y.saturating_add(row),
+                    viewport.x.saturating_add(col.saturating_sub(origin.col)),
+                    viewport.y.saturating_add(row.saturating_sub(origin.row)),
                 ));
             }
         } else if !view.ready {
@@ -732,7 +746,7 @@ mod tests {
         config::UiTheme,
         layout::{Axis, Node, Tab},
         tui::{
-            ChordMode, MultiPaneTui, PaneViewState, ShareView,
+            ChordMode, MultiPaneTui, PaneViewState, ScreenCell, ShareView,
             geometry::visible_leaf_panes,
             test_support::{
                 home_tui, layout, named_members, split_layout, two_tab_presence_tui, watcher,
@@ -1593,6 +1607,34 @@ mod tests {
             .draw(|frame| render_multi_pane(frame, &tui, &screens))
             .expect("render");
 
+        terminal.backend_mut().assert_cursor_position((3, 2));
+    }
+
+    #[test]
+    fn focused_pane_crops_to_the_cursor_and_places_its_cursor_locally() {
+        let mut parser = vt100::Parser::new(3, 5, 0);
+        parser.process(b"abcde\r\nfghij\r\nklmno\x1b[3;5H");
+        let tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 3, 5)],
+        ))
+        .expect("valid layout");
+        let screens = BTreeMap::from([(1, parser.screen())]);
+        let mut terminal = Terminal::new(TestBackend::new(5, 5)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_multi_pane(frame, &tui, &screens))
+            .expect("render");
+
+        assert_eq!(
+            tui.pane_view(1).expect("pane view").origin.get(),
+            ScreenCell { row: 2, col: 2 },
+        );
+        assert_eq!(terminal.backend().buffer()[(1, 2)].symbol(), "m");
         terminal.backend_mut().assert_cursor_position((3, 2));
     }
 
