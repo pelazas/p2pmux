@@ -788,7 +788,7 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.15 is out — you have 0.1.14. u update · c copy · `brew update && brew upgrade p2pmux`
+p2pmux 0.1.15 is out — you have 0.1.14. u update · `brew update && brew upgrade p2pmux`
 ```
 
 `u` or a click on that line asks before it runs the command in a new terminal on this machine.

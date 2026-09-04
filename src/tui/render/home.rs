@@ -317,7 +317,10 @@ fn render_home_in(
         // to go and get. Both are worth a line; only one is worth the bold.
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" {}", update.inbox_line()),
+                truncate_trailing(
+                    &format!(" {}", update.inbox_line()),
+                    usize::from(layout.update.width),
+                ),
                 Style::default().fg(theme.agent_overlay_secondary),
             )),
             layout.update,
