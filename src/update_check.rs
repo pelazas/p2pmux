@@ -9,10 +9,10 @@
 //! - **It never delays a launch.** The check runs on its own thread and the
 //!   answer arrives whenever it arrives; a network that is down or slow costs
 //!   nothing but a notice that does not appear.
-//! - **It never installs anything.** Replacing the binary you are running,
-//!   under whichever package manager put it there, is not something to do
-//!   behind a `y/n` prompt at startup. It tells you the one command that fits
-//!   how *this* copy was installed, and that is all.
+//! - **It never installs anything.** This module names the command that fits
+//!   how *this* copy was installed. Replacing the binary you are running is
+//!   not something to do behind a `y/n` prompt at startup. The inbox can run
+//!   that command later, after you ask it to.
 //! - **It asks at most once a day.** The answer is cached with the time it was
 //!   fetched, so a person who opens ten sessions makes one request.
 //!

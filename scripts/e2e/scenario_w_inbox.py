@@ -176,13 +176,13 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
                 what="the update notice",
             )
             check(
-                "a newer release is named on the inbox, with the command to take it",
-                "Update with" in update,
+                "a newer release is named on the inbox, with a way to take it",
+                "u update" in update and f"{NEWER_VERSION} is out" in update,
                 [line for line in update.split("\n") if "is out" in line][:1],
             )
         except DeadlineExceeded as error:
             check(
-                "a newer release is named on the inbox, with the command to take it",
+                "a newer release is named on the inbox, with a way to take it",
                 False,
                 str(error)[:400],
             )
