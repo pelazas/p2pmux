@@ -117,7 +117,7 @@ pub struct MultiPaneTui {
     /// answers something the reader just did and is gone by the next thing they
     /// do. A release is worth saying once and worth still being there when they
     /// look back at the inbox an hour later.
-    pub(in crate::tui) update_notice: Option<String>,
+    pub(in crate::tui) update_notice: Option<crate::update_check::UpdateNotice>,
     /// The area Home was last measured against.
     ///
     /// Kept so that a key handler which decides to open a terminal can size it
@@ -647,11 +647,11 @@ impl MultiPaneTui {
     ///
     /// Returns whether anything changed, so the answer arriving from a
     /// background check costs one repaint rather than one a frame.
-    pub fn set_update_notice(&mut self, line: String) -> bool {
-        if self.update_notice.as_deref() == Some(line.as_str()) {
+    pub fn set_update_notice(&mut self, notice: crate::update_check::UpdateNotice) -> bool {
+        if self.update_notice.as_ref() == Some(&notice) {
             return false;
         }
-        self.update_notice = Some(line);
+        self.update_notice = Some(notice);
         true
     }
 

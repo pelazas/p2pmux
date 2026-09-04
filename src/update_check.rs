@@ -65,7 +65,10 @@ pub enum Check {
 }
 
 impl UpdateNotice {
-    /// The one line the inbox shows.
+    /// The one line `p2pmux doctor` prints: versions, and the command to type.
+    ///
+    /// Doctor is a sentence on stdout, not a screen with keys, so the command
+    /// is the whole of what it can offer. The inbox has its own line.
     pub fn line(&self) -> String {
         format!(
             "p2pmux {} is out — you have {}. Update with `{}`",
@@ -73,6 +76,33 @@ impl UpdateNotice {
             env!("CARGO_PKG_VERSION"),
             self.command
         )
+    }
+
+    /// The one line the inbox shows.
+    ///
+    /// Same three facts as [`Self::line`], plus the key that takes the update
+    /// without leaving to paste. The command stays on the line because a notice
+    /// that only says "an update is available" is one people learn to skip.
+    pub fn inbox_line(&self) -> String {
+        format!(
+            "p2pmux {} is out — you have {}. u update · `{}`",
+            self.version,
+            env!("CARGO_PKG_VERSION"),
+            self.command
+        )
+    }
+
+    /// Argv that runs [`Self::command`] in a pane.
+    ///
+    /// The upgrade line is a shell snippet (`&&`, a pipe), and a pane launches
+    /// an argv, not a string. `sh -c` is the one translation that keeps the
+    /// command the notice already named.
+    pub fn argv(&self) -> Vec<String> {
+        vec![
+            String::from("sh"),
+            String::from("-c"),
+            self.command.to_owned(),
+        ]
     }
 }
 
@@ -366,5 +396,26 @@ mod tests {
         assert!(line.contains("0.9.9"), "{line}");
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
         assert!(line.contains("brew upgrade p2pmux"), "{line}");
+        assert!(
+            line.contains("Update with"),
+            "doctor has no key to offer, so it names the command: {line}"
+        );
+        assert!(
+            !line.contains("u update"),
+            "the inbox verb does not belong on stdout: {line}"
+        );
+
+        let inbox = notice.inbox_line();
+        assert!(inbox.contains("0.9.9"), "{inbox}");
+        assert!(inbox.contains("u update"), "{inbox}");
+        assert!(inbox.contains("brew upgrade p2pmux"), "{inbox}");
+        assert_eq!(
+            notice.argv(),
+            vec![
+                String::from("sh"),
+                String::from("-c"),
+                String::from("brew update && brew upgrade p2pmux"),
+            ]
+        );
     }
 }

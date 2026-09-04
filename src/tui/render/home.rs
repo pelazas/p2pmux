@@ -271,14 +271,14 @@ fn render_home_in(
     }
 
     if layout.update.height > 0
-        && let Some(update) = tui.update_notice.as_deref()
+        && let Some(update) = tui.update_notice.as_ref()
     {
         // Quieter than the nudge above it, and deliberately so: an install with
         // no hooks cannot do its job, while this one only has a newer version
         // to go and get. Both are worth a line; only one is worth the bold.
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" {update}"),
+                format!(" {}", update.inbox_line()),
                 Style::default().fg(theme.agent_overlay_secondary),
             )),
             layout.update,
@@ -1394,29 +1394,18 @@ mod tests {
         tui.set_home_open(true, "test");
         assert!(!screen(&tui, 120, 30).join("\n").contains("is out"));
 
-        assert!(
-            tui.set_update_notice(
-                crate::update_check::UpdateNotice {
-                    version: String::from("9.9.9"),
-                    command: "brew update && brew upgrade p2pmux",
-                }
-                .line()
-            )
-        );
+        let notice = crate::update_check::UpdateNotice {
+            version: String::from("9.9.9"),
+            command: "brew update && brew upgrade p2pmux",
+        };
+        assert!(tui.set_update_notice(notice.clone()));
         // Once. A repeat answer from a later check costs no repaint.
-        assert!(
-            !tui.set_update_notice(
-                crate::update_check::UpdateNotice {
-                    version: String::from("9.9.9"),
-                    command: "brew update && brew upgrade p2pmux",
-                }
-                .line()
-            )
-        );
+        assert!(!tui.set_update_notice(notice));
 
         let drawn = screen(&tui, 120, 30).join("\n");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
         assert!(drawn.contains("brew upgrade p2pmux"), "{drawn}");
+        assert!(drawn.contains("u update"), "{drawn}");
 
         // The setup nudge keeps its own line too: an install that cannot say
         // `needs you` and an install that is a version behind are two different
@@ -1424,7 +1413,10 @@ mod tests {
         let mut unwired =
             crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Unknown)]);
         unwired.set_home_open(true, "test");
-        assert!(unwired.set_update_notice(String::from("p2pmux 9.9.9 is out")));
+        assert!(unwired.set_update_notice(crate::update_check::UpdateNotice {
+            version: String::from("9.9.9"),
+            command: "brew update && brew upgrade p2pmux",
+        }));
         let drawn = screen(&unwired, 120, 30).join("\n");
         assert!(drawn.contains(HOME_EMPTY_NO_HOOKS), "{drawn}");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
