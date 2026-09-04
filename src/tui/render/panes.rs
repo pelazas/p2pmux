@@ -27,6 +27,7 @@ use crate::{
             modals::{
                 render_add_machine_modal, render_delete_tab_confirmation, render_quit_prompt,
                 render_remote_work_prompt, render_rename_prompt, render_share_modal,
+                render_update_confirm,
             },
             vt::{VtScreen, viewed_screen},
         },
@@ -554,6 +555,9 @@ pub(in crate::tui) fn render_shared_multi_pane(
         if let Some(command) = tui.remote_work_command() {
             render_remote_work_prompt(frame, theme, command);
         }
+        if let (true, Some(notice)) = (tui.update_confirm_open(), tui.update_notice.as_ref()) {
+            render_update_confirm(frame, theme, notice);
+        }
         return;
     }
 
@@ -714,6 +718,9 @@ pub(in crate::tui) fn render_shared_multi_pane(
     }
     if let Some(command) = tui.remote_work_command() {
         render_remote_work_prompt(frame, &tui.theme, command);
+    }
+    if let (true, Some(notice)) = (tui.update_confirm_open(), tui.update_notice.as_ref()) {
+        render_update_confirm(frame, &tui.theme, notice);
     }
 }
 

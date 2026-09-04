@@ -1,5 +1,5 @@
 //! Centred overlay panels: the share invite, the rename prompt, the delete-tab
-//! confirmation, and the quit prompt.
+//! confirmation, the quit prompt, and the inbox update confirm.
 
 use ratatui::{
     Frame,
@@ -480,6 +480,79 @@ pub(in crate::tui) fn render_remote_work_prompt(
     );
 }
 
+/// The inbox update line, asking before a command that replaces this binary.
+///
+/// It names the command in full, because that is the entire decision, and it
+/// says the session will not pick up the new binary until it is started again.
+/// Enter is the confirm; Esc is the way out. There is no prompt at startup.
+pub(in crate::tui) fn render_update_confirm(
+    frame: &mut Frame<'_>,
+    theme: &UiTheme,
+    notice: &crate::update_check::UpdateNotice,
+) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(8).clamp(44, 72).min(area.width);
+    let inner_width = usize::from(width.saturating_sub(4)).max(1);
+    let command_lines = wrap_fixed(notice.command, inner_width);
+    let stay = wrap_fixed(
+        "This session stays on the old binary until you quit and reopen.",
+        inner_width,
+    );
+    let inner_lines = 6usize
+        .saturating_add(command_lines.len())
+        .saturating_add(stay.len());
+    let height = u16::try_from(inner_lines.saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(area.height)
+        .max(9);
+    let panel = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::bordered().border_style(Style::default().fg(theme.footer_accent)),
+        panel,
+    );
+    let inner = Block::bordered().inner(panel);
+    let key = Style::default()
+        .fg(theme.footer_accent)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::styled(
+            "Update p2pmux?",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    for line in command_lines {
+        lines.push(Line::styled(
+            format!("  {line}"),
+            Style::default().fg(theme.agent_overlay_warm),
+        ));
+    }
+    lines.push(Line::raw(""));
+    for line in stay {
+        lines.push(Line::styled(
+            line,
+            Style::default().fg(theme.agent_overlay_muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Enter", key),
+        Span::raw("  run in a new terminal"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Esc", key),
+        Span::raw("  cancel"),
+    ]));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 pub(in crate::tui) fn render_quit_prompt(frame: &mut Frame<'_>, theme: &UiTheme) {
     let area = frame.area();
     let width = area.width.saturating_sub(8).clamp(36, 60).min(area.width);
@@ -610,6 +683,7 @@ mod tests {
             ModalState::ConfirmRemoteWork {
                 command: vec!["cargo".into(), "test".into()],
             },
+            ModalState::ConfirmUpdate,
         ] {
             let terminal = draw(&tui_with_a_live_pane(modal.clone()), parser.screen());
             assert!(
@@ -617,6 +691,29 @@ mod tests {
                 "{modal:?} left the caret in the pane behind it"
             );
         }
+    }
+
+    #[test]
+    fn the_update_confirm_names_the_command_and_that_this_session_stays_old() {
+        let mut tui = tui_with_a_live_pane(ModalState::ConfirmUpdate);
+        tui.set_update_notice(crate::update_check::UpdateNotice {
+            version: String::from("9.9.9"),
+            command: "brew update && brew upgrade p2pmux",
+        });
+        let terminal = draw(&tui, vt100::Parser::new(2, 9, 0).screen());
+        let buffer = terminal.backend().buffer();
+        let drawn = (0..16)
+            .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains("brew upgrade p2pmux"), "{drawn}");
+        assert!(drawn.contains("old binary"), "{drawn}");
+        assert!(drawn.contains("Enter"), "{drawn}");
+        assert!(drawn.contains("Esc"), "{drawn}");
+        assert!(
+            !drawn.contains("Update with"),
+            "the standing doctor line is not this dialog: {drawn}"
+        );
     }
 
     /// The one dialog that does take typing puts the caret where the typing

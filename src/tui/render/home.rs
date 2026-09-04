@@ -93,6 +93,23 @@ const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
+/// The same bar while a newer p2pmux is on the line above it. `u` is the verb
+/// for that line; it drops first when the bar will not hold it, because the
+/// standing line already names the key.
+const HOME_KEYS_UPDATE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" open   "),
+    FooterSegment::Key("m"),
+    FooterSegment::Text(" pick machine   "),
+    FooterSegment::Key("a"),
+    FooterSegment::Text(" add machine   "),
+    FooterSegment::Key("n"),
+    FooterSegment::Text(" new terminal   "),
+    FooterSegment::Key("u"),
+    FooterSegment::Text(" update   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
 /// The bar while the cursor is on a machine, which is when both keys that open
 /// something mean "there" rather than "here".
 const HOME_KEYS_MACHINE: &[FooterSegment] = &[
@@ -119,6 +136,20 @@ const HOME_KEYS_PAGED: &[FooterSegment] = &[
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
+const HOME_KEYS_PAGED_UPDATE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" open   "),
+    FooterSegment::Key("h l"),
+    FooterSegment::Text(" page   "),
+    FooterSegment::Key("a"),
+    FooterSegment::Text(" add machine   "),
+    FooterSegment::Key("n"),
+    FooterSegment::Text(" new terminal   "),
+    FooterSegment::Key("u"),
+    FooterSegment::Text(" update   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
 
 /// What survives when the window is too narrow for the bar above it.
 ///
@@ -141,8 +172,16 @@ const HOME_KEYS_CORE: &[FooterSegment] = &[
     FooterSegment::Text(" quit"),
 ];
 const HOME_KEYS_TIERS: &[&[FooterSegment]] = &[HOME_KEYS, HOME_KEYS_SHORT, HOME_KEYS_CORE];
+const HOME_KEYS_UPDATE_TIERS: &[&[FooterSegment]] =
+    &[HOME_KEYS_UPDATE, HOME_KEYS, HOME_KEYS_SHORT, HOME_KEYS_CORE];
 const HOME_KEYS_PAGED_TIERS: &[&[FooterSegment]] =
     &[HOME_KEYS_PAGED, HOME_KEYS_SHORT, HOME_KEYS_CORE];
+const HOME_KEYS_PAGED_UPDATE_TIERS: &[&[FooterSegment]] = &[
+    HOME_KEYS_PAGED_UPDATE,
+    HOME_KEYS_PAGED,
+    HOME_KEYS_SHORT,
+    HOME_KEYS_CORE,
+];
 /// On a machine row `enter` means something else, so the short tier says which.
 const HOME_KEYS_MACHINE_SHORT: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
@@ -302,6 +341,7 @@ fn render_home_in(
             keys,
             tui.home_page_count() > 1,
             tui.home_machine.is_some(),
+            tui.update_notice.is_some(),
         );
     }
 }
@@ -1111,6 +1151,7 @@ fn render_home_keys(
     keys: Rect,
     paged: bool,
     on_machine: bool,
+    has_update: bool,
 ) {
     if keys.height == 0 {
         return;
@@ -1129,11 +1170,13 @@ fn render_home_keys(
         keys.y,
         keys.right(),
         home_footer(
-            match (on_machine, paged) {
+            match (on_machine, paged, has_update) {
                 // What the keys do now outranks how to page a list they are not on.
-                (true, _) => HOME_KEYS_MACHINE_TIERS,
-                (false, true) => HOME_KEYS_PAGED_TIERS,
-                (false, false) => HOME_KEYS_TIERS,
+                (true, _, _) => HOME_KEYS_MACHINE_TIERS,
+                (false, true, true) => HOME_KEYS_PAGED_UPDATE_TIERS,
+                (false, true, false) => HOME_KEYS_PAGED_TIERS,
+                (false, false, true) => HOME_KEYS_UPDATE_TIERS,
+                (false, false, false) => HOME_KEYS_TIERS,
             },
             keys.right().saturating_sub(keys.x.saturating_add(1)),
         ),
@@ -1183,9 +1226,9 @@ mod tests {
 
     use super::{
         ELAPSED_WIDTH, GUEST_DETAIL, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_KEYS_CORE,
-        HOME_KEYS_MACHINE_TIERS, HOME_KEYS_PAGED_TIERS, HOME_KEYS_TIERS, HOME_ROW_NO_HOOKS,
-        format_home_row, header_line, home_card, home_elapsed, home_footer, home_kind_label,
-        machine_detail, machine_line,
+        HOME_KEYS_MACHINE_TIERS, HOME_KEYS_PAGED_TIERS, HOME_KEYS_PAGED_UPDATE_TIERS,
+        HOME_KEYS_TIERS, HOME_KEYS_UPDATE_TIERS, HOME_ROW_NO_HOOKS, format_home_row, header_line,
+        home_card, home_elapsed, home_footer, home_kind_label, machine_detail, machine_line,
     };
     use crate::tui::render::footer::{FooterSegment, footer_segments_width};
     use crate::{
@@ -1413,10 +1456,12 @@ mod tests {
         let mut unwired =
             crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Unknown)]);
         unwired.set_home_open(true, "test");
-        assert!(unwired.set_update_notice(crate::update_check::UpdateNotice {
-            version: String::from("9.9.9"),
-            command: "brew update && brew upgrade p2pmux",
-        }));
+        assert!(
+            unwired.set_update_notice(crate::update_check::UpdateNotice {
+                version: String::from("9.9.9"),
+                command: "brew update && brew upgrade p2pmux",
+            })
+        );
         let drawn = screen(&unwired, 120, 30).join("\n");
         assert!(drawn.contains(HOME_EMPTY_NO_HOOKS), "{drawn}");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
@@ -1440,6 +1485,10 @@ mod tests {
         let drawn = screen(&tui, 120, 30).join("\n");
         assert!(drawn.contains("that machine is asleep"), "{drawn}");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
+        assert!(
+            drawn.contains("u update"),
+            "the key bar names the verb while the notice is up: {drawn}"
+        );
     }
 
     /// The screen is emptiest exactly when its reader is newest, so that is
@@ -1512,7 +1561,9 @@ mod tests {
         for width in [30u16, 40, 50, 60, 70, 80, 120] {
             for tiers in [
                 HOME_KEYS_TIERS,
+                HOME_KEYS_UPDATE_TIERS,
                 HOME_KEYS_PAGED_TIERS,
+                HOME_KEYS_PAGED_UPDATE_TIERS,
                 HOME_KEYS_MACHINE_TIERS,
             ] {
                 let chosen = home_footer(tiers, width);

@@ -280,6 +280,7 @@ impl MultiPaneTui {
                 | ModalState::Share
                 | ModalState::Quit
                 | ModalState::AddMachine(_)
+                | ModalState::ConfirmUpdate
         )
     }
 

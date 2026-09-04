@@ -76,6 +76,10 @@ pub enum UiIntent {
         name: String,
         grid_rows: u16,
         grid_cols: u16,
+        /// Pane title after spawn. `None` keeps the `chat: …` title used for
+        /// agent panes. `Some` is for a pane that is not a chat.
+        #[serde(default)]
+        title: Option<String>,
     },
     DeleteTab {
         tab_id: TabId,
@@ -339,6 +343,11 @@ pub(in crate::tui) enum ModalState {
         /// which the prompt says in those words.
         command: Vec<String>,
     },
+    /// The inbox update line: run the command that fits this install, or don't.
+    ///
+    /// Not a startup prompt. The notice has been on screen the whole session,
+    /// and this is the person asking for it.
+    ConfirmUpdate,
 }
 /// The add-machine panel, and what it needs to notice the machine arriving.
 ///
