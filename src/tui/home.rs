@@ -36,6 +36,15 @@ pub(in crate::tui) fn chat_pane_title(command: &[String]) -> String {
     format!("chat: {}", command.join(" "))
 }
 
+/// Copy the upgrade command and say what happened, for the attaching process
+/// to flash on Home. The TUI itself never writes the clipboard.
+pub(crate) fn update_copy_result(command: &str) -> String {
+    match super::copy_selection_to_clipboard(command) {
+        Ok(_) => String::from("copied the update command"),
+        Err(error) => format!("clipboard copy failed: {error}"),
+    }
+}
+
 /// Where a state sorts in the inbox. Higher comes first.
 ///
 /// Deliberately *not* [`AgentRosterState::severity`], which the overlay and the
@@ -826,6 +835,10 @@ impl MultiPaneTui {
             }
             KeyCode::Char('u') if key.modifiers.is_empty() => {
                 self.open_update_confirm();
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() && self.update_notice.is_some() => {
+                self.pending_update_copy = true;
                 KeyHandling::Consumed(vec![])
             }
             // The same question Ctrl+Q asks, asked the same way. Home is the
@@ -2519,5 +2532,48 @@ mod tests {
             ),
             "this binary, not the fleet row under the cursor: {intents:?}"
         );
+    }
+
+    #[test]
+    fn c_copies_the_update_command_without_touching_the_clipboard_in_the_tui() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        assert_eq!(tui.take_update_copy_request(), None);
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.take_update_copy_request(),
+            None,
+            "c with no notice is not a copy"
+        );
+
+        tui.set_update_notice(behind_notice());
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.take_update_copy_request(),
+            Some(String::from("brew update && brew upgrade p2pmux"))
+        );
+        assert_eq!(
+            tui.take_update_copy_request(),
+            None,
+            "the copy is claimed once"
+        );
+        assert!(tui.home_open());
+        assert!(!tui.update_confirm_open());
+    }
+
+    #[test]
+    fn c_on_the_update_confirm_copies_and_leaves_the_dialog_up() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_update_notice(behind_notice());
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), AREA);
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.take_update_copy_request(),
+            Some(String::from("brew update && brew upgrade p2pmux"))
+        );
+        assert!(tui.update_confirm_open());
+        assert!(tui.home_open());
     }
 }

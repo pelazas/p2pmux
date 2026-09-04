@@ -153,6 +153,10 @@ pub struct MultiPaneTui {
     /// A share-modal copy request. Invite material lives in the node's rendezvous record
     /// rather than in the layout, so the attached client resolves and copies it.
     pub(in crate::tui) pending_share_copy: Option<ShareCopy>,
+    /// Copy the upgrade command from the inbox notice. The command is already
+    /// on the TUI; the attaching process still owns the clipboard, as it does
+    /// for share copies.
+    pub(in crate::tui) pending_update_copy: bool,
     /// Whether the add-machine panel has asked the client to record the
     /// session's ticket in the pairing file. The TUI owns no filesystem.
     pub(in crate::tui) pending_pair_offer: bool,
@@ -242,6 +246,7 @@ impl MultiPaneTui {
             session_locked: false,
             mouse_forwarding: false,
             pending_share_copy: None,
+            pending_update_copy: false,
             pending_pair_offer: false,
         })
     }
@@ -354,6 +359,20 @@ impl MultiPaneTui {
     /// it already does for selection copies.
     pub fn take_share_copy_request(&mut self) -> Option<ShareCopy> {
         self.pending_share_copy.take()
+    }
+
+    /// Takes the clipboard write the inbox update line asked for, if any.
+    pub fn take_update_copy_request(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.pending_update_copy) {
+            return None;
+        }
+        self.update_notice
+            .as_ref()
+            .map(|notice| notice.command.to_string())
+    }
+
+    pub fn set_home_notice(&mut self, notice: Option<String>) {
+        self.home_notice = notice;
     }
 
     pub(in crate::tui) fn pane_location(&self, pane_id: PaneId) -> Option<(usize, usize)> {

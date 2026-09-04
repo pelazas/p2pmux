@@ -498,7 +498,7 @@ pub(in crate::tui) fn render_update_confirm(
         "This session stays on the old binary until you quit and reopen.",
         inner_width,
     );
-    let inner_lines = 6usize
+    let inner_lines = 7usize
         .saturating_add(command_lines.len())
         .saturating_add(stay.len());
     let height = u16::try_from(inner_lines.saturating_add(2))
@@ -545,6 +545,10 @@ pub(in crate::tui) fn render_update_confirm(
     lines.push(Line::from(vec![
         Span::styled("Enter", key),
         Span::raw("  run in a new terminal"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("c", key),
+        Span::raw("  copy command"),
     ]));
     lines.push(Line::from(vec![
         Span::styled("Esc", key),
@@ -709,6 +713,7 @@ mod tests {
         assert!(drawn.contains("brew upgrade p2pmux"), "{drawn}");
         assert!(drawn.contains("old binary"), "{drawn}");
         assert!(drawn.contains("Enter"), "{drawn}");
+        assert!(drawn.contains("copy command"), "{drawn}");
         assert!(drawn.contains("Esc"), "{drawn}");
         assert!(
             !drawn.contains("Update with"),

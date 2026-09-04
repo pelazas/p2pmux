@@ -271,6 +271,10 @@ impl MultiPaneTui {
             KeyCode::Enter | KeyCode::Char('y') if key.modifiers.is_empty() => {
                 KeyHandling::Consumed(self.run_inbox_update(area))
             }
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                self.pending_update_copy = true;
+                KeyHandling::Consumed(vec![])
+            }
             KeyCode::Esc | KeyCode::Char('n') if key.modifiers.is_empty() => {
                 self.modal = ModalState::None;
                 KeyHandling::Consumed(vec![])

@@ -937,6 +937,9 @@ pub fn run_on(
                                 share_code.as_deref(),
                             ));
                         }
+                        if let Some(command) = tui.take_update_copy_request() {
+                            tui.set_home_notice(Some(crate::tui::update_copy_result(&command)));
+                        }
                         if tui.take_pair_offer()
                             && let Some(ticket) = share_ticket.as_deref()
                             && let Err(error) = crate::pairing::offer(ticket)

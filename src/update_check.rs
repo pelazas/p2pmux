@@ -85,7 +85,7 @@ impl UpdateNotice {
     /// that only says "an update is available" is one people learn to skip.
     pub fn inbox_line(&self) -> String {
         format!(
-            "p2pmux {} is out — you have {}. u update · `{}`",
+            "p2pmux {} is out — you have {}. u update · c copy · `{}`",
             self.version,
             env!("CARGO_PKG_VERSION"),
             self.command
@@ -408,6 +408,7 @@ mod tests {
         let inbox = notice.inbox_line();
         assert!(inbox.contains("0.9.9"), "{inbox}");
         assert!(inbox.contains("u update"), "{inbox}");
+        assert!(inbox.contains("c copy"), "{inbox}");
         assert!(inbox.contains("brew upgrade p2pmux"), "{inbox}");
         assert_eq!(
             notice.argv(),
