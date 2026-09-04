@@ -232,6 +232,9 @@ pub(in crate::tui) struct PendingCreate {
     /// than as something this process spawned, and the tab it landed on is
     /// still the tab the person who asked wants to be looking at.
     pub(in crate::tui) target_peer: Vec<u8>,
+    /// Pane title after spawn. `None` keeps the `chat: …` title used for agent
+    /// panes.
+    pub(in crate::tui) title: Option<String>,
 }
 /// Pure retry state for direct remote-pane subscriptions. Ticks are supplied by the UI drain
 /// loop, which keeps retry behavior deterministic in tests and prevents a failed connect from

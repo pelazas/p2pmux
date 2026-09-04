@@ -1,7 +1,9 @@
 //! Key handling while a modal owns the keyboard: the rename prompt, the share
-//! panel, the delete-tab confirmation, and the quit prompt.
+//! panel, the delete-tab confirmation, the quit prompt, and the inbox update
+//! confirm.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 
 use crate::{
     layout::{TabId, normalize_title},
@@ -229,6 +231,49 @@ impl MultiPaneTui {
             KeyCode::Enter | KeyCode::Char('y') if key.modifiers.is_empty() => {
                 self.modal = ModalState::None;
                 KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id }])
+            }
+            KeyCode::Esc | KeyCode::Char('n') if key.modifiers.is_empty() => {
+                self.modal = ModalState::None;
+                KeyHandling::Consumed(vec![])
+            }
+            _ => KeyHandling::Consumed(vec![]),
+        }
+    }
+
+    /// The inbox update line: ask before running the command that replaces this
+    /// binary.
+    ///
+    /// No-op when there is no notice. A key that opens a dialog about a line
+    /// that is not on screen would be a dialog about nothing.
+    pub(in crate::tui) fn open_update_confirm(&mut self) {
+        if self.update_notice.is_none() {
+            return;
+        }
+        self.modal = ModalState::ConfirmUpdate;
+        self.exit_chord_mode();
+    }
+
+    pub fn update_confirm_open(&self) -> bool {
+        matches!(self.modal, ModalState::ConfirmUpdate)
+    }
+
+    /// Enter runs it in a new terminal on this machine. Esc backs out.
+    ///
+    /// The command is the one the standing line already named. Running it here
+    /// rather than on the selected fleet machine is the point: this is the
+    /// copy of p2pmux the person is sitting in.
+    pub(in crate::tui) fn handle_confirm_update_key(
+        &mut self,
+        key: KeyEvent,
+        area: Rect,
+    ) -> KeyHandling {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') if key.modifiers.is_empty() => {
+                KeyHandling::Consumed(self.run_inbox_update(area))
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                self.pending_update_copy = true;
+                KeyHandling::Consumed(vec![])
             }
             KeyCode::Esc | KeyCode::Char('n') if key.modifiers.is_empty() => {
                 self.modal = ModalState::None;

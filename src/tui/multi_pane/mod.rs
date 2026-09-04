@@ -118,7 +118,7 @@ pub struct MultiPaneTui {
     /// answers something the reader just did and is gone by the next thing they
     /// do. A release is worth saying once and worth still being there when they
     /// look back at the inbox an hour later.
-    pub(in crate::tui) update_notice: Option<String>,
+    pub(in crate::tui) update_notice: Option<crate::update_check::UpdateNotice>,
     /// The area Home was last measured against.
     ///
     /// Kept so that a key handler which decides to open a terminal can size it
@@ -154,6 +154,10 @@ pub struct MultiPaneTui {
     /// A share-modal copy request. Invite material lives in the node's rendezvous record
     /// rather than in the layout, so the attached client resolves and copies it.
     pub(in crate::tui) pending_share_copy: Option<ShareCopy>,
+    /// Copy the upgrade command from the inbox notice. The command is already
+    /// on the TUI; the attaching process still owns the clipboard, as it does
+    /// for share copies.
+    pub(in crate::tui) pending_update_copy: bool,
     /// Whether the add-machine panel has asked the client to record the
     /// session's ticket in the pairing file. The TUI owns no filesystem.
     pub(in crate::tui) pending_pair_offer: bool,
@@ -243,6 +247,7 @@ impl MultiPaneTui {
             session_locked: false,
             mouse_forwarding: false,
             pending_share_copy: None,
+            pending_update_copy: false,
             pending_pair_offer: false,
         })
     }
@@ -281,6 +286,7 @@ impl MultiPaneTui {
                 | ModalState::Share
                 | ModalState::Quit
                 | ModalState::AddMachine(_)
+                | ModalState::ConfirmUpdate
         )
     }
 
@@ -354,6 +360,20 @@ impl MultiPaneTui {
     /// it already does for selection copies.
     pub fn take_share_copy_request(&mut self) -> Option<ShareCopy> {
         self.pending_share_copy.take()
+    }
+
+    /// Takes the clipboard write the inbox update line asked for, if any.
+    pub fn take_update_copy_request(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.pending_update_copy) {
+            return None;
+        }
+        self.update_notice
+            .as_ref()
+            .map(|notice| notice.command.to_string())
+    }
+
+    pub fn set_home_notice(&mut self, notice: Option<String>) {
+        self.home_notice = notice;
     }
 
     pub(in crate::tui) fn pane_location(&self, pane_id: PaneId) -> Option<(usize, usize)> {
@@ -702,11 +722,11 @@ impl MultiPaneTui {
     ///
     /// Returns whether anything changed, so the answer arriving from a
     /// background check costs one repaint rather than one a frame.
-    pub fn set_update_notice(&mut self, line: String) -> bool {
-        if self.update_notice.as_deref() == Some(line.as_str()) {
+    pub fn set_update_notice(&mut self, notice: crate::update_check::UpdateNotice) -> bool {
+        if self.update_notice.as_ref() == Some(&notice) {
             return false;
         }
-        self.update_notice = Some(line);
+        self.update_notice = Some(notice);
         true
     }
 

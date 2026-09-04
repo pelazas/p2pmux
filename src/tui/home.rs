@@ -36,6 +36,15 @@ pub(in crate::tui) fn chat_pane_title(command: &[String]) -> String {
     format!("chat: {}", command.join(" "))
 }
 
+/// Copy the upgrade command and say what happened, for the attaching process
+/// to flash on Home. The TUI itself never writes the clipboard.
+pub(crate) fn update_copy_result(command: &str) -> String {
+    match super::copy_selection_to_clipboard(command) {
+        Ok(_) => String::from("copied the update command"),
+        Err(error) => format!("clipboard copy failed: {error}"),
+    }
+}
+
 /// Where a state sorts in the inbox. Higher comes first.
 ///
 /// Deliberately *not* [`AgentRosterState::severity`], which the overlay and the
@@ -290,11 +299,24 @@ impl MultiPaneTui {
         row: u16,
         area: Rect,
     ) -> Vec<UiIntent> {
+        if self.home_update_at(column, row, area) {
+            self.open_update_confirm();
+            return Vec::new();
+        }
         let Some(clicked) = self.home_row_at(column, row, area) else {
             return Vec::new();
         };
         self.home_selected = Some(clicked);
         self.open_home_selection()
+    }
+
+    /// A click on the update line is the same as `u`: ask, then maybe run.
+    ///
+    /// Checked before the agent rows so a line that sits under the list cannot
+    /// be a mis-click onto the last card.
+    pub(in crate::tui) fn home_update_at(&self, column: u16, row: u16, area: Rect) -> bool {
+        let layout = home_layout(self.geometry(area).content, self);
+        layout.update.height > 0 && crate::tui::geometry::rect_contains(layout.update, column, row)
     }
 
     pub(in crate::tui) fn home_row_at(
@@ -461,6 +483,33 @@ impl MultiPaneTui {
             name: machine.name,
             grid_rows,
             grid_cols,
+            title: None,
+        }]
+    }
+
+    /// Run the upgrade command for *this* copy of p2pmux, in a new terminal.
+    ///
+    /// Empty `peer_id` is this machine, which is the only correct target: the
+    /// notice is about the binary in this process, not about whichever fleet
+    /// row happens to have the cursor. A pane title of `update` rather than
+    /// `chat: sh -c …` so the tab bar says what it is.
+    pub(in crate::tui) fn run_inbox_update(&mut self, area: Rect) -> Vec<UiIntent> {
+        let Some(notice) = self.update_notice.clone() else {
+            self.modal = ModalState::None;
+            return Vec::new();
+        };
+        let (grid_rows, grid_cols) =
+            crate::tui::geometry::grid_for_pane(self.geometry(area).content);
+        self.modal = ModalState::None;
+        self.set_home_open(false, "update");
+        self.clear_zoom();
+        vec![UiIntent::CreateTabOn {
+            peer_id: Vec::new(),
+            command: notice.argv(),
+            name: String::from("this machine"),
+            grid_rows,
+            grid_cols,
+            title: Some(String::from("update")),
         }]
     }
 
@@ -782,6 +831,14 @@ impl MultiPaneTui {
                 // on: `p2pmux pair` in a terminal, then finding out whether it
                 // worked by running something else. Both halves belong here.
                 self.open_add_machine();
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Char('u') if key.modifiers.is_empty() => {
+                self.open_update_confirm();
+                KeyHandling::Consumed(vec![])
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() && self.update_notice.is_some() => {
+                self.pending_update_copy = true;
                 KeyHandling::Consumed(vec![])
             }
             // The same question Ctrl+Q asks, asked the same way. Home is the
@@ -2352,5 +2409,171 @@ mod tests {
             "{intents:?}"
         );
         assert!(!tui.home_open(), "and the screen gets out of the way");
+    }
+
+    fn behind_notice() -> crate::update_check::UpdateNotice {
+        crate::update_check::UpdateNotice {
+            version: String::from("9.9.9"),
+            command: "brew update && brew upgrade p2pmux",
+        }
+    }
+
+    #[test]
+    fn u_with_no_notice_opens_nothing() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), AREA),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(!tui.update_confirm_open());
+        assert!(tui.home_open());
+    }
+
+    #[test]
+    fn u_opens_the_update_confirm_and_esc_backs_out() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_update_notice(behind_notice());
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), AREA),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(tui.update_confirm_open());
+        assert!(tui.home_open());
+        assert!(tui.modal_open());
+
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), AREA),
+            KeyHandling::Consumed(vec![])
+        );
+        assert!(!tui.update_confirm_open());
+        assert!(tui.home_open());
+    }
+
+    #[test]
+    fn enter_on_the_update_confirm_opens_a_local_terminal_running_the_command() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_update_notice(behind_notice());
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), AREA);
+
+        let handling = tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA);
+        let KeyHandling::Consumed(intents) = handling else {
+            panic!("expected consumed intents, got {handling:?}");
+        };
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [UiIntent::CreateTabOn {
+                    peer_id,
+                    command,
+                    name,
+                    title: Some(title),
+                    ..
+                }] if peer_id.is_empty()
+                    && command == &behind_notice().argv()
+                    && name == "this machine"
+                    && title == "update"
+            ),
+            "{intents:?}"
+        );
+        assert!(!tui.home_open());
+        assert!(!tui.update_confirm_open());
+    }
+
+    #[test]
+    fn enter_on_home_still_opens_the_selected_agent_when_the_confirm_is_not_up() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_update_notice(behind_notice());
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA),
+            KeyHandling::Consumed(vec![UiIntent::FocusPane { pane_id: 1 }])
+        );
+        assert!(!tui.home_open());
+    }
+
+    #[test]
+    fn a_click_on_the_update_line_opens_the_confirm_and_does_not_open_an_agent() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        tui.set_update_notice(behind_notice());
+        let update = home_layout(tui.geometry(AREA).content, &tui).update;
+        assert!(update.height > 0, "the notice has a row");
+        let before = tui.home_selected.clone();
+
+        assert!(
+            tui.handle_home_click(update.x.saturating_add(1), update.y, AREA)
+                .is_empty()
+        );
+        assert!(tui.update_confirm_open());
+        assert_eq!(tui.home_selected, before);
+        assert!(tui.home_open());
+    }
+
+    #[test]
+    fn confirming_an_update_never_targets_the_selected_fleet_machine() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_update_notice(behind_notice());
+        tui.home_machine = Some(0);
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), AREA);
+        let handling = tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), AREA);
+        let KeyHandling::Consumed(intents) = handling else {
+            panic!("expected consumed intents, got {handling:?}");
+        };
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [UiIntent::CreateTabOn { peer_id, .. }] if peer_id.is_empty()
+            ),
+            "this binary, not the fleet row under the cursor: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn c_copies_the_update_command_without_touching_the_clipboard_in_the_tui() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        assert_eq!(tui.take_update_copy_request(), None);
+
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.take_update_copy_request(),
+            None,
+            "c with no notice is not a copy"
+        );
+
+        tui.set_update_notice(behind_notice());
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.take_update_copy_request(),
+            Some(String::from("brew update && brew upgrade p2pmux"))
+        );
+        assert_eq!(
+            tui.take_update_copy_request(),
+            None,
+            "the copy is claimed once"
+        );
+        assert!(tui.home_open());
+        assert!(!tui.update_confirm_open());
+    }
+
+    #[test]
+    fn c_on_the_update_confirm_copies_and_leaves_the_dialog_up() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_update_notice(behind_notice());
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), AREA);
+        let _ = tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            tui.take_update_copy_request(),
+            Some(String::from("brew update && brew upgrade p2pmux"))
+        );
+        assert!(tui.update_confirm_open());
+        assert!(tui.home_open());
     }
 }

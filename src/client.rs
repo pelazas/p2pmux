@@ -769,7 +769,7 @@ pub fn run_on(
             // from the moment this client started, so nothing here waited for
             // it and a machine with no network simply never fills this in.
             if let Ok(notice) = update_notices.try_recv() {
-                dirty |= tui.set_update_notice(notice.line());
+                dirty |= tui.set_update_notice(notice);
             }
             // A pointer held past a pane's edge sends no further drag events —
             // a terminal reports a drag when the cell under the pointer
@@ -936,6 +936,9 @@ pub fn run_on(
                                 share_ticket.as_deref(),
                                 share_code.as_deref(),
                             ));
+                        }
+                        if let Some(command) = tui.take_update_copy_request() {
+                            tui.set_home_notice(Some(crate::tui::update_copy_result(&command)));
                         }
                         if tui.take_pair_offer()
                             && let Some(ticket) = share_ticket.as_deref()

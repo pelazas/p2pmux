@@ -83,6 +83,9 @@ impl MultiPaneTui {
         if matches!(self.modal, ModalState::ConfirmDeleteTab { .. }) {
             return self.handle_confirm_delete_tab_key(key);
         }
+        if matches!(self.modal, ModalState::ConfirmUpdate) {
+            return self.handle_confirm_update_key(key, area);
+        }
         // Above Ctrl+O, so the key that opens the inbox does not walk out from
         // under a panel that is waiting on another machine to answer.
         if self.add_machine_open() {

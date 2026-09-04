@@ -70,6 +70,10 @@ impl SharedLayoutRuntime {
                         self.invite.code.as_deref(),
                     ));
                 }
+                if let Some(command) = self.tui.take_update_copy_request() {
+                    self.tui
+                        .set_home_notice(Some(crate::tui::update_copy_result(&command)));
+                }
                 // A foreground session hands out the same invite an attached one
                 // does, so the add-machine panel has to record the ticket here
                 // too. Without it the machine that joins is never remembered.
