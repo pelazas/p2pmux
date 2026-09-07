@@ -450,6 +450,14 @@ fn ctl_help_lists_the_six_verbs() {
 }
 
 #[test]
+fn spawn_help_lists_new() {
+    let output = run(&["ctl", "spawn", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(help.contains("--new"), "{help}");
+}
+
+#[test]
 fn ctl_without_a_session_does_not_start_one() {
     let session = FakeSession::empty();
     let output = run_with_home(session.home(), &["ctl", "machines"]);

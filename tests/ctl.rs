@@ -314,6 +314,7 @@ fn spawn_send_and_focus_drive_a_local_pane() {
     let first_json: serde_json::Value = serde_json::from_str(first_out.trim()).unwrap();
     let pane_id = first_json["pane_id"].as_u64().expect("pane_id");
     assert_eq!(first_json["reused"], false, "{first_out}");
+    assert_eq!(first_json["visible_to_guests"], false, "{first_out}");
 
     let second = ctl_cli(
         &fixture,
@@ -333,6 +334,27 @@ fn spawn_send_and_focus_drive_a_local_pane() {
     let second_json: serde_json::Value = serde_json::from_str(second_out.trim()).unwrap();
     assert_eq!(second_json["pane_id"], pane_id, "{second_out}");
     assert_eq!(second_json["reused"], true, "{second_out}");
+
+    let third = ctl_cli(
+        &fixture,
+        &[
+            "ctl",
+            "spawn",
+            "--new",
+            "--machine",
+            "Test User",
+            "--",
+            "sleep",
+            "120",
+        ],
+    );
+    let third_out = String::from_utf8_lossy(&third.stdout);
+    let third_err = String::from_utf8_lossy(&third.stderr);
+    assert!(third.status.success(), "new spawn failed: {third_err}");
+    let third_json: serde_json::Value = serde_json::from_str(third_out.trim()).unwrap();
+    let new_pane = third_json["pane_id"].as_u64().expect("pane_id");
+    assert_ne!(new_pane, pane_id, "{third_out}");
+    assert_eq!(third_json["reused"], false, "{third_out}");
 
     let send = ctl_cli(&fixture, &["ctl", "send", &pane_id.to_string(), "x"]);
     let send_err = String::from_utf8_lossy(&send.stderr);
@@ -430,11 +452,12 @@ fn an_old_node_is_reported_when_hello_is_ignored() {
     writer.write_all(b"{\"type\":\"nope\"}\n").unwrap();
     writer.flush().unwrap();
     let started = Instant::now();
-    let reply = ctl::receive_json::<CtlToClient>(&mut reader).unwrap();
-    assert!(
-        reply.is_none(),
-        "an unknown first line must not look like ctl"
-    );
+    let reply = ctl::receive_json::<CtlToClient>(&mut reader);
+    match reply {
+        Ok(None) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        other => panic!("an unknown first line must not look like ctl: {other:?}"),
+    }
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the client should notice quickly that this is not a ctl node"

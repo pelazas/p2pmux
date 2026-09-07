@@ -89,7 +89,7 @@ Stdout is JSON. Failures are one sentence on stderr. The six verbs:
 ```text
 p2pmux ctl [--session NAME] machines
 p2pmux ctl [--session NAME] agents
-p2pmux ctl [--session NAME] spawn --machine NAME -- <command...>
+p2pmux ctl [--session NAME] spawn [--new] --machine NAME -- <command...>
 p2pmux ctl [--session NAME] send <pane-id> [--] <keys>
 p2pmux ctl [--session NAME] focus <agent>
 p2pmux ctl [--session NAME] events
@@ -97,15 +97,24 @@ p2pmux ctl [--session NAME] events
 
 `machines` is the pairing-owned list, including this machine. `agents` is the same roster Ctrl+O
 shows. `spawn` starts an allowlisted command on a machine you own, or a login shell when the
-command is empty. A live pane already titled `chat: {command}` on that host is reused; a pane
-that has exited or finished is not. Nested `p2pmux` is refused. The command waits until the pane
-exists.
+command is empty. Nested `p2pmux` is refused. The command waits until the pane exists.
+
+Without `--new`, a live pane already titled `chat: {command}` on that host is reused; a pane that
+has exited or finished is not. `--new` always starts a pane, which is what two jobs on one
+machine need. The JSON includes `visible_to_guests` when someone unpaired is in the session: the
+pane still opens, and anyone holding the join code can see it. Omit `--session` so ctl talks to
+the fleet session; a runner that wanted a private fleet skips the spawn when that flag is true.
 
 `send` writes the keys as PTY bytes, with no extra newline and no key names. It fails if someone
-else holds the pane's input lease. `focus` only moves to an agent that already has a pane —
-`p2pmux ctl spawn` is how one gets there. `events` prints `needs_you` / `done` / `error` as JSON
-lines: a snapshot first, then each change. The `message` field is present only when this node
-already has it.
+else holds the pane's input lease. It is typing, not a way to hand work from one agent to
+another. `focus` only moves to an agent that already has a pane — `p2pmux ctl spawn` is how one
+gets there. `events` prints `needs_you` / `done` / `error` as JSON lines: a snapshot first, then
+each change. The `message` field is present only when this node already has it, so a laptop
+watching a droplet sees the state and not the sentence.
+
+One agent finishing so another can start: wait on `events` until that `pane_id` is `done`, then
+`spawn --new` with the next command. The payload belongs on the command line (`claude -p …`),
+not in `send`.
 
 Ctl has its own pin, currently 1, independent of the peer wire pin. A client and a node that do
 not share it are told both numbers and which end to upgrade. A node too old to speak ctl at all
