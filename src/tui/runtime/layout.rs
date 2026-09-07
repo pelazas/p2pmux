@@ -464,11 +464,8 @@ impl SharedLayoutRuntime {
                 name,
                 grid_rows,
                 grid_cols,
-                title,
             } => {
-                self.begin_create_on(
-                    None, grid_rows, grid_cols, None, peer_id, command, name, title,
-                )?;
+                self.begin_create_on(None, grid_rows, grid_cols, None, peer_id, command, name)?;
             }
             UiIntent::DeletePane { pane_id } => {
                 let request_id = self.next_id();
@@ -619,7 +616,6 @@ impl SharedLayoutRuntime {
             Vec::new(),
             Vec::new(),
             String::new(),
-            None,
         )
     }
 
@@ -638,7 +634,6 @@ impl SharedLayoutRuntime {
         target: Vec<u8>,
         command: Vec<String>,
         target_name: String,
-        title: Option<String>,
     ) -> Result<(), Box<dyn Error>> {
         if self.pending_create.is_some() {
             self.status = String::from("waiting for current pane reservation");
@@ -657,7 +652,6 @@ impl SharedLayoutRuntime {
             hosted_here,
             target_name,
             target_peer: target.clone(),
-            title,
         });
         self.send_request(LayoutRequest {
             request_id,
@@ -794,7 +788,6 @@ impl SharedLayoutRuntime {
                 hosted_here: true,
                 target_name: String::new(),
                 target_peer: Vec::new(),
-                title: None,
             },
         };
         if pending.request_id == 0 || pending.grid_rows == 0 || pending.grid_cols == 0 {
@@ -950,13 +943,9 @@ impl SharedLayoutRuntime {
         // pressing Enter on the same agent twice find the pane instead of
         // opening a second one.
         if !pending.command.is_empty() {
-            let title = pending
-                .title
-                .clone()
-                .unwrap_or_else(|| crate::tui::home::chat_pane_title(&pending.command));
             self.handle_intent(UiIntent::RenamePane {
                 pane_id: reservation.pane_id,
-                title,
+                title: crate::tui::home::chat_pane_title(&pending.command),
             })?;
         }
         Ok(())

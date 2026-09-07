@@ -104,6 +104,11 @@ pub struct MultiPaneTui {
     /// the list of machines was already on screen. `None` means the cursor is
     /// back on the agents, which is where it starts and where `Esc` returns it.
     pub(in crate::tui) home_machine: Option<usize>,
+    /// Whether the cursor is on the inbox update line rather than on an agent.
+    ///
+    /// Same idea as [`Self::home_machine`]: a third stop, not a fake agent row.
+    /// `HomeRowId` is an agent identity. This line is about this binary.
+    pub(in crate::tui) home_update_selected: bool,
     /// One line Home has to say about the last thing that was asked of it.
     ///
     /// Home's own rather than the window footer's, because the answers it gives
@@ -232,6 +237,7 @@ impl MultiPaneTui {
             home_open: false,
             home_selected: None,
             home_machine: None,
+            home_update_selected: false,
             home_notice: None,
             update_notice: None,
             last_home_area: Rect::new(0, 0, 80, 24),
@@ -285,7 +291,6 @@ impl MultiPaneTui {
                 | ModalState::Share
                 | ModalState::Quit
                 | ModalState::AddMachine(_)
-                | ModalState::ConfirmUpdate
         )
     }
 
@@ -672,6 +677,7 @@ impl MultiPaneTui {
             return false;
         }
         self.update_notice = Some(notice);
+        self.repair_home_selection();
         true
     }
 

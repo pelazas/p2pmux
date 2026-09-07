@@ -9,10 +9,11 @@
 //! - **It never delays a launch.** The check runs on its own thread and the
 //!   answer arrives whenever it arrives; a network that is down or slow costs
 //!   nothing but a notice that does not appear.
-//! - **It never installs anything.** This module names the command that fits
-//!   how *this* copy was installed. Replacing the binary you are running is
-//!   not something to do behind a `y/n` prompt at startup. The inbox can run
-//!   that command later, after you ask it to.
+//! - **It never installs anything.** Replacing the binary you are running,
+//!   under whichever package manager put it there, is not something to do
+//!   behind a `y/n` prompt at startup. It tells you the one command that fits
+//!   how *this* copy was installed. The inbox can copy that command; it does
+//!   not run it.
 //! - **It asks at most once a day.** The answer is cached with the time it was
 //!   fetched, so a person who opens ten sessions makes one request.
 //!
@@ -80,29 +81,17 @@ impl UpdateNotice {
 
     /// The one line the inbox shows.
     ///
-    /// Same three facts as [`Self::line`], plus the key that takes the update
-    /// without leaving to paste. The command stays on the line because a notice
-    /// that only says "an update is available" is one people learn to skip.
+    /// Same three facts as [`Self::line`], without "Update with": that sentence
+    /// is for stdout, where the command is something to type. The inbox line is
+    /// a control — click or Enter copies — so it names the version and the
+    /// command and leaves the verb to the screen.
     pub fn inbox_line(&self) -> String {
         format!(
-            "p2pmux {} is out — you have {}. u update · `{}`",
+            "p2pmux {} is out — you have {}. `{}`",
             self.version,
             env!("CARGO_PKG_VERSION"),
             self.command
         )
-    }
-
-    /// Argv that runs [`Self::command`] in a pane.
-    ///
-    /// The upgrade line is a shell snippet (`&&`, a pipe), and a pane launches
-    /// an argv, not a string. `sh -c` is the one translation that keeps the
-    /// command the notice already named.
-    pub fn argv(&self) -> Vec<String> {
-        vec![
-            String::from("sh"),
-            String::from("-c"),
-            self.command.to_owned(),
-        ]
     }
 }
 
@@ -407,19 +396,14 @@ mod tests {
 
         let inbox = notice.inbox_line();
         assert!(inbox.contains("0.9.9"), "{inbox}");
-        assert!(inbox.contains("u update"), "{inbox}");
-        assert!(
-            !inbox.contains("c copy"),
-            "copy lives on the dialog, not the standing line: {inbox}"
-        );
         assert!(inbox.contains("brew upgrade p2pmux"), "{inbox}");
-        assert_eq!(
-            notice.argv(),
-            vec![
-                String::from("sh"),
-                String::from("-c"),
-                String::from("brew update && brew upgrade p2pmux"),
-            ]
+        assert!(
+            !inbox.contains("u update"),
+            "the inbox has no extra letter for this line: {inbox}"
+        );
+        assert!(
+            !inbox.contains("Update with"),
+            "that sentence is doctor's, for a line you type: {inbox}"
         );
     }
 }

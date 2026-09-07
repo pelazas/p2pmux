@@ -788,19 +788,19 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.15 is out — you have 0.1.14. u update · `brew update && brew upgrade p2pmux`
+p2pmux 0.1.15 is out — you have 0.1.14. `brew update && brew upgrade p2pmux`
 ```
 
-`u` or a click on that line asks before it runs the command in a new terminal on this machine.
-`c` copies the command if you would rather paste it yourself. The session you are in keeps the
-binary it started with until you quit and start again.
+Click that line, or arrow onto it and press Enter, to copy the command. Paste it in a
+shell that is not this session, then quit and start again so the new binary is the one
+that runs. The session you are in keeps the binary it started with until you do.
 
 `p2pmux doctor` asks the same question and answers it either way, which is the one to run when you
-want to know now. Doctor prints the command as a line to type; it has no `u`.
+want to know now. Doctor prints the command as a line to type.
 
-What it does not do is install anything at startup. Replacing the binary you are running, under
-whichever package manager put it there, is not a thing to do behind a `y/n` prompt as the session
-comes up.
+What it does not do is install anything. Replacing the binary you are running, under whichever
+package manager put it there, is not a thing to do behind a `y/n` prompt as the session
+comes up, and not a thing to do from a tab inside the process being replaced.
 
 The check is a `HEAD` request to `github.com/pelazas/p2pmux/releases/latest`, whose redirect names
 the newest tag. It runs on its own thread from the moment a client starts, so nothing waits for it;
