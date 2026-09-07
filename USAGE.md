@@ -832,7 +832,7 @@ p2pmux checks once a day whether a newer release exists, and says so on its own 
 of the inbox, with the one command that fits how this copy was installed:
 
 ```
-p2pmux 0.1.15 is out — you have 0.1.14. `brew update && brew upgrade p2pmux`
+p2pmux 0.1.16 is out — you have 0.1.15. `brew update && brew upgrade p2pmux`
 ```
 
 Click that line, or arrow onto it and press Enter, to copy the command. Paste it in a
@@ -864,7 +864,7 @@ version each one reports and a mark on the one that runs:
 ```
 p2pmux on PATH
   /opt/homebrew/bin/p2pmux          0.1.11    <- runs as `p2pmux`
-  /usr/local/bin/p2pmux             0.1.15
+  /usr/local/bin/p2pmux             0.1.16
   /Users/you/.cargo/bin/p2pmux      unknown
 ```
 
