@@ -13,6 +13,12 @@ old one; older peers still report it as a host they could not reach.
 
 ## Unreleased
 
+**Copying a selection joins rows the pane wrapped to fit.** A sentence that broke
+at the pane width used to land on the clipboard as two lines, the second one
+starting mid-word, and the footer counted the extra wrap. Hard newlines are
+unchanged. Local copy, an attached client's copy, and the node's
+`SelectionCopy` path all go through the same function.
+
 **`p2pmux ctl` drives a live session from the CLI, without taking the TUI seat.** Six verbs
 (`machines`, `agents`, `spawn`, `send`, `focus`, `events`) speak JSON on stdout to the session
 node. Ctl has its own pin, currently 1. The peer wire pin is still 12: a ctl client and a session
