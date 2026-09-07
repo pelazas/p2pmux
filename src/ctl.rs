@@ -38,6 +38,10 @@ pub enum CtlFromClient {
         machine: String,
         #[serde(default)]
         command: Vec<String>,
+        /// Skip reuse of a live `chat: {command}` pane. Omitted by older
+        /// clients, which keep the inbox behaviour.
+        #[serde(default)]
+        new: bool,
     },
     Send {
         pane_id: u64,
@@ -122,6 +126,7 @@ pub enum CtlAction {
     Spawn {
         machine: String,
         command: Vec<String>,
+        new: bool,
     },
     Send {
         pane_id: u64,
@@ -246,9 +251,14 @@ pub fn run(socket: &Path, action: CtlAction) -> Result<(), Box<dyn Error>> {
     let request = match &action {
         CtlAction::Machines => CtlFromClient::Machines,
         CtlAction::Agents => CtlFromClient::Agents,
-        CtlAction::Spawn { machine, command } => CtlFromClient::Spawn {
+        CtlAction::Spawn {
+            machine,
+            command,
+            new,
+        } => CtlFromClient::Spawn {
             machine: machine.clone(),
             command: command.clone(),
+            new: *new,
         },
         CtlAction::Send { pane_id, keys } => CtlFromClient::Send {
             pane_id: *pane_id,
@@ -264,13 +274,14 @@ pub fn run(socket: &Path, action: CtlAction) -> Result<(), Box<dyn Error>> {
     if matches!(action, CtlAction::Events) {
         reader.get_mut().set_read_timeout(None)?;
         loop {
-            match receive_json::<CtlToClient>(&mut reader)? {
-                Some(event @ CtlToClient::Event { .. }) => {
+            match receive_json::<CtlToClient>(&mut reader) {
+                Ok(Some(event @ CtlToClient::Event { .. })) => {
                     println!("{}", serde_json::to_string(&event)?);
                 }
-                Some(CtlToClient::Error { message }) => return Err(CtlError(message).into()),
-                Some(_) => {}
-                None => return Ok(()),
+                Ok(Some(CtlToClient::Error { message })) => return Err(CtlError(message).into()),
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -354,7 +365,10 @@ pub fn receive_json<T: for<'de> Deserialize<'de>>(
         Err(error) => return Err(error),
     };
     if count == 0 {
-        return Ok(None);
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "ctl connection closed",
+        ));
     }
     if count > MAX_FRAME {
         return Err(io::Error::new(
@@ -415,6 +429,32 @@ mod tests {
         assert!(is_nested_p2pmux(&[String::from("/usr/local/bin/p2pmux")]));
         assert!(!is_nested_p2pmux(&[String::from("claude")]));
         assert!(!is_nested_p2pmux(&[]));
+    }
+
+    #[test]
+    fn spawn_without_new_keeps_reusing() {
+        let spawn: CtlFromClient = serde_json::from_value(serde_json::json!({
+            "type": "spawn",
+            "machine": "droplet",
+            "command": ["claude"]
+        }))
+        .unwrap();
+        assert_eq!(
+            spawn,
+            CtlFromClient::Spawn {
+                machine: String::from("droplet"),
+                command: vec![String::from("claude")],
+                new: false,
+            }
+        );
+
+        let forced = serde_json::to_value(CtlFromClient::Spawn {
+            machine: String::from("droplet"),
+            command: vec![String::from("claude")],
+            new: true,
+        })
+        .unwrap();
+        assert_eq!(forced["new"], true);
     }
 
     #[test]

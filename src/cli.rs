@@ -234,6 +234,9 @@ enum CtlCommand {
     Spawn {
         #[arg(long)]
         machine: String,
+        /// Do not reuse a live pane titled `chat: {command}` on that machine.
+        #[arg(long)]
+        new: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -502,9 +505,14 @@ fn run_ctl(session: Option<&str>, action: &CtlCommand) -> Result<(), Box<dyn Err
     let action = match action {
         CtlCommand::Machines => crate::ctl::CtlAction::Machines,
         CtlCommand::Agents => crate::ctl::CtlAction::Agents,
-        CtlCommand::Spawn { machine, command } => crate::ctl::CtlAction::Spawn {
+        CtlCommand::Spawn {
+            machine,
+            command,
+            new,
+        } => crate::ctl::CtlAction::Spawn {
             machine: machine.clone(),
             command: command.clone(),
+            new: *new,
         },
         CtlCommand::Send { pane, keys } => {
             let pane_id = pane

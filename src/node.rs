@@ -1264,7 +1264,7 @@ struct CtlClient {
     events: bool,
     seen_events: BTreeSet<(String, String)>,
     spawn_wait: Option<u64>,
-    spawn_retry: Option<(String, Vec<String>)>,
+    spawn_retry: Option<(String, Vec<String>, bool)>,
 }
 
 fn accept_ctl_hello(mut reader: BufReader<UnixStream>, pin: u32, clients: &mut Vec<CtlClient>) {
@@ -1323,8 +1323,8 @@ fn poll_ctl_clients(clients: &mut Vec<CtlClient>, node: &mut SharedLayoutNode) -
 
 fn poll_one_ctl(client: &mut CtlClient, node: &mut SharedLayoutNode) -> io::Result<bool> {
     let mut did_work = false;
-    if let Some((machine, command)) = client.spawn_retry.clone() {
-        match dispatch_ctl_spawn(node, client, machine, command) {
+    if let Some((machine, command, new)) = client.spawn_retry.clone() {
+        match dispatch_ctl_spawn(node, client, machine, command, new) {
             Ok(true) => {
                 client.spawn_retry = None;
                 did_work = true;
@@ -1386,8 +1386,12 @@ fn poll_one_ctl(client: &mut CtlClient, node: &mut SharedLayoutNode) -> io::Resu
             )?;
             did_work = true;
         }
-        Ok(Some(CtlFromClient::Spawn { machine, command })) => {
-            match dispatch_ctl_spawn(node, client, machine, command) {
+        Ok(Some(CtlFromClient::Spawn {
+            machine,
+            command,
+            new,
+        })) => {
+            match dispatch_ctl_spawn(node, client, machine, command, new) {
                 Ok(_) => {}
                 Err(message) => {
                     ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?
@@ -1432,7 +1436,9 @@ fn poll_one_ctl(client: &mut CtlClient, node: &mut SharedLayoutNode) -> io::Resu
         Err(error)
             if matches!(
                 error.kind(),
-                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
             ) =>
         {
             return Err(error);
@@ -1447,8 +1453,9 @@ fn dispatch_ctl_spawn(
     client: &mut CtlClient,
     machine: String,
     command: Vec<String>,
+    new: bool,
 ) -> Result<bool, String> {
-    match node.runtime.ctl_try_spawn(&machine, command.clone()) {
+    match node.runtime.ctl_try_spawn(&machine, command.clone(), new) {
         Ok(crate::ctl::CtlSpawn::Reused(pane_id)) => {
             ctl::write_json(
                 client.reader.get_mut(),
@@ -1461,7 +1468,7 @@ fn dispatch_ctl_spawn(
             Ok(true)
         }
         Ok(crate::ctl::CtlSpawn::Busy) => {
-            client.spawn_retry = Some((machine, command));
+            client.spawn_retry = Some((machine, command, new));
             Ok(false)
         }
         Ok(crate::ctl::CtlSpawn::Started(request_id)) => {

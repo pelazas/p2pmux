@@ -72,6 +72,7 @@ impl SharedLayoutRuntime {
         &mut self,
         machine: &str,
         command: Vec<String>,
+        new: bool,
     ) -> Result<CtlSpawn, String> {
         if is_nested_p2pmux(&command) {
             return Err(String::from("p2pmux does not nest p2pmux in a pane"));
@@ -96,7 +97,7 @@ impl SharedLayoutRuntime {
                 "{machine} is asleep — start p2pmux on it and it rejoins on its own"
             ));
         };
-        if let Some(pane_id) = self.live_chat_pane(machine, &command) {
+        if !new && let Some(pane_id) = self.live_chat_pane(machine, &command) {
             return Ok(CtlSpawn::Reused(pane_id));
         }
         if self.pending_create.is_some() {
