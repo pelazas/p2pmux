@@ -72,7 +72,7 @@ cargo install p2pmux --locked
 
 Linux builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and up). A musl system has to build from source. Windows is not supported.
 
-Update the same way you installed. `p2pmux --version` prints what you are running. A session already running keeps the binary it started with, so `p2pmux kill <name>` and start again to pick up a new version.
+Update the same way you installed. On the inbox, click the update line (or arrow onto it and press Enter) to copy that command, paste it in a shell, then quit and start again. `p2pmux --version` prints what you are running. A session already running keeps the binary it started with.
 
 ## Quick start
 

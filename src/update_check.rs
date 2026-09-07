@@ -12,7 +12,8 @@
 //! - **It never installs anything.** Replacing the binary you are running,
 //!   under whichever package manager put it there, is not something to do
 //!   behind a `y/n` prompt at startup. It tells you the one command that fits
-//!   how *this* copy was installed, and that is all.
+//!   how *this* copy was installed. The inbox can copy that command; it does
+//!   not run it.
 //! - **It asks at most once a day.** The answer is cached with the time it was
 //!   fetched, so a person who opens ten sessions makes one request.
 //!
@@ -65,10 +66,28 @@ pub enum Check {
 }
 
 impl UpdateNotice {
-    /// The one line the inbox shows.
+    /// The one line `p2pmux doctor` prints: versions, and the command to type.
+    ///
+    /// Doctor is a sentence on stdout, not a screen with keys, so the command
+    /// is the whole of what it can offer. The inbox has its own line.
     pub fn line(&self) -> String {
         format!(
             "p2pmux {} is out — you have {}. Update with `{}`",
+            self.version,
+            env!("CARGO_PKG_VERSION"),
+            self.command
+        )
+    }
+
+    /// The one line the inbox shows.
+    ///
+    /// Same three facts as [`Self::line`], without "Update with": that sentence
+    /// is for stdout, where the command is something to type. The inbox line is
+    /// a control — click or Enter copies — so it names the version and the
+    /// command and leaves the verb to the screen.
+    pub fn inbox_line(&self) -> String {
+        format!(
+            "p2pmux {} is out — you have {}. `{}`",
             self.version,
             env!("CARGO_PKG_VERSION"),
             self.command
@@ -366,5 +385,25 @@ mod tests {
         assert!(line.contains("0.9.9"), "{line}");
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
         assert!(line.contains("brew upgrade p2pmux"), "{line}");
+        assert!(
+            line.contains("Update with"),
+            "doctor has no key to offer, so it names the command: {line}"
+        );
+        assert!(
+            !line.contains("u update"),
+            "the inbox verb does not belong on stdout: {line}"
+        );
+
+        let inbox = notice.inbox_line();
+        assert!(inbox.contains("0.9.9"), "{inbox}");
+        assert!(inbox.contains("brew upgrade p2pmux"), "{inbox}");
+        assert!(
+            !inbox.contains("u update"),
+            "the inbox has no extra letter for this line: {inbox}"
+        );
+        assert!(
+            !inbox.contains("Update with"),
+            "that sentence is doctor's, for a line you type: {inbox}"
+        );
     }
 }

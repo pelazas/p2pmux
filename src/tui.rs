@@ -45,6 +45,7 @@ pub(crate) use geometry::{
     initial_root_pane_grid, missed_resize, resize_recheck_due, stale_node_size,
 };
 pub use home::MachineRow;
+pub(crate) use home::update_copy_result;
 pub use host::HostPaneRuntime;
 pub use input::mouse::PaneMouseProtocol;
 pub use multi_pane::MultiPaneTui;

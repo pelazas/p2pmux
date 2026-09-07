@@ -177,7 +177,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
             )
             check(
                 "a newer release is named on the inbox, with the command to take it",
-                "Update with" in update,
+                f"{NEWER_VERSION} is out" in update,
                 [line for line in update.split("\n") if "is out" in line][:1],
             )
         except DeadlineExceeded as error:
