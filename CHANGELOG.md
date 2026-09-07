@@ -21,8 +21,10 @@ numbers and which end is old. A node that does not know ctl yet is told to upgra
 left hanging.
 
 `spawn` reuses a live inbox pane (`chat: {command}`) on that machine, waits until the pane exists,
-and will not nest `p2pmux`. `send` is raw PTY bytes and fails out loud when another member holds
-the input lease.
+and will not nest `p2pmux`. `spawn --new` always starts a pane. The reply includes
+`visible_to_guests` when someone unpaired is in the session. `send` is raw PTY bytes and fails out
+loud when another member holds the input lease. A ctl client that hangs up is dropped rather than
+held until the cap.
 
 ## v0.1.15 — 2026-09-01
 
