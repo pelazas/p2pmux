@@ -248,7 +248,9 @@ impl SharedLayoutRuntime {
                 .map(|pane| pane.pane_id)
                 .find(|pane_id| !self.tui.snapshot().panes.contains_key(pane_id));
             if let Some(pane_id) = arrived {
+                let request_id = pending.request_id;
                 self.pending_create = None;
+                self.ctl_complete(request_id, Ok(pane_id));
                 if let Some(tab) = snapshot
                     .tabs
                     .iter()
@@ -888,6 +890,10 @@ impl SharedLayoutRuntime {
                     refused: false,
                 });
                 self.status = format!("pane spawn failed: {error}");
+                self.ctl_complete(
+                    pending.request_id,
+                    Err(format!("pane spawn failed: {error}")),
+                );
                 return Ok(());
             }
         };
@@ -908,6 +914,10 @@ impl SharedLayoutRuntime {
                 refused: false,
             });
             self.status = format!("pane registration failed: {error}");
+            self.ctl_complete(
+                pending.request_id,
+                Err(format!("pane registration failed: {error}")),
+            );
             return Ok(());
         }
         self.provisional
@@ -941,12 +951,16 @@ impl SharedLayoutRuntime {
         // this machine is the only peer allowed to name it — the layout lets a
         // pane's host rename it and nobody else. That title is what makes
         // pressing Enter on the same agent twice find the pane instead of
-        // opening a second one.
+        // opening a second one. Ctl reports the pane after the name is on it,
+        // or the next spawn would miss the live one and open another.
         if !pending.command.is_empty() {
             self.handle_intent(UiIntent::RenamePane {
                 pane_id: reservation.pane_id,
                 title: crate::tui::home::chat_pane_title(&pending.command),
             })?;
+        }
+        if asked_here {
+            self.ctl_complete(pending.request_id, Ok(reservation.pane_id));
         }
         Ok(())
     }
@@ -987,7 +1001,8 @@ impl SharedLayoutRuntime {
         // refuses and the screen left Home, opened nothing, and said nothing —
         // three sentences written for exactly this moment, none of them ever
         // seen by a user.
-        self.status = notice;
+        self.status = notice.clone();
+        self.ctl_complete(request_id, Err(notice));
     }
 
     pub(in crate::tui) fn reject_request(&mut self, request_id: u64) {

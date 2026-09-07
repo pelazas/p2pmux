@@ -3,6 +3,7 @@
 //!
 //! The inherent impl is split by concern across this module's files.
 
+mod ctl;
 mod failover;
 mod forward;
 mod layout;
@@ -10,7 +11,7 @@ mod node;
 mod run;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     io,
     time::{Duration, Instant},
@@ -57,6 +58,8 @@ pub struct SharedLayoutRuntime {
     pub(in crate::tui) subscription_rx:
         tokio::sync::mpsc::UnboundedReceiver<(PaneId, Result<GuestPane, String>)>,
     pub(in crate::tui) pending_create: Option<PendingCreate>,
+    pub(in crate::tui) ctl_waiting: BTreeSet<u64>,
+    pub(in crate::tui) ctl_results: BTreeMap<u64, Result<u64, String>>,
     /// A terminal another machine of yours asked for here, waiting for the
     /// person at this machine to say yes.
     ///
@@ -275,6 +278,8 @@ impl SharedLayoutRuntime {
             subscription_tx,
             subscription_rx,
             pending_create: None,
+            ctl_waiting: BTreeSet::new(),
+            ctl_results: BTreeMap::new(),
             pending_remote: None,
             provisional: BTreeMap::new(),
             pending_locks: BTreeMap::new(),

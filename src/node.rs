@@ -5,7 +5,7 @@
 //! only component allowed to render a terminal.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fs,
     io::{self, BufRead, BufReader, Write},
@@ -22,6 +22,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    ctl::{self, CTL_PROTOCOL_PIN, CtlFromClient, CtlToClient},
     local_ipc::{
         AgentOverlaySnapshotRow, AttachmentGate, ClientMessage, NodeMessage, PaneLeaseSnapshot,
         PaneScreenSnapshot, PresenceRow, ScreenUpdate, SessionSummary,
@@ -39,6 +40,7 @@ use crate::{
 use crate::tui::SharedLayoutRuntime;
 
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
+const MAX_CTL_CLIENTS: usize = 8;
 const ATTACHED_IDLE_BACKOFF: Duration = Duration::from_millis(1);
 const DETACHED_IDLE_BACKOFF: Duration = Duration::from_millis(16);
 // A node with no local client still drains for remote guests, so it cannot simply sleep.
@@ -608,6 +610,7 @@ fn run_socket_loop(
     let fleet_host = crate::fleet::FleetHost::new(tokio::runtime::Handle::current());
     let mut warned_about_size = false;
     let mut last_work = Instant::now();
+    let mut ctl_clients: Vec<CtlClient> = Vec::new();
     loop {
         let mut shutdown = false;
         let mut did_work = false;
@@ -631,78 +634,100 @@ fn run_socket_loop(
                         continue;
                     };
                     let mut reader = BufReader::new(stream);
-                    match read_message(&mut reader) {
-                        // Probes and shutdowns are control requests. They must not consume or
-                        // contend with the single interactive attachment slot.
-                        Ok(Some(ClientMessage::Probe)) => {
-                            let _ = write_message(reader.get_mut(), &NodeMessage::ProbeAck);
-                        }
-                        // Like a probe: a one-shot request from a short-lived
-                        // process, not the interactive client, so it must not
-                        // contend for the single attachment slot. The producer
-                        // gets no reply — it has already exited by the time one
-                        // could be written, and a hook that blocks on the mux
-                        // is a hook that stalls the agent it is reporting on.
-                        Ok(Some(ClientMessage::AgentStatus {
-                            pane_id,
-                            kind,
-                            status,
-                            cwd,
-                            message,
-                        })) => {
-                            // Counted here rather than in `p2pmux notify`,
-                            // which is a separate process spawned by an agent
-                            // hook on every tool call: a file write there would
-                            // be a file write on the agent's critical path, and
-                            // this side already has the message.
-                            crate::telemetry::bump(crate::telemetry::Counter::Agents, 1);
-                            did_work |=
-                                node.apply_agent_status(pane_id, &kind, &status, &cwd, &message);
-                        }
-                        Ok(Some(ClientMessage::Shutdown { generation })) => {
-                            let _ = write_message(
-                                reader.get_mut(),
-                                &NodeMessage::ShutdownAck { generation },
-                            );
-                            shutdown = true;
-                            break;
-                        }
-                        Ok(Some(ClientMessage::Hello { cols, rows })) => {
-                            let Ok(generation) = gate.attach() else {
-                                let _ = write_message(
+                    match read_line(&mut reader) {
+                        Ok(Some(line)) => match serde_json::from_str::<CtlFromClient>(&line) {
+                            Ok(CtlFromClient::CtlHello { pin }) => {
+                                accept_ctl_hello(reader, pin, &mut ctl_clients);
+                                did_work = true;
+                            }
+                            Ok(_) => {
+                                let _ = ctl::write_json(
                                     reader.get_mut(),
-                                    &NodeMessage::AttachRejected {
-                                        reason: crate::local_ipc::ALREADY_ATTACHED.into(),
+                                    &CtlToClient::Error {
+                                        message: String::from("ctl hello is required first"),
                                     },
                                 );
-                                continue;
-                            };
-                            match attach_client(reader, generation, cols, rows, descriptor, node) {
-                                Ok(attached) => {
-                                    client = Some(attached);
-                                    if tether == Tether::UntilFirstAttach {
-                                        tether = Tether::Detached;
-                                    }
-                                    // Only now is anybody looking. Until this,
-                                    // this node had no location to broadcast.
-                                    node.runtime.set_client_attached(true);
-                                    did_work = true;
-                                }
-                                // Losing one client is not losing the session.
-                                // Everything this can fail on belongs to the
-                                // connection, not to the node: a peer that
-                                // hung up mid-handshake -- for which macOS
-                                // answers EINVAL to `setsockopt` rather than
-                                // anything about the peer -- or a descriptor
-                                // limit reached while duplicating its socket.
-                                // Ending the socket loop over any of them took
-                                // every pane down with it.
-                                Err(error) => {
-                                    eprintln!("p2pmux node: could not attach that client: {error}");
-                                    let _ = gate.detach(generation);
-                                }
                             }
-                        }
+                            Err(_) => match serde_json::from_str::<ClientMessage>(&line) {
+                                // Probes and shutdowns are control requests. They must not consume or
+                                // contend with the single interactive attachment slot.
+                                Ok(ClientMessage::Probe) => {
+                                    let _ = write_message(reader.get_mut(), &NodeMessage::ProbeAck);
+                                }
+                                // Like a probe: a one-shot request from a short-lived
+                                // process, not the interactive client, so it must not
+                                // contend for the single attachment slot. The producer
+                                // gets no reply — it has already exited by the time one
+                                // could be written, and a hook that blocks on the mux
+                                // is a hook that stalls the agent it is reporting on.
+                                Ok(ClientMessage::AgentStatus {
+                                    pane_id,
+                                    kind,
+                                    status,
+                                    cwd,
+                                    message,
+                                }) => {
+                                    // Counted here rather than in `p2pmux notify`,
+                                    // which is a separate process spawned by an agent
+                                    // hook on every tool call: a file write there would
+                                    // be a file write on the agent's critical path, and
+                                    // this side already has the message.
+                                    crate::telemetry::bump(crate::telemetry::Counter::Agents, 1);
+                                    did_work |= node.apply_agent_status(
+                                        pane_id, &kind, &status, &cwd, &message,
+                                    );
+                                }
+                                Ok(ClientMessage::Shutdown { generation }) => {
+                                    let _ = write_message(
+                                        reader.get_mut(),
+                                        &NodeMessage::ShutdownAck { generation },
+                                    );
+                                    shutdown = true;
+                                    break;
+                                }
+                                Ok(ClientMessage::Hello { cols, rows }) => {
+                                    let Ok(generation) = gate.attach() else {
+                                        let _ = write_message(
+                                            reader.get_mut(),
+                                            &NodeMessage::AttachRejected {
+                                                reason: crate::local_ipc::ALREADY_ATTACHED.into(),
+                                            },
+                                        );
+                                        continue;
+                                    };
+                                    match attach_client(
+                                        reader, generation, cols, rows, descriptor, node,
+                                    ) {
+                                        Ok(attached) => {
+                                            client = Some(attached);
+                                            if tether == Tether::UntilFirstAttach {
+                                                tether = Tether::Detached;
+                                            }
+                                            // Only now is anybody looking. Until this,
+                                            // this node had no location to broadcast.
+                                            node.runtime.set_client_attached(true);
+                                            did_work = true;
+                                        }
+                                        // Losing one client is not losing the session.
+                                        // Everything this can fail on belongs to the
+                                        // connection, not to the node: a peer that
+                                        // hung up mid-handshake -- for which macOS
+                                        // answers EINVAL to `setsockopt` rather than
+                                        // anything about the peer -- or a descriptor
+                                        // limit reached while duplicating its socket.
+                                        // Ending the socket loop over any of them took
+                                        // every pane down with it.
+                                        Err(error) => {
+                                            eprintln!(
+                                                "p2pmux node: could not attach that client: {error}"
+                                            );
+                                            let _ = gate.detach(generation);
+                                        }
+                                    }
+                                }
+                                Ok(_) | Err(_) => {}
+                            },
+                        },
                         Ok(None) => {}
                         Err(error)
                             if matches!(
@@ -712,7 +737,7 @@ fn run_socket_loop(
                                     | io::ErrorKind::ConnectionReset
                                     | io::ErrorKind::BrokenPipe
                             ) => {}
-                        Err(_) | Ok(Some(_)) => {}
+                        Err(_) => {}
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -745,6 +770,9 @@ fn run_socket_loop(
                 .drain()
                 .map_err(|error| io::Error::other(error.to_string()))?;
             drain_elapsed = drain_started.elapsed();
+        }
+        if !ctl_clients.is_empty() && poll_ctl_clients(&mut ctl_clients, node) {
+            did_work = true;
         }
         // A takeover or a step-down changes what this machine is advertising about itself.
         // `p2pmux ls` and `p2pmux ticket <name>` read the record out of process, so until it
@@ -1207,14 +1235,21 @@ fn socket_loop_backoff(
     }
 }
 
-fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<ClientMessage>> {
+fn read_line(reader: &mut BufReader<UnixStream>) -> io::Result<Option<String>> {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) => Ok(None),
-        Ok(_) => serde_json::from_str(&line)
+        Ok(_) => Ok(Some(line)),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_message(reader: &mut BufReader<UnixStream>) -> io::Result<Option<ClientMessage>> {
+    match read_line(reader)? {
+        Some(line) => serde_json::from_str(&line)
             .map(Some)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid local IPC message")),
-        Err(error) => Err(error),
+        None => Ok(None),
     }
 }
 fn write_message(stream: &mut UnixStream, message: &NodeMessage) -> io::Result<()> {
@@ -1222,6 +1257,258 @@ fn write_message(stream: &mut UnixStream, message: &NodeMessage) -> io::Result<(
     frame.push(b'\n');
     stream.write_all(&frame)?;
     stream.flush()
+}
+
+struct CtlClient {
+    reader: BufReader<UnixStream>,
+    events: bool,
+    seen_events: BTreeSet<(String, String)>,
+    spawn_wait: Option<u64>,
+    spawn_retry: Option<(String, Vec<String>)>,
+}
+
+fn accept_ctl_hello(mut reader: BufReader<UnixStream>, pin: u32, clients: &mut Vec<CtlClient>) {
+    if pin != CTL_PROTOCOL_PIN {
+        let _ = ctl::write_json(
+            reader.get_mut(),
+            &CtlToClient::CtlHelloRejected {
+                ours: CTL_PROTOCOL_PIN,
+                theirs: pin,
+            },
+        );
+        return;
+    }
+    if clients.len() >= MAX_CTL_CLIENTS {
+        let _ = ctl::write_json(
+            reader.get_mut(),
+            &CtlToClient::Error {
+                message: String::from("too many ctl clients"),
+            },
+        );
+        return;
+    }
+    if ctl::write_json(
+        reader.get_mut(),
+        &CtlToClient::CtlHelloAck {
+            pin: CTL_PROTOCOL_PIN,
+        },
+    )
+    .is_err()
+    {
+        return;
+    }
+    let _ = reader
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(1)));
+    clients.push(CtlClient {
+        reader,
+        events: false,
+        seen_events: BTreeSet::new(),
+        spawn_wait: None,
+        spawn_retry: None,
+    });
+}
+
+fn poll_ctl_clients(clients: &mut Vec<CtlClient>, node: &mut SharedLayoutNode) -> bool {
+    let mut did_work = false;
+    clients.retain_mut(|client| match poll_one_ctl(client, node) {
+        Ok(worked) => {
+            did_work |= worked;
+            true
+        }
+        Err(_) => false,
+    });
+    did_work
+}
+
+fn poll_one_ctl(client: &mut CtlClient, node: &mut SharedLayoutNode) -> io::Result<bool> {
+    let mut did_work = false;
+    if let Some((machine, command)) = client.spawn_retry.clone() {
+        match dispatch_ctl_spawn(node, client, machine, command) {
+            Ok(true) => {
+                client.spawn_retry = None;
+                did_work = true;
+            }
+            Ok(false) => {}
+            Err(message) => {
+                client.spawn_retry = None;
+                ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?;
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(request_id) = client.spawn_wait
+        && let Some(result) = node.runtime.ctl_take_result(request_id)
+    {
+        client.spawn_wait = None;
+        match result {
+            Ok(pane_id) => ctl::write_json(
+                client.reader.get_mut(),
+                &CtlToClient::Spawned {
+                    pane_id,
+                    reused: false,
+                },
+            )?,
+            Err(message) => {
+                ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?
+            }
+        }
+        return Ok(true);
+    }
+    if client.events {
+        did_work |= publish_ctl_events(client, node)?;
+    }
+    match ctl::receive_json::<CtlFromClient>(&mut client.reader) {
+        Ok(Some(CtlFromClient::CtlHello { .. })) => {
+            ctl::write_json(
+                client.reader.get_mut(),
+                &CtlToClient::Error {
+                    message: String::from("already said hello"),
+                },
+            )?;
+            did_work = true;
+        }
+        Ok(Some(CtlFromClient::Machines)) => {
+            ctl::write_json(
+                client.reader.get_mut(),
+                &CtlToClient::Machines {
+                    machines: node.runtime.ctl_machines(),
+                },
+            )?;
+            did_work = true;
+        }
+        Ok(Some(CtlFromClient::Agents)) => {
+            ctl::write_json(
+                client.reader.get_mut(),
+                &CtlToClient::Agents {
+                    agents: node.runtime.ctl_agents(),
+                },
+            )?;
+            did_work = true;
+        }
+        Ok(Some(CtlFromClient::Spawn { machine, command })) => {
+            match dispatch_ctl_spawn(node, client, machine, command) {
+                Ok(_) => {}
+                Err(message) => {
+                    ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?
+                }
+            }
+            did_work = true;
+        }
+        Ok(Some(CtlFromClient::Send { pane_id, keys })) => {
+            match node.runtime.ctl_send(pane_id, &keys) {
+                Ok(pane_id) => {
+                    ctl::write_json(client.reader.get_mut(), &CtlToClient::Sent { pane_id })?
+                }
+                Err(message) => {
+                    ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?
+                }
+            }
+            did_work = true;
+        }
+        Ok(Some(CtlFromClient::Focus { agent })) => {
+            match node.runtime.ctl_focus(&agent) {
+                Ok(pane_id) => {
+                    ctl::write_json(client.reader.get_mut(), &CtlToClient::Focused { pane_id })?
+                }
+                Err(message) => {
+                    ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?
+                }
+            }
+            did_work = true;
+        }
+        Ok(Some(CtlFromClient::Events)) => {
+            client.events = true;
+            client.seen_events.clear();
+            publish_ctl_events(client, node)?;
+            did_work = true;
+        }
+        Ok(None) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+            ) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            return Err(error);
+        }
+        Err(_) => return Err(io::Error::other("ctl client gone")),
+    }
+    Ok(did_work)
+}
+
+fn dispatch_ctl_spawn(
+    node: &mut SharedLayoutNode,
+    client: &mut CtlClient,
+    machine: String,
+    command: Vec<String>,
+) -> Result<bool, String> {
+    match node.runtime.ctl_try_spawn(&machine, command.clone()) {
+        Ok(crate::ctl::CtlSpawn::Reused(pane_id)) => {
+            ctl::write_json(
+                client.reader.get_mut(),
+                &CtlToClient::Spawned {
+                    pane_id,
+                    reused: true,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        Ok(crate::ctl::CtlSpawn::Busy) => {
+            client.spawn_retry = Some((machine, command));
+            Ok(false)
+        }
+        Ok(crate::ctl::CtlSpawn::Started(request_id)) => {
+            let _ = node.drain();
+            if let Some(result) = node.runtime.ctl_take_result(request_id) {
+                match result {
+                    Ok(pane_id) => ctl::write_json(
+                        client.reader.get_mut(),
+                        &CtlToClient::Spawned {
+                            pane_id,
+                            reused: false,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?,
+                    Err(message) => {
+                        return Err(message);
+                    }
+                }
+            } else {
+                client.spawn_wait = Some(request_id);
+            }
+            Ok(true)
+        }
+        Err(message) => Err(message),
+    }
+}
+
+fn publish_ctl_events(client: &mut CtlClient, node: &mut SharedLayoutNode) -> io::Result<bool> {
+    let mut wrote = false;
+    let mut seen = BTreeSet::new();
+    for event in node.runtime.ctl_event_snapshot() {
+        let crate::ctl::CtlToClient::Event {
+            ref id, ref state, ..
+        } = event
+        else {
+            continue;
+        };
+        let key = (id.clone(), state.clone());
+        seen.insert(key.clone());
+        if client.seen_events.contains(&key) {
+            continue;
+        }
+        ctl::write_json(client.reader.get_mut(), &event)?;
+        wrote = true;
+    }
+    client.seen_events = seen;
+    Ok(wrote)
 }
 
 struct AttachedClient {
