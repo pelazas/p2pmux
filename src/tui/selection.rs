@@ -19,6 +19,11 @@ use crate::tui::{PaneTextSelection, text::copied_line_count};
 /// whole buffer, and an attached client keeps the viewports it fetched on the
 /// way past. A row nobody can supply is copied as a blank line rather than
 /// silently shortening the selection.
+///
+/// Soft-wrapped rows are one clipboard line. Resize already joins them with
+/// `row_wrapped`; copy has to do the same or a sentence the pane broke to fit
+/// lands as two lines, the second one starting mid-word. A real newline in the
+/// pane is still a newline.
 pub(in crate::tui) fn selection_text<'a>(
     selection: PaneTextSelection,
     view_at: impl Fn(usize) -> Option<Cow<'a, vt100::Screen>>,
@@ -35,6 +40,7 @@ pub(in crate::tui) fn selection_text<'a>(
     }
     let last_col = cols.saturating_sub(1);
     let mut lines = Vec::new();
+    let mut current = String::new();
     let mut line = start.line();
     while line <= end.line() {
         let offset = offset_showing(line);
@@ -53,17 +59,30 @@ pub(in crate::tui) fn selection_text<'a>(
             } else {
                 last_col
             };
-            lines.push(match screen.as_deref() {
-                Some(screen) => row_text(
-                    screen,
-                    u16::try_from(line + offset as i64).unwrap_or(0),
-                    first,
-                    last,
-                ),
-                None => String::new(),
-            });
+            let row = u16::try_from(line + offset as i64).unwrap_or(0);
+            match screen.as_deref() {
+                Some(screen) => {
+                    current.push_str(&row_text(screen, row, first, last));
+                    // Join when this row continues onto the next *and* that
+                    // next row is in the selection. A wrap we did not select
+                    // past stays a fragment; a hole in the next viewport is
+                    // flushed below, not glued onto a blank.
+                    if line == end.line() || !screen.row_wrapped(row) {
+                        lines.push(std::mem::take(&mut current).trim_end().to_owned());
+                    }
+                }
+                None => {
+                    if !current.is_empty() {
+                        lines.push(std::mem::take(&mut current).trim_end().to_owned());
+                    }
+                    lines.push(String::new());
+                }
+            }
             line += 1;
         }
+    }
+    if !current.is_empty() {
+        lines.push(current.trim_end().to_owned());
     }
     Some(lines.join("\n"))
 }
@@ -86,7 +105,7 @@ fn row_text(screen: &vt100::Screen, row: u16, first_col: u16, last_col: u16) -> 
             line.push_str(if contents.is_empty() { " " } else { contents });
         }
     }
-    line.trim_end().to_owned()
+    line
 }
 pub(crate) fn copy_selection_to_clipboard(text: &str) -> io::Result<usize> {
     copy_to_system_clipboard(text)?;
