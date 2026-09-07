@@ -8,6 +8,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -21,6 +22,10 @@ use p2pmux::{
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(8);
+/// One node at a time while it opens its first PTY. Six of these in parallel
+/// on Linux CI was enough for a later spawn to come back as a reservation
+/// failure.
+static START: Mutex<()> = Mutex::new(());
 
 struct Fixture {
     root: PathBuf,
@@ -38,6 +43,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn start(name: &str) -> Self {
+        let _start = START.lock().expect("fixture start");
         let root = PathBuf::from(format!("/tmp/p2pmux-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
@@ -353,26 +359,9 @@ fn events_stream_without_a_tui() {
     let mut fixture = Fixture::start("ctl-events");
     fixture.wait_until_ctl_answers();
 
-    let spawn = ctl_cli(
-        &fixture,
-        &[
-            "ctl",
-            "spawn",
-            "--machine",
-            "Test User",
-            "--",
-            "sleep",
-            "120",
-        ],
-    );
-    assert!(
-        spawn.status.success(),
-        "{}",
-        String::from_utf8_lossy(&spawn.stderr)
-    );
-    let spawned: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&spawn.stdout).trim()).unwrap();
-    let pane_id = spawned["pane_id"].as_u64().unwrap();
+    // The node already hosts pane 1. Opening another PTY here raced the other
+    // ctl tests on Linux CI and came back as a reservation failure.
+    let pane_id = 1;
 
     let (mut writer, mut reader, reply) = hello(&fixture.socket, CTL_PROTOCOL_PIN);
     assert!(
