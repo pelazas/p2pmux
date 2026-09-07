@@ -1,6 +1,6 @@
 """Record the README demo: two real p2pmux members, one shared session, one GIF.
 
-The story, in about twelve seconds: userA is hosting and has the share panel open; userB
+The story, in about eighteen seconds: userA is hosting and has the share panel open; userB
 types `p2pmux join <code>` into their own shell, lands in the same layout, opens a pane
 of their own and runs a command in it, then crosses to userA's pane and runs one there.
 
@@ -27,18 +27,18 @@ Run:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import pickle
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -72,6 +72,7 @@ ESCAPE = b"\x1b"
 # works too, but pane mode paints the focused border chord-red on the way, and a red
 # frame between two green ones reads as three states when only one thing happened.
 ALT_SHIFT_LEFT = b"\x1b[1;4D"
+ALT_SHIFT_RIGHT = b"\x1b[1;4C"
 # Ctrl+U, spent to claim a pane. Any keystroke claims one, but the keystroke that wins
 # the lease is consumed by the claim, so it has to be one that costs nothing if it does
 # reach the shell: kill-line on an already-empty prompt draws nothing either way.
@@ -80,8 +81,12 @@ CLAIM = b"\x15"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_DIR = REPO_ROOT / "target" / "release"
 
-COLS, ROWS = 96, 14
+# 18 rows leaves the share panel as an overlay instead of a full-screen takeover
+# (the current invite also carries the install hint, which ate the old 14-row frame).
+# 96 columns keeps the GIF 900px wide at Menlo 15 / 9px cells.
+COLS, ROWS = 96, 18
 FPS = 12
+SHORT_JOIN = re.compile(r"p2pmux join ([A-Z0-9]{5}-[A-Z0-9]{5})")
 
 # This GIF's own frame: two stacked cards, and the padding around them.
 PAD = 18
@@ -120,6 +125,58 @@ MEMBERS = {
         ("Desktop/", "code/api/", "code/web/", "code/README.md", "todo.txt"),
     ),
 }
+
+
+# ----------------------------------------------------------- local rendezvous
+
+
+class _Rendezvous(BaseHTTPRequestHandler):
+    """The same PUT/GET/DELETE shape as rv.p2pmux.com, in this process.
+
+    Recording has to show a ten-character code. That code is stored by whatever
+    `P2PMUX_RENDEZVOUS_URL` points at, and a sandboxed run cannot assume the
+    public worker is reachable. Both members inherit this URL, so the join
+    userB types on camera still resolves the way a real one does.
+    """
+
+    records: dict[str, bytes] = {}
+
+    def do_PUT(self) -> None:
+        index = urlparse(self.path).path.rsplit("/", 1)[-1]
+        length = int(self.headers.get("Content-Length", "0"))
+        _Rendezvous.records[index] = self.rfile.read(length)
+        self.send_response(204)
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        index = urlparse(self.path).path.rsplit("/", 1)[-1]
+        blob = _Rendezvous.records.get(index)
+        if blob is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(blob)))
+        self.end_headers()
+        self.wfile.write(blob)
+
+    def do_DELETE(self) -> None:
+        index = urlparse(self.path).path.rsplit("/", 1)[-1]
+        _Rendezvous.records.pop(index, None)
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        del fmt, args
+
+
+def start_rendezvous() -> str:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Rendezvous)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    os.environ["P2PMUX_RENDEZVOUS_URL"] = url
+    return url
 
 
 # --------------------------------------------------------------------- capture
@@ -242,26 +299,6 @@ def member_home(harness: Harness, member: Member, display_name: str | None = Non
     return home
 
 
-def wait_for_join_code(home: Path, timeout: float = 25.0) -> str:
-    """The short code the coordinator published, read off its own session record.
-
-    Not `Harness.create_room`: that looks a ticket up by the *display* name, while a
-    record is keyed by the session's memorable name, so it only ever matched by luck.
-    """
-    store = home / "Library" / "Application Support" / "p2pmux" / "sessions"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for path in sorted(store.glob("*.json")):
-            try:
-                descriptor = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if descriptor.get("join_code"):
-                return descriptor["join_code"]
-        time.sleep(0.1)
-    raise AssertionError(f"no join code appeared in {store} within {timeout}s")
-
-
 def build_scene(harness: Harness) -> tuple[object, object, str]:
     """Everything that happens before the camera rolls: userA hosting, share panel open,
     and userB sitting at their own shell prompt with nothing but the code to type."""
@@ -271,20 +308,30 @@ def build_scene(harness: Harness) -> tuple[object, object, str]:
     # `p2pmux join <code>` -- no --name flag padding out the line.
     guest_home = member_home(harness, guest_member, display_name=guest_member.name)
 
+    rendezvous = os.environ["P2PMUX_RENDEZVOUS_URL"]
     host = harness.spawn(
         host_member.name,
         ["create", "--name", host_member.name, "--session-name", SESSION],
         cols=COLS,
         rows=ROWS,
-        env={"HOME": str(host_home), "SHELL": "/bin/zsh"},
+        env={
+            "HOME": str(host_home),
+            "SHELL": "/bin/zsh",
+            "P2PMUX_RENDEZVOUS_URL": rendezvous,
+        },
     )
     host.wait_for(r"userA@mac %", timeout=25)
-    code = wait_for_join_code(host_home)
 
     # userA has the share panel up, which is where the code on screen comes from.
+    # The short code is published after attach, so open the panel and wait there
+    # rather than trusting the session record to match what the client is drawing.
     host.send(CTRL_S)
     host.wait_for(r"Share this session", timeout=10)
-    host.wait_for(re.escape(code), timeout=10)
+    screen = host.wait_for(SHORT_JOIN, timeout=25)
+    match = SHORT_JOIN.search(screen)
+    if match is None:
+        raise AssertionError(f"share panel had no short code:\n{screen}")
+    code = match.group(1)
 
     # userB's window is a plain login shell, not the binary: the recording has to show
     # the join being typed, so there has to be somewhere to type it.
@@ -297,6 +344,7 @@ def build_scene(harness: Harness) -> tuple[object, object, str]:
             "HOME": str(guest_home),
             "SHELL": "/bin/zsh",
             "PATH": f"{RELEASE_DIR}:{os.environ['PATH']}",
+            "P2PMUX_RENDEZVOUS_URL": rendezvous,
         },
         launcher=["/bin/zsh", "-i"],
     )
@@ -320,19 +368,21 @@ def claim(guest, host, title: str) -> None:
 
 
 def perform(host, guest, code: str) -> None:
-    """The recorded ten seconds.
+    """The recorded beat. Pauses are for reading; waits are the product.
 
-    Every wait for a state change is a real deadline-bounded wait, not a sleep sized to
-    what the last run happened to take: the pauses are pacing, the waits are the product.
+    The caret is local: it sits on whichever pane this client is looking at. If
+    userA is still focused on pane 1 when userB types there, both windows draw
+    that caret, and it looks like two people typing. So userA looks at pane 2
+    before the hop — watching, not driving.
     """
-    pause(0.8)
+    pause(1.6)
 
     # 1. userB joins from their own shell, with the ten characters on userA's screen.
-    guest.type(f"p2pmux join {code}", per_key_delay=0.055)
-    pause(0.3)
+    guest.type(f"p2pmux join {code}", per_key_delay=0.09)
+    pause(0.45)
     guest.send(ENTER)
     guest.wait_for(r"Pane #1 host: userA", timeout=30)
-    pause(0.7)
+    pause(1.2)
 
     # 2. userA sees someone arrive and closes the share panel.
     host.send(ESCAPE)
@@ -341,12 +391,12 @@ def perform(host, guest, code: str) -> None:
         timeout=5,
         what="the share panel to close",
     )
-    pause(0.7)
+    pause(1.0)
 
     # 3. userB opens a pane of their own, hosted on userB's machine. Pane mode is sticky,
     # so leave it before typing -- otherwise `l` is read as the lock command.
     guest.send(CTRL_P)
-    pause(0.4)
+    pause(0.55)
     guest.send(b"r")
     for peer in (host, guest):
         peer.wait_for(r"Pane #2 host: userB", timeout=15)
@@ -366,7 +416,7 @@ def perform(host, guest, code: str) -> None:
         timeout=10,
         what="pane #2's control state to settle",
     )
-    pause(0.5)
+    pause(1.0)
 
     # 4. userB takes their own pane and runs something in it. Typing is what claims a
     # pane, and the keystroke that wins the lease is spent on the claim rather than
@@ -374,25 +424,29 @@ def perform(host, guest, code: str) -> None:
     # arrives whole. From here the border is userB's green on both screens, the same
     # green as their name on the card.
     claim(guest, host, r"Pane #2 host: userB control: userB")
-    guest.type("ls ~/code", per_key_delay=0.1)
-    pause(0.25)
+    guest.type("ls ~/code", per_key_delay=0.14)
+    pause(0.4)
     guest.send(ENTER)
     guest.wait_for(r"README\.md", timeout=10)
-    pause(1.3)
+    pause(2.0)
 
-    # 5. Focus crosses to userA's pane. No chord, so no red on the way.
+    # 5. userB hops to userA's pane. userA looks at pane 2 so their caret stays
+    # put — watching userB's machine while userB types on theirs.
     guest.send(ALT_SHIFT_LEFT)
-    pause(0.6)
+    pause(0.35)
+    host.send(ALT_SHIFT_RIGHT)
+    pause(0.9)
 
     # 6. The same claim, on a pane userA hosts: userB is now driving a shell on the other
     # machine, and both screens draw that border in the same green.
     claim(guest, host, r"Pane #1 host: userA control: userB")
-    guest.type("echo userB", per_key_delay=0.085)
-    pause(0.3)
+    pause(0.5)
+    guest.type("echo userB", per_key_delay=0.12)
+    pause(0.4)
     guest.send(ENTER)
     for peer in (host, guest):
         peer.wait_for(r"│userB\s", timeout=10)
-    pause(1.8)
+    pause(2.8)
 
 
 def render_gif(frames: list[dict], output: Path, frames_dir: Path) -> None:
@@ -435,6 +489,7 @@ def main() -> int:
             render_gif(pickle.load(handle), output, frames_dir)
         return 0
 
+    start_rendezvous()
     with Harness("demo") as harness:
         host, guest, code = build_scene(harness)
 

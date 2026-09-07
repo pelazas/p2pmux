@@ -6,6 +6,7 @@
 </picture>
 
 <p>
+  <a href="https://github.com/pelazas/p2pmux"><img alt="GitHub stars" src="https://img.shields.io/github/stars/pelazas/p2pmux"></a>
   <a href="https://github.com/pelazas/p2pmux/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/pelazas/p2pmux/ci.yml?branch=main&label=ci"></a>
   <a href="https://github.com/pelazas/p2pmux/releases"><img alt="Release" src="https://img.shields.io/github/v/release/pelazas/p2pmux"></a>
   <a href="https://crates.io/crates/p2pmux"><img alt="crates.io" src="https://img.shields.io/crates/v/p2pmux?logo=rust"></a>
@@ -98,6 +99,8 @@ Two machines you own: `p2pmux pair` on the new one, then `p2pmux pair <code>` on
 
 The join code lasts six hours. If rendezvous is down, `Ctrl+S` offers a ticket that contacts no service at all.
 
+If this is useful, [star pelazas/p2pmux on GitHub](https://github.com/pelazas/p2pmux).
+
 ## What you get
 
 - Every pane is a PTY on its owner's machine. Host and guest are per pane, not per person.
@@ -132,7 +135,7 @@ The longer version is at [p2pmux.com/trust](https://p2pmux.com/trust).
 
 ## Telemetry
 
-On first run, p2pmux asks whether it may send one anonymous line a day. Enter means yes. Nothing is sent before you answer, and nothing is sent if you say no. `p2pmux telemetry off` stops it. `DO_NOT_TRACK=1` and `CI` skip the prompt and send nothing. A machine with no terminal to ask in, such as a droplet running `p2pmux daemon`, is never asked and never sends.
+On first run, p2pmux asks whether it may send one anonymous line a day. Enter means yes. p2pmux sends nothing until you answer, and nothing if you say no. `p2pmux telemetry off` stops it. `DO_NOT_TRACK=1` and `CI` skip the prompt and send nothing. A machine with no terminal to ask in, such as a droplet running `p2pmux daemon`, is never asked and never sends.
 
 ## Status
 

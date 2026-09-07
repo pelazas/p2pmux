@@ -1082,6 +1082,13 @@ fn run_socket_loop(
             }
             did_work |= changed;
             if !detached && !client.close_after_ack && !client.shutdown_after_ack {
+                let invite = (
+                    node.runtime.share_ticket().map(str::to_owned),
+                    node.runtime.share_code().map(str::to_owned),
+                );
+                if client.publish.invite.as_ref() != Some(&invite) {
+                    full_snapshot = true;
+                }
                 let result = if full_snapshot {
                     queue_snapshot(
                         descriptor,
@@ -1422,6 +1429,10 @@ fn write_snapshot(
     update_screen_sequences(&mut publish.screen_sequences, &screens);
     publish.last_screen_publish = Some(Instant::now());
     publish.force_screens = false;
+    publish.invite = Some((
+        node.runtime.share_ticket().map(str::to_owned),
+        node.runtime.share_code().map(str::to_owned),
+    ));
     if crate::perf::enabled()
         && [drain_elapsed, json_serialize, json_write]
             .into_iter()
@@ -1536,6 +1547,10 @@ fn queue_snapshot(
             update_screen_sequences(&mut publish.screen_sequences, &screens);
             publish.last_screen_publish = Some(Instant::now());
             publish.force_screens = false;
+            publish.invite = Some((
+                node.runtime.share_ticket().map(str::to_owned),
+                node.runtime.share_code().map(str::to_owned),
+            ));
         }
         QueueResult::Dropped | QueueResult::CoalesceScreens => {
             publish.reset_for_snapshot();
@@ -1569,6 +1584,13 @@ struct AttachmentPublishState {
     force_screens: bool,
     target_urgency: Option<(u64, Instant)>,
     perf_id: Option<u64>,
+    /// Ticket and short code last sent to this client.
+    ///
+    /// The code is published after attach, on a slow path, so the first snapshot
+    /// usually has a ticket and no code. Incremental updates never carried the
+    /// pair, and Ctrl+S kept saying the rendezvous was down after it had already
+    /// accepted the record.
+    invite: Option<(Option<String>, Option<String>)>,
 }
 
 impl AttachmentPublishState {
@@ -1599,6 +1621,7 @@ impl AttachmentPublishState {
         self.screen_sequences.clear();
         self.pending_screens = true;
         self.force_screens = true;
+        self.invite = None;
     }
 }
 
