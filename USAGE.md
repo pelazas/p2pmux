@@ -311,8 +311,9 @@ reported that did not land.
 Dragging out through the top or the bottom of a pane scrolls it, and keeps scrolling while you hold
 the pointer there, so a selection is not limited to what fits on screen. Both ends stay on the lines
 they were placed on rather than on the rows they happened to land on, so what you copy is every line
-between them, including the ones that scrolled past on the way. Out through a *side* scrolls
-nothing: that is reaching for the pane next door.
+between them, including the ones that scrolled past on the way. A row that exists only because the
+pane wrapped the text to fit is copied as part of the same line, not as a second one. Out through a
+*side* scrolls nothing: that is reaching for the pane next door.
 
 Drag a shared pane border to resize its split. Corner drags lock to one axis after a
 short motion threshold, preview locally, and commit one shared ratio on release. The affected pane

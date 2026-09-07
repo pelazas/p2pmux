@@ -19,6 +19,11 @@ use crate::tui::{PaneTextSelection, text::copied_line_count};
 /// whole buffer, and an attached client keeps the viewports it fetched on the
 /// way past. A row nobody can supply is copied as a blank line rather than
 /// silently shortening the selection.
+///
+/// Soft-wrapped rows are one clipboard line. Resize already joins them with
+/// `row_wrapped`; copy has to do the same or a sentence the pane broke to fit
+/// lands as two lines, the second one starting mid-word. A real newline in the
+/// pane is still a newline.
 pub(in crate::tui) fn selection_text<'a>(
     selection: PaneTextSelection,
     view_at: impl Fn(usize) -> Option<Cow<'a, vt100::Screen>>,
@@ -35,6 +40,7 @@ pub(in crate::tui) fn selection_text<'a>(
     }
     let last_col = cols.saturating_sub(1);
     let mut lines = Vec::new();
+    let mut current = String::new();
     let mut line = start.line();
     while line <= end.line() {
         let offset = offset_showing(line);
@@ -53,17 +59,30 @@ pub(in crate::tui) fn selection_text<'a>(
             } else {
                 last_col
             };
-            lines.push(match screen.as_deref() {
-                Some(screen) => row_text(
-                    screen,
-                    u16::try_from(line + offset as i64).unwrap_or(0),
-                    first,
-                    last,
-                ),
-                None => String::new(),
-            });
+            let row = u16::try_from(line + offset as i64).unwrap_or(0);
+            match screen.as_deref() {
+                Some(screen) => {
+                    current.push_str(&row_text(screen, row, first, last));
+                    // Join when this row continues onto the next *and* that
+                    // next row is in the selection. A wrap we did not select
+                    // past stays a fragment; a hole in the next viewport is
+                    // flushed below, not glued onto a blank.
+                    if line == end.line() || !screen.row_wrapped(row) {
+                        lines.push(std::mem::take(&mut current).trim_end().to_owned());
+                    }
+                }
+                None => {
+                    if !current.is_empty() {
+                        lines.push(std::mem::take(&mut current).trim_end().to_owned());
+                    }
+                    lines.push(String::new());
+                }
+            }
             line += 1;
         }
+    }
+    if !current.is_empty() {
+        lines.push(current.trim_end().to_owned());
     }
     Some(lines.join("\n"))
 }
@@ -86,7 +105,7 @@ fn row_text(screen: &vt100::Screen, row: u16, first_col: u16, last_col: u16) -> 
             line.push_str(if contents.is_empty() { " " } else { contents });
         }
     }
-    line.trim_end().to_owned()
+    line
 }
 pub(crate) fn copy_selection_to_clipboard(text: &str) -> io::Result<usize> {
     copy_to_system_clipboard(text)?;
@@ -300,5 +319,111 @@ mod tests {
             ))),
             None
         );
+    }
+
+    fn copied(parser: &vt100::Parser, selection: PaneTextSelection) -> Option<String> {
+        selection_text(selection, |offset| {
+            Some(viewed_screen(parser.screen(), offset))
+        })
+    }
+
+    /// Issue #139: a sentence the pane wrapped to fit is one line in the
+    /// document and has to come back as one line on the clipboard. Splitting
+    /// on the wrap made a drag over three paragraphs copy as four lines, with
+    /// the last one starting mid-word.
+    #[test]
+    fn a_soft_wrapped_row_copies_as_one_line() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefghij");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 1, 1),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("abcdefghij".to_owned()));
+    }
+
+    /// A real line break is still a line break. Wrap-joining must not swallow
+    /// `\r\n` just because the previous row happened to fill the width.
+    #[test]
+    fn a_hard_break_still_splits_even_when_the_row_is_full() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefgh\r\nijklmnop");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 1, 7),
+        };
+
+        assert_eq!(
+            copied(&parser, selection),
+            Some("abcdefgh\nijklmnop".to_owned())
+        );
+    }
+
+    /// Selecting only the first visual row of a wrap does not invent the rest.
+    #[test]
+    fn a_partial_wrap_copies_only_the_selected_rows() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefghij");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 0, 7),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("abcdefgh".to_owned()));
+    }
+
+    /// The wrap can sit across two viewports: a two-row pane that then
+    /// scrolled, so the first visual row is one offset and the continuation
+    /// is another. Copying still has to join them.
+    #[test]
+    fn a_wrap_that_scrolled_off_still_joins() {
+        let mut parser = vt100::Parser::new(2, 8, 10);
+        parser.process(b"abcdefghij\r\nXXXXXXX\r\nYYYYYYY");
+        // Live view is the last two hard-broken rows. The wrap starts at the
+        // top of offset 2 (`abcdefgh`) and continues as the top of offset 1
+        // (`ij`), so a copy has to join across viewports.
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(2, 0, 0),
+            cursor: point(1, 0, 1),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("abcdefghij".to_owned()));
+    }
+
+    /// A wrap followed by a real newline in the same drag is two clipboard
+    /// lines, not three and not one.
+    #[test]
+    fn a_wrap_then_a_hard_break_copies_as_two_lines() {
+        let mut parser = vt100::Parser::new(3, 8, 0);
+        parser.process(b"abcdefghij\r\nnext");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 2, 3),
+        };
+
+        assert_eq!(
+            copied(&parser, selection),
+            Some("abcdefghij\nnext".to_owned())
+        );
+    }
+
+    /// Starting mid-row still joins onto the continuation.
+    #[test]
+    fn a_wrap_joined_from_mid_row_keeps_the_selected_suffix() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefghij");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 2),
+            cursor: point(0, 1, 1),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("cdefghij".to_owned()));
     }
 }
