@@ -93,6 +93,20 @@ const HOME_KEYS: &[FooterSegment] = &[
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
+/// The bar while the cursor is on the update line. Enter copies rather than
+/// opening an agent; the standing line already named the command.
+const HOME_KEYS_UPDATE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" copy   "),
+    FooterSegment::Key("m"),
+    FooterSegment::Text(" pick machine   "),
+    FooterSegment::Key("a"),
+    FooterSegment::Text(" add machine   "),
+    FooterSegment::Key("n"),
+    FooterSegment::Text(" new terminal   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
 /// The bar while the cursor is on a machine, which is when both keys that open
 /// something mean "there" rather than "here".
 const HOME_KEYS_MACHINE: &[FooterSegment] = &[
@@ -110,6 +124,18 @@ const HOME_KEYS_MACHINE: &[FooterSegment] = &[
 const HOME_KEYS_PAGED: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
     FooterSegment::Text(" open   "),
+    FooterSegment::Key("h l"),
+    FooterSegment::Text(" page   "),
+    FooterSegment::Key("a"),
+    FooterSegment::Text(" add machine   "),
+    FooterSegment::Key("n"),
+    FooterSegment::Text(" new terminal   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
+const HOME_KEYS_PAGED_UPDATE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" copy   "),
     FooterSegment::Key("h l"),
     FooterSegment::Text(" page   "),
     FooterSegment::Key("a"),
@@ -140,9 +166,34 @@ const HOME_KEYS_CORE: &[FooterSegment] = &[
     FooterSegment::Key("q"),
     FooterSegment::Text(" quit"),
 ];
+/// Enter still has to say copy when the bar has shed everything else.
+const HOME_KEYS_UPDATE_SHORT: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" copy   "),
+    FooterSegment::Key("m"),
+    FooterSegment::Text(" machines   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
+const HOME_KEYS_UPDATE_CORE: &[FooterSegment] = &[
+    FooterSegment::Key("enter"),
+    FooterSegment::Text(" copy   "),
+    FooterSegment::Key("q"),
+    FooterSegment::Text(" quit"),
+];
 const HOME_KEYS_TIERS: &[&[FooterSegment]] = &[HOME_KEYS, HOME_KEYS_SHORT, HOME_KEYS_CORE];
+const HOME_KEYS_UPDATE_TIERS: &[&[FooterSegment]] = &[
+    HOME_KEYS_UPDATE,
+    HOME_KEYS_UPDATE_SHORT,
+    HOME_KEYS_UPDATE_CORE,
+];
 const HOME_KEYS_PAGED_TIERS: &[&[FooterSegment]] =
     &[HOME_KEYS_PAGED, HOME_KEYS_SHORT, HOME_KEYS_CORE];
+const HOME_KEYS_PAGED_UPDATE_TIERS: &[&[FooterSegment]] = &[
+    HOME_KEYS_PAGED_UPDATE,
+    HOME_KEYS_UPDATE_SHORT,
+    HOME_KEYS_UPDATE_CORE,
+];
 /// On a machine row `enter` means something else, so the short tier says which.
 const HOME_KEYS_MACHINE_SHORT: &[FooterSegment] = &[
     FooterSegment::Key("enter"),
@@ -236,6 +287,7 @@ fn render_home_in(
                         // band would make two rows look live and leave the user
                         // guessing which one Enter is about.
                         tui.home_machine.is_none()
+                            && !tui.home_update_selected
                             && tui.home_selected.as_ref() == Some(&row.row_id()),
                         layout.rows.width,
                         now_unix_ms,
@@ -271,15 +323,24 @@ fn render_home_in(
     }
 
     if layout.update.height > 0
-        && let Some(update) = tui.update_notice.as_deref()
+        && let Some(update) = tui.update_notice.as_ref()
     {
         // Quieter than the nudge above it, and deliberately so: an install with
         // no hooks cannot do its job, while this one only has a newer version
         // to go and get. Both are worth a line; only one is worth the bold.
+        // The selection band is the same as a card's, so Enter is visibly
+        // about this line when the cursor is on it.
+        let mut style = Style::default().fg(theme.agent_overlay_secondary);
+        if tui.home_update_selected && tui.home_machine.is_none() {
+            style = style.bg(theme.agent_overlay_selected_background);
+        }
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" {update}"),
-                Style::default().fg(theme.agent_overlay_secondary),
+                truncate_trailing(
+                    &format!(" {}", update.inbox_line()),
+                    usize::from(layout.update.width),
+                ),
+                style,
             )),
             layout.update,
         );
@@ -302,6 +363,7 @@ fn render_home_in(
             keys,
             tui.home_page_count() > 1,
             tui.home_machine.is_some(),
+            tui.home_update_selected,
         );
     }
 }
@@ -1111,6 +1173,7 @@ fn render_home_keys(
     keys: Rect,
     paged: bool,
     on_machine: bool,
+    on_update: bool,
 ) {
     if keys.height == 0 {
         return;
@@ -1129,11 +1192,13 @@ fn render_home_keys(
         keys.y,
         keys.right(),
         home_footer(
-            match (on_machine, paged) {
+            match (on_machine, paged, on_update) {
                 // What the keys do now outranks how to page a list they are not on.
-                (true, _) => HOME_KEYS_MACHINE_TIERS,
-                (false, true) => HOME_KEYS_PAGED_TIERS,
-                (false, false) => HOME_KEYS_TIERS,
+                (true, _, _) => HOME_KEYS_MACHINE_TIERS,
+                (false, true, true) => HOME_KEYS_PAGED_UPDATE_TIERS,
+                (false, true, false) => HOME_KEYS_PAGED_TIERS,
+                (false, false, true) => HOME_KEYS_UPDATE_TIERS,
+                (false, false, false) => HOME_KEYS_TIERS,
             },
             keys.right().saturating_sub(keys.x.saturating_add(1)),
         ),
@@ -1183,7 +1248,8 @@ mod tests {
 
     use super::{
         ELAPSED_WIDTH, GUEST_DETAIL, HOME_EMPTY_NO_AGENTS, HOME_EMPTY_NO_HOOKS, HOME_KEYS_CORE,
-        HOME_KEYS_MACHINE_TIERS, HOME_KEYS_PAGED_TIERS, HOME_KEYS_TIERS, HOME_ROW_NO_HOOKS,
+        HOME_KEYS_MACHINE_TIERS, HOME_KEYS_PAGED_TIERS, HOME_KEYS_PAGED_UPDATE_TIERS,
+        HOME_KEYS_TIERS, HOME_KEYS_UPDATE_CORE, HOME_KEYS_UPDATE_TIERS, HOME_ROW_NO_HOOKS,
         format_home_row, header_line, home_card, home_elapsed, home_footer, home_kind_label,
         machine_detail, machine_line,
     };
@@ -1394,29 +1460,29 @@ mod tests {
         tui.set_home_open(true, "test");
         assert!(!screen(&tui, 120, 30).join("\n").contains("is out"));
 
-        assert!(
-            tui.set_update_notice(
-                crate::update_check::UpdateNotice {
-                    version: String::from("9.9.9"),
-                    command: "brew update && brew upgrade p2pmux",
-                }
-                .line()
-            )
-        );
+        let notice = crate::update_check::UpdateNotice {
+            version: String::from("9.9.9"),
+            command: "brew update && brew upgrade p2pmux",
+        };
+        assert!(tui.set_update_notice(notice.clone()));
         // Once. A repeat answer from a later check costs no repaint.
-        assert!(
-            !tui.set_update_notice(
-                crate::update_check::UpdateNotice {
-                    version: String::from("9.9.9"),
-                    command: "brew update && brew upgrade p2pmux",
-                }
-                .line()
-            )
-        );
+        assert!(!tui.set_update_notice(notice));
 
         let drawn = screen(&tui, 120, 30).join("\n");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
         assert!(drawn.contains("brew upgrade p2pmux"), "{drawn}");
+        assert!(
+            !drawn.contains("u update"),
+            "the line is a control, not a new letter: {drawn}"
+        );
+        assert!(
+            drawn.contains("enter open"),
+            "the bar still opens an agent while the cursor is on one: {drawn}"
+        );
+        assert!(
+            !drawn.contains("enter copy"),
+            "copy is Enter only while the cursor is on the line: {drawn}"
+        );
 
         // The setup nudge keeps its own line too: an install that cannot say
         // `needs you` and an install that is a version behind are two different
@@ -1424,7 +1490,12 @@ mod tests {
         let mut unwired =
             crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Unknown)]);
         unwired.set_home_open(true, "test");
-        assert!(unwired.set_update_notice(String::from("p2pmux 9.9.9 is out")));
+        assert!(
+            unwired.set_update_notice(crate::update_check::UpdateNotice {
+                version: String::from("9.9.9"),
+                command: "brew update && brew upgrade p2pmux",
+            })
+        );
         let drawn = screen(&unwired, 120, 30).join("\n");
         assert!(drawn.contains(HOME_EMPTY_NO_HOOKS), "{drawn}");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
@@ -1448,6 +1519,32 @@ mod tests {
         let drawn = screen(&tui, 120, 30).join("\n");
         assert!(drawn.contains("that machine is asleep"), "{drawn}");
         assert!(drawn.contains("9.9.9 is out"), "{drawn}");
+        assert!(
+            !drawn.contains("u update"),
+            "a standing notice does not add a Home letter: {drawn}"
+        );
+    }
+
+    #[test]
+    fn the_bar_says_enter_copy_only_while_the_cursor_is_on_the_update_line() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("mac", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        assert!(tui.set_update_notice(crate::update_check::UpdateNotice {
+            version: String::from("9.9.9"),
+            command: "brew update && brew upgrade p2pmux",
+        }));
+        tui.home_update_selected = true;
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(
+            drawn.contains("enter copy"),
+            "the verb matches the cursor: {drawn}"
+        );
+        assert!(
+            !drawn.contains("enter open"),
+            "open would be a lie on this line: {drawn}"
+        );
+        assert!(!drawn.contains("u update"), "{drawn}");
     }
 
     /// The screen is emptiest exactly when its reader is newest, so that is
@@ -1520,13 +1617,15 @@ mod tests {
         for width in [30u16, 40, 50, 60, 70, 80, 120] {
             for tiers in [
                 HOME_KEYS_TIERS,
+                HOME_KEYS_UPDATE_TIERS,
                 HOME_KEYS_PAGED_TIERS,
+                HOME_KEYS_PAGED_UPDATE_TIERS,
                 HOME_KEYS_MACHINE_TIERS,
             ] {
                 let chosen = home_footer(tiers, width);
                 let drawn = footer_segments_width(chosen);
                 assert!(
-                    drawn <= width || chosen == HOME_KEYS_CORE,
+                    drawn <= width || chosen == HOME_KEYS_CORE || chosen == HOME_KEYS_UPDATE_CORE,
                     "at {width} columns the bar drew {drawn}: {chosen:?}"
                 );
                 assert!(
