@@ -178,10 +178,12 @@ def draw_terminal(
 
 
 def encode_gif(frames_dir: Path, output: Path, fps: int) -> None:
+    # TUI frames are flat indexed color. Dithering them just adds grain, and
+    # `stats_mode=diff` was undersampling the member greens that appear late.
     filters = (
         "[0:v]split[a][b];"
-        "[a]palettegen=max_colors=160:stats_mode=diff[p];"
-        "[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle"
+        "[a]palettegen=max_colors=256:stats_mode=full[p];"
+        "[b][p]paletteuse=dither=none:diff_mode=rectangle"
     )
     subprocess.run(
         [
