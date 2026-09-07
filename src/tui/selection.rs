@@ -301,4 +301,110 @@ mod tests {
             None
         );
     }
+
+    fn copied(parser: &vt100::Parser, selection: PaneTextSelection) -> Option<String> {
+        selection_text(selection, |offset| {
+            Some(viewed_screen(parser.screen(), offset))
+        })
+    }
+
+    /// Issue #139: a sentence the pane wrapped to fit is one line in the
+    /// document and has to come back as one line on the clipboard. Splitting
+    /// on the wrap made a drag over three paragraphs copy as four lines, with
+    /// the last one starting mid-word.
+    #[test]
+    fn a_soft_wrapped_row_copies_as_one_line() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefghij");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 1, 1),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("abcdefghij".to_owned()));
+    }
+
+    /// A real line break is still a line break. Wrap-joining must not swallow
+    /// `\r\n` just because the previous row happened to fill the width.
+    #[test]
+    fn a_hard_break_still_splits_even_when_the_row_is_full() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefgh\r\nijklmnop");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 1, 7),
+        };
+
+        assert_eq!(
+            copied(&parser, selection),
+            Some("abcdefgh\nijklmnop".to_owned())
+        );
+    }
+
+    /// Selecting only the first visual row of a wrap does not invent the rest.
+    #[test]
+    fn a_partial_wrap_copies_only_the_selected_rows() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefghij");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 0, 7),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("abcdefgh".to_owned()));
+    }
+
+    /// The wrap can sit across two viewports: a two-row pane that then
+    /// scrolled, so the first visual row is one offset and the continuation
+    /// is another. Copying still has to join them.
+    #[test]
+    fn a_wrap_that_scrolled_off_still_joins() {
+        let mut parser = vt100::Parser::new(2, 8, 10);
+        parser.process(b"abcdefghij\r\nXXXXXXX\r\nYYYYYYY");
+        // Live view is the last two hard-broken rows. The wrap starts at the
+        // top of offset 2 (`abcdefgh`) and continues as the top of offset 1
+        // (`ij`), so a copy has to join across viewports.
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(2, 0, 0),
+            cursor: point(1, 0, 1),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("abcdefghij".to_owned()));
+    }
+
+    /// A wrap followed by a real newline in the same drag is two clipboard
+    /// lines, not three and not one.
+    #[test]
+    fn a_wrap_then_a_hard_break_copies_as_two_lines() {
+        let mut parser = vt100::Parser::new(3, 8, 0);
+        parser.process(b"abcdefghij\r\nnext");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 0),
+            cursor: point(0, 2, 3),
+        };
+
+        assert_eq!(
+            copied(&parser, selection),
+            Some("abcdefghij\nnext".to_owned())
+        );
+    }
+
+    /// Starting mid-row still joins onto the continuation.
+    #[test]
+    fn a_wrap_joined_from_mid_row_keeps_the_selected_suffix() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"abcdefghij");
+        let selection = PaneTextSelection {
+            pane_id: 1,
+            anchor: point(0, 0, 2),
+            cursor: point(0, 1, 1),
+        };
+
+        assert_eq!(copied(&parser, selection), Some("cdefghij".to_owned()));
+    }
 }
