@@ -314,6 +314,7 @@ fn spawn_send_and_focus_drive_a_local_pane() {
     let first_json: serde_json::Value = serde_json::from_str(first_out.trim()).unwrap();
     let pane_id = first_json["pane_id"].as_u64().expect("pane_id");
     assert_eq!(first_json["reused"], false, "{first_out}");
+    assert_eq!(first_json["visible_to_guests"], false, "{first_out}");
 
     let second = ctl_cli(
         &fixture,

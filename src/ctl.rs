@@ -73,6 +73,8 @@ pub enum CtlToClient {
     Spawned {
         pane_id: u64,
         reused: bool,
+        #[serde(default)]
+        visible_to_guests: bool,
     },
     Sent {
         pane_id: u64,
@@ -302,12 +304,18 @@ pub fn run(socket: &Path, action: CtlAction) -> Result<(), Box<dyn Error>> {
                 serde_json::to_string(&serde_json::json!({ "agents": agents }))?
             );
         }
-        Some(CtlToClient::Spawned { pane_id, reused }) => {
+        Some(CtlToClient::Spawned {
+            pane_id,
+            reused,
+            visible_to_guests,
+        }) => {
             println!(
                 "{}",
-                serde_json::to_string(
-                    &serde_json::json!({ "pane_id": pane_id, "reused": reused })
-                )?
+                serde_json::to_string(&serde_json::json!({
+                    "pane_id": pane_id,
+                    "reused": reused,
+                    "visible_to_guests": visible_to_guests,
+                }))?
             );
         }
         Some(CtlToClient::Sent { pane_id }) => {
@@ -455,6 +463,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(forced["new"], true);
+    }
+
+    #[test]
+    fn spawned_without_visible_to_guests_defaults_false() {
+        let spawned: CtlToClient = serde_json::from_value(serde_json::json!({
+            "type": "spawned",
+            "pane_id": 3,
+            "reused": true
+        }))
+        .unwrap();
+        assert_eq!(
+            spawned,
+            CtlToClient::Spawned {
+                pane_id: 3,
+                reused: true,
+                visible_to_guests: false,
+            }
+        );
     }
 
     #[test]

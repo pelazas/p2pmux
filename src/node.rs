@@ -1342,13 +1342,9 @@ fn poll_one_ctl(client: &mut CtlClient, node: &mut SharedLayoutNode) -> io::Resu
     {
         client.spawn_wait = None;
         match result {
-            Ok(pane_id) => ctl::write_json(
-                client.reader.get_mut(),
-                &CtlToClient::Spawned {
-                    pane_id,
-                    reused: false,
-                },
-            )?,
+            Ok(pane_id) => {
+                ctl::write_json(client.reader.get_mut(), &ctl_spawned(node, pane_id, false))?
+            }
             Err(message) => {
                 ctl::write_json(client.reader.get_mut(), &CtlToClient::Error { message })?
             }
@@ -1457,14 +1453,8 @@ fn dispatch_ctl_spawn(
 ) -> Result<bool, String> {
     match node.runtime.ctl_try_spawn(&machine, command.clone(), new) {
         Ok(crate::ctl::CtlSpawn::Reused(pane_id)) => {
-            ctl::write_json(
-                client.reader.get_mut(),
-                &CtlToClient::Spawned {
-                    pane_id,
-                    reused: true,
-                },
-            )
-            .map_err(|error| error.to_string())?;
+            ctl::write_json(client.reader.get_mut(), &ctl_spawned(node, pane_id, true))
+                .map_err(|error| error.to_string())?;
             Ok(true)
         }
         Ok(crate::ctl::CtlSpawn::Busy) => {
@@ -1475,14 +1465,10 @@ fn dispatch_ctl_spawn(
             let _ = node.drain();
             if let Some(result) = node.runtime.ctl_take_result(request_id) {
                 match result {
-                    Ok(pane_id) => ctl::write_json(
-                        client.reader.get_mut(),
-                        &CtlToClient::Spawned {
-                            pane_id,
-                            reused: false,
-                        },
-                    )
-                    .map_err(|error| error.to_string())?,
+                    Ok(pane_id) => {
+                        ctl::write_json(client.reader.get_mut(), &ctl_spawned(node, pane_id, false))
+                            .map_err(|error| error.to_string())?
+                    }
                     Err(message) => {
                         return Err(message);
                     }
@@ -1493,6 +1479,14 @@ fn dispatch_ctl_spawn(
             Ok(true)
         }
         Err(message) => Err(message),
+    }
+}
+
+fn ctl_spawned(node: &mut SharedLayoutNode, pane_id: u64, reused: bool) -> CtlToClient {
+    CtlToClient::Spawned {
+        pane_id,
+        reused,
+        visible_to_guests: node.runtime.ctl_visible_to_guests(),
     }
 }
 

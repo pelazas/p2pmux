@@ -125,6 +125,11 @@ impl SharedLayoutRuntime {
         Ok(CtlSpawn::Started(request_id))
     }
 
+    pub(crate) fn ctl_visible_to_guests(&mut self) -> bool {
+        self.ctl_prepare();
+        super::super::home::spawn_visible_to_guests(&self.tui)
+    }
+
     pub(crate) fn ctl_watch(&mut self, request_id: u64) {
         self.ctl_waiting.insert(request_id);
     }

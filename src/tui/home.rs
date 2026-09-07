@@ -1085,6 +1085,11 @@ pub(in crate::tui) fn machine_rows(tui: &MultiPaneTui) -> Vec<MachineRow> {
     rows
 }
 
+/// Whether a pane opened in this session is on a screen someone unpaired can see.
+pub(in crate::tui) fn spawn_visible_to_guests(tui: &MultiPaneTui) -> bool {
+    machine_rows(tui).iter().any(|row| !row.owned)
+}
+
 /// One machine on the inbox, and one row of `p2pmux machines`.
 ///
 /// Public because the CLI builds these too: the `m` key on Home and the command
@@ -1227,7 +1232,7 @@ mod tests {
 
     use super::{
         HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, chat_pane_title, home_card,
-        home_layout, home_page_size, machine_rows,
+        home_layout, home_page_size, machine_rows, spawn_visible_to_guests,
     };
     use crate::{
         layout::{Axis, Node, Tab},
@@ -1564,6 +1569,29 @@ mod tests {
             .expect("the paired machine is listed");
         assert!(!oldbox.reachable);
         assert_eq!(oldbox.accepts_work, Some(true));
+    }
+
+    #[test]
+    fn a_guest_in_the_session_makes_ctl_spawn_visible_to_guests() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.snapshot.members[0].display_name = String::from("laptop");
+        tui.snapshot.members.push(crate::layout::Member {
+            peer_id: vec![0xca, 0xfe],
+            endpoint_addr: vec![2],
+            display_name: String::from("sam"),
+            kind: crate::layout::MemberKind::Person,
+            machine_proof: Default::default(),
+            machine_id: Default::default(),
+        });
+
+        assert!(spawn_visible_to_guests(&tui));
+    }
+
+    #[test]
+    fn a_session_of_only_this_machine_is_not_visible_to_guests() {
+        let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        assert!(!spawn_visible_to_guests(&tui));
     }
 
     #[test]
