@@ -208,11 +208,45 @@ enum Command {
     },
     /// Report whether each agent's hooks are wired up.
     Doctor,
+    /// Drive a live session from a script, without taking the TUI seat.
+    Ctl {
+        /// Session name as `p2pmux list` prints it. Omit it for the fleet
+        /// session when this machine is paired, otherwise the newest live one.
+        #[arg(long)]
+        session: Option<String>,
+        #[command(subcommand)]
+        action: CtlCommand,
+    },
     #[command(name = "__node", hide = true)]
     Node {
         #[arg(long)]
         bootstrap: std::path::PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CtlCommand {
+    /// Pairing-owned machines this session can start work on.
+    Machines,
+    /// The same agent list Ctrl+O would show.
+    Agents,
+    /// Start an allowlisted command on a machine you own.
+    Spawn {
+        #[arg(long)]
+        machine: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Write bytes into a pane as if they were typed.
+    Send {
+        pane: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        keys: Vec<String>,
+    },
+    /// Move this node's focus to an agent that already has a pane.
+    Focus { agent: String },
+    /// Stream needs_you / done / error as JSON lines.
+    Events,
 }
 
 #[derive(Debug, Subcommand)]
@@ -411,6 +445,7 @@ pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
             None => crate::agent_setup::setup_all(false, false),
         }),
         Some(Command::Doctor) => Some(crate::agent_setup::doctor()),
+        Some(Command::Ctl { session, action }) => Some(run_ctl(session.as_deref(), action)),
         // Reading and writing one small file. A user asking what is being sent
         // about them wants the answer now, not after a thread pool starts.
         Some(Command::Telemetry { command }) => Some(run_telemetry(command.as_ref())),
@@ -459,6 +494,52 @@ fn run_telemetry(command: Option<&TelemetryCommand>) -> Result<(), Box<dyn Error
         }
     }
     Ok(())
+}
+
+/// Talk to a live node without taking its TUI seat, and without starting one.
+fn run_ctl(session: Option<&str>, action: &CtlCommand) -> Result<(), Box<dyn Error>> {
+    let descriptor = resolve_ctl_session(session)?;
+    let action = match action {
+        CtlCommand::Machines => crate::ctl::CtlAction::Machines,
+        CtlCommand::Agents => crate::ctl::CtlAction::Agents,
+        CtlCommand::Spawn { machine, command } => crate::ctl::CtlAction::Spawn {
+            machine: machine.clone(),
+            command: command.clone(),
+        },
+        CtlCommand::Send { pane, keys } => {
+            let pane_id = pane
+                .parse::<u64>()
+                .map_err(|_| crate::ctl::CtlError(String::from("pane id must be a number")))?;
+            let keys = match keys.split_first() {
+                Some((first, rest)) if first == "--" => rest.join(" "),
+                _ => keys.join(" "),
+            };
+            crate::ctl::CtlAction::Send { pane_id, keys }
+        }
+        CtlCommand::Focus { agent } => crate::ctl::CtlAction::Focus {
+            agent: agent.clone(),
+        },
+        CtlCommand::Events => crate::ctl::CtlAction::Events,
+    };
+    crate::ctl::run(&descriptor.socket_path, action)
+}
+
+fn resolve_ctl_session(
+    name: Option<&str>,
+) -> Result<crate::session_store::SessionDescriptor, Box<dyn Error>> {
+    if let Some(name) = name {
+        return find_live(name);
+    }
+    let live = crate::session_store::SessionStore::for_current_user()?.list_live()?;
+    let pairing = crate::pairing::load_or_empty();
+    let candidates = if pairing.can_rejoin() {
+        hosting_the_fleet(&live, pairing.ticket.as_deref())
+    } else {
+        live
+    };
+    newest_live(&candidates).ok_or_else(|| {
+        CliError("no live session here; start p2pmux first, then ctl talks to it").into()
+    })
 }
 
 /// The live sessions on this machine, as `ticket`, `code`, `attach`, `kill` and `rename` name them.
@@ -569,7 +650,8 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         | Some(Command::List)
         | Some(Command::Setup { .. })
         | Some(Command::Telemetry { .. })
-        | Some(Command::Doctor) => Ok(()),
+        | Some(Command::Doctor)
+        | Some(Command::Ctl { .. }) => Ok(()),
         Some(Command::Local) => crate::tui::run_local(),
         Some(Command::Config { command }) => match command {
             ConfigCommand::Init => {

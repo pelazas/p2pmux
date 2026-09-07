@@ -439,6 +439,29 @@ fn enroll_is_kept_for_machine_images_and_kept_out_of_the_help() {
     assert!(help.contains("pair"), "{help}");
 }
 
+#[test]
+fn ctl_help_lists_the_six_verbs() {
+    let output = run(&["ctl", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    for verb in ["machines", "agents", "spawn", "send", "focus", "events"] {
+        assert!(help.contains(verb), "ctl help missing {verb}: {help}");
+    }
+}
+
+#[test]
+fn ctl_without_a_session_does_not_start_one() {
+    let session = FakeSession::empty();
+    let output = run_with_home(session.home(), &["ctl", "machines"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(
+        stderr.contains("no live session here; start p2pmux first"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("then ctl talks to it"), "{stderr}");
+}
+
 fn minted_ticket() -> JoinTicket {
     JoinTicket::mint(
         EndpointAddr::new(SecretKey::from_bytes(&[9; 32]).public())

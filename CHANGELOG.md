@@ -11,6 +11,19 @@ enrolment token — and a peer on the wrong side of it is refused rather than ha
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+**`p2pmux ctl` drives a live session from the CLI, without taking the TUI seat.** Six verbs
+(`machines`, `agents`, `spawn`, `send`, `focus`, `events`) speak JSON on stdout to the session
+node. Ctl has its own pin, currently 1. The peer wire pin is still 12: a ctl client and a session
+peer are different sockets, and moving one does not move the other. A pin mismatch names both
+numbers and which end is old. A node that does not know ctl yet is told to upgrade it rather than
+left hanging.
+
+`spawn` reuses a live inbox pane (`chat: {command}`) on that machine, waits until the pane exists,
+and will not nest `p2pmux`. `send` is raw PTY bytes and fails out loud when another member holds
+the input lease.
+
 ## v0.1.15 — 2026-09-01
 
 Ten fixes and a shorter first-run telemetry ask, and no protocol change that costs anything: one field is added to the agent roster,
