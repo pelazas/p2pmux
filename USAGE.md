@@ -77,6 +77,40 @@ Terminal 2: cargo run -- join <the code from Ctrl+S>
 Its PTY grid is fixed from the terminal size at startup: larger windows leave extra cells blank
 and smaller windows crop the upper-left fixed viewport.
 
+## Driving a session from a script
+
+`p2pmux ctl` talks to a live session without taking the TUI seat, so a fleet-agent node with
+nobody attached still answers. It does not start a session: if none is running, start `p2pmux`
+first. `--session` names one as `p2pmux list` prints it; omit it for the fleet session when this
+machine is paired, otherwise the newest live one.
+
+Stdout is JSON. Failures are one sentence on stderr. The six verbs:
+
+```text
+p2pmux ctl [--session NAME] machines
+p2pmux ctl [--session NAME] agents
+p2pmux ctl [--session NAME] spawn --machine NAME -- <command...>
+p2pmux ctl [--session NAME] send <pane-id> [--] <keys>
+p2pmux ctl [--session NAME] focus <agent>
+p2pmux ctl [--session NAME] events
+```
+
+`machines` is the pairing-owned list, including this machine. `agents` is the same roster Ctrl+O
+shows. `spawn` starts an allowlisted command on a machine you own, or a login shell when the
+command is empty. A live pane already titled `chat: {command}` on that host is reused; a pane
+that has exited or finished is not. Nested `p2pmux` is refused. The command waits until the pane
+exists.
+
+`send` writes the keys as PTY bytes, with no extra newline and no key names. It fails if someone
+else holds the pane's input lease. `focus` only moves to an agent that already has a pane —
+`p2pmux ctl spawn` is how one gets there. `events` prints `needs_you` / `done` / `error` as JSON
+lines: a snapshot first, then each change. The `message` field is present only when this node
+already has it.
+
+Ctl has its own pin, currently 1, independent of the peer wire pin. A client and a node that do
+not share it are told both numbers and which end to upgrade. A node too old to speak ctl at all
+says so after a short wait rather than hanging.
+
 ## Inviting someone
 
 `Ctrl+S` shows the line your guest runs. Enter copies it; send it as-is:
