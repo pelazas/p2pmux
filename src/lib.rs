@@ -7,6 +7,7 @@ pub mod agent_status;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod ctl;
 pub mod daemon;
 pub mod failover;
 pub mod fleet;
