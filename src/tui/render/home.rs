@@ -218,9 +218,9 @@ const ELAPSED_WIDTH: u16 = 8;
 /// What a rail line has left for words once the rule and its space are drawn.
 const RAIL_TEXT_WIDTH: usize = MACHINE_RAIL_WIDTH as usize - 2;
 /// A spacer, the name, and what the machine is doing.
-const RAIL_LINES_PER_MACHINE: usize = 3;
+const RAIL_LINES_PER_MACHINE: usize = crate::tui::home::RAIL_LINES_PER_MACHINE as usize;
 /// The rule and the key under it, which the fleet never grows into.
-const RAIL_FOOTER_LINES: usize = 2;
+const RAIL_FOOTER_LINES: usize = crate::tui::home::RAIL_FOOTER_LINES as usize;
 /// Where a card's second and third lines start: under the dot, not under the
 /// marker, so the block of text hangs off the state glyph that introduces it.
 const CARD_INDENT: u16 = 3;

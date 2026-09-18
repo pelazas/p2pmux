@@ -319,6 +319,9 @@ impl MultiPaneTui {
             self.request_update_copy();
             return Vec::new();
         }
+        if let Some(hit) = self.home_machine_at(column, row, area) {
+            return self.handle_home_machine_click(area, hit);
+        }
         let Some(clicked) = self.home_row_at(column, row, area) else {
             return Vec::new();
         };
@@ -358,6 +361,42 @@ impl MultiPaneTui {
             // held for — and the click was where the whole complaint started.
             .filter(|row| row.reachable_from_here())
             .map(|row| row.row_id())
+    }
+
+    /// Which machine, if any, the pointer is on.
+    pub(in crate::tui) fn home_machine_at(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<HomeMachineHit> {
+        let layout = home_layout(self.geometry(area).content, self);
+        if !crate::tui::geometry::rect_contains(layout.machines, column, row) {
+            return None;
+        }
+        let y = row.saturating_sub(layout.machines.y);
+        match layout.machine_panel {
+            MachinePanel::Rail => {
+                rail_machine_at(layout.machines.height, y, machine_rows(self).len())
+            }
+            MachinePanel::Table => table_machine_at(y, &machine_rows(self)),
+            MachinePanel::Strip if layout.machines.height > 0 => Some(HomeMachineHit::Row(0)),
+            MachinePanel::Strip | MachinePanel::Empty => None,
+        }
+    }
+
+    fn handle_home_machine_click(&mut self, area: Rect, hit: HomeMachineHit) -> Vec<UiIntent> {
+        match hit {
+            HomeMachineHit::Add => {
+                self.open_add_machine();
+                Vec::new()
+            }
+            HomeMachineHit::Row(index) => {
+                self.home_update_selected = false;
+                self.home_machine = Some(index);
+                self.open_terminal_on_selected_machine(area, Vec::new())
+            }
+        }
     }
 
     pub(in crate::tui) fn clamp_home_page(&mut self) {
@@ -931,6 +970,13 @@ pub(in crate::tui) enum MachinePanel {
     Empty,
 }
 
+/// A click in the machine dock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum HomeMachineHit {
+    Row(usize),
+    Add,
+}
+
 /// How much of the screen one agent gets.
 ///
 /// A line each was the right answer when the screen was a list of processes.
@@ -999,6 +1045,12 @@ const PREVIEW_MIN_WIDTH: u16 = 28;
 const PREVIEW_MIN_HEIGHT: u16 = 8;
 /// Heading, one machine, and the `a` footer: the smallest useful dock.
 const MACHINE_DOCK_MIN_HEIGHT: u16 = 7;
+/// Blank + `MACHINES · N` at the top of the dock.
+pub(in crate::tui) const RAIL_HEADING_LINES: u16 = 2;
+/// The rule and `a  add a machine` at the foot.
+pub(in crate::tui) const RAIL_FOOTER_LINES: u16 = 2;
+/// Spacer, name, and detail for one machine.
+pub(in crate::tui) const RAIL_LINES_PER_MACHINE: u16 = 3;
 
 /// Every machine this client knows about, session members first.
 ///
@@ -1160,6 +1212,55 @@ fn empty_previews(area: Rect) -> Rect {
     Rect::new(area.right(), area.y, 0, 0)
 }
 
+/// The same count `machine_rail` draws, so a click lands on a machine that is
+/// actually on screen.
+fn rail_shown_machines(height: u16, n_machines: usize) -> usize {
+    let body = usize::from(height)
+        .saturating_sub(usize::from(RAIL_HEADING_LINES))
+        .saturating_sub(usize::from(RAIL_FOOTER_LINES));
+    let per = usize::from(RAIL_LINES_PER_MACHINE);
+    let mut shown = body / per;
+    if shown < n_machines {
+        shown = body.saturating_sub(2) / per;
+    }
+    shown.min(n_machines)
+}
+
+fn rail_machine_at(height: u16, y: u16, n_machines: usize) -> Option<HomeMachineHit> {
+    if height == 0 {
+        return None;
+    }
+    if y + 1 == height {
+        return Some(HomeMachineHit::Add);
+    }
+    if y < RAIL_HEADING_LINES {
+        return None;
+    }
+    let shown = rail_shown_machines(height, n_machines);
+    let index =
+        usize::from(y.saturating_sub(RAIL_HEADING_LINES)) / usize::from(RAIL_LINES_PER_MACHINE);
+    (index < shown).then_some(HomeMachineHit::Row(index))
+}
+
+fn table_machine_at(y: u16, rows: &[MachineRow]) -> Option<HomeMachineHit> {
+    // Blank, heading, then owned machines, then an extra heading and the guests.
+    if y < 2 {
+        return None;
+    }
+    let mut line = y.saturating_sub(2);
+    let owned = rows.iter().filter(|row| row.owned).count();
+    let guests = rows.len().saturating_sub(owned);
+    if usize::from(line) < owned {
+        return Some(HomeMachineHit::Row(usize::from(line)));
+    }
+    line = line.saturating_sub(u16::try_from(owned).unwrap_or(u16::MAX));
+    if guests == 0 || line == 0 {
+        return None;
+    }
+    let index = owned.saturating_add(usize::from(line.saturating_sub(1)));
+    (index < rows.len()).then_some(HomeMachineHit::Row(index))
+}
+
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
     // Header and agent list on the left, machines under them, pane previews in
     // the rest. The key bar is not here: it takes over the window footer, so
@@ -1281,8 +1382,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        HOME_PAGE_MAX, HOME_SIDEBAR_WIDTH, HomeCard, MachinePanel, chat_pane_title, home_card,
-        home_layout, home_page_size, machine_rows, spawn_visible_to_guests,
+        HOME_PAGE_MAX, HOME_SIDEBAR_WIDTH, HomeCard, MachinePanel, RAIL_HEADING_LINES,
+        RAIL_LINES_PER_MACHINE, chat_pane_title, home_card, home_layout, home_page_size,
+        machine_rows, spawn_visible_to_guests,
     };
     use crate::{
         layout::{Axis, Node, Tab},
@@ -2591,6 +2693,83 @@ mod tests {
         );
         assert_eq!(tui.take_update_copy_request(), None);
         assert!(!tui.home_update_selected);
+    }
+
+    #[test]
+    fn a_click_on_a_machine_opens_a_terminal_there() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let machines = home_layout(tui.geometry(AREA).content, &tui).machines;
+        assert!(machines.height >= RAIL_HEADING_LINES + RAIL_LINES_PER_MACHINE);
+
+        let intents = tui.handle_home_click(
+            machines.x.saturating_add(2),
+            machines
+                .y
+                .saturating_add(RAIL_HEADING_LINES)
+                .saturating_add(1),
+            AREA,
+        );
+        assert!(
+            matches!(intents.as_slice(), [UiIntent::CreateTab { .. }]),
+            "{intents:?}"
+        );
+        assert!(!tui.home_open(), "the screen gets out of the way");
+    }
+
+    #[test]
+    fn a_click_on_an_asleep_machine_says_so_and_stays() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("oldbox"),
+            machine_id: None,
+            accepts_work: None,
+        }];
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let machines = home_layout(tui.geometry(AREA).content, &tui).machines;
+        let oldbox = machine_rows(&tui)
+            .iter()
+            .position(|row| row.name == "oldbox")
+            .expect("oldbox is listed");
+        let y = machines.y
+            + RAIL_HEADING_LINES
+            + u16::try_from(oldbox).unwrap_or(0) * RAIL_LINES_PER_MACHINE
+            + 1;
+
+        assert!(
+            tui.handle_home_click(machines.x.saturating_add(2), y, AREA)
+                .is_empty()
+        );
+        assert!(tui.home_open());
+        assert!(
+            tui.home_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("asleep")),
+            "{:?}",
+            tui.home_notice
+        );
+    }
+
+    #[test]
+    fn a_click_on_add_a_machine_opens_the_panel() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let machines = home_layout(tui.geometry(AREA).content, &tui).machines;
+        assert!(machines.height > 0);
+
+        assert!(
+            tui.handle_home_click(
+                machines.x.saturating_add(2),
+                machines.bottom().saturating_sub(1),
+                AREA
+            )
+            .is_empty()
+        );
+        assert!(tui.add_machine_open());
+        assert!(tui.home_open());
     }
 
     #[test]
