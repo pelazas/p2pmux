@@ -4,16 +4,22 @@ Newest first. Versions are the tags on [Releases](https://github.com/pelazas/p2p
 
 ## Compatibility
 
-**v0.1.8 through v0.1.16 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
-on any of the nine can join the others. v0.1.7 and older cannot join any of them: that pin moved in
+**v0.1.8 through v0.1.17 share sessions.** The wire protocol has not moved since v0.1.8, so a peer
+on any of the ten can join the others. v0.1.7 and older cannot join any of them: that pin moved in
 v0.1.8 — a machine now tells the session it has joined a fleet, and a joining machine can present an
 enrolment token — and a peer on the wrong side of it is refused rather than half-joining. From
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
-## Unreleased
+## v0.1.17 — 2026-09-18
 
-No protocol change: the wire pin stays 12, and ctl stays on pin 1.
+The inbox grows a pane grid, setup drops a ctl skill, and no protocol change: the wire pin stays
+12, so v0.1.8 through v0.1.17 share sessions. Ctl stays on pin 1.
+
+**The inbox draws every pane as a clickable preview.** Agents stack above machines on the left;
+the rest of the screen is a grid of the session's terminals, cropped to a small window. A click
+on a tile opens that pane. A click on a machine row opens a terminal there, the same as Enter.
+A terminal too narrow or too short for the grid keeps the lists full width, as it did.
 
 **`p2pmux setup` installs a skill** at `~/.claude/skills/p2pmux/SKILL.md` and
 `~/.cursor/skills/p2pmux/SKILL.md`, so an agent can list the session with `p2pmux ctl agents` and
