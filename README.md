@@ -108,7 +108,7 @@ If this is useful, [star pelazas/p2pmux on GitHub](https://github.com/pelazas/p2
 - Shared tabs, panes, and nested splits. Up to 8 members, 9 tabs, 8 panes per tab.
 - End-to-end encrypted peer-to-peer streaming, over an iroh relay when NAT requires it. The tab bar shows `direct 55ms` or `relayed 120ms`.
 - If the coordinator's laptop closes, panes on every other machine keep running. Layout changes and new joins pause. After five minutes the earliest-joined survivor takes over.
-- `Ctrl+O` lists every detected coding agent on every machine in the session, sorted by which one is blocking you. Press Enter to type in that terminal.
+- `Ctrl+O` lists every detected coding agent on every machine in the session, sorted by which one is blocking you, and a grid of every pane beside that list. Press Enter or click a window to type in that terminal.
 
 ## Keys
 

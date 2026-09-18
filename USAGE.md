@@ -389,29 +389,32 @@ detection fall back to their default.
 
 `Ctrl+O` opens the inbox. So does bare `p2pmux` whenever it rejoins a session that already
 exists rather than creating one. It is one screen listing every supported coding agent
-running on every machine in the session, sorted by which one is blocking you. Supported agents
+running on every machine in the session, sorted by which one is blocking you, with a miniature
+window of every pane in the multiplexer beside that list. Supported agents
 are Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv), Pi
 (including Node-based launches), and OpenCode (`opencode`).
 
 ```
 p2pmux (paris) │ inbox 2 │ Tab #1 · Tab #2
 
- Agents · 2 need you                                    │ MACHINES · 3
-                                                        │
-›● desktop    claude                  needs you    2m14s│ ● laptop
-   wants to run: rm -rf node_modules                    │   this machine · 2 agents
-   work/api · tab 1 · pane 2                            │
-                                                        │ ● droplet
- ✗ laptop     codex                   error       1m02s │   1 agent
-   cargo test --all exited 101                          │
-   Desktop/p2pmux · tab 2 · pane 1                      │ ○ oldbox
-                                                        │   asleep
- ✓ laptop     opencode                done        31m04s│
-   6 files changed, tests pass                          │
-   scratch/demo · tab 3 · pane 1                        │ ─────────────────────────
-                                                        │ a  add a machine
+ Agents · 2 need you
+›● desktop    claude     needs you    2m14s  ┌ tab 1 · pane 2 ─┐ ┌ tab 2 · pane 1 ─┐
+   wants to run: rm -rf node_modules         │ claude          │ │ cargo test      │
+   work/api · tab 1 · pane 2                 │                 │ │                 │
+                                             └─────────────────┘ └─────────────────┘
+ ✗ laptop     codex      error        1m02s  ┌ tab 3 · pane 1 ─┐
+   cargo test --all exited 101               │ opencode        │
+│ MACHINES · 3                               └─────────────────┘
+│ ● laptop
+│   this machine · 2 agents
+│ ● droplet
+│ a  add a machine
  enter open · a add machine · n new terminal · q quit
 ```
+
+Agents sit in the left column, machines under them, and every pane in the session occupies a
+small window in the rest of the screen. Click a window to land on that tab and pane. A terminal
+too narrow or too short to hold the grid keeps the lists full width, as it did.
 
 Each agent gets a card: a status dot, the machine it is on, the agent, its state and how long it
 has been in that state; then its own words at whatever length it said them; then the repository it
@@ -442,9 +445,11 @@ if you want the agent alone on screen.
 constantly, so swallowing it would break the terminal you just opened. Inside a pane every
 unmodified key belongs to the program running there.
 
-Left-clicking a card opens it. The mouse wheel turns the page. To retain readline's
-beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A to the focused
-PTY instead.
+Left-clicking a card opens it. Left-clicking a machine opens a terminal there, the same as
+Enter with the cursor on that row. Left-clicking a preview tile opens that pane. The mouse
+wheel over the agent list turns the agent page; over the grid it turns the pane page. To retain
+readline's beginning-of-line shortcut, press `Ctrl+A` twice within 200ms to forward one Ctrl+A
+to the focused PTY instead.
 
 ### Agents in another session
 
@@ -475,16 +480,17 @@ It does not feed the `inbox N` badge either. Going to an agent is what answers i
 there is no going to that one from here, so a count including it could only ever rise. The row
 still says `needs you` in its own state column, where it is true.
 
-### The machines rail
+### The machines list
 
-Every machine you have paired with is listed down the right-hand side for as long as the inbox is
+Every machine you have paired with is listed under the agents for as long as the inbox is
 up: whether it is answering, whether it accepts work from your machines, and how many agents it is
 running. A machine that is paired but not in the session is one you own that is not answering, and
 it says `asleep` rather than disappearing.
 
-The rail takes width the agents were not using. A terminal too narrow for it puts the same table
-under the agents instead, and one too narrow for that falls back to a line of names and ticks,
-which still answers "is my fleet up", which is what earns it the space.
+On a wide terminal the list docks at the bottom of the left column so the pane grid can use the
+rest of the screen. A terminal too narrow for that grid puts the same table under the agents
+instead, and one too narrow for that falls back to a line of names and ticks, which still answers
+"is my fleet up", which is what earns it the space.
 
 `a` adds one, without leaving the screen:
 
@@ -514,9 +520,9 @@ It records the session's ticket in `pairing.toml`, which is what makes bare `p2p
 both machines afterwards. It does not answer the accepts-work question. That is asked once, by
 `p2pmux pair`, and its answer is default-deny.
 
-`m` moves the cursor into the rail, and the arrow keys walk it from there; `m` again or `Esc`
+`m` moves the cursor into the machine list, and the arrow keys walk it from there; `m` again or `Esc`
 hands the cursor back to the agents. With it on a machine, `enter` and `n` both mean "a terminal
-*there*". One machine is one row however many p2pmux it has run, because a peer id belongs to a
+*there*". A click on a row does the same. One machine is one row however many p2pmux it has run, because a peer id belongs to a
 process and the row is about the box.
 
 The `inbox` badge in the tab bar carries the count of agents blocked on a human, in amber, so it
