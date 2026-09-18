@@ -377,11 +377,15 @@ fn home_empty_state(height: u16, theme: &UiTheme) -> Vec<Line<'static>> {
     let muted = Style::default().fg(theme.agent_overlay_muted);
     // A blank, the heading, a blank, and two lines per step.
     let wanted = 3 + HOME_EMPTY_STEPS.len() * 3;
+    let one = Line::styled(format!(" {HOME_EMPTY_NO_AGENTS}"), muted);
+    if height == 0 {
+        return Vec::new();
+    }
     if usize::from(height) < wanted {
-        return vec![
-            Line::raw(""),
-            Line::styled(format!(" {HOME_EMPTY_NO_AGENTS}"), muted),
-        ];
+        if height == 1 {
+            return vec![one];
+        }
+        return vec![Line::raw(""), one];
     }
     let mut lines = vec![
         Line::raw(""),
@@ -1804,7 +1808,7 @@ mod tests {
 
         let drawn = screen(&tui, 120, 30).join("\n");
         assert!(
-            drawn.contains("another p2pmux session · no record of it under this HOME"),
+            drawn.contains("another p2pmux session · no record of it"),
             "the row says which of the two things it is, and why it can offer no command: {drawn}"
         );
         assert!(
@@ -1981,7 +1985,7 @@ mod tests {
         });
         tui.set_home_open(true, "test");
 
-        let drawn = screen(&tui, 70, 20).join("\n");
+        let drawn = screen(&tui, 50, 20).join("\n");
         assert!(drawn.contains("IN THIS SESSION, NOT YOURS"), "{drawn}");
         let fleet_heading = drawn.find("NAME").expect("the fleet heading");
         let guest_heading = drawn.find("IN THIS SESSION").expect("the guest heading");

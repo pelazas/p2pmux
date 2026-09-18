@@ -905,17 +905,21 @@ pub(in crate::tui) struct HomeLayout {
     /// arrived, and shaped by [`HomeLayout::machine_panel`].
     pub(in crate::tui) machines: Rect,
     pub(in crate::tui) machine_panel: MachinePanel,
+    /// Miniature windows of every pane in the session. Zero-sized when the
+    /// terminal is too small to hold a left column and a grid at once.
+    pub(in crate::tui) previews: Rect,
 }
 
 /// How the fleet is drawn, which is a question of how much room there is.
 ///
-/// The screen's spare space is horizontal as much as vertical — the column that
-/// says what an agent is doing is rarely more than half used — so the widest
-/// tier spends that width on machines rather than leaving it blank.
+/// On a terminal wide enough for pane previews, the fleet docks under the
+/// agents in the left column. Narrower terminals keep the table or strip that
+/// used to sit under the list, and hide the grid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::tui) enum MachinePanel {
-    /// A column down the right-hand side, with a line each for what a machine
-    /// is and what it is running.
+    /// The compact fleet list: a heading, a row each, and `a` to add one.
+    /// Drawn in the left column under the agents when the preview grid is up,
+    /// and unused when the terminal has fallen back to a table or strip.
     Rail,
     /// The same facts as a table under the agents, when the terminal is too
     /// narrow to give a column away.
@@ -987,14 +991,14 @@ pub(in crate::tui) fn home_page_size(rows_height: u16) -> usize {
 
 /// How wide the rail is, including the rule it hangs off.
 pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 28;
-/// The narrowest terminal that gets a rail.
-///
-/// Below this the agents would be paying for the fleet: a card whose sentence
-/// column is under 40 columns truncates what the agent said, which is the one
-/// thing on the screen worth reading in full.
-const MACHINE_RAIL_MIN_WIDTH: u16 = 88;
-/// The shortest terminal that gets a rail: a heading, a blank, and one machine.
-const MACHINE_RAIL_MIN_HEIGHT: u16 = 6;
+/// Agents on top, machines under them. Wide enough for the attach-session line.
+pub(in crate::tui) const HOME_SIDEBAR_WIDTH: u16 = 48;
+/// Narrowest preview column that still reads as a window rather than a sliver.
+const PREVIEW_MIN_WIDTH: u16 = 28;
+/// Shortest preview column that can hold a bordered tile.
+const PREVIEW_MIN_HEIGHT: u16 = 8;
+/// Heading, one machine, and the `a` footer: the smallest useful dock.
+const MACHINE_DOCK_MIN_HEIGHT: u16 = 7;
 
 /// Every machine this client knows about, session members first.
 ///
@@ -1127,14 +1131,87 @@ fn machine_table_lines(rows: &[MachineRow]) -> u16 {
         .saturating_add(guests)
 }
 
+fn can_show_previews(area: Rect) -> bool {
+    area.width >= HOME_SIDEBAR_WIDTH.saturating_add(PREVIEW_MIN_WIDTH)
+        && area.height >= PREVIEW_MIN_HEIGHT
+}
+
+/// How tall the machine dock is in the left column.
+///
+/// Agents keep a header and at least one compact card. The dock then takes what
+/// the fleet wants, up to that remainder, and never less than a heading, one
+/// machine, and the add-a-machine footer when the column is tall enough.
+fn machine_dock_height(sidebar_height: u16, n_machines: usize) -> u16 {
+    if n_machines == 0 {
+        return 0;
+    }
+    let wanted = MACHINE_DOCK_MIN_HEIGHT.saturating_add(
+        u16::try_from(n_machines.saturating_sub(1).saturating_mul(3)).unwrap_or(u16::MAX),
+    );
+    let agents_floor = 2u16.saturating_add(3);
+    let cap = sidebar_height.saturating_sub(agents_floor);
+    if cap < MACHINE_DOCK_MIN_HEIGHT {
+        return cap;
+    }
+    wanted.min(cap)
+}
+
+fn empty_previews(area: Rect) -> Rect {
+    Rect::new(area.right(), area.y, 0, 0)
+}
+
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
-    // Header, then rows, then the machines — down the right on a terminal with
-    // width to spare, and pinned to the bottom otherwise. The key bar is not
-    // here: it takes over the window footer, so that four keys stay visible in
-    // the same place they are on every other screen.
+    // Header and agent list on the left, machines under them, pane previews in
+    // the rest. The key bar is not here: it takes over the window footer, so
+    // that four keys stay visible in the same place they are on every other
+    // screen.
     let rows_for_machines = machine_rows(tui);
-    let machines = rows_for_machines.len();
-    if machines == 0 {
+    if can_show_previews(area) {
+        // Header, hint and update keep the full width so a version line and a
+        // `p2pmux setup` nudge stay readable. The split under them is the two
+        // lists and the pane grid.
+        let header_height = 2u16.min(area.height);
+        let header = Rect::new(area.x, area.y, area.width, header_height);
+        let mut y = header.bottom();
+        let mut left = area.height.saturating_sub(header_height);
+        let hint_height = u16::from(tui.home_all_unwired() || tui.home_notice.is_some()).min(left);
+        let hint = Rect::new(area.x, y, area.width, hint_height);
+        y = hint.bottom();
+        left = left.saturating_sub(hint_height);
+        let update_height = u16::from(tui.update_notice.is_some()).min(left);
+        let update = Rect::new(area.x, y, area.width, update_height);
+        y = update.bottom();
+        left = left.saturating_sub(update_height);
+        let body = Rect::new(area.x, y, area.width, left);
+        let sidebar = Rect::new(body.x, body.y, HOME_SIDEBAR_WIDTH, body.height);
+        let previews = Rect::new(
+            sidebar.right(),
+            body.y,
+            body.width.saturating_sub(HOME_SIDEBAR_WIDTH),
+            body.height,
+        );
+        let dock = machine_dock_height(sidebar.height, rows_for_machines.len());
+        let rows = Rect::new(
+            sidebar.x,
+            sidebar.y,
+            sidebar.width,
+            sidebar.height.saturating_sub(dock),
+        );
+        return HomeLayout {
+            header,
+            rows,
+            hint,
+            update,
+            machines: Rect::new(sidebar.x, rows.bottom(), sidebar.width, dock),
+            machine_panel: if rows_for_machines.is_empty() {
+                MachinePanel::Empty
+            } else {
+                MachinePanel::Rail
+            },
+            previews,
+        };
+    }
+    if rows_for_machines.is_empty() {
         let (header, rows, hint, update) = stacked(area, tui, 0);
         return HomeLayout {
             header,
@@ -1143,38 +1220,10 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
             update,
             machines: Rect::new(area.x, update.bottom(), area.width, 0),
             machine_panel: MachinePanel::Empty,
+            previews: empty_previews(area),
         };
     }
-    if area.width >= MACHINE_RAIL_MIN_WIDTH && area.height >= MACHINE_RAIL_MIN_HEIGHT {
-        // The rail is full height rather than sized to the fleet: it is a column
-        // of the screen, and a short one would leave a ragged hole beside the
-        // agents. A fleet too tall for it says so on its last line.
-        let rail = Rect::new(
-            area.right().saturating_sub(MACHINE_RAIL_WIDTH),
-            area.y,
-            MACHINE_RAIL_WIDTH,
-            area.height,
-        );
-        let (header, rows, hint, update) = stacked(
-            Rect::new(
-                area.x,
-                area.y,
-                area.width.saturating_sub(MACHINE_RAIL_WIDTH),
-                area.height,
-            ),
-            tui,
-            0,
-        );
-        return HomeLayout {
-            header,
-            rows,
-            hint,
-            update,
-            machines: rail,
-            machine_panel: MachinePanel::Rail,
-        };
-    }
-    // Under the agents, then. The machines outrank agent rows when space runs
+    // Too small for the grid. The machines outrank agent rows when space runs
     // out, but never take the last one: a list with nothing left in it stops
     // being a list, and Home would be a screen about machines with the agents
     // it exists for cut off. All or nothing — half a block is a blank line
@@ -1196,6 +1245,7 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
         update,
         machines: Rect::new(area.x, update.bottom(), area.width, height),
         machine_panel: panel,
+        previews: empty_previews(area),
     }
 }
 
@@ -1231,7 +1281,7 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, chat_pane_title, home_card,
+        HOME_PAGE_MAX, HOME_SIDEBAR_WIDTH, HomeCard, MachinePanel, chat_pane_title, home_card,
         home_layout, home_page_size, machine_rows, spawn_visible_to_guests,
     };
     use crate::{
@@ -1456,7 +1506,15 @@ mod tests {
 
         let layout = home_layout(AREA, &tui);
         assert_eq!(layout.machine_panel, MachinePanel::Rail);
-        assert_eq!(layout.machines.height, AREA.height);
+        assert!(
+            layout.machines.height > 0,
+            "a fleet of one still gets a dock"
+        );
+        assert_eq!(layout.machines.x, AREA.x, "machines sit under the agents");
+        assert!(
+            layout.previews.width > 0,
+            "the rest of a 100-column screen is the pane grid"
+        );
     }
 
     /// The rail drew one row per *member*, and a peer id is per process — so a
@@ -1494,19 +1552,29 @@ mod tests {
         assert!(!machines[1].this_machine);
     }
 
-    /// The rail is a column of the screen, so what it costs is width, and the
-    /// agents keep every line they had.
+    /// The left column is a strip of the screen. Agents and machines share it
+    /// vertically; the rest of the width is the pane grid.
     #[test]
-    fn the_rail_takes_width_from_the_agents_and_never_a_row() {
+    fn the_sidebar_takes_width_from_the_previews_and_stacks_the_lists() {
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
         let layout = home_layout(AREA, &tui);
-        assert_eq!(layout.rows.width, AREA.width - MACHINE_RAIL_WIDTH);
-        assert_eq!(layout.machines.x, AREA.width - MACHINE_RAIL_WIDTH);
+        assert_eq!(layout.rows.width, HOME_SIDEBAR_WIDTH);
+        assert_eq!(layout.header.width, AREA.width);
+        assert_eq!(layout.machines.width, HOME_SIDEBAR_WIDTH);
+        assert_eq!(layout.machines.x, AREA.x);
+        assert_eq!(layout.previews.x, AREA.x.saturating_add(HOME_SIDEBAR_WIDTH));
         assert_eq!(
-            layout.rows.height,
-            AREA.height - 2,
-            "the header is the only thing above the agents"
+            layout.previews.width,
+            AREA.width.saturating_sub(HOME_SIDEBAR_WIDTH)
+        );
+        assert!(
+            layout.rows.height >= 3,
+            "the agents keep at least one compact card above the dock"
+        );
+        assert!(
+            layout.machines.y >= layout.rows.bottom(),
+            "machines sit under the agents, not beside them"
         );
     }
 
@@ -1536,20 +1604,19 @@ mod tests {
         assert_eq!(cramped.rows.height, 2);
     }
 
-    /// A terminal too short for a rail falls back rather than drawing a
-    /// two-line column beside a two-line list.
+    /// A terminal too short for a preview grid falls back rather than drawing
+    /// empty tiles beside a two-line list.
     #[test]
-    fn a_wide_but_short_terminal_falls_back_from_the_rail() {
+    fn a_wide_but_short_terminal_falls_back_from_the_grid() {
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
-        assert_eq!(
-            home_layout(Rect::new(0, 0, 120, 5), &tui).machine_panel,
-            MachinePanel::Strip
-        );
-        assert_eq!(
-            home_layout(Rect::new(0, 0, 120, 6), &tui).machine_panel,
-            MachinePanel::Rail
-        );
+        let short = home_layout(Rect::new(0, 0, 120, 5), &tui);
+        assert_eq!(short.machine_panel, MachinePanel::Strip);
+        assert_eq!(short.previews.width, 0);
+
+        let tall_enough = home_layout(Rect::new(0, 0, 120, 8), &tui);
+        assert_eq!(tall_enough.machine_panel, MachinePanel::Rail);
+        assert!(tall_enough.previews.width > 0);
     }
 
     #[test]
@@ -1787,12 +1854,18 @@ mod tests {
         (tui, page_size)
     }
 
+    /// Enough agents that a page cannot hold them, whatever the card size.
+    fn two_page_tui() -> (MultiPaneTui, usize) {
+        paged_tui(crate::layout::MAX_TABS)
+    }
+
     /// A list longer than a page is paged, not scrolled, and `h`/`l` move a
     /// whole page with the cursor rather than leaving it behind.
     #[test]
     fn h_and_l_turn_the_page_and_take_the_cursor_with_them() {
-        let (mut tui, page_size) = paged_tui(8);
-        assert_eq!(tui.home_page_count(), 2);
+        let (mut tui, page_size) = two_page_tui();
+        let pages = tui.home_page_count();
+        assert!(pages >= 2, "the fixture is longer than one page");
         assert_eq!(tui.home_page(), 0);
 
         let first = selected_pane(&tui);
@@ -1805,20 +1878,21 @@ mod tests {
             "the cursor lands on the first agent of the page it arrives at"
         );
 
-        // Two pages, so `l` wraps back rather than stopping at the end.
-        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        for _ in 1..pages {
+            tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        }
         assert_eq!(tui.home_page(), 0);
         assert_eq!(selected_pane(&tui), first);
 
         tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), AREA);
-        assert_eq!(tui.home_page(), 1);
+        assert_eq!(tui.home_page(), pages - 1);
     }
 
     /// The page follows the cursor. Walking off the bottom of one page has to
     /// bring the next one into view, or `j` stops at the end of page one.
     #[test]
     fn walking_the_cursor_off_a_page_brings_the_next_one_into_view() {
-        let (mut tui, page_size) = paged_tui(8);
+        let (mut tui, page_size) = two_page_tui();
 
         for _ in 0..page_size {
             tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
@@ -1837,7 +1911,7 @@ mod tests {
     /// A page must not survive the agents that were on it going away.
     #[test]
     fn a_page_that_empties_falls_back_to_one_that_has_something_on_it() {
-        let (mut tui, page_size) = paged_tui(8);
+        let (mut tui, page_size) = two_page_tui();
         tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
         assert_eq!(tui.home_page(), 1);
 
@@ -2503,9 +2577,18 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.set_home_open(true, "test");
         tui.set_home_viewport_for(AREA);
-        let update = home_layout(tui.geometry(AREA).content, &tui).update;
-        assert_eq!(update.height, 0);
-        assert!(tui.handle_home_click(2, update.y, AREA).is_empty());
+        let layout = home_layout(tui.geometry(AREA).content, &tui);
+        assert_eq!(layout.update.height, 0);
+        // The zero-height update rect sits on the first agent row. A click
+        // there would open that agent; this is about the line not existing.
+        assert!(
+            tui.handle_home_click(
+                layout.previews.x.saturating_add(1),
+                layout.previews.y.saturating_add(1),
+                AREA
+            )
+            .is_empty()
+        );
         assert_eq!(tui.take_update_copy_request(), None);
         assert!(!tui.home_update_selected);
     }
