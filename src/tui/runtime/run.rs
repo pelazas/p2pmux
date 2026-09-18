@@ -388,9 +388,12 @@ impl SharedLayoutRuntime {
                     return Ok(false);
                 }
                 if self.tui.home_open() {
-                    *dirty |= self
-                        .tui
-                        .scroll_home(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
+                    *dirty |= self.tui.scroll_home(
+                        area,
+                        mouse.column,
+                        mouse.row,
+                        matches!(mouse.kind, MouseEventKind::ScrollUp),
+                    );
                     return Ok(false);
                 }
                 // A child that reports mouse scrolls its own buffer; local scrollback

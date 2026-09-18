@@ -575,7 +575,7 @@ pub(in crate::tui) fn render_shared_multi_pane(
     // frame.
     if tui.home_open() {
         let now_unix_ms = crate::tui::clock::unix_ms_now();
-        render_home(frame, tui, now_unix_ms);
+        render_home(frame, tui, screens, now_unix_ms);
         if tui.add_machine_open() {
             render_add_machine_modal(
                 frame,

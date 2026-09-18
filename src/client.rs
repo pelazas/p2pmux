@@ -1003,7 +1003,12 @@ pub fn run_on(
                         mouse.kind,
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     ) {
-                        tui.scroll_home(area, matches!(mouse.kind, MouseEventKind::ScrollUp));
+                        tui.scroll_home(
+                            area,
+                            mouse.column,
+                            mouse.row,
+                            matches!(mouse.kind, MouseEventKind::ScrollUp),
+                        );
                     } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                         let handling = tui.handle_mouse(mouse, area, PaneMouseProtocol::default());
                         send_intents(&mut stream, tui, handling.intents, &mut pending_focus)?;
@@ -2391,7 +2396,7 @@ mod tests {
         refresh_tui_timers(tui, Instant::now() + HOME_TOGGLE_WINDOW, &mut animation);
 
         assert!(!should_forward_paste(tui, b"host"));
-        assert!(tui.scroll_home(area, false));
+        assert!(tui.scroll_home(area, 0, 0, false));
     }
 
     #[test]

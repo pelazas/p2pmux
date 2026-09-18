@@ -23,6 +23,7 @@ use crate::{
     protocol::AgentRosterState,
     tui::{
         AgentOverlayRow, HomeRowId, ModalState, MultiPaneTui, UiIntent, debug_log::ui_debug_log,
+        geometry::visible_leaf_panes,
     },
 };
 
@@ -101,6 +102,7 @@ impl MultiPaneTui {
             self.home_machine = None;
             self.home_update_selected = false;
             self.home_page = 0;
+            self.home_preview_page = 0;
             self.repair_home_selection();
         }
         ui_debug_log(
@@ -238,18 +240,23 @@ impl MultiPaneTui {
     /// than from a count the caller had to work out for itself.
     pub fn set_home_viewport_for(&mut self, area: Rect) {
         self.last_home_area = area;
-        let rows = home_layout(self.geometry(area).content, self).rows.height;
-        self.set_home_viewport(home_page_size(rows));
+        let layout = home_layout(self.geometry(area).content, self);
+        self.set_home_viewport(home_page_size(layout.rows.height));
+        self.clamp_home_preview_page(layout.previews);
     }
 
     /// Wheel over the inbox. Returns whether anything moved, so a scroll at the
     /// end of the list never costs a repaint.
     ///
-    /// A page at a time rather than an agent at a time: the list is paged, and
-    /// a wheel that slid one card off the top would leave a page nobody chose,
-    /// with the first agent half in view.
-    pub fn scroll_home(&mut self, area: Rect, up: bool) -> bool {
+    /// Over the agent list a page of cards; over the pane grid a page of
+    /// tiles. A page at a time rather than one item: sliding one card off the
+    /// top would leave a page nobody chose.
+    pub fn scroll_home(&mut self, area: Rect, column: u16, row: u16, up: bool) -> bool {
         self.set_home_viewport_for(area);
+        let layout = home_layout(self.geometry(area).content, self);
+        if crate::tui::geometry::rect_contains(layout.previews, column, row) {
+            return self.scroll_home_previews(layout.previews, up);
+        }
         let previous = self.home_page;
         if up {
             self.home_page = self.home_page.saturating_sub(1);
@@ -265,6 +272,20 @@ impl MultiPaneTui {
             return true;
         }
         false
+    }
+
+    fn scroll_home_previews(&mut self, previews: Rect, up: bool) -> bool {
+        let pages = self.home_preview_page_count(previews);
+        if pages < 2 {
+            return false;
+        }
+        let previous = self.home_preview_page;
+        if up {
+            self.home_preview_page = previous.saturating_sub(1);
+        } else {
+            self.home_preview_page = previous.saturating_add(1).min(pages.saturating_sub(1));
+        }
+        previous != self.home_preview_page
     }
 
     /// `h` and `l`, and the page keys: a whole page at a time, cursor and all.
@@ -322,12 +343,15 @@ impl MultiPaneTui {
         if let Some(hit) = self.home_machine_at(column, row, area) {
             return self.handle_home_machine_click(area, hit);
         }
-        let Some(clicked) = self.home_row_at(column, row, area) else {
-            return Vec::new();
-        };
-        self.home_update_selected = false;
-        self.home_selected = Some(clicked);
-        self.open_home_selection()
+        if let Some(clicked) = self.home_row_at(column, row, area) {
+            self.home_update_selected = false;
+            self.home_selected = Some(clicked);
+            return self.open_home_selection();
+        }
+        if let Some(pane_id) = self.home_preview_pane_at(column, row, area) {
+            return self.enter_pane_from_home(pane_id);
+        }
+        Vec::new()
     }
 
     /// A click on the update line copies the command, the same as Enter on it.
@@ -399,8 +423,42 @@ impl MultiPaneTui {
         }
     }
 
+    pub(in crate::tui) fn home_preview_pane_at(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<PaneId> {
+        let layout = home_layout(self.geometry(area).content, self);
+        if !crate::tui::geometry::rect_contains(layout.previews, column, row) {
+            return None;
+        }
+        let panes = home_preview_panes(self);
+        let cap = preview_page_capacity(layout.previews);
+        if cap == 0 {
+            return None;
+        }
+        let start = self.home_preview_page.saturating_mul(cap);
+        let page = panes.into_iter().skip(start).take(cap).collect::<Vec<_>>();
+        preview_tiles(layout.previews, page.len())
+            .into_iter()
+            .zip(page)
+            .find(|(tile, _)| crate::tui::geometry::rect_contains(*tile, column, row))
+            .map(|(_, pane_id)| pane_id)
+    }
+
     pub(in crate::tui) fn clamp_home_page(&mut self) {
         self.home_page = self.home_page.min(self.home_page_count().saturating_sub(1));
+    }
+
+    fn clamp_home_preview_page(&mut self, previews: Rect) {
+        let pages = self.home_preview_page_count(previews);
+        self.home_preview_page = self.home_preview_page.min(pages.saturating_sub(1));
+    }
+
+    fn home_preview_page_count(&self, previews: Rect) -> usize {
+        let cap = preview_page_capacity(previews).max(1);
+        home_preview_panes(self).len().div_ceil(cap).max(1)
     }
 
     /// Puts the page the cursor is on on screen.
@@ -1212,6 +1270,78 @@ fn empty_previews(area: Rect) -> Rect {
     Rect::new(area.right(), area.y, 0, 0)
 }
 
+/// Smallest tile that still has a border and a few cells of the pane inside.
+const PREVIEW_TILE_MIN_WIDTH: u16 = 18;
+const PREVIEW_TILE_MIN_HEIGHT: u16 = 6;
+
+/// Every pane in the session, tab order then layout order.
+pub(in crate::tui) fn home_preview_panes(tui: &MultiPaneTui) -> Vec<PaneId> {
+    tui.snapshot
+        .tabs
+        .iter()
+        .flat_map(|tab| visible_leaf_panes(&tab.root))
+        .collect()
+}
+
+pub(in crate::tui) fn preview_page_capacity(area: Rect) -> usize {
+    if area.width < PREVIEW_TILE_MIN_WIDTH || area.height < PREVIEW_TILE_MIN_HEIGHT {
+        return 0;
+    }
+    usize::from(area.width / PREVIEW_TILE_MIN_WIDTH)
+        * usize::from(area.height / PREVIEW_TILE_MIN_HEIGHT)
+}
+
+pub(in crate::tui) fn preview_tiles(area: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let max_cols = (area.width / PREVIEW_TILE_MIN_WIDTH).max(1);
+    let max_rows = (area.height / PREVIEW_TILE_MIN_HEIGHT).max(1);
+    let count = count.min(usize::from(max_cols).saturating_mul(usize::from(max_rows)));
+    let cols = max_cols
+        .min(u16::try_from(count).unwrap_or(u16::MAX))
+        .max(1);
+    let rows = u16::try_from(count)
+        .unwrap_or(u16::MAX)
+        .div_ceil(cols)
+        .min(max_rows)
+        .max(1);
+    let tile_w = area.width / cols;
+    let tile_h = area.height / rows;
+    (0..count)
+        .filter_map(|index| {
+            let col = u16::try_from(index).unwrap_or(u16::MAX) % cols;
+            let row = u16::try_from(index).unwrap_or(u16::MAX) / cols;
+            (row < rows).then_some(Rect::new(
+                area.x.saturating_add(col.saturating_mul(tile_w)),
+                area.y.saturating_add(row.saturating_mul(tile_h)),
+                tile_w,
+                tile_h,
+            ))
+        })
+        .collect()
+}
+
+pub(in crate::tui) fn home_preview_title(tui: &MultiPaneTui, pane_id: PaneId) -> String {
+    if let Some(title) = tui
+        .snapshot
+        .panes
+        .get(&pane_id)
+        .and_then(|pane| pane.title.as_deref())
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_owned();
+    }
+    for (tab_index, tab) in tui.snapshot.tabs.iter().enumerate() {
+        let leaves = visible_leaf_panes(&tab.root);
+        let Some(pane_index) = leaves.iter().position(|id| *id == pane_id) else {
+            continue;
+        };
+        return format!("tab {} · pane {}", tab_index + 1, pane_index + 1);
+    }
+    format!("pane {pane_id}")
+}
+
 /// The same count `machine_rail` draws, so a click lands on a machine that is
 /// actually on screen.
 fn rail_shown_machines(height: u16, n_machines: usize) -> usize {
@@ -1384,14 +1514,14 @@ mod tests {
     use super::{
         HOME_PAGE_MAX, HOME_SIDEBAR_WIDTH, HomeCard, MachinePanel, RAIL_HEADING_LINES,
         RAIL_LINES_PER_MACHINE, chat_pane_title, home_card, home_layout, home_page_size,
-        machine_rows, spawn_visible_to_guests,
+        home_preview_panes, machine_rows, preview_tiles, spawn_visible_to_guests,
     };
     use crate::{
         layout::{Axis, Node, Tab},
         protocol::AgentRosterState,
         tui::{
             KeyHandling, MultiPaneTui, UiIntent,
-            test_support::{agent_row, home_tui, layout},
+            test_support::{agent_row, home_tui, layout, split_layout},
         },
     };
 
@@ -2681,15 +2811,10 @@ mod tests {
         tui.set_home_viewport_for(AREA);
         let layout = home_layout(tui.geometry(AREA).content, &tui);
         assert_eq!(layout.update.height, 0);
-        // The zero-height update rect sits on the first agent row. A click
-        // there would open that agent; this is about the line not existing.
+        // Footer keys are not the update line and not a pane.
         assert!(
-            tui.handle_home_click(
-                layout.previews.x.saturating_add(1),
-                layout.previews.y.saturating_add(1),
-                AREA
-            )
-            .is_empty()
+            tui.handle_home_click(2, AREA.height.saturating_sub(1), AREA)
+                .is_empty()
         );
         assert_eq!(tui.take_update_copy_request(), None);
         assert!(!tui.home_update_selected);
@@ -2770,6 +2895,48 @@ mod tests {
         );
         assert!(tui.add_machine_open());
         assert!(tui.home_open());
+    }
+
+    #[test]
+    fn a_click_on_a_preview_opens_that_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let layout = home_layout(tui.geometry(AREA).content, &tui);
+        let panes = home_preview_panes(&tui);
+        assert_eq!(panes, vec![1, 2, 3]);
+        let tiles = preview_tiles(layout.previews, panes.len());
+        assert_eq!(tiles.len(), 3, "{tiles:?}");
+        let tile = tiles[1];
+
+        let intents =
+            tui.handle_home_click(tile.x.saturating_add(1), tile.y.saturating_add(1), AREA);
+        assert_eq!(intents, vec![UiIntent::FocusPane { pane_id: 2 }]);
+        assert!(!tui.home_open());
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn preview_tiles_fill_the_area_in_a_grid() {
+        let area = Rect::new(10, 4, 54, 18);
+        let tiles = preview_tiles(area, 4);
+        assert_eq!(tiles.len(), 4);
+        assert!(
+            tiles
+                .iter()
+                .all(|tile| tile.width >= 18 && tile.height >= 6),
+            "{tiles:?}"
+        );
+        assert!(
+            tiles.iter().all(|tile| {
+                tile.x >= area.x
+                    && tile.y >= area.y
+                    && tile.right() <= area.right()
+                    && tile.bottom() <= area.bottom()
+            }),
+            "{tiles:?}"
+        );
     }
 
     #[test]
