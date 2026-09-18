@@ -2154,4 +2154,51 @@ mod tests {
             "the tile is the pane, cropped: {drawn}"
         );
     }
+
+    /// The card the cursor is on has a matching window, so you can see which
+    /// pane Enter will open without reading the location line.
+    #[test]
+    fn the_selected_agents_preview_is_brighter() {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        let mut tui = crate::tui::test_support::home_tui(&[
+            ("laptop", "claude", AgentRosterState::Pending),
+            ("droplet", "codex", AgentRosterState::Working),
+        ]);
+        tui.set_home_open(true, "test");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| super::render_home(frame, &tui, &BTreeMap::new(), 0))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let layout =
+            crate::tui::home::home_layout(tui.geometry(Rect::new(0, 0, 120, 30)).content, &tui);
+        let panes = crate::tui::home::home_preview_panes(&tui);
+        let tiles = crate::tui::home::preview_tiles(layout.previews, panes.len());
+        assert!(tiles.len() >= 2, "two panes make two windows: {tiles:?}");
+        let selected = tui
+            .home_selected
+            .as_ref()
+            .map(|row| row.pane_id)
+            .expect("an agent is selected");
+        let selected_index = panes
+            .iter()
+            .position(|id| *id == selected)
+            .expect("the selected agent has a window");
+        let other = (0..tiles.len())
+            .find(|index| *index != selected_index)
+            .expect("another window");
+
+        assert_eq!(
+            buffer[(tiles[selected_index].x, tiles[selected_index].y)].fg,
+            tui.theme.agent_overlay_chrome,
+            "the selected agent's window is the one the cursor is on"
+        );
+        assert_eq!(
+            buffer[(tiles[other].x, tiles[other].y)].fg,
+            tui.theme.agent_overlay_secondary,
+            "the other windows stay quiet"
+        );
+    }
 }
