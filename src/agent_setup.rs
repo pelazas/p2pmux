@@ -5,7 +5,7 @@
 //! from output timing any more, because timing could never tell a thinking agent
 //! from one blocked on a permission prompt. That makes hook installation the
 //! difference between an inbox that works and one that lists processes it
-//! knows nothing about — far too important to leave as six JSON objects for a
+//! knows nothing about — far too important to leave as JSON objects for a
 //! human to paste into the right place in `settings.json`.
 //!
 //! **Marker-owned, not merged.** Every entry this writes carries
@@ -35,6 +35,7 @@ const MARKER: &str = "p2pmux";
 /// the one that could never be inferred: only the agent knows it is blocked on a
 /// human.
 const CLAUDE_HOOKS: &[(&str, &str, bool)] = &[
+    ("SessionStart", "running", false),
     ("UserPromptSubmit", "running", false),
     ("PreToolUse", "running", true),
     ("PostToolUse", "running", true),
