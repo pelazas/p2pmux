@@ -50,12 +50,12 @@ pub(in crate::tui) const HOME_EMPTY_NO_AGENTS: &str =
 /// list of processes, and running an agent before wiring them teaches that.
 const HOME_EMPTY_STEPS: &[(&str, &str)] = &[
     (
-        "Run `p2pmux setup` once, so your agents can say what they need.",
-        "",
+        "Run `p2pmux setup` once.",
+        "Then agents can say what they need.",
     ),
     (
-        "Start claude, codex or opencode in any terminal — on this machine",
-        "or on any machine in the list — and it appears here on its own.",
+        "Start claude, codex or opencode.",
+        "On any machine, it appears here.",
     ),
 ];
 /// The nudge shown when agents are running but nothing is reporting on them.
@@ -1630,6 +1630,14 @@ mod tests {
         assert!(setup < start, "wiring the hooks comes first: {drawn}");
         assert!(drawn.contains(" 1  "), "{drawn}");
         assert!(drawn.contains(" 2  "), "{drawn}");
+        assert!(
+            drawn.contains("say what they need"),
+            "the steps still fit the sidebar: {drawn}"
+        );
+        assert!(
+            drawn.contains("it appears here"),
+            "the second step still fits the sidebar: {drawn}"
+        );
     }
 
     /// A terminal too short for the steps says the same thing in one line
