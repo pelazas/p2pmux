@@ -1,11 +1,11 @@
-//! Drawing Home: the header count, a card per agent, the machines rail, and
-//! the key bar.
+//! Drawing Home: the header count, a card per agent, the machines list, pane
+//! previews, and the key bar.
 //!
-//! What is deliberately *not* here is as load-bearing as what is: no output
-//! previews, no token or cost counters, no git status, no charts, and no list of
-//! who else is in the session. Each of those turns a screen you glance at into a
-//! screen you read, and Enter is one keypress away from the terminal that has
-//! all of them.
+//! What is deliberately *not* here: no token or cost counters, no git status,
+//! no charts, and no list of who else is in the session. The pane grid is the
+//! terminals themselves, cropped, not a summary of them.
+
+use std::collections::BTreeMap;
 
 use ratatui::{
     Frame,
@@ -13,19 +13,24 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Clear, Paragraph},
 };
 
 use crate::{
     config::UiTheme,
+    layout::PaneId,
     protocol::AgentRosterState,
     tui::{
-        AgentOverlayRow, MultiPaneTui,
+        AgentOverlayRow, MultiPaneTui, ScreenCell,
         home::{
             HomeCard, HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_card,
-            home_layout, home_page_size, machine_rows,
+            home_layout, home_page_size, home_preview_panes, home_preview_title, machine_rows,
+            preview_page_capacity, preview_tiles,
         },
-        render::footer::{FooterSegment, footer_segments_width, render_footer_segments},
+        render::{
+            footer::{FooterSegment, footer_segments_width, render_footer_segments},
+            vt::VtScreen,
+        },
         text::{sanitize_single_line, text_width, truncate_leading, truncate_trailing},
     },
 };
@@ -45,12 +50,12 @@ pub(in crate::tui) const HOME_EMPTY_NO_AGENTS: &str =
 /// list of processes, and running an agent before wiring them teaches that.
 const HOME_EMPTY_STEPS: &[(&str, &str)] = &[
     (
-        "Run `p2pmux setup` once, so your agents can say what they need.",
-        "",
+        "Run `p2pmux setup` once.",
+        "Then agents can say what they need.",
     ),
     (
-        "Start claude, codex or opencode in any terminal — on this machine",
-        "or on any machine in the list — and it appears here on its own.",
+        "Start claude, codex or opencode.",
+        "On any machine, it appears here.",
     ),
 ];
 /// The nudge shown when agents are running but nothing is reporting on them.
@@ -218,18 +223,24 @@ const ELAPSED_WIDTH: u16 = 8;
 /// What a rail line has left for words once the rule and its space are drawn.
 const RAIL_TEXT_WIDTH: usize = MACHINE_RAIL_WIDTH as usize - 2;
 /// A spacer, the name, and what the machine is doing.
-const RAIL_LINES_PER_MACHINE: usize = 3;
+const RAIL_LINES_PER_MACHINE: usize = crate::tui::home::RAIL_LINES_PER_MACHINE as usize;
 /// The rule and the key under it, which the fleet never grows into.
-const RAIL_FOOTER_LINES: usize = 2;
+const RAIL_FOOTER_LINES: usize = crate::tui::home::RAIL_FOOTER_LINES as usize;
 /// Where a card's second and third lines start: under the dot, not under the
 /// marker, so the block of text hangs off the state glyph that introduces it.
 const CARD_INDENT: u16 = 3;
 
-pub(in crate::tui) fn render_home(frame: &mut Frame<'_>, tui: &MultiPaneTui, now_unix_ms: u64) {
+pub(in crate::tui) fn render_home(
+    frame: &mut Frame<'_>,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
+    now_unix_ms: u64,
+) {
     let geometry = tui.geometry(frame.area());
     render_home_in(
         frame,
         tui,
+        screens,
         home_layout(geometry.content, tui),
         geometry.footer,
         now_unix_ms,
@@ -239,6 +250,7 @@ pub(in crate::tui) fn render_home(frame: &mut Frame<'_>, tui: &MultiPaneTui, now
 fn render_home_in(
     frame: &mut Frame<'_>,
     tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
     layout: HomeLayout,
     keys: Rect,
     now_unix_ms: u64,
@@ -356,6 +368,8 @@ fn render_home_in(
         frame.render_widget(Paragraph::new(lines), layout.machines);
     }
 
+    render_previews(frame, tui, screens, layout, theme);
+
     if keys.width > 0 && keys.height > 0 {
         render_home_keys(
             frame.buffer_mut(),
@@ -377,11 +391,15 @@ fn home_empty_state(height: u16, theme: &UiTheme) -> Vec<Line<'static>> {
     let muted = Style::default().fg(theme.agent_overlay_muted);
     // A blank, the heading, a blank, and two lines per step.
     let wanted = 3 + HOME_EMPTY_STEPS.len() * 3;
+    let one = Line::styled(format!(" {HOME_EMPTY_NO_AGENTS}"), muted);
+    if height == 0 {
+        return Vec::new();
+    }
     if usize::from(height) < wanted {
-        return vec![
-            Line::raw(""),
-            Line::styled(format!(" {HOME_EMPTY_NO_AGENTS}"), muted),
-        ];
+        if height == 1 {
+            return vec![one];
+        }
+        return vec![Line::raw(""), one];
     }
     let mut lines = vec![
         Line::raw(""),
@@ -1059,6 +1077,54 @@ fn rail_line(mut spans: Vec<Span<'static>>, theme: &UiTheme) -> Line<'static> {
     Line::from(line)
 }
 
+fn render_previews(
+    frame: &mut Frame<'_>,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<PaneId, &vt100::Screen>,
+    layout: HomeLayout,
+    theme: &UiTheme,
+) {
+    if layout.previews.width == 0 || layout.previews.height == 0 {
+        return;
+    }
+    let cap = preview_page_capacity(layout.previews);
+    if cap == 0 {
+        return;
+    }
+    let panes = home_preview_panes(tui);
+    let start = tui.home_preview_page.saturating_mul(cap);
+    let page = panes.into_iter().skip(start).take(cap).collect::<Vec<_>>();
+    let selected_pane = tui
+        .home_selected
+        .as_ref()
+        .filter(|_| tui.home_machine.is_none() && !tui.home_update_selected)
+        .map(|row| row.pane_id);
+    let tiles = preview_tiles(layout.previews, page.len());
+    for (pane_id, tile) in page.into_iter().zip(tiles) {
+        let highlighted = selected_pane == Some(pane_id);
+        let title = truncate_trailing(
+            &home_preview_title(tui, pane_id),
+            usize::from(tile.width.saturating_sub(2)),
+        );
+        let block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(if highlighted {
+                theme.agent_overlay_chrome
+            } else {
+                theme.agent_overlay_secondary
+            }));
+        let inner = block.inner(tile);
+        frame.render_widget(block, tile);
+        frame.render_widget(Clear, inner);
+        if let Some(screen) = screens.get(&pane_id) {
+            frame.render_widget(
+                VtScreen::new(screen).at_origin(ScreenCell::default()),
+                inner,
+            );
+        }
+    }
+}
+
 /// The same facts as a table under the agents, for a terminal too narrow to
 /// give a column away.
 fn machine_table(tui: &MultiPaneTui, theme: &UiTheme, width: u16) -> Vec<Line<'static>> {
@@ -1244,6 +1310,7 @@ fn pad(value: &str, width: u16) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Instant;
 
     use super::{
@@ -1306,7 +1373,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
-            .draw(|frame| super::render_home(frame, tui, 0))
+            .draw(|frame| super::render_home(frame, tui, &BTreeMap::new(), 0))
             .expect("render");
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -1563,6 +1630,14 @@ mod tests {
         assert!(setup < start, "wiring the hooks comes first: {drawn}");
         assert!(drawn.contains(" 1  "), "{drawn}");
         assert!(drawn.contains(" 2  "), "{drawn}");
+        assert!(
+            drawn.contains("say what they need"),
+            "the steps still fit the sidebar: {drawn}"
+        );
+        assert!(
+            drawn.contains("it appears here"),
+            "the second step still fits the sidebar: {drawn}"
+        );
     }
 
     /// A terminal too short for the steps says the same thing in one line
@@ -1804,7 +1879,7 @@ mod tests {
 
         let drawn = screen(&tui, 120, 30).join("\n");
         assert!(
-            drawn.contains("another p2pmux session · no record of it under this HOME"),
+            drawn.contains("another p2pmux session · no record of it"),
             "the row says which of the two things it is, and why it can offer no command: {drawn}"
         );
         assert!(
@@ -1844,21 +1919,21 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
         terminal
-            .draw(|frame| super::render_home(frame, &tui, 0))
+            .draw(|frame| super::render_home(frame, &tui, &BTreeMap::new(), 0))
             .expect("render");
         let buffer = terminal.backend().buffer().clone();
-        let line_holding = |needle: &str| -> u16 {
+        let line_in_sidebar = |needle: &str| -> u16 {
             (0..30u16)
                 .find(|row| {
-                    (0..120u16)
+                    (0..crate::tui::home::HOME_SIDEBAR_WIDTH)
                         .map(|column| buffer[(column, *row)].symbol())
                         .collect::<String>()
                         .contains(needle)
                 })
-                .unwrap_or_else(|| panic!("nothing on screen holds {needle}"))
+                .unwrap_or_else(|| panic!("nothing in the agent list holds {needle}"))
         };
 
-        let detached = line_holding("another p2pmux session · p2pmux attach dakar");
+        let detached = line_in_sidebar("another p2pmux session · p2pmux attach dakar");
         assert!(
             buffer[(2, detached)].modifier.contains(Modifier::DIM),
             "the row Enter refuses has to look like one"
@@ -1869,7 +1944,7 @@ mod tests {
                 .contains(Modifier::DIM),
             "the whole card is dim, not only the line naming the session"
         );
-        let openable = line_holding("tab 1 · pane 1");
+        let openable = line_in_sidebar("tab 1 · pane 1");
         assert!(
             !buffer[(2, openable)].modifier.contains(Modifier::DIM),
             "and the agent Enter does open must not be dimmed with it"
@@ -1981,7 +2056,7 @@ mod tests {
         });
         tui.set_home_open(true, "test");
 
-        let drawn = screen(&tui, 70, 20).join("\n");
+        let drawn = screen(&tui, 50, 20).join("\n");
         assert!(drawn.contains("IN THIS SESSION, NOT YOURS"), "{drawn}");
         let fleet_heading = drawn.find("NAME").expect("the fleet heading");
         let guest_heading = drawn.find("IN THIS SESSION").expect("the guest heading");
@@ -2038,6 +2113,100 @@ mod tests {
         assert!(
             drawn.contains(" more"),
             "the machines that did not fit are counted, not dropped: {drawn}"
+        );
+    }
+
+    #[test]
+    fn the_preview_grid_draws_a_window_per_pane() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+
+        let drawn = screen(&tui, 120, 30).join("\n");
+        assert!(
+            drawn.matches("tab 1 · pane 1").count() >= 2,
+            "the card names the pane and the grid draws a window titled the same: {drawn}"
+        );
+        assert!(
+            drawn.contains('┌') && drawn.contains('┐'),
+            "a preview is a bordered window: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_preview_tile_shows_the_pane_contents() {
+        let mut tui =
+            crate::tui::test_support::home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        let mut parser = vt100::Parser::new(8, 24, 0);
+        parser.process(b"hello-from-pane");
+        let mut screens = BTreeMap::new();
+        screens.insert(1, parser.screen());
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| super::render_home(frame, &tui, &screens, 0))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let drawn = (0..30u16)
+            .map(|row| {
+                (0..120u16)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drawn.contains("hello-from-pane"),
+            "the tile is the pane, cropped: {drawn}"
+        );
+    }
+
+    /// The card the cursor is on has a matching window, so you can see which
+    /// pane Enter will open without reading the location line.
+    #[test]
+    fn the_selected_agents_preview_is_brighter() {
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        let mut tui = crate::tui::test_support::home_tui(&[
+            ("laptop", "claude", AgentRosterState::Pending),
+            ("droplet", "codex", AgentRosterState::Working),
+        ]);
+        tui.set_home_open(true, "test");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| super::render_home(frame, &tui, &BTreeMap::new(), 0))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let layout =
+            crate::tui::home::home_layout(tui.geometry(Rect::new(0, 0, 120, 30)).content, &tui);
+        let panes = crate::tui::home::home_preview_panes(&tui);
+        let tiles = crate::tui::home::preview_tiles(layout.previews, panes.len());
+        assert!(tiles.len() >= 2, "two panes make two windows: {tiles:?}");
+        let selected = tui
+            .home_selected
+            .as_ref()
+            .map(|row| row.pane_id)
+            .expect("an agent is selected");
+        let selected_index = panes
+            .iter()
+            .position(|id| *id == selected)
+            .expect("the selected agent has a window");
+        let other = (0..tiles.len())
+            .find(|index| *index != selected_index)
+            .expect("another window");
+
+        assert_eq!(
+            buffer[(tiles[selected_index].x, tiles[selected_index].y)].fg,
+            tui.theme.agent_overlay_chrome,
+            "the selected agent's window is the one the cursor is on"
+        );
+        assert_eq!(
+            buffer[(tiles[other].x, tiles[other].y)].fg,
+            tui.theme.agent_overlay_secondary,
+            "the other windows stay quiet"
         );
     }
 }

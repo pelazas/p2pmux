@@ -135,6 +135,9 @@ pub struct MultiPaneTui {
     pub(in crate::tui) home_page: usize,
     /// How many agents that page holds, from the last layout that was measured.
     pub(in crate::tui) home_page_size: usize,
+    /// Which page of pane previews is drawn. Independent of the agent list:
+    /// the two lists do not have the same length.
+    pub(in crate::tui) home_preview_page: usize,
     /// The pane Home handed the user into, drawn alone in the content area.
     ///
     /// A local view choice, so it never reaches the layout: the pane keeps the
@@ -244,6 +247,7 @@ impl MultiPaneTui {
             last_home_area: Rect::new(0, 0, 80, 24),
             home_page: 0,
             home_page_size: crate::tui::home::HOME_PAGE_MAX,
+            home_preview_page: 0,
             zoomed_pane: None,
             paired_machines: Vec::new(),
             fleet_has_no_address: false,

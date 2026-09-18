@@ -66,7 +66,7 @@ sleep 900
 def is_row(line: str) -> bool:
     """Whether this line is an inbox row rather than prose that names an agent.
 
-    The empty state says "Start claude, codex or opencode in any terminal",
+    The empty state says "Start claude, codex or opencode",
     which contains the agent kind. A row carries a status dot.
     """
     return AGENT_KIND in line and ("●" in line or "○" in line)

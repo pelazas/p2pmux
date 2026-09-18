@@ -23,6 +23,7 @@ use crate::{
     protocol::AgentRosterState,
     tui::{
         AgentOverlayRow, HomeRowId, ModalState, MultiPaneTui, UiIntent, debug_log::ui_debug_log,
+        geometry::visible_leaf_panes,
     },
 };
 
@@ -101,6 +102,7 @@ impl MultiPaneTui {
             self.home_machine = None;
             self.home_update_selected = false;
             self.home_page = 0;
+            self.home_preview_page = 0;
             self.repair_home_selection();
         }
         ui_debug_log(
@@ -238,18 +240,23 @@ impl MultiPaneTui {
     /// than from a count the caller had to work out for itself.
     pub fn set_home_viewport_for(&mut self, area: Rect) {
         self.last_home_area = area;
-        let rows = home_layout(self.geometry(area).content, self).rows.height;
-        self.set_home_viewport(home_page_size(rows));
+        let layout = home_layout(self.geometry(area).content, self);
+        self.set_home_viewport(home_page_size(layout.rows.height));
+        self.clamp_home_preview_page(layout.previews);
     }
 
     /// Wheel over the inbox. Returns whether anything moved, so a scroll at the
     /// end of the list never costs a repaint.
     ///
-    /// A page at a time rather than an agent at a time: the list is paged, and
-    /// a wheel that slid one card off the top would leave a page nobody chose,
-    /// with the first agent half in view.
-    pub fn scroll_home(&mut self, area: Rect, up: bool) -> bool {
+    /// Over the agent list a page of cards; over the pane grid a page of
+    /// tiles. A page at a time rather than one item: sliding one card off the
+    /// top would leave a page nobody chose.
+    pub fn scroll_home(&mut self, area: Rect, column: u16, row: u16, up: bool) -> bool {
         self.set_home_viewport_for(area);
+        let layout = home_layout(self.geometry(area).content, self);
+        if crate::tui::geometry::rect_contains(layout.previews, column, row) {
+            return self.scroll_home_previews(layout.previews, up);
+        }
         let previous = self.home_page;
         if up {
             self.home_page = self.home_page.saturating_sub(1);
@@ -265,6 +272,20 @@ impl MultiPaneTui {
             return true;
         }
         false
+    }
+
+    fn scroll_home_previews(&mut self, previews: Rect, up: bool) -> bool {
+        let pages = self.home_preview_page_count(previews);
+        if pages < 2 {
+            return false;
+        }
+        let previous = self.home_preview_page;
+        if up {
+            self.home_preview_page = previous.saturating_sub(1);
+        } else {
+            self.home_preview_page = previous.saturating_add(1).min(pages.saturating_sub(1));
+        }
+        previous != self.home_preview_page
     }
 
     /// `h` and `l`, and the page keys: a whole page at a time, cursor and all.
@@ -319,12 +340,18 @@ impl MultiPaneTui {
             self.request_update_copy();
             return Vec::new();
         }
-        let Some(clicked) = self.home_row_at(column, row, area) else {
-            return Vec::new();
-        };
-        self.home_update_selected = false;
-        self.home_selected = Some(clicked);
-        self.open_home_selection()
+        if let Some(hit) = self.home_machine_at(column, row, area) {
+            return self.handle_home_machine_click(area, hit);
+        }
+        if let Some(clicked) = self.home_row_at(column, row, area) {
+            self.home_update_selected = false;
+            self.home_selected = Some(clicked);
+            return self.open_home_selection();
+        }
+        if let Some(pane_id) = self.home_preview_pane_at(column, row, area) {
+            return self.enter_pane_from_home(pane_id);
+        }
+        Vec::new()
     }
 
     /// A click on the update line copies the command, the same as Enter on it.
@@ -360,8 +387,78 @@ impl MultiPaneTui {
             .map(|row| row.row_id())
     }
 
+    /// Which machine, if any, the pointer is on.
+    pub(in crate::tui) fn home_machine_at(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<HomeMachineHit> {
+        let layout = home_layout(self.geometry(area).content, self);
+        if !crate::tui::geometry::rect_contains(layout.machines, column, row) {
+            return None;
+        }
+        let y = row.saturating_sub(layout.machines.y);
+        match layout.machine_panel {
+            MachinePanel::Rail => {
+                rail_machine_at(layout.machines.height, y, machine_rows(self).len())
+            }
+            MachinePanel::Table => table_machine_at(y, &machine_rows(self)),
+            MachinePanel::Strip if layout.machines.height > 0 => Some(HomeMachineHit::Row(0)),
+            MachinePanel::Strip | MachinePanel::Empty => None,
+        }
+    }
+
+    fn handle_home_machine_click(&mut self, area: Rect, hit: HomeMachineHit) -> Vec<UiIntent> {
+        match hit {
+            HomeMachineHit::Add => {
+                self.open_add_machine();
+                Vec::new()
+            }
+            HomeMachineHit::Row(index) => {
+                self.home_update_selected = false;
+                self.home_machine = Some(index);
+                self.open_terminal_on_selected_machine(area, Vec::new())
+            }
+        }
+    }
+
+    pub(in crate::tui) fn home_preview_pane_at(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<PaneId> {
+        let layout = home_layout(self.geometry(area).content, self);
+        if !crate::tui::geometry::rect_contains(layout.previews, column, row) {
+            return None;
+        }
+        let panes = home_preview_panes(self);
+        let cap = preview_page_capacity(layout.previews);
+        if cap == 0 {
+            return None;
+        }
+        let start = self.home_preview_page.saturating_mul(cap);
+        let page = panes.into_iter().skip(start).take(cap).collect::<Vec<_>>();
+        preview_tiles(layout.previews, page.len())
+            .into_iter()
+            .zip(page)
+            .find(|(tile, _)| crate::tui::geometry::rect_contains(*tile, column, row))
+            .map(|(_, pane_id)| pane_id)
+    }
+
     pub(in crate::tui) fn clamp_home_page(&mut self) {
         self.home_page = self.home_page.min(self.home_page_count().saturating_sub(1));
+    }
+
+    fn clamp_home_preview_page(&mut self, previews: Rect) {
+        let pages = self.home_preview_page_count(previews);
+        self.home_preview_page = self.home_preview_page.min(pages.saturating_sub(1));
+    }
+
+    fn home_preview_page_count(&self, previews: Rect) -> usize {
+        let cap = preview_page_capacity(previews).max(1);
+        home_preview_panes(self).len().div_ceil(cap).max(1)
     }
 
     /// Puts the page the cursor is on on screen.
@@ -905,17 +1002,21 @@ pub(in crate::tui) struct HomeLayout {
     /// arrived, and shaped by [`HomeLayout::machine_panel`].
     pub(in crate::tui) machines: Rect,
     pub(in crate::tui) machine_panel: MachinePanel,
+    /// Miniature windows of every pane in the session. Zero-sized when the
+    /// terminal is too small to hold a left column and a grid at once.
+    pub(in crate::tui) previews: Rect,
 }
 
 /// How the fleet is drawn, which is a question of how much room there is.
 ///
-/// The screen's spare space is horizontal as much as vertical — the column that
-/// says what an agent is doing is rarely more than half used — so the widest
-/// tier spends that width on machines rather than leaving it blank.
+/// On a terminal wide enough for pane previews, the fleet docks under the
+/// agents in the left column. Narrower terminals keep the table or strip that
+/// used to sit under the list, and hide the grid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::tui) enum MachinePanel {
-    /// A column down the right-hand side, with a line each for what a machine
-    /// is and what it is running.
+    /// The compact fleet list: a heading, a row each, and `a` to add one.
+    /// Drawn in the left column under the agents when the preview grid is up,
+    /// and unused when the terminal has fallen back to a table or strip.
     Rail,
     /// The same facts as a table under the agents, when the terminal is too
     /// narrow to give a column away.
@@ -925,6 +1026,13 @@ pub(in crate::tui) enum MachinePanel {
     Strip,
     /// Nothing known yet. The member list has not arrived.
     Empty,
+}
+
+/// A click in the machine dock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum HomeMachineHit {
+    Row(usize),
+    Add,
 }
 
 /// How much of the screen one agent gets.
@@ -987,14 +1095,20 @@ pub(in crate::tui) fn home_page_size(rows_height: u16) -> usize {
 
 /// How wide the rail is, including the rule it hangs off.
 pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 28;
-/// The narrowest terminal that gets a rail.
-///
-/// Below this the agents would be paying for the fleet: a card whose sentence
-/// column is under 40 columns truncates what the agent said, which is the one
-/// thing on the screen worth reading in full.
-const MACHINE_RAIL_MIN_WIDTH: u16 = 88;
-/// The shortest terminal that gets a rail: a heading, a blank, and one machine.
-const MACHINE_RAIL_MIN_HEIGHT: u16 = 6;
+/// Agents on top, machines under them. Wide enough for the attach-session line.
+pub(in crate::tui) const HOME_SIDEBAR_WIDTH: u16 = 48;
+/// Narrowest preview column that still reads as a window rather than a sliver.
+const PREVIEW_MIN_WIDTH: u16 = 28;
+/// Shortest preview column that can hold a bordered tile.
+const PREVIEW_MIN_HEIGHT: u16 = 8;
+/// Heading, one machine, and the `a` footer: the smallest useful dock.
+const MACHINE_DOCK_MIN_HEIGHT: u16 = 7;
+/// Blank + `MACHINES · N` at the top of the dock.
+pub(in crate::tui) const RAIL_HEADING_LINES: u16 = 2;
+/// The rule and `a  add a machine` at the foot.
+pub(in crate::tui) const RAIL_FOOTER_LINES: u16 = 2;
+/// Spacer, name, and detail for one machine.
+pub(in crate::tui) const RAIL_LINES_PER_MACHINE: u16 = 3;
 
 /// Every machine this client knows about, session members first.
 ///
@@ -1127,14 +1241,208 @@ fn machine_table_lines(rows: &[MachineRow]) -> u16 {
         .saturating_add(guests)
 }
 
+fn can_show_previews(area: Rect) -> bool {
+    area.width >= HOME_SIDEBAR_WIDTH.saturating_add(PREVIEW_MIN_WIDTH)
+        && area.height >= PREVIEW_MIN_HEIGHT
+}
+
+/// How tall the machine dock is in the left column.
+///
+/// Agents keep a header and at least one compact card. The dock then takes what
+/// the fleet wants, up to that remainder, and never less than a heading, one
+/// machine, and the add-a-machine footer when the column is tall enough.
+fn machine_dock_height(sidebar_height: u16, n_machines: usize) -> u16 {
+    if n_machines == 0 {
+        return 0;
+    }
+    let wanted = MACHINE_DOCK_MIN_HEIGHT.saturating_add(
+        u16::try_from(n_machines.saturating_sub(1).saturating_mul(3)).unwrap_or(u16::MAX),
+    );
+    let agents_floor = 2u16.saturating_add(3);
+    let cap = sidebar_height.saturating_sub(agents_floor);
+    if cap < MACHINE_DOCK_MIN_HEIGHT {
+        return cap;
+    }
+    wanted.min(cap)
+}
+
+fn empty_previews(area: Rect) -> Rect {
+    Rect::new(area.right(), area.y, 0, 0)
+}
+
+/// Smallest tile that still has a border and a few cells of the pane inside.
+const PREVIEW_TILE_MIN_WIDTH: u16 = 18;
+const PREVIEW_TILE_MIN_HEIGHT: u16 = 6;
+
+/// Every pane in the session, tab order then layout order.
+pub(in crate::tui) fn home_preview_panes(tui: &MultiPaneTui) -> Vec<PaneId> {
+    tui.snapshot
+        .tabs
+        .iter()
+        .flat_map(|tab| visible_leaf_panes(&tab.root))
+        .collect()
+}
+
+pub(in crate::tui) fn preview_page_capacity(area: Rect) -> usize {
+    if area.width < PREVIEW_TILE_MIN_WIDTH || area.height < PREVIEW_TILE_MIN_HEIGHT {
+        return 0;
+    }
+    usize::from(area.width / PREVIEW_TILE_MIN_WIDTH)
+        * usize::from(area.height / PREVIEW_TILE_MIN_HEIGHT)
+}
+
+pub(in crate::tui) fn preview_tiles(area: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let max_cols = (area.width / PREVIEW_TILE_MIN_WIDTH).max(1);
+    let max_rows = (area.height / PREVIEW_TILE_MIN_HEIGHT).max(1);
+    let count = count.min(usize::from(max_cols).saturating_mul(usize::from(max_rows)));
+    let cols = max_cols
+        .min(u16::try_from(count).unwrap_or(u16::MAX))
+        .max(1);
+    let rows = u16::try_from(count)
+        .unwrap_or(u16::MAX)
+        .div_ceil(cols)
+        .min(max_rows)
+        .max(1);
+    let tile_w = area.width / cols;
+    let tile_h = area.height / rows;
+    (0..count)
+        .filter_map(|index| {
+            let col = u16::try_from(index).unwrap_or(u16::MAX) % cols;
+            let row = u16::try_from(index).unwrap_or(u16::MAX) / cols;
+            (row < rows).then_some(Rect::new(
+                area.x.saturating_add(col.saturating_mul(tile_w)),
+                area.y.saturating_add(row.saturating_mul(tile_h)),
+                tile_w,
+                tile_h,
+            ))
+        })
+        .collect()
+}
+
+pub(in crate::tui) fn home_preview_title(tui: &MultiPaneTui, pane_id: PaneId) -> String {
+    if let Some(title) = tui
+        .snapshot
+        .panes
+        .get(&pane_id)
+        .and_then(|pane| pane.title.as_deref())
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_owned();
+    }
+    for (tab_index, tab) in tui.snapshot.tabs.iter().enumerate() {
+        let leaves = visible_leaf_panes(&tab.root);
+        let Some(pane_index) = leaves.iter().position(|id| *id == pane_id) else {
+            continue;
+        };
+        return format!("tab {} · pane {}", tab_index + 1, pane_index + 1);
+    }
+    format!("pane {pane_id}")
+}
+
+/// The same count `machine_rail` draws, so a click lands on a machine that is
+/// actually on screen.
+fn rail_shown_machines(height: u16, n_machines: usize) -> usize {
+    let body = usize::from(height)
+        .saturating_sub(usize::from(RAIL_HEADING_LINES))
+        .saturating_sub(usize::from(RAIL_FOOTER_LINES));
+    let per = usize::from(RAIL_LINES_PER_MACHINE);
+    let mut shown = body / per;
+    if shown < n_machines {
+        shown = body.saturating_sub(2) / per;
+    }
+    shown.min(n_machines)
+}
+
+fn rail_machine_at(height: u16, y: u16, n_machines: usize) -> Option<HomeMachineHit> {
+    if height == 0 {
+        return None;
+    }
+    if y + 1 == height {
+        return Some(HomeMachineHit::Add);
+    }
+    if y < RAIL_HEADING_LINES {
+        return None;
+    }
+    let shown = rail_shown_machines(height, n_machines);
+    let index =
+        usize::from(y.saturating_sub(RAIL_HEADING_LINES)) / usize::from(RAIL_LINES_PER_MACHINE);
+    (index < shown).then_some(HomeMachineHit::Row(index))
+}
+
+fn table_machine_at(y: u16, rows: &[MachineRow]) -> Option<HomeMachineHit> {
+    // Blank, heading, then owned machines, then an extra heading and the guests.
+    if y < 2 {
+        return None;
+    }
+    let mut line = y.saturating_sub(2);
+    let owned = rows.iter().filter(|row| row.owned).count();
+    let guests = rows.len().saturating_sub(owned);
+    if usize::from(line) < owned {
+        return Some(HomeMachineHit::Row(usize::from(line)));
+    }
+    line = line.saturating_sub(u16::try_from(owned).unwrap_or(u16::MAX));
+    if guests == 0 || line == 0 {
+        return None;
+    }
+    let index = owned.saturating_add(usize::from(line.saturating_sub(1)));
+    (index < rows.len()).then_some(HomeMachineHit::Row(index))
+}
+
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
-    // Header, then rows, then the machines — down the right on a terminal with
-    // width to spare, and pinned to the bottom otherwise. The key bar is not
-    // here: it takes over the window footer, so that four keys stay visible in
-    // the same place they are on every other screen.
+    // Header and agent list on the left, machines under them, pane previews in
+    // the rest. The key bar is not here: it takes over the window footer, so
+    // that four keys stay visible in the same place they are on every other
+    // screen.
     let rows_for_machines = machine_rows(tui);
-    let machines = rows_for_machines.len();
-    if machines == 0 {
+    if can_show_previews(area) {
+        // Header, hint and update keep the full width so a version line and a
+        // `p2pmux setup` nudge stay readable. The split under them is the two
+        // lists and the pane grid.
+        let header_height = 2u16.min(area.height);
+        let header = Rect::new(area.x, area.y, area.width, header_height);
+        let mut y = header.bottom();
+        let mut left = area.height.saturating_sub(header_height);
+        let hint_height = u16::from(tui.home_all_unwired() || tui.home_notice.is_some()).min(left);
+        let hint = Rect::new(area.x, y, area.width, hint_height);
+        y = hint.bottom();
+        left = left.saturating_sub(hint_height);
+        let update_height = u16::from(tui.update_notice.is_some()).min(left);
+        let update = Rect::new(area.x, y, area.width, update_height);
+        y = update.bottom();
+        left = left.saturating_sub(update_height);
+        let body = Rect::new(area.x, y, area.width, left);
+        let sidebar = Rect::new(body.x, body.y, HOME_SIDEBAR_WIDTH, body.height);
+        let previews = Rect::new(
+            sidebar.right(),
+            body.y,
+            body.width.saturating_sub(HOME_SIDEBAR_WIDTH),
+            body.height,
+        );
+        let dock = machine_dock_height(sidebar.height, rows_for_machines.len());
+        let rows = Rect::new(
+            sidebar.x,
+            sidebar.y,
+            sidebar.width,
+            sidebar.height.saturating_sub(dock),
+        );
+        return HomeLayout {
+            header,
+            rows,
+            hint,
+            update,
+            machines: Rect::new(sidebar.x, rows.bottom(), sidebar.width, dock),
+            machine_panel: if rows_for_machines.is_empty() {
+                MachinePanel::Empty
+            } else {
+                MachinePanel::Rail
+            },
+            previews,
+        };
+    }
+    if rows_for_machines.is_empty() {
         let (header, rows, hint, update) = stacked(area, tui, 0);
         return HomeLayout {
             header,
@@ -1143,38 +1451,10 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
             update,
             machines: Rect::new(area.x, update.bottom(), area.width, 0),
             machine_panel: MachinePanel::Empty,
+            previews: empty_previews(area),
         };
     }
-    if area.width >= MACHINE_RAIL_MIN_WIDTH && area.height >= MACHINE_RAIL_MIN_HEIGHT {
-        // The rail is full height rather than sized to the fleet: it is a column
-        // of the screen, and a short one would leave a ragged hole beside the
-        // agents. A fleet too tall for it says so on its last line.
-        let rail = Rect::new(
-            area.right().saturating_sub(MACHINE_RAIL_WIDTH),
-            area.y,
-            MACHINE_RAIL_WIDTH,
-            area.height,
-        );
-        let (header, rows, hint, update) = stacked(
-            Rect::new(
-                area.x,
-                area.y,
-                area.width.saturating_sub(MACHINE_RAIL_WIDTH),
-                area.height,
-            ),
-            tui,
-            0,
-        );
-        return HomeLayout {
-            header,
-            rows,
-            hint,
-            update,
-            machines: rail,
-            machine_panel: MachinePanel::Rail,
-        };
-    }
-    // Under the agents, then. The machines outrank agent rows when space runs
+    // Too small for the grid. The machines outrank agent rows when space runs
     // out, but never take the last one: a list with nothing left in it stops
     // being a list, and Home would be a screen about machines with the agents
     // it exists for cut off. All or nothing — half a block is a blank line
@@ -1196,6 +1476,7 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
         update,
         machines: Rect::new(area.x, update.bottom(), area.width, height),
         machine_panel: panel,
+        previews: empty_previews(area),
     }
 }
 
@@ -1231,15 +1512,16 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        HOME_PAGE_MAX, HomeCard, MACHINE_RAIL_WIDTH, MachinePanel, chat_pane_title, home_card,
-        home_layout, home_page_size, machine_rows, spawn_visible_to_guests,
+        HOME_PAGE_MAX, HOME_SIDEBAR_WIDTH, HomeCard, MachinePanel, RAIL_HEADING_LINES,
+        RAIL_LINES_PER_MACHINE, chat_pane_title, home_card, home_layout, home_page_size,
+        home_preview_panes, machine_rows, preview_tiles, spawn_visible_to_guests,
     };
     use crate::{
         layout::{Axis, Node, Tab},
         protocol::AgentRosterState,
         tui::{
             KeyHandling, MultiPaneTui, UiIntent,
-            test_support::{agent_row, home_tui, layout},
+            test_support::{agent_row, home_tui, layout, split_layout},
         },
     };
 
@@ -1456,7 +1738,15 @@ mod tests {
 
         let layout = home_layout(AREA, &tui);
         assert_eq!(layout.machine_panel, MachinePanel::Rail);
-        assert_eq!(layout.machines.height, AREA.height);
+        assert!(
+            layout.machines.height > 0,
+            "a fleet of one still gets a dock"
+        );
+        assert_eq!(layout.machines.x, AREA.x, "machines sit under the agents");
+        assert!(
+            layout.previews.width > 0,
+            "the rest of a 100-column screen is the pane grid"
+        );
     }
 
     /// The rail drew one row per *member*, and a peer id is per process — so a
@@ -1494,19 +1784,29 @@ mod tests {
         assert!(!machines[1].this_machine);
     }
 
-    /// The rail is a column of the screen, so what it costs is width, and the
-    /// agents keep every line they had.
+    /// The left column is a strip of the screen. Agents and machines share it
+    /// vertically; the rest of the width is the pane grid.
     #[test]
-    fn the_rail_takes_width_from_the_agents_and_never_a_row() {
+    fn the_sidebar_takes_width_from_the_previews_and_stacks_the_lists() {
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
         let layout = home_layout(AREA, &tui);
-        assert_eq!(layout.rows.width, AREA.width - MACHINE_RAIL_WIDTH);
-        assert_eq!(layout.machines.x, AREA.width - MACHINE_RAIL_WIDTH);
+        assert_eq!(layout.rows.width, HOME_SIDEBAR_WIDTH);
+        assert_eq!(layout.header.width, AREA.width);
+        assert_eq!(layout.machines.width, HOME_SIDEBAR_WIDTH);
+        assert_eq!(layout.machines.x, AREA.x);
+        assert_eq!(layout.previews.x, AREA.x.saturating_add(HOME_SIDEBAR_WIDTH));
         assert_eq!(
-            layout.rows.height,
-            AREA.height - 2,
-            "the header is the only thing above the agents"
+            layout.previews.width,
+            AREA.width.saturating_sub(HOME_SIDEBAR_WIDTH)
+        );
+        assert!(
+            layout.rows.height >= 3,
+            "the agents keep at least one compact card above the dock"
+        );
+        assert!(
+            layout.machines.y >= layout.rows.bottom(),
+            "machines sit under the agents, not beside them"
         );
     }
 
@@ -1536,20 +1836,19 @@ mod tests {
         assert_eq!(cramped.rows.height, 2);
     }
 
-    /// A terminal too short for a rail falls back rather than drawing a
-    /// two-line column beside a two-line list.
+    /// A terminal too short for a preview grid falls back rather than drawing
+    /// empty tiles beside a two-line list.
     #[test]
-    fn a_wide_but_short_terminal_falls_back_from_the_rail() {
+    fn a_wide_but_short_terminal_falls_back_from_the_grid() {
         let tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
 
-        assert_eq!(
-            home_layout(Rect::new(0, 0, 120, 5), &tui).machine_panel,
-            MachinePanel::Strip
-        );
-        assert_eq!(
-            home_layout(Rect::new(0, 0, 120, 6), &tui).machine_panel,
-            MachinePanel::Rail
-        );
+        let short = home_layout(Rect::new(0, 0, 120, 5), &tui);
+        assert_eq!(short.machine_panel, MachinePanel::Strip);
+        assert_eq!(short.previews.width, 0);
+
+        let tall_enough = home_layout(Rect::new(0, 0, 120, 8), &tui);
+        assert_eq!(tall_enough.machine_panel, MachinePanel::Rail);
+        assert!(tall_enough.previews.width > 0);
     }
 
     #[test]
@@ -1787,12 +2086,18 @@ mod tests {
         (tui, page_size)
     }
 
+    /// Enough agents that a page cannot hold them, whatever the card size.
+    fn two_page_tui() -> (MultiPaneTui, usize) {
+        paged_tui(crate::layout::MAX_TABS)
+    }
+
     /// A list longer than a page is paged, not scrolled, and `h`/`l` move a
     /// whole page with the cursor rather than leaving it behind.
     #[test]
     fn h_and_l_turn_the_page_and_take_the_cursor_with_them() {
-        let (mut tui, page_size) = paged_tui(8);
-        assert_eq!(tui.home_page_count(), 2);
+        let (mut tui, page_size) = two_page_tui();
+        let pages = tui.home_page_count();
+        assert!(pages >= 2, "the fixture is longer than one page");
         assert_eq!(tui.home_page(), 0);
 
         let first = selected_pane(&tui);
@@ -1805,20 +2110,21 @@ mod tests {
             "the cursor lands on the first agent of the page it arrives at"
         );
 
-        // Two pages, so `l` wraps back rather than stopping at the end.
-        tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        for _ in 1..pages {
+            tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
+        }
         assert_eq!(tui.home_page(), 0);
         assert_eq!(selected_pane(&tui), first);
 
         tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), AREA);
-        assert_eq!(tui.home_page(), 1);
+        assert_eq!(tui.home_page(), pages - 1);
     }
 
     /// The page follows the cursor. Walking off the bottom of one page has to
     /// bring the next one into view, or `j` stops at the end of page one.
     #[test]
     fn walking_the_cursor_off_a_page_brings_the_next_one_into_view() {
-        let (mut tui, page_size) = paged_tui(8);
+        let (mut tui, page_size) = two_page_tui();
 
         for _ in 0..page_size {
             tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), AREA);
@@ -1837,7 +2143,7 @@ mod tests {
     /// A page must not survive the agents that were on it going away.
     #[test]
     fn a_page_that_empties_falls_back_to_one_that_has_something_on_it() {
-        let (mut tui, page_size) = paged_tui(8);
+        let (mut tui, page_size) = two_page_tui();
         tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), AREA);
         assert_eq!(tui.home_page(), 1);
 
@@ -2503,11 +2809,134 @@ mod tests {
         let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
         tui.set_home_open(true, "test");
         tui.set_home_viewport_for(AREA);
-        let update = home_layout(tui.geometry(AREA).content, &tui).update;
-        assert_eq!(update.height, 0);
-        assert!(tui.handle_home_click(2, update.y, AREA).is_empty());
+        let layout = home_layout(tui.geometry(AREA).content, &tui);
+        assert_eq!(layout.update.height, 0);
+        // Footer keys are not the update line and not a pane.
+        assert!(
+            tui.handle_home_click(2, AREA.height.saturating_sub(1), AREA)
+                .is_empty()
+        );
         assert_eq!(tui.take_update_copy_request(), None);
         assert!(!tui.home_update_selected);
+    }
+
+    #[test]
+    fn a_click_on_a_machine_opens_a_terminal_there() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let machines = home_layout(tui.geometry(AREA).content, &tui).machines;
+        assert!(machines.height >= RAIL_HEADING_LINES + RAIL_LINES_PER_MACHINE);
+
+        let intents = tui.handle_home_click(
+            machines.x.saturating_add(2),
+            machines
+                .y
+                .saturating_add(RAIL_HEADING_LINES)
+                .saturating_add(1),
+            AREA,
+        );
+        assert!(
+            matches!(intents.as_slice(), [UiIntent::CreateTab { .. }]),
+            "{intents:?}"
+        );
+        assert!(!tui.home_open(), "the screen gets out of the way");
+    }
+
+    #[test]
+    fn a_click_on_an_asleep_machine_says_so_and_stays() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.paired_machines = vec![crate::tui::PairedMachine {
+            name: String::from("oldbox"),
+            machine_id: None,
+            accepts_work: None,
+        }];
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let machines = home_layout(tui.geometry(AREA).content, &tui).machines;
+        let oldbox = machine_rows(&tui)
+            .iter()
+            .position(|row| row.name == "oldbox")
+            .expect("oldbox is listed");
+        let y = machines.y
+            + RAIL_HEADING_LINES
+            + u16::try_from(oldbox).unwrap_or(0) * RAIL_LINES_PER_MACHINE
+            + 1;
+
+        assert!(
+            tui.handle_home_click(machines.x.saturating_add(2), y, AREA)
+                .is_empty()
+        );
+        assert!(tui.home_open());
+        assert!(
+            tui.home_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("asleep")),
+            "{:?}",
+            tui.home_notice
+        );
+    }
+
+    #[test]
+    fn a_click_on_add_a_machine_opens_the_panel() {
+        let mut tui = home_tui(&[("laptop", "claude", AgentRosterState::Working)]);
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let machines = home_layout(tui.geometry(AREA).content, &tui).machines;
+        assert!(machines.height > 0);
+
+        assert!(
+            tui.handle_home_click(
+                machines.x.saturating_add(2),
+                machines.bottom().saturating_sub(1),
+                AREA
+            )
+            .is_empty()
+        );
+        assert!(tui.add_machine_open());
+        assert!(tui.home_open());
+    }
+
+    #[test]
+    fn a_click_on_a_preview_opens_that_pane() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.set_home_open(true, "test");
+        tui.set_home_viewport_for(AREA);
+        let layout = home_layout(tui.geometry(AREA).content, &tui);
+        let panes = home_preview_panes(&tui);
+        assert_eq!(panes, vec![1, 2, 3]);
+        let tiles = preview_tiles(layout.previews, panes.len());
+        assert_eq!(tiles.len(), 3, "{tiles:?}");
+        let tile = tiles[1];
+
+        let intents =
+            tui.handle_home_click(tile.x.saturating_add(1), tile.y.saturating_add(1), AREA);
+        assert_eq!(intents, vec![UiIntent::FocusPane { pane_id: 2 }]);
+        assert!(!tui.home_open());
+        assert_eq!(tui.focused_pane(), 2);
+    }
+
+    #[test]
+    fn preview_tiles_fill_the_area_in_a_grid() {
+        let area = Rect::new(10, 4, 54, 18);
+        let tiles = preview_tiles(area, 4);
+        assert_eq!(tiles.len(), 4);
+        assert!(
+            tiles
+                .iter()
+                .all(|tile| tile.width >= 18 && tile.height >= 6),
+            "{tiles:?}"
+        );
+        assert!(
+            tiles.iter().all(|tile| {
+                tile.x >= area.x
+                    && tile.y >= area.y
+                    && tile.right() <= area.right()
+                    && tile.bottom() <= area.bottom()
+            }),
+            "{tiles:?}"
+        );
     }
 
     #[test]

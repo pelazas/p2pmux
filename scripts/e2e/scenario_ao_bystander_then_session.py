@@ -188,7 +188,7 @@ def run_once(index: int, verbose: bool) -> list[tuple[str, bool, str]]:
                 screen = mine.snapshot()
 
             # A status dot, so the empty state's "Start claude, codex or
-            # opencode in any terminal" is not read as a row.
+            # opencode" is not read as a row.
             rows = [
                 line
                 for line in screen.split("\n")
