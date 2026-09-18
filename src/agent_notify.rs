@@ -106,7 +106,7 @@ fn summarize(message: &str) -> String {
 /// continues — so mapping it to `Error` would paint healthy turns red.
 fn state_from_event(event: &str) -> Option<AgentState> {
     match event {
-        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStop" => {
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStop" => {
             Some(AgentState::Working)
         }
         "Notification" => Some(AgentState::Pending),
@@ -362,12 +362,47 @@ fn unix_ms_now() -> u64 {
         .unwrap_or_default()
 }
 
+/// What a Claude SessionStart hook injects when this process is in a pane.
+///
+/// Two sentences, then the skill. Kept short because it is added to every
+/// in-pane Claude session, not only the ones that asked about p2pmux.
+const SESSION_INTRO: &str = "This pane is a p2pmux session. `p2pmux ctl agents` lists other agents. Do not `p2pmux ctl send` into another agent; start a new pane with the task on the command line. The p2pmux skill has the exact commands.";
+
+/// JSON Claude Code reads from SessionStart stdout to inject context.
+///
+/// `None` for every other event, every other agent, and a SessionStart that
+/// is not in a p2pmux pane. PreToolUse stdout is Claude's permission
+/// channel; writing this there would break tools.
+fn session_start_context(kind: AgentKind, raw: &str, in_pane: bool) -> Option<String> {
+    if !in_pane || kind != AgentKind::Claude {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(raw).ok()?;
+    if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "continue": true,
+            "suppressOutput": true,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SESSION_INTRO,
+            }
+        })
+        .to_string(),
+    )
+}
+
 /// Run the producer for one hook invocation.
 ///
 /// Always `Ok`. Every failure path is a silent no-op by design — see the module
 /// documentation.
 pub fn run(kind: AgentKind, status_arg: Option<&str>) -> Result<(), Box<dyn Error>> {
     let raw = read_payload();
+    if let Some(json) = session_start_context(kind, &raw, pane_and_socket().is_some()) {
+        println!("{json}");
+    }
     let update = match kind {
         AgentKind::Claude => derive_claude(&raw, status_arg),
         AgentKind::OpenCode => derive_opencode(&raw, status_arg),
@@ -406,6 +441,10 @@ mod tests {
 
     #[test]
     fn events_map_to_states_when_no_status_is_given() {
+        assert_eq!(
+            state(r#"{"hook_event_name":"SessionStart"}"#, None),
+            Some(AgentState::Working)
+        );
         assert_eq!(
             state(r#"{"hook_event_name":"UserPromptSubmit"}"#, None),
             Some(AgentState::Working)
@@ -674,6 +713,80 @@ mod tests {
         );
         assert_eq!(
             opencode_state(r#"{"event":"session.idle"}"#, Some("dnoe")),
+            None
+        );
+    }
+
+    fn intro(kind: AgentKind, raw: &str, in_pane: bool) -> Option<serde_json::Value> {
+        session_start_context(kind, raw, in_pane).map(|json| {
+            serde_json::from_str(&json).expect("session intro is JSON Claude can parse")
+        })
+    }
+
+    #[test]
+    fn session_start_in_a_pane_injects_ctl_context() {
+        let json = intro(
+            AgentKind::Claude,
+            r#"{"hook_event_name":"SessionStart"}"#,
+            true,
+        )
+        .expect("in-pane SessionStart must speak");
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(
+            json["hookSpecificOutput"]["additionalContext"],
+            SESSION_INTRO
+        );
+        assert_eq!(json["suppressOutput"], true);
+        assert!(
+            SESSION_INTRO.contains("`p2pmux ctl agents`"),
+            "the intro must name the discovery command"
+        );
+    }
+
+    #[test]
+    fn session_start_outside_a_pane_stays_silent() {
+        assert_eq!(
+            intro(
+                AgentKind::Claude,
+                r#"{"hook_event_name":"SessionStart"}"#,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn every_other_hook_stays_silent_on_stdout() {
+        for raw in [
+            r#"{"hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"hook_event_name":"PreToolUse"}"#,
+            r#"{"hook_event_name":"PostToolUse"}"#,
+            r#"{"hook_event_name":"Notification"}"#,
+            r#"{"hook_event_name":"Stop"}"#,
+            r#"{"hook_event_name":"SessionEnd"}"#,
+            r#"{"hook_event_name":"sessionStart"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                intro(AgentKind::Claude, raw, true),
+                None,
+                "{raw} must not write SessionStart JSON"
+            );
+        }
+        assert_eq!(
+            intro(
+                AgentKind::Cursor,
+                r#"{"hook_event_name":"SessionStart"}"#,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            intro(
+                AgentKind::OpenCode,
+                r#"{"hook_event_name":"SessionStart"}"#,
+                true
+            ),
             None
         );
     }

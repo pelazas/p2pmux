@@ -11,6 +11,17 @@ enrolment token — and a peer on the wrong side of it is refused rather than ha
 v0.1.10 that refusal says so in as many words, naming both protocol numbers and which machine is the
 old one; older peers still report it as a host they could not reach.
 
+## Unreleased
+
+No protocol change: the wire pin stays 12, and ctl stays on pin 1.
+
+**`p2pmux setup` installs a skill** at `~/.claude/skills/p2pmux/SKILL.md` and
+`~/.cursor/skills/p2pmux/SKILL.md`, so an agent can list the session with `p2pmux ctl agents` and
+start work with `spawn --new` instead of typing into a live pane. Uninstall removes exactly that
+file when it still carries `owner: p2pmux`. A Claude `SessionStart` hook that is actually in a
+p2pmux pane injects two sentences pointing at `ctl agents`; every other hook, and Cursor, still
+prints nothing on stdout. `ctl send` is unchanged.
+
 ## v0.1.16 — 2026-09-07
 
 Ctl, a copy-wrap fix, and no protocol change: the wire pin stays 12, so v0.1.8 through v0.1.16

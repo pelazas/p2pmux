@@ -114,7 +114,8 @@ watching a droplet sees the state and not the sentence.
 
 One agent finishing so another can start: wait on `events` until that `pane_id` is `done`, then
 `spawn --new` with the next command. The payload belongs on the command line (`claude -p …`),
-not in `send`.
+not in `send`. `p2pmux setup` installs a skill so Claude Code and Cursor know that: list with
+`ctl agents`, start work with `spawn --new`, never `send` into a live agent.
 
 Ctl has its own pin, currently 1, independent of the peer wire pin. A client and a node that do
 not share it are told both numbers and which end to upgrade. A node too old to speak ctl at all
@@ -588,18 +589,24 @@ failing does not stop the other.
 
 #### Claude Code
 
-`setup` writes six marker-owned entries into `~/.claude/settings.json`, one per lifecycle event,
+`setup` writes seven marker-owned entries into `~/.claude/settings.json`, one per lifecycle event,
 through a temporary file and a rename. Every entry it writes carries `"owner": "p2pmux"`, so
 installing replaces exactly its own entries and removing takes exactly those: your own hooks on the
 same events (a completion chime on `Stop`, say) survive both untouched. Running it twice is the same
 as running it once. It refuses to rewrite a `settings.json` it cannot parse rather than clobber it,
 and `--dry-run` says what it would do.
 
+It also writes `~/.claude/skills/p2pmux/SKILL.md` (and `~/.cursor/skills/p2pmux/SKILL.md` from
+`setup cursor`), the cookbook for `ctl agents` / `spawn --new` / `events`. Uninstall deletes that
+file only when it still says `owner: p2pmux`.
+
 Each hook pipes its payload to `p2pmux notify`, which writes one line to the pane's session and
 exits. Outside a p2pmux pane it writes the same status to a record named after the agent's own
 process instead, so an agent you started in any other terminal still reports; either way it fails
-silently and never errors into the agent, so it is safe to leave registered everywhere. Restart any
-running Claude Code sessions to pick the hooks up.
+silently and never errors into the agent, so it is safe to leave registered everywhere. A
+`SessionStart` hook that *is* in a pane prints a short additionalContext pointing at `ctl agents`;
+every other hook still prints nothing, including Cursor's `sessionStart`. Restart any running
+Claude Code sessions to pick the hooks up.
 
 An entry written by a p2pmux old enough to predate the `owner` marker still counts as ours:
 `doctor` reports it as wired, and `setup` replaces it rather than installing a second copy beside

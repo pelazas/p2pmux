@@ -94,7 +94,7 @@ Two machines you own: `p2pmux pair` on the new one, then `p2pmux pair <code>` on
 | `p2pmux pair` | Pair a machine you own |
 | `p2pmux list` | List live sessions on this machine |
 | `p2pmux kill <name>` | Stop a session |
-| `p2pmux setup` | Install agent hooks |
+| `p2pmux setup` | Install agent hooks and the ctl skill |
 | `p2pmux doctor` | Check the install |
 
 The join code lasts six hours. If rendezvous is down, `Ctrl+S` offers a ticket that contacts no service at all.
