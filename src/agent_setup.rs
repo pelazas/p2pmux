@@ -76,8 +76,28 @@ pub fn claude_settings_path() -> Option<PathBuf> {
     Some(home()?.join(".claude").join("settings.json"))
 }
 
+fn claude_skill_path() -> Option<PathBuf> {
+    Some(
+        home()?
+            .join(".claude")
+            .join("skills")
+            .join("p2pmux")
+            .join("SKILL.md"),
+    )
+}
+
 pub fn cursor_hooks_path() -> Option<PathBuf> {
     Some(home()?.join(".cursor").join("hooks.json"))
+}
+
+fn cursor_skill_path() -> Option<PathBuf> {
+    Some(
+        home()?
+            .join(".cursor")
+            .join("skills")
+            .join("p2pmux")
+            .join("SKILL.md"),
+    )
 }
 
 fn home() -> Option<PathBuf> {
@@ -302,7 +322,11 @@ pub fn setup_cursor(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
     let Some(path) = cursor_hooks_path() else {
         return Err(Box::from("cannot locate $HOME"));
     };
-    setup_cursor_at_path(&path, uninstall, dry_run)
+    let Some(skill) = cursor_skill_path() else {
+        return Err(Box::from("cannot locate $HOME"));
+    };
+    setup_cursor_at_path(&path, uninstall, dry_run)?;
+    setup_skill_at_path(&skill, uninstall, dry_run, "cursor")
 }
 
 fn setup_cursor_at_path(
@@ -424,7 +448,19 @@ pub fn setup_claude(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
     let Some(path) = claude_settings_path() else {
         return Err(Box::from("cannot locate $HOME"));
     };
-    let mut settings = read_settings(&path)?;
+    let Some(skill) = claude_skill_path() else {
+        return Err(Box::from("cannot locate $HOME"));
+    };
+    setup_claude_at_path(&path, uninstall, dry_run)?;
+    setup_skill_at_path(&skill, uninstall, dry_run, "claude")
+}
+
+fn setup_claude_at_path(
+    path: &PathBuf,
+    uninstall: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut settings = read_settings(path)?;
     let had_ours = strip_ours(&mut settings);
 
     if uninstall {
@@ -443,7 +479,7 @@ pub fn setup_claude(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
             );
             return Ok(());
         }
-        write_settings(&path, &settings)?;
+        write_settings(path, &settings)?;
         println!("claude: removed the p2pmux hooks from {}", path.display());
         return Ok(());
     }
@@ -478,7 +514,7 @@ pub fn setup_claude(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
         };
         entries.push(hook_entry(status, *matcher));
     }
-    write_settings(&path, &settings)?;
+    write_settings(path, &settings)?;
     println!(
         "claude: wrote {} p2pmux hooks to {}",
         CLAUDE_HOOKS.len(),
@@ -497,6 +533,12 @@ pub fn setup_claude(uninstall: bool, dry_run: bool) -> Result<(), Box<dyn Error>
 /// and happened to name `p2pmux.js` is refused rather than removed.
 const OPENCODE_PLUGIN: &str = include_str!("assets/opencode_plugin.js");
 
+/// The skill `setup` writes next to Claude Code and Cursor hooks.
+///
+/// Same marker rule as the opencode plugin: uninstall deletes it only when
+/// the file still says `owner: p2pmux`.
+const AGENT_SKILL: &str = include_str!("assets/p2pmux_skill.md");
+
 pub fn opencode_plugin_path() -> Option<PathBuf> {
     Some(
         home()?
@@ -510,6 +552,61 @@ pub fn opencode_plugin_path() -> Option<PathBuf> {
 /// Whether a file at `path` is one this module wrote.
 fn ours_on_disk(path: &PathBuf) -> bool {
     fs::read_to_string(path).is_ok_and(|body| body.contains(&format!("owner: {MARKER}")))
+}
+
+/// Install or remove one copy of [`AGENT_SKILL`]. Idempotent in both directions.
+fn setup_skill_at_path(
+    path: &PathBuf,
+    uninstall: bool,
+    dry_run: bool,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let present = path.exists();
+
+    if uninstall {
+        if !present {
+            println!("{label}: already removed (no skill at {})", path.display());
+            return Ok(());
+        }
+        if !ours_on_disk(path) {
+            return Err(Box::from(format!(
+                "{} was not written by p2pmux — refusing to delete it",
+                path.display()
+            )));
+        }
+        if dry_run {
+            println!("{label}: would delete {} (dry run)", path.display());
+            return Ok(());
+        }
+        fs::remove_file(path)?;
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        println!("{label}: removed the p2pmux skill from {}", path.display());
+        return Ok(());
+    }
+
+    if present && !ours_on_disk(path) {
+        return Err(Box::from(format!(
+            "{} exists and was not written by p2pmux — refusing to overwrite it",
+            path.display()
+        )));
+    }
+    if dry_run {
+        println!(
+            "{label}: would write the p2pmux skill to {} (dry run)",
+            path.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("md.p2pmux-tmp");
+    fs::write(&temporary, AGENT_SKILL)?;
+    fs::rename(&temporary, path)?;
+    println!("{label}: wrote the p2pmux skill to {}", path.display());
+    Ok(())
 }
 
 pub fn opencode_wiring() -> Wiring {
@@ -1171,5 +1268,117 @@ mod tests {
         assert!(ours_on_disk(&path));
 
         fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    fn skill_fixture_path(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "p2pmux-skill-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        directory.join("skills").join("p2pmux").join("SKILL.md")
+    }
+
+    fn skill_fixture_root(path: &Path) -> &Path {
+        path.parent()
+            .expect("p2pmux directory")
+            .parent()
+            .expect("skills directory")
+            .parent()
+            .expect("fixture directory")
+    }
+
+    #[test]
+    fn the_agent_skill_says_who_owns_it() {
+        assert!(
+            AGENT_SKILL.contains(&format!("owner: {MARKER}")),
+            "install writes a file uninstall would then refuse to delete"
+        );
+    }
+
+    #[test]
+    fn skill_paths_sit_under_home() {
+        let home = std::env::var_os("HOME").expect("HOME is set for tests");
+        assert_eq!(
+            claude_skill_path(),
+            Some(
+                PathBuf::from(&home)
+                    .join(".claude")
+                    .join("skills")
+                    .join("p2pmux")
+                    .join("SKILL.md")
+            )
+        );
+        assert_eq!(
+            cursor_skill_path(),
+            Some(
+                PathBuf::from(home)
+                    .join(".cursor")
+                    .join("skills")
+                    .join("p2pmux")
+                    .join("SKILL.md")
+            )
+        );
+    }
+
+    #[test]
+    fn installing_the_skill_is_idempotent() {
+        let path = skill_fixture_path("idempotent");
+        setup_skill_at_path(&path, false, false, "claude").expect("first install");
+        setup_skill_at_path(&path, false, false, "claude").expect("second install");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            AGENT_SKILL,
+            "a second install left a different file"
+        );
+        fs::remove_dir_all(skill_fixture_root(&path)).expect("cleanup");
+    }
+
+    #[test]
+    fn uninstalling_the_skill_deletes_ours_and_the_empty_directory() {
+        let path = skill_fixture_path("uninstall");
+        setup_skill_at_path(&path, false, false, "claude").expect("install");
+        setup_skill_at_path(&path, true, false, "claude").expect("uninstall");
+        assert!(!path.exists(), "the skill file is still there");
+        assert!(
+            !path.parent().expect("p2pmux directory").exists(),
+            "the empty skill directory was left behind"
+        );
+        fs::remove_dir_all(skill_fixture_root(&path)).expect("cleanup");
+    }
+
+    #[test]
+    fn skill_dry_run_writes_nothing() {
+        let path = skill_fixture_path("dry-run");
+        setup_skill_at_path(&path, false, true, "claude").expect("dry-run install");
+        assert!(!path.exists(), "dry-run created the skill");
+        setup_skill_at_path(&path, false, false, "claude").expect("install");
+        setup_skill_at_path(&path, true, true, "claude").expect("dry-run uninstall");
+        assert!(path.exists(), "dry-run uninstall deleted the skill");
+        fs::remove_dir_all(skill_fixture_root(&path)).expect("cleanup");
+    }
+
+    #[test]
+    fn a_skill_we_did_not_write_is_left_alone() {
+        let path = skill_fixture_path("foreign");
+        fs::create_dir_all(path.parent().expect("p2pmux directory")).expect("create");
+        fs::write(&path, b"# my p2pmux notes\n").expect("write");
+
+        let install = setup_skill_at_path(&path, false, false, "claude").expect_err("must refuse");
+        assert!(install.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read(&path).expect("still there"),
+            b"# my p2pmux notes\n",
+            "a foreign skill was overwritten"
+        );
+
+        let uninstall = setup_skill_at_path(&path, true, false, "claude").expect_err("must refuse");
+        assert!(uninstall.to_string().contains("refusing to delete"));
+        assert!(path.exists(), "a foreign skill was deleted");
+
+        fs::remove_dir_all(skill_fixture_root(&path)).expect("cleanup");
     }
 }
