@@ -391,7 +391,8 @@ detection fall back to their default.
 `Ctrl+O` opens the inbox. So does bare `p2pmux` whenever it rejoins a session that already
 exists rather than creating one. It is one screen listing every supported coding agent
 running on every machine in the session, sorted by which one is blocking you, with a miniature
-window of every pane in the multiplexer beside that list. Supported agents
+window of every pane in the multiplexer beside that list. A page of those windows is four across
+and two down. Supported agents
 are Claude Code (`claude`), Codex (`codex`), Cursor Agent (including its `agent`/Node argv), Pi
 (including Node-based launches), and OpenCode (`opencode`).
 
