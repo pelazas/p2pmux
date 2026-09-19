@@ -401,21 +401,21 @@ p2pmux (paris) │ inbox 2 │ Tab #1 · Tab #2
  Agents · 2 need you
 ›● desktop    claude     needs you    2m14s  ┌ tab 1 · pane 2 ─┐ ┌ tab 2 · pane 1 ─┐
    wants to run: rm -rf node_modules         │ claude          │ │ cargo test      │
-   work/api · tab 1 · pane 2                 │                 │ │                 │
-                                             └─────────────────┘ └─────────────────┘
+   work/api · tab 1 · pane 2                 └─────────────────┘ └─────────────────┘
  ✗ laptop     codex      error        1m02s  ┌ tab 3 · pane 1 ─┐
    cargo test --all exited 101               │ opencode        │
-│ MACHINES · 3                               └─────────────────┘
-│ ● laptop
-│   this machine · 2 agents
-│ ● droplet
-│ a  add a machine
+                                             └─────────────────┘
+ Machines
+ ● laptop   this machine · 2 agents
+ ● droplet  ready
+ a  add a machine
  enter open · a add machine · n new terminal · q quit
 ```
 
-Agents sit in the left column, machines under them, and every pane in the session occupies a
-small window in the rest of the screen. Click a window to land on that tab and pane. A terminal
-too narrow or too short to hold the grid keeps the lists full width, as it did.
+Agents sit in the left column, machines directly under them, and every pane in the session
+occupies a small window in the rest of the screen. A page is four across and two down; more
+panes turn the page rather than shrinking the tiles. Click a window to land on that tab and
+pane. A terminal too narrow or too short to hold the grid keeps the lists full width, as it did.
 
 Each agent gets a card: a status dot, the machine it is on, the agent, its state and how long it
 has been in that state; then its own words at whatever length it said them; then the repository it
@@ -488,10 +488,10 @@ up: whether it is answering, whether it accepts work from your machines, and how
 running. A machine that is paired but not in the session is one you own that is not answering, and
 it says `asleep` rather than disappearing.
 
-On a wide terminal the list docks at the bottom of the left column so the pane grid can use the
-rest of the screen. A terminal too narrow for that grid puts the same table under the agents
-instead, and one too narrow for that falls back to a line of names and ticks, which still answers
-"is my fleet up", which is what earns it the space.
+On a wide terminal the list sits under the agent cards, one line per machine, so the pane grid
+can use the rest of the screen. A terminal too narrow for that grid puts the same table under the
+agents instead, and one too narrow for that falls back to a line of names and ticks, which still
+answers "is my fleet up", which is what earns it the space.
 
 `a` adds one, without leaving the screen:
 
