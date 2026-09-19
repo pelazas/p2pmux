@@ -1093,22 +1093,22 @@ pub(in crate::tui) fn home_page_size(rows_height: u16) -> usize {
     (usize::from(rows_height) / home_card(rows_height).lines()).clamp(1, HOME_PAGE_MAX)
 }
 
-/// How wide the rail is, including the rule it hangs off.
-pub(in crate::tui) const MACHINE_RAIL_WIDTH: u16 = 28;
 /// Agents on top, machines under them. Wide enough for the attach-session line.
 pub(in crate::tui) const HOME_SIDEBAR_WIDTH: u16 = 48;
 /// Narrowest preview column that still reads as a window rather than a sliver.
 const PREVIEW_MIN_WIDTH: u16 = 28;
 /// Shortest preview column that can hold a bordered tile.
 const PREVIEW_MIN_HEIGHT: u16 = 8;
-/// Heading, one machine, and the `a` footer: the smallest useful dock.
-const MACHINE_DOCK_MIN_HEIGHT: u16 = 7;
-/// Blank + `MACHINES · N` at the top of the dock.
+/// Blank + heading at the top of the dock.
 pub(in crate::tui) const RAIL_HEADING_LINES: u16 = 2;
-/// The rule and `a  add a machine` at the foot.
-pub(in crate::tui) const RAIL_FOOTER_LINES: u16 = 2;
-/// Spacer, name, and detail for one machine.
-pub(in crate::tui) const RAIL_LINES_PER_MACHINE: u16 = 3;
+/// `a  add a machine` at the foot.
+pub(in crate::tui) const RAIL_FOOTER_LINES: u16 = 1;
+/// Name and detail for one machine.
+pub(in crate::tui) const RAIL_LINES_PER_MACHINE: u16 = 1;
+/// Heading, one machine, and the `a` footer: the smallest useful dock.
+const MACHINE_DOCK_MIN_HEIGHT: u16 = RAIL_HEADING_LINES
+    .saturating_add(1)
+    .saturating_add(RAIL_FOOTER_LINES);
 
 /// Every machine this client knows about, session members first.
 ///
@@ -1255,9 +1255,9 @@ fn machine_dock_height(sidebar_height: u16, n_machines: usize) -> u16 {
     if n_machines == 0 {
         return 0;
     }
-    let wanted = MACHINE_DOCK_MIN_HEIGHT.saturating_add(
-        u16::try_from(n_machines.saturating_sub(1).saturating_mul(3)).unwrap_or(u16::MAX),
-    );
+    let wanted = RAIL_HEADING_LINES
+        .saturating_add(u16::try_from(n_machines).unwrap_or(u16::MAX))
+        .saturating_add(RAIL_FOOTER_LINES);
     let agents_floor = 2u16.saturating_add(3);
     let cap = sidebar_height.saturating_sub(agents_floor);
     if cap < MACHINE_DOCK_MIN_HEIGHT {
@@ -1292,12 +1292,8 @@ fn preview_grid(area: Rect) -> Option<(u16, u16, u16, u16)> {
     if area.width < PREVIEW_TILE_MIN_WIDTH || area.height < PREVIEW_TILE_MIN_HEIGHT {
         return None;
     }
-    let cols = (area.width / PREVIEW_TILE_MIN_WIDTH)
-        .min(PREVIEW_COLS)
-        .max(1);
-    let rows = (area.height / PREVIEW_TILE_MIN_HEIGHT)
-        .min(PREVIEW_ROWS)
-        .max(1);
+    let cols = (area.width / PREVIEW_TILE_MIN_WIDTH).clamp(1, PREVIEW_COLS);
+    let rows = (area.height / PREVIEW_TILE_MIN_HEIGHT).clamp(1, PREVIEW_ROWS);
     Some((cols, rows, area.width / cols, area.height / rows))
 }
 
@@ -1354,7 +1350,7 @@ fn rail_shown_machines(height: u16, n_machines: usize) -> usize {
     let per = usize::from(RAIL_LINES_PER_MACHINE);
     let mut shown = body / per;
     if shown < n_machines {
-        shown = body.saturating_sub(2) / per;
+        shown = body.saturating_sub(1) / per;
     }
     shown.min(n_machines)
 }
@@ -1392,6 +1388,33 @@ fn table_machine_at(y: u16, rows: &[MachineRow]) -> Option<HomeMachineHit> {
     }
     let index = owned.saturating_add(usize::from(line.saturating_sub(1)));
     (index < rows.len()).then_some(HomeMachineHit::Row(index))
+}
+
+/// How many of the agent column's lines are actually written, so the fleet
+/// can sit under that instead of at the bottom of the leftover space.
+fn agent_content_height(tui: &MultiPaneTui, rows_height: u16) -> u16 {
+    if rows_height == 0 {
+        return 0;
+    }
+    if tui.home_rows().is_empty() {
+        // Numbered first-run copy: a blank, a heading, a blank, and two lines
+        // per step. Keep in step with `home_empty_state`.
+        const NUMBERED: u16 = 9;
+        return if rows_height >= NUMBERED {
+            NUMBERED
+        } else if rows_height >= 2 {
+            2
+        } else {
+            1
+        };
+    }
+    let lines = home_card(rows_height).lines();
+    let page = home_page_size(rows_height);
+    let start = tui.home_page.saturating_mul(page);
+    let n = tui.home_rows().len().saturating_sub(start).min(page);
+    u16::try_from(n.saturating_mul(lines))
+        .unwrap_or(u16::MAX)
+        .min(rows_height)
 }
 
 pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout {
@@ -1436,7 +1459,13 @@ pub(in crate::tui) fn home_layout(area: Rect, tui: &MultiPaneTui) -> HomeLayout 
             rows,
             hint,
             update,
-            machines: Rect::new(sidebar.x, rows.bottom(), sidebar.width, dock),
+            machines: Rect::new(
+                sidebar.x,
+                rows.y
+                    .saturating_add(agent_content_height(tui, rows.height)),
+                sidebar.width,
+                dock,
+            ),
             machine_panel: if rows_for_machines.is_empty() {
                 MachinePanel::Empty
             } else {
@@ -1808,9 +1837,18 @@ mod tests {
             layout.rows.height >= 3,
             "the agents keep at least one compact card above the dock"
         );
+        assert_eq!(layout.machines.x, AREA.x);
         assert!(
-            layout.machines.y >= layout.rows.bottom(),
+            layout.machines.y > layout.rows.y,
             "machines sit under the agents, not beside them"
+        );
+        assert_eq!(
+            layout.machines.y,
+            layout
+                .rows
+                .y
+                .saturating_add(u16::try_from(home_card(layout.rows.height).lines()).unwrap_or(0)),
+            "the dock sits under the cards, not at the floor of the column"
         );
     }
 
@@ -2834,10 +2872,7 @@ mod tests {
 
         let intents = tui.handle_home_click(
             machines.x.saturating_add(2),
-            machines
-                .y
-                .saturating_add(RAIL_HEADING_LINES)
-                .saturating_add(1),
+            machines.y.saturating_add(RAIL_HEADING_LINES),
             AREA,
         );
         assert!(
@@ -2864,8 +2899,7 @@ mod tests {
             .expect("oldbox is listed");
         let y = machines.y
             + RAIL_HEADING_LINES
-            + u16::try_from(oldbox).unwrap_or(0) * RAIL_LINES_PER_MACHINE
-            + 1;
+            + u16::try_from(oldbox).unwrap_or(0) * RAIL_LINES_PER_MACHINE;
 
         assert!(
             tui.handle_home_click(machines.x.saturating_add(2), y, AREA)

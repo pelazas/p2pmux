@@ -23,9 +23,9 @@ use crate::{
     tui::{
         AgentOverlayRow, MultiPaneTui, ScreenCell,
         home::{
-            HomeCard, HomeLayout, MACHINE_RAIL_WIDTH, MachinePanel, MachineRow, home_card,
-            home_layout, home_page_size, home_preview_panes, home_preview_title, machine_rows,
-            preview_page_capacity, preview_tiles,
+            HomeCard, HomeLayout, MachinePanel, MachineRow, home_card, home_layout, home_page_size,
+            home_preview_panes, home_preview_title, machine_rows, preview_page_capacity,
+            preview_tiles,
         },
         render::{
             footer::{FooterSegment, footer_segments_width, render_footer_segments},
@@ -220,11 +220,9 @@ const STATE_WIDTH: u16 = 12;
 /// Wide enough for `9h59m59s`, which is every clock anyone watches. A longer
 /// one pushes into the description column rather than losing a digit.
 const ELAPSED_WIDTH: u16 = 8;
-/// What a rail line has left for words once the rule and its space are drawn.
-const RAIL_TEXT_WIDTH: usize = MACHINE_RAIL_WIDTH as usize - 2;
 /// A spacer, the name, and what the machine is doing.
 const RAIL_LINES_PER_MACHINE: usize = crate::tui::home::RAIL_LINES_PER_MACHINE as usize;
-/// The rule and the key under it, which the fleet never grows into.
+/// The add-a-machine key, which the fleet never grows into.
 const RAIL_FOOTER_LINES: usize = crate::tui::home::RAIL_FOOTER_LINES as usize;
 /// Where a card's second and third lines start: under the dot, not under the
 /// marker, so the block of text hangs off the state glyph that introduces it.
@@ -360,7 +358,7 @@ fn render_home_in(
 
     if layout.machines.height > 0 {
         let lines = match layout.machine_panel {
-            MachinePanel::Rail => machine_rail(tui, theme, layout.machines.height),
+            MachinePanel::Rail => machine_rail(tui, theme, layout.machines),
             MachinePanel::Table => machine_table(tui, theme, layout.machines.width),
             MachinePanel::Strip => machine_strip(tui, theme),
             MachinePanel::Empty => Vec::new(),
@@ -908,115 +906,98 @@ fn home_kind_label(kind: &str) -> &'static str {
         .unwrap_or("agent")
 }
 
-/// The fleet down the right-hand side: every machine, two lines each.
-///
-/// A column rather than a footer because the space it spends was never being
-/// used — the sentence an agent gets is rarely half the width of the screen —
-/// and because a fleet you can see the whole time is the difference between
-/// machines being part of the product and being a command you remember to run.
-fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, height: u16) -> Vec<Line<'static>> {
+/// The fleet under the agents: every machine, one line each.
+fn machine_rail(tui: &MultiPaneTui, theme: &UiTheme, area: Rect) -> Vec<Line<'static>> {
     let machines = machine_rows(tui);
     let mut lines = vec![
-        rail_line(Vec::new(), theme),
-        rail_line(
-            vec![Span::styled(
-                format!("MACHINES · {}", machines.len()),
-                Style::default()
-                    .fg(theme.agent_overlay_muted)
-                    .add_modifier(Modifier::BOLD),
-            )],
-            theme,
+        Line::raw(""),
+        Line::styled(
+            String::from(" Machines"),
+            Style::default()
+                .fg(theme.agent_overlay_foreground)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
-    // A spacer and two lines each, inside whatever the heading and the key at
-    // the foot leave behind. A fleet too tall for that gives up two more lines
-    // to a count of what did not fit, because a rail that simply stopped would
-    // be a fleet with machines silently missing from it.
-    let height = usize::from(height);
+    let height = usize::from(area.height);
     let body = height
         .saturating_sub(lines.len())
         .saturating_sub(RAIL_FOOTER_LINES);
     let mut shown = body / RAIL_LINES_PER_MACHINE;
     if shown < machines.len() {
-        shown = body.saturating_sub(2) / RAIL_LINES_PER_MACHINE;
+        shown = body.saturating_sub(1) / RAIL_LINES_PER_MACHINE;
     }
     for (index, machine) in machines.iter().enumerate().take(shown) {
-        let selected = tui.home_machine == Some(index);
-        lines.push(rail_line(Vec::new(), theme));
-        lines.push(rail_line(
-            vec![
-                Span::styled(
-                    machine_glyph(machine),
-                    Style::default().fg(if machine.owned && machine.reachable {
-                        theme.agent_overlay_chrome
-                    } else {
-                        theme.agent_overlay_secondary
-                    }),
-                ),
-                Span::styled(
-                    truncate_trailing(&sanitize_single_line(&machine.name), RAIL_TEXT_WIDTH - 2),
-                    if selected {
-                        Style::default()
-                            .fg(theme.agent_overlay_foreground)
-                            .bg(theme.agent_overlay_selected_background)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.agent_overlay_foreground)
-                    },
-                ),
-            ],
-            theme,
-        ));
-        lines.push(rail_line(
-            vec![Span::styled(
-                format!(
-                    "  {}",
-                    truncate_trailing(&machine_detail(machine), RAIL_TEXT_WIDTH - 2)
-                ),
-                Style::default().fg(theme.agent_overlay_muted),
-            )],
+        lines.push(machine_rail_line(
+            machine,
+            tui.home_machine == Some(index),
+            area.width,
             theme,
         ));
     }
     if shown < machines.len() {
         let rest = machines.len() - shown;
-        lines.push(rail_line(Vec::new(), theme));
-        lines.push(rail_line(
-            vec![Span::styled(
-                format!("+{rest} more"),
-                Style::default().fg(theme.agent_overlay_secondary),
-            )],
-            theme,
+        lines.push(Line::styled(
+            format!(" +{rest} more"),
+            Style::default().fg(theme.agent_overlay_secondary),
         ));
     }
-    // The way to add another one, at the foot of the list of the ones you have,
-    // which is where somebody looking at a fleet of one will be looking.
     while lines.len() + RAIL_FOOTER_LINES < height {
-        lines.push(rail_line(Vec::new(), theme));
+        lines.push(Line::raw(""));
     }
-    lines.push(rail_line(
-        vec![Span::styled(
-            "─".repeat(RAIL_TEXT_WIDTH.saturating_sub(1)),
-            Style::default().fg(theme.agent_overlay_secondary),
-        )],
-        theme,
-    ));
-    lines.push(rail_line(
-        vec![
-            Span::styled(
-                "a",
-                Style::default()
-                    .fg(theme.agent_overlay_chrome)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  add a machine",
-                Style::default().fg(theme.agent_overlay_foreground),
-            ),
-        ],
-        theme,
-    ));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " a",
+            Style::default()
+                .fg(theme.agent_overlay_chrome)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  add a machine",
+            Style::default().fg(theme.agent_overlay_foreground),
+        ),
+    ]));
     lines
+}
+
+fn machine_rail_line(
+    machine: &MachineRow,
+    selected: bool,
+    width: u16,
+    theme: &UiTheme,
+) -> Line<'static> {
+    let glyph = machine_glyph(machine);
+    let detail = machine_detail(machine);
+    let budget = usize::from(width.saturating_sub(1));
+    let reserved = usize::from(
+        text_width(glyph)
+            .saturating_add(2)
+            .saturating_add(text_width(&detail)),
+    );
+    let name = truncate_trailing(
+        &sanitize_single_line(&machine.name),
+        budget.saturating_sub(reserved).max(1),
+    );
+    let mut name_style = Style::default().fg(theme.agent_overlay_foreground);
+    let mut detail_style = Style::default().fg(theme.agent_overlay_muted);
+    if selected {
+        name_style = name_style
+            .bg(theme.agent_overlay_selected_background)
+            .add_modifier(Modifier::BOLD);
+        detail_style = detail_style.bg(theme.agent_overlay_selected_background);
+    }
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            glyph,
+            Style::default().fg(if machine.owned && machine.reachable {
+                theme.agent_overlay_chrome
+            } else {
+                theme.agent_overlay_secondary
+            }),
+        ),
+        Span::styled(name, name_style),
+        Span::styled(format!("  {detail}"), detail_style),
+    ])
 }
 
 /// What a machine is, under its name: whether it is this one, whether it is
@@ -1065,16 +1046,6 @@ fn machine_glyph(machine: &MachineRow) -> &'static str {
         (true, true) => "● ",
         (true, false) => "○ ",
     }
-}
-
-/// One rail line, hung off the rule that separates it from the agents.
-fn rail_line(mut spans: Vec<Span<'static>>, theme: &UiTheme) -> Line<'static> {
-    let mut line = vec![Span::styled(
-        "│ ",
-        Style::default().fg(theme.agent_overlay_secondary),
-    )];
-    line.append(&mut spans);
-    Line::from(line)
 }
 
 fn render_previews(
@@ -1981,15 +1952,11 @@ mod tests {
         tui.set_home_open(true, "test");
 
         let drawn = screen(&tui, 120, 30).join("\n");
-        assert!(drawn.contains("MACHINES · 2"), "{drawn}");
+        assert!(drawn.contains("Machines"), "{drawn}");
         assert!(drawn.contains("● laptop"), "{drawn}");
         assert!(drawn.contains("this machine · 1 agent"), "{drawn}");
         assert!(drawn.contains("○ oldbox"), "{drawn}");
         assert!(drawn.contains("asleep"), "{drawn}");
-        assert!(
-            drawn.contains('│'),
-            "the rail hangs off a rule rather than floating: {drawn}"
-        );
         // At the foot of the machines you have, which is where somebody looking
         // for how to add another one is already looking.
         assert!(drawn.contains("add a machine"), "{drawn}");
@@ -2109,7 +2076,7 @@ mod tests {
         tui.set_home_open(true, "test");
 
         let drawn = screen(&tui, 120, 14).join("\n");
-        assert!(drawn.contains("MACHINES · 7"), "{drawn}");
+        assert!(drawn.contains("Machines"), "{drawn}");
         assert!(
             drawn.contains(" more"),
             "the machines that did not fit are counted, not dropped: {drawn}"

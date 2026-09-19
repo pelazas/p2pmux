@@ -177,7 +177,7 @@ def main() -> int:
         # Bare `p2pmux` rejoins the paired session and opens the inbox, which
         # is the screen all three remaining checks are about.
         inbox = harness.spawn("inbox", [])
-        inbox.wait_for(r"MACHINES", timeout=60.0)
+        inbox.wait_for(r"Machines", timeout=60.0)
         screen = inbox.wait_for(r"mybotvm", timeout=60.0)
         step("the droplet is on the inbox's machine list")
 
@@ -207,7 +207,7 @@ def main() -> int:
         # whole point of the distinction and makes this readable without
         # driving a cursor around.
         inbox.send(b"\x0f")
-        inbox.wait_for(r"MACHINES", timeout=30.0)
+        inbox.wait_for(r"Machines", timeout=30.0)
         screen = inbox.wait_for(r"enter starts a new c", timeout=60.0)
         step("the Hermes row says enter starts a new conversation, not joins one")
         assert "enter joins its" not in screen, (
