@@ -1273,6 +1273,11 @@ fn empty_previews(area: Rect) -> Rect {
 /// Smallest tile that still has a border and a few cells of the pane inside.
 const PREVIEW_TILE_MIN_WIDTH: u16 = 18;
 const PREVIEW_TILE_MIN_HEIGHT: u16 = 6;
+/// A page is four across and two down. Cell size comes from the area, never
+/// from how many panes are on it, so adding a pane appends a tile instead of
+/// shrinking the ones already there.
+const PREVIEW_COLS: u16 = 4;
+const PREVIEW_ROWS: u16 = 2;
 
 /// Every pane in the session, tab order then layout order.
 pub(in crate::tui) fn home_preview_panes(tui: &MultiPaneTui) -> Vec<PaneId> {
@@ -1283,41 +1288,39 @@ pub(in crate::tui) fn home_preview_panes(tui: &MultiPaneTui) -> Vec<PaneId> {
         .collect()
 }
 
-pub(in crate::tui) fn preview_page_capacity(area: Rect) -> usize {
+fn preview_grid(area: Rect) -> Option<(u16, u16, u16, u16)> {
     if area.width < PREVIEW_TILE_MIN_WIDTH || area.height < PREVIEW_TILE_MIN_HEIGHT {
-        return 0;
+        return None;
     }
-    usize::from(area.width / PREVIEW_TILE_MIN_WIDTH)
-        * usize::from(area.height / PREVIEW_TILE_MIN_HEIGHT)
+    let cols = (area.width / PREVIEW_TILE_MIN_WIDTH)
+        .min(PREVIEW_COLS)
+        .max(1);
+    let rows = (area.height / PREVIEW_TILE_MIN_HEIGHT)
+        .min(PREVIEW_ROWS)
+        .max(1);
+    Some((cols, rows, area.width / cols, area.height / rows))
+}
+
+pub(in crate::tui) fn preview_page_capacity(area: Rect) -> usize {
+    preview_grid(area)
+        .map(|(cols, rows, _, _)| usize::from(cols).saturating_mul(usize::from(rows)))
+        .unwrap_or(0)
 }
 
 pub(in crate::tui) fn preview_tiles(area: Rect, count: usize) -> Vec<Rect> {
-    if count == 0 || area.width == 0 || area.height == 0 {
+    let Some((cols, rows, tile_w, tile_h)) = preview_grid(area) else {
         return Vec::new();
-    }
-    let max_cols = (area.width / PREVIEW_TILE_MIN_WIDTH).max(1);
-    let max_rows = (area.height / PREVIEW_TILE_MIN_HEIGHT).max(1);
-    let count = count.min(usize::from(max_cols).saturating_mul(usize::from(max_rows)));
-    let cols = max_cols
-        .min(u16::try_from(count).unwrap_or(u16::MAX))
-        .max(1);
-    let rows = u16::try_from(count)
-        .unwrap_or(u16::MAX)
-        .div_ceil(cols)
-        .min(max_rows)
-        .max(1);
-    let tile_w = area.width / cols;
-    let tile_h = area.height / rows;
-    (0..count)
-        .filter_map(|index| {
-            let col = u16::try_from(index).unwrap_or(u16::MAX) % cols;
-            let row = u16::try_from(index).unwrap_or(u16::MAX) / cols;
-            (row < rows).then_some(Rect::new(
-                area.x.saturating_add(col.saturating_mul(tile_w)),
-                area.y.saturating_add(row.saturating_mul(tile_h)),
+    };
+    let cap = usize::from(cols).saturating_mul(usize::from(rows));
+    (0..count.min(cap))
+        .map(|index| {
+            let index = u16::try_from(index).unwrap_or(u16::MAX);
+            Rect::new(
+                area.x.saturating_add((index % cols).saturating_mul(tile_w)),
+                area.y.saturating_add((index / cols).saturating_mul(tile_h)),
                 tile_w,
                 tile_h,
-            ))
+            )
         })
         .collect()
 }
@@ -1514,7 +1517,8 @@ mod tests {
     use super::{
         HOME_PAGE_MAX, HOME_SIDEBAR_WIDTH, HomeCard, MachinePanel, RAIL_HEADING_LINES,
         RAIL_LINES_PER_MACHINE, chat_pane_title, home_card, home_layout, home_page_size,
-        home_preview_panes, machine_rows, preview_tiles, spawn_visible_to_guests,
+        home_preview_panes, machine_rows, preview_page_capacity, preview_tiles,
+        spawn_visible_to_guests,
     };
     use crate::{
         layout::{Axis, Node, Tab},
@@ -2918,25 +2922,32 @@ mod tests {
     }
 
     #[test]
-    fn preview_tiles_fill_the_area_in_a_grid() {
-        let area = Rect::new(10, 4, 54, 18);
-        let tiles = preview_tiles(area, 4);
-        assert_eq!(tiles.len(), 4);
+    fn preview_tiles_keep_their_size_as_panes_arrive() {
+        let area = Rect::new(10, 4, 80, 20);
+        let one = preview_tiles(area, 1);
+        let eight = preview_tiles(area, 8);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!(eight.len(), 8, "{eight:?}");
+        assert_eq!(one[0].width, eight[0].width);
+        assert_eq!(one[0].height, eight[0].height);
         assert!(
-            tiles
+            eight
                 .iter()
-                .all(|tile| tile.width >= 18 && tile.height >= 6),
-            "{tiles:?}"
+                .all(|tile| tile.width == one[0].width && tile.height == one[0].height),
+            "{eight:?}"
         );
-        assert!(
-            tiles.iter().all(|tile| {
-                tile.x >= area.x
-                    && tile.y >= area.y
-                    && tile.right() <= area.right()
-                    && tile.bottom() <= area.bottom()
-            }),
-            "{tiles:?}"
+        assert_eq!(eight[3].y, eight[0].y, "four to a row: {eight:?}");
+        assert_eq!(
+            eight[4].y,
+            eight[0].y.saturating_add(eight[0].height),
+            "the fifth tile wraps: {eight:?}"
         );
+        assert_eq!(
+            preview_tiles(area, 9).len(),
+            8,
+            "a ninth pane is the next page"
+        );
+        assert_eq!(preview_page_capacity(Rect::new(0, 0, 200, 80)), 8);
     }
 
     #[test]
