@@ -13,6 +13,7 @@ pub mod failover;
 pub mod fleet;
 pub mod hosted_rendezvous;
 pub mod install_path;
+mod io_wait;
 pub mod kitty_keyboard;
 pub mod layout;
 pub mod lease;

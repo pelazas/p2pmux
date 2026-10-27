@@ -338,7 +338,8 @@ prompt does not report mouse, so nothing changes there.
 
 ## Scrollback
 
-For locally hosted panes, mouse-wheel scrollback is loaded from the host on demand when you first
+A pane keeps the last 10,000 lines that scrolled off it. Closing the pane drops that history,
+and so does closing its tab. For locally hosted panes, mouse-wheel scrollback is loaded from the host on demand when you first
 scroll up, then cached while you browse it. Starting a scroll freezes a host-authored viewport for
 that browse session, so output can continue at the live edge without changing what is being read.
 
@@ -476,7 +477,8 @@ hooks`, in that session and in this one alike.
 Run that from a terminal, not from a pane in here. Reaching it from inside would mean a whole
 second p2pmux nested in a pane of this one. That takes the prefix key from the mux around it
 and, on a session that already has a terminal, ends at `already attached` and leaves an empty
-shell. The row stays on the list because it is the only record of where that agent went.
+shell. `p2pmux` refuses to open one from inside a pane for that reason. Unset `P2PMUX_PANE_ID`
+to force it. The row stays on the list because it is the only record of where that agent went.
 
 It does not feed the `inbox N` badge either. Going to an agent is what answers its summons, and
 there is no going to that one from here, so a count including it could only ever rise. The row

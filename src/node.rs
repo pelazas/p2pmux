@@ -42,6 +42,12 @@ use crate::tui::SharedLayoutRuntime;
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
 const MAX_CTL_CLIENTS: usize = 8;
 const ATTACHED_IDLE_BACKOFF: Duration = Duration::from_millis(1);
+/// How long an attached session may sit with nothing happening before the loop
+/// stops turning a thousand times a second. Short enough that the first quiet
+/// moment is still responsive; the park that follows waits on the socket and
+/// the PTY, so a key or a line of output ends it immediately.
+const ATTACHED_QUIET_AFTER: Duration = Duration::from_millis(50);
+const ATTACHED_QUIET_BACKOFF: Duration = Duration::from_millis(200);
 const DETACHED_IDLE_BACKOFF: Duration = Duration::from_millis(16);
 // A node with no local client still drains for remote guests, so it cannot simply sleep.
 // It can slow down once nothing has happened for a while: the cost is that the wake-up
@@ -80,9 +86,9 @@ const SELF_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 // unit file.
 //
 // Generous against what the work costs: scrollback is capped at 10,000 lines a
-// pane, so even a node hosting a dozen busy panes lands an order of magnitude
-// under this. The nodes that made this necessary were holding 598MB while
-// hosting nothing at all.
+// pane and those lines are kept as text, so a dozen busy panes stay well under
+// this. The nodes that made this necessary were holding 598MB while hosting
+// nothing at all.
 const TETHERED_MEMORY_CEILING: u64 = 384 * 1024 * 1024;
 // Where any node, however it was started, says out loud how big it has become.
 //
@@ -611,6 +617,9 @@ fn run_socket_loop(
     let mut warned_about_size = false;
     let mut last_work = Instant::now();
     let mut ctl_clients: Vec<CtlClient> = Vec::new();
+    // Before any pane can print. The reader thread's pulse is a no-op until this.
+    crate::io_wait::enable();
+    let wake = crate::io_wait::reader()?;
     loop {
         let mut shutdown = false;
         let mut did_work = false;
@@ -976,6 +985,7 @@ fn run_socket_loop(
                                         pane_id,
                                         total_rows: window.total_rows,
                                         screen: window.screen,
+                                        lines: window.lines,
                                     },
                                 );
                                 Some(
@@ -1174,7 +1184,7 @@ fn run_socket_loop(
             last_work = now;
         }
         match socket_loop_backoff(client.is_some(), did_work, now.duration_since(last_work)) {
-            Some(backoff) => std::thread::sleep(backoff),
+            Some(backoff) => park_node(&listener, client.as_ref(), &ctl_clients, &wake, backoff),
             None => std::thread::yield_now(),
         }
     }
@@ -1184,6 +1194,7 @@ struct FrozenScrollback {
     pane_id: u64,
     total_rows: u64,
     screen: vt100::Screen,
+    lines: Vec<crate::screen::HistoryLine>,
 }
 
 impl FrozenScrollback {
@@ -1196,12 +1207,25 @@ impl FrozenScrollback {
     /// `set_scrollback` itself is a field write. Offsets are absolute, so
     /// successive calls need no restore.
     fn viewport(&mut self, offset: u64) -> (u64, Vec<u8>) {
-        self.screen
-            .set_scrollback(offset.min(self.total_rows) as usize);
-        let snapshot = crate::screen::snapshot_payload(&self.screen)
-            .expect("host scrollback viewport must fit the screen codec")
-            .as_ref()
-            .to_vec();
+        let offset = offset.min(self.total_rows);
+        self.screen.set_scrollback(offset as usize);
+        // The parser only keeps a short buffer. An offset it still has is the
+        // screen itself; an older one is redrawn from the stored lines.
+        if self.screen.scrollback() as u64 == offset {
+            let snapshot = crate::screen::snapshot_payload(&self.screen)
+                .expect("host scrollback viewport must fit the screen codec")
+                .as_ref()
+                .to_vec();
+            return (self.total_rows, snapshot);
+        }
+        let (rows, cols) = self.screen.size();
+        let snapshot = crate::screen::snapshot_history_viewport(
+            &self.lines,
+            self.total_rows,
+            rows,
+            cols,
+            offset,
+        );
         (self.total_rows, snapshot)
     }
 }
@@ -1229,10 +1253,47 @@ fn socket_loop_backoff(
 ) -> Option<Duration> {
     match (client_attached, did_work) {
         (true, true) => None,
+        (true, false) if quiet_for >= ATTACHED_QUIET_AFTER => Some(ATTACHED_QUIET_BACKOFF),
         (true, false) => Some(ATTACHED_IDLE_BACKOFF),
         (false, false) if quiet_for >= DETACHED_QUIET_AFTER => Some(DETACHED_QUIET_BACKOFF),
         (false, _) => Some(DETACHED_IDLE_BACKOFF),
     }
+}
+
+/// Sleep, but wake at once for a key, a connection, a ctl request, or pane output.
+fn park_node(
+    listener: &UnixListener,
+    client: Option<&AttachedClient>,
+    ctl: &[CtlClient],
+    wake: &std::os::unix::net::UnixStream,
+    timeout: Duration,
+) {
+    use std::os::fd::AsFd;
+
+    use nix::poll::{PollFd, PollFlags};
+
+    if client.is_some_and(|client| !client.reader.buffer().is_empty()) {
+        return;
+    }
+    if ctl.iter().any(|client| !client.reader.buffer().is_empty()) {
+        return;
+    }
+    let mut fds = Vec::with_capacity(3 + ctl.len());
+    fds.push(PollFd::new(wake.as_fd(), PollFlags::POLLIN));
+    fds.push(PollFd::new(listener.as_fd(), PollFlags::POLLIN));
+    if let Some(client) = client {
+        fds.push(PollFd::new(
+            client.reader.get_ref().as_fd(),
+            PollFlags::POLLIN,
+        ));
+    }
+    for client in ctl {
+        fds.push(PollFd::new(
+            client.reader.get_ref().as_fd(),
+            PollFlags::POLLIN,
+        ));
+    }
+    crate::io_wait::park(&mut fds, timeout);
 }
 
 fn read_line(reader: &mut BufReader<UnixStream>) -> io::Result<Option<String>> {
@@ -2716,9 +2777,13 @@ mod tests {
             socket_loop_backoff(false, false, DETACHED_QUIET_AFTER),
             Some(DETACHED_QUIET_BACKOFF)
         );
-        // An attached client is never slowed, however long it has sat idle.
         assert_eq!(
-            socket_loop_backoff(true, false, DETACHED_QUIET_AFTER * 10),
+            socket_loop_backoff(true, false, ATTACHED_QUIET_AFTER),
+            Some(ATTACHED_QUIET_BACKOFF),
+            "an attached session that is actually idle waits on its sockets"
+        );
+        assert_eq!(
+            socket_loop_backoff(true, false, Duration::ZERO),
             Some(ATTACHED_IDLE_BACKOFF)
         );
     }
@@ -2925,6 +2990,7 @@ mod tests {
             pane_id: 1,
             total_rows,
             screen: host.screen().clone(),
+            lines: host.frozen_lines(),
         };
         let (_, payload) = frozen.viewport(1);
         let mut guest = crate::screen::GuestScreen::new();
@@ -2955,6 +3021,7 @@ mod tests {
             pane_id: 1,
             total_rows,
             screen: host.screen().clone(),
+            lines: host.frozen_lines(),
         };
         let expected = |offset: usize| {
             let mut screen = host.screen().clone();

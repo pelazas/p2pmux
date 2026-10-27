@@ -292,6 +292,7 @@ impl SharedLayoutRuntime {
         LocalScrollback::Window(Box::new(LocalScrollbackWindow {
             total_rows,
             screen: pane.screen.screen().clone(),
+            lines: pane.screen.frozen_lines(),
         }))
     }
 
@@ -303,7 +304,11 @@ impl SharedLayoutRuntime {
     ) -> Result<Option<String>, ()> {
         if let Some(pane) = self.local.get(&selection.pane_id) {
             return Ok(selection_text(selection, |offset| {
-                Some(viewed_screen(pane.screen.screen(), offset))
+                if offset == 0 {
+                    Some(viewed_screen(pane.screen.screen(), 0))
+                } else {
+                    Some(std::borrow::Cow::Owned(pane.screen.view_at(offset)))
+                }
             }));
         }
         let Some(pane) = self.remote.get(&selection.pane_id) else {

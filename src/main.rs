@@ -1,6 +1,11 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // A tab completion asks this process for candidates and exits. Anything
+    // written before this would land in the script the shell is sourcing.
+    clap_complete::CompleteEnv::with_factory(p2pmux::cli::command)
+        .completer("p2pmux")
+        .complete();
     let cli = p2pmux::cli::parse();
     // Some commands must not pay to start a runtime — see `run_without_runtime`.
     // Everything else gets one.

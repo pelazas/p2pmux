@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Once,
     time::{Duration, Instant},
 };
 
@@ -21,10 +22,13 @@ pub const PUSHED_STATUS_GRACE: Duration = Duration::from_secs(20);
 pub fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
+    dont_hold_proc_fds();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
-        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cwd(UpdateKind::Always),
     );
     system
         .process(pid)
@@ -326,10 +330,11 @@ pub fn process_memory(pid: u32) -> Option<u64> {
     }
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
+    dont_hold_proc_fds();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
-        ProcessRefreshKind::nothing().with_memory(),
+        ProcessRefreshKind::nothing().without_tasks().with_memory(),
     );
     system.process(pid).map(sysinfo::Process::memory)
 }
@@ -422,18 +427,111 @@ impl Default for SysinfoSampler {
     }
 }
 
-impl ProcessSampler for SysinfoSampler {
-    fn snapshot(&mut self) -> Vec<ProcessSnapshot> {
+impl SysinfoSampler {
+    /// One snapshot, with command lines only for pane descendants and for
+    /// processes that could be an agent.
+    ///
+    /// The first pass is every process, but only its pid, parent and name. That
+    /// is enough to walk a tree and to know which pids exist (`knows_pid`).
+    /// Command lines, executables and working directories are a second pass,
+    /// and only for the pids that can change an answer: the panes' own process
+    /// trees, and anything whose name is an agent runtime. Reading those three
+    /// fields for every process on the machine is what held a `/proc` file for
+    /// each of them, and what copied other people's command lines into this one.
+    pub fn snapshot_for(&mut self, roots: &[u32]) -> Vec<ProcessSnapshot> {
+        dont_hold_proc_fds();
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing()
-                .with_exe(UpdateKind::Always)
-                .with_cmd(UpdateKind::Always)
-                .with_cwd(UpdateKind::Always),
+            ProcessRefreshKind::nothing().without_tasks(),
         );
+        let interesting = interesting_pids(&self.system, roots);
+        if !interesting.is_empty() {
+            let pids: Vec<Pid> = interesting.into_iter().map(Pid::from_u32).collect();
+            self.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&pids),
+                true,
+                ProcessRefreshKind::nothing()
+                    .without_tasks()
+                    .with_exe(UpdateKind::Always)
+                    .with_cmd(UpdateKind::Always)
+                    .with_cwd(UpdateKind::Always),
+            );
+        }
         self.system.processes().values().map(snapshot_of).collect()
     }
+}
+
+impl ProcessSampler for SysinfoSampler {
+    fn snapshot(&mut self) -> Vec<ProcessSnapshot> {
+        self.snapshot_for(&[])
+    }
+}
+
+/// Stop `sysinfo` keeping a `/proc` file open per process between samples.
+///
+/// On Linux the library's default budget is half the process's open-file
+/// limit, and it spends that budget leaving `stat` files open so the next
+/// sample can `pread` them. An idle session has no reason to hold a file for
+/// every process on the machine. `0` means "keep none"; the files are still
+/// read, then closed. Other platforms ignore the call.
+fn dont_hold_proc_fds() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        sysinfo::set_open_files_limit(0);
+    });
+}
+
+/// Names that can be an agent, or the runtime an agent is launched under.
+///
+/// A loose agent is not a child of any pane, so the pane-tree walk never
+/// reaches it. Hermes is `python`, OpenClaw and pi are `node`, and `exec -a
+/// claude` is a shell whose name is `claude`. Their command lines are the
+/// only thing that distinguishes them, so those names are read and nothing
+/// else's is. Shells are deliberately absent: a pane's own shell is a root,
+/// and every other shell on the machine is not this session's business.
+fn interesting_name(name: &str) -> bool {
+    matches!(
+        name,
+        "p2pmux"
+            | "claude"
+            | "codex"
+            | "cursor-agent"
+            | "pi"
+            | "opencode"
+            | "hermes"
+            | "openclaw"
+            | "clawd"
+            | "node"
+            | "python"
+            | "python3"
+    ) || name.starts_with("python")
+}
+
+fn interesting_pids(system: &System, roots: &[u32]) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut named = Vec::new();
+    for process in system.processes().values() {
+        let pid = process.pid().as_u32();
+        if let Some(parent) = process.parent() {
+            children.entry(parent.as_u32()).or_default().push(pid);
+        }
+        if interesting_name(&process.name().to_string_lossy()) {
+            named.push(pid);
+        }
+    }
+    let mut wanted = HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(pid) = stack.pop() {
+        if !wanted.insert(pid) {
+            continue;
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    wanted.extend(named);
+    wanted.into_iter().collect()
 }
 
 /// One `sysinfo` process in this module's own terms.
@@ -524,10 +622,12 @@ pub fn agent_ancestor(from_pid: u32, preferred: AgentKind) -> Option<(u32, Agent
 }
 
 fn refreshed(system: &mut System, pid: Pid) -> Option<&sysinfo::Process> {
+    dont_hold_proc_fds();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always),
     );
@@ -1116,6 +1216,18 @@ mod tests {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn command_lines_are_read_for_agent_runtimes_and_not_for_shells() {
+        assert!(interesting_name("claude"));
+        assert!(interesting_name("cursor-agent"));
+        assert!(interesting_name("python3.12"));
+        assert!(interesting_name("node"));
+        assert!(interesting_name("p2pmux"));
+        assert!(!interesting_name("bash"));
+        assert!(!interesting_name("zsh"));
+        assert!(!interesting_name("sh"));
+    }
 
     #[test]
     fn cwd_for_pid_reads_a_live_childs_working_directory() {
