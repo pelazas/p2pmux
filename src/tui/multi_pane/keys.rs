@@ -189,6 +189,9 @@ impl MultiPaneTui {
             } else {
                 self.exit_chord_mode();
             }
+            if let Some(handling) = self.close_exited_pane(intent.as_ref()) {
+                return handling;
+            }
             KeyHandling::Consumed(intent.into_iter().collect())
         } else {
             // Typing leaves the mode; a modified key just passes through it.
@@ -198,6 +201,55 @@ impl MultiPaneTui {
             }
             KeyHandling::Forward
         }
+    }
+
+    /// Closing the last exited pane has to do what the footer says.
+    ///
+    /// The layout refuses to delete the only pane of a tab, and refuses to
+    /// delete the only tab, so Ctrl+P x on a dead session used to be rejected
+    /// and the session sat there. The pane's host ends the session instead.
+    /// A sole exited pane in a tab that still has neighbours closes that tab.
+    fn close_exited_pane(&self, intent: Option<&UiIntent>) -> Option<KeyHandling> {
+        let pane_id = match intent? {
+            UiIntent::DeletePane { pane_id } => *pane_id,
+            UiIntent::DeleteTab { tab_id } => {
+                if self.snapshot.tabs.len() != 1 {
+                    return None;
+                }
+                let tab = self
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == *tab_id)?;
+                let panes = visible_leaf_panes(&tab.root);
+                if panes.len() != 1 {
+                    return None;
+                }
+                panes[0]
+            }
+            _ => return None,
+        };
+        let pane = self.snapshot.panes.get(&pane_id)?;
+        if !pane.exited || self.local_peer_id.as_deref() != Some(pane.host_peer_id.as_slice()) {
+            return None;
+        }
+        let tab = self
+            .snapshot
+            .tabs
+            .iter()
+            .find(|tab| visible_leaf_panes(&tab.root).contains(&pane_id))?;
+        if visible_leaf_panes(&tab.root).len() != 1 {
+            return None;
+        }
+        if self.snapshot.tabs.len() == 1 {
+            return Some(KeyHandling::Quit(QuitAction::Kill));
+        }
+        if matches!(intent, Some(UiIntent::DeletePane { .. })) {
+            return Some(KeyHandling::Consumed(vec![UiIntent::DeleteTab {
+                tab_id: tab.tab_id,
+            }]));
+        }
+        None
     }
 
     pub(in crate::tui) fn handle_pane_chord(
@@ -842,6 +894,102 @@ mod tests {
                 grid_rows: 10,
                 grid_cols: 10,
             }])
+        );
+    }
+
+    #[test]
+    fn closing_the_last_exited_pane_ends_the_session() {
+        let area = Rect::new(0, 0, 40, 12);
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 4, 10)],
+        ))
+        .expect("valid layout");
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.snapshot.panes.get_mut(&1).unwrap().exited = true;
+
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Quit(QuitAction::Kill)
+        );
+
+        let mut tui = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 4, 10)],
+        ))
+        .expect("valid layout");
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.snapshot.panes.get_mut(&1).unwrap().exited = true;
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Quit(QuitAction::Kill)
+        );
+    }
+
+    #[test]
+    fn a_guest_cannot_end_the_session_and_another_tab_closes_instead() {
+        let area = Rect::new(0, 0, 40, 12);
+        let mut guest = MultiPaneTui::new(layout(
+            vec![Tab {
+                tab_id: 1,
+                root: Node::Leaf { pane_id: 1 },
+                title: None,
+            }],
+            &[(1, 4, 10)],
+        ))
+        .expect("valid layout");
+        guest.local_peer_id = Some(b"guest".to_vec());
+        guest.snapshot.panes.get_mut(&1).unwrap().exited = true;
+        let _ = guest.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            guest.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeletePane { pane_id: 1 }])
+        );
+
+        let mut tui = MultiPaneTui::new(layout(
+            vec![
+                Tab {
+                    tab_id: 1,
+                    root: Node::Leaf { pane_id: 1 },
+                    title: None,
+                },
+                Tab {
+                    tab_id: 2,
+                    root: Node::Leaf { pane_id: 2 },
+                    title: None,
+                },
+            ],
+            &[(1, 4, 10), (2, 4, 10)],
+        ))
+        .expect("valid layout");
+        tui.local_peer_id = Some(b"host".to_vec());
+        tui.snapshot.panes.get_mut(&1).unwrap().exited = true;
+        let _ = tui.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+        );
+        assert_eq!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), area),
+            KeyHandling::Consumed(vec![UiIntent::DeleteTab { tab_id: 1 }])
         );
     }
 
