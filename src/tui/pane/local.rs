@@ -5,7 +5,7 @@ use std::{
     error::Error,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self as sync_mpsc, Receiver},
     },
@@ -19,7 +19,6 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     agent_detect::{
         AgentScan, AgentState, ListedAgent, PaneAgentTracker, ProcessSnapshot, SysinfoSampler,
-        sample_global_snapshot,
     },
     layout::PaneId,
     lease::{LeaseDecision, LeaseManager, LeaseState},
@@ -419,19 +418,23 @@ pub(in crate::tui) struct AgentSamplingWorker {
     pub(in crate::tui) snapshots: Receiver<Vec<ProcessSnapshot>>,
     pub(in crate::tui) stop: Arc<AtomicBool>,
     pub(in crate::tui) join: Option<JoinHandle<()>>,
+    roots: Arc<Mutex<Vec<u32>>>,
 }
 impl AgentSamplingWorker {
     pub(in crate::tui) fn spawn() -> Self {
         let (snapshot_tx, snapshots) = sync_mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let roots = Arc::new(Mutex::new(Vec::new()));
+        let worker_roots = Arc::clone(&roots);
         let join = thread::spawn(move || {
             let mut sampler = SysinfoSampler::default();
             while !worker_stop.load(Ordering::Relaxed) {
-                if snapshot_tx
-                    .send(sample_global_snapshot(&mut sampler))
-                    .is_err()
-                {
+                let roots = worker_roots
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                if snapshot_tx.send(sampler.snapshot_for(&roots)).is_err() {
                     break;
                 }
                 // Slept in slices rather than in one go, because `shutdown`
@@ -449,6 +452,18 @@ impl AgentSamplingWorker {
             snapshots,
             stop,
             join: Some(join),
+            roots,
+        }
+    }
+
+    /// The pane shells the next scan should read command lines for.
+    ///
+    /// The scan itself runs on its own thread, so this is whatever the session
+    /// looked like at the last drain. The first scan can race ahead of that
+    /// and see none; the one five seconds later sees them.
+    pub(in crate::tui) fn set_roots(&self, roots: Vec<u32>) {
+        if let Ok(mut guard) = self.roots.lock() {
+            *guard = roots;
         }
     }
 

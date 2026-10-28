@@ -1,6 +1,7 @@
 //! Fixed-grid vt100 state codec used only by the host and guest renderers.
 
 use std::{
+    collections::VecDeque,
     fmt,
     sync::Arc,
     time::{Duration, Instant},
@@ -13,6 +14,14 @@ use crate::{
 
 pub const SCREEN_CODEC_VERSION: u8 = 1;
 pub(crate) const SCROLLBACK_LINES: usize = 10_000;
+/// How many rows the parser itself is allowed to keep.
+///
+/// A vt100 row is a cell for every column, about 32 bytes each, whether or not
+/// the line had anything on it. Ten thousand of those is tens of megabytes per
+/// pane, and the allocator does not hand that back when the pane closes.
+/// The parser only needs a short run of rows to notice what just scrolled off;
+/// everything older is kept below as the text of the line.
+const PARSER_SCROLLBACK: usize = 64;
 const SNAPSHOT_HEADER_BYTES: usize = 5;
 
 #[derive(Clone, Debug)]
@@ -410,8 +419,21 @@ impl vt100::Callbacks for PaneCallbacks {
     }
 }
 
+/// One row that has scrolled off the live screen, stored as the bytes that
+/// redraw it rather than as a cell for every column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryLine {
+    bytes: Vec<u8>,
+    wrapped: bool,
+}
+
 pub struct HostScreen {
     parser: vt100::Parser<PaneCallbacks>,
+    /// Lines that have left the parser's own short scrollback, oldest first.
+    history: VecDeque<HistoryLine>,
+    /// The parser's current scrollback, oldest first. A line moves into
+    /// `history` at the moment the parser is about to drop it.
+    staged: Vec<HistoryLine>,
     /// Baseline for `state_diff`, held one batch behind `parser`.
     ///
     /// This used to be a clone of the live screen, but `vt100::Screen::clone` copies the
@@ -438,12 +460,14 @@ impl HostScreen {
         let parser = vt100::Parser::new_with_callbacks(
             rows,
             cols,
-            SCROLLBACK_LINES,
+            PARSER_SCROLLBACK,
             PaneCallbacks::default(),
         );
         let snapshot = snapshot_payload(parser.screen())?;
         Ok(Self {
             parser,
+            history: VecDeque::new(),
+            staged: Vec::new(),
             previous: vt100::Parser::new(rows, cols, 0),
             current: ScreenFrame {
                 sequence: 1,
@@ -469,9 +493,8 @@ impl HostScreen {
         // drift from the live screen by exactly the cursor moves being repaired.
         let bytes = &*self.hvp.feed(bytes);
         self.kitty_keyboard.observe(bytes);
-        self.parser.process(bytes);
-        let after_history = retained_scrollback_len(self.parser.screen_mut());
-        self.retained_scrollback = after_history;
+        self.ingest(bytes);
+        let after_history = self.retained_scrollback;
         let appended = after_history.saturating_sub(before_history).max(
             usize::from(before_history == SCROLLBACK_LINES && after_history == SCROLLBACK_LINES)
                 * bytes.iter().filter(|byte| **byte == b'\n').count(),
@@ -532,8 +555,7 @@ impl HostScreen {
         });
         self.parser.screen_mut().set_size(rows, cols);
         if let Some((text, pen)) = reflow {
-            self.parser
-                .process(&reflow_payload(&text, rows, cols, &pen));
+            self.ingest(&reflow_payload(&text, rows, cols, &pen));
             // Rows the replay pushed past the top are history now, and the monotonic
             // end position has to count them or scrollback addressing drifts.
             let (_, scrolled) = replay_extent(&text, rows, cols);
@@ -551,8 +573,8 @@ impl HostScreen {
         // own width. Dropping it here is what made a pane unscrollable after every
         // window resize, split, or zoom -- and permanently so for a full-frame
         // agent UI, which repaints in place and never scrolls a fresh row in to
-        // rebuild what was thrown away.
-        self.retained_scrollback = retained_scrollback_len(self.parser.screen_mut());
+        // rebuild what was thrown away. `ingest` already counted whatever the
+        // reflow pushed off the top.
         let mut snapshot = snapshot_payload(self.parser.screen())?.to_vec();
         append_cursor_style(&mut snapshot, self.cursor_style(), MAX_SNAPSHOT_BYTES);
         let frame = ScreenFrame {
@@ -617,7 +639,7 @@ impl HostScreen {
         max_rows: usize,
         max_bytes: usize,
     ) -> (u64, Vec<Vec<u8>>) {
-        let (total_rows, history_end) = self.history_metadata();
+        let (total_rows, _) = self.history_metadata();
         if total_rows == 0 {
             return (0, Vec::new());
         }
@@ -626,24 +648,73 @@ impl HostScreen {
         let first = last.saturating_sub(max_rows as u64);
         let mut rows = Vec::new();
         let mut bytes = 0_usize;
-        let retained = self.retained_scrollback as u64;
-        let retained_start = history_end.saturating_sub(retained);
-        let available_start = history_end.saturating_sub(total_rows);
-        let mut screen = self.parser.screen().clone();
-        for row in first..last {
-            let absolute = available_start.saturating_add(row);
-            let physical = absolute.saturating_sub(retained_start);
-            screen.set_scrollback(retained.saturating_sub(physical) as usize);
-            let Some(formatted) = screen.rows_formatted(0, screen.size().1).next() else {
-                continue;
-            };
-            if bytes.saturating_add(formatted.len()) > max_bytes {
+        for line in self
+            .history
+            .iter()
+            .chain(self.staged.iter())
+            .skip(first as usize)
+            .take((last - first) as usize)
+        {
+            if bytes.saturating_add(line.bytes.len()) > max_bytes {
                 break;
             }
-            bytes = bytes.saturating_add(formatted.len());
-            rows.push(formatted);
+            bytes = bytes.saturating_add(line.bytes.len());
+            rows.push(line.bytes.clone());
         }
         (total_rows, rows)
+    }
+
+    /// The screen as it looks `offset` rows back, including lines the parser
+    /// itself has already forgotten.
+    ///
+    /// Offsets the parser still holds are a `set_scrollback` on a clone, which
+    /// is exactly the view selection and the wheel used to take. Anything
+    /// older is redrawn from the stored lines: the parser no longer has them.
+    pub(crate) fn view_at(&self, offset: usize) -> vt100::Screen {
+        let mut screen = self.parser.screen().clone();
+        screen.set_scrollback(offset);
+        if offset == 0 || screen.scrollback() == offset {
+            return screen;
+        }
+        let (rows, cols) = self.parser.screen().size();
+        let scrollback = self.history.len() + self.staged.len();
+        let mut lines: Vec<&HistoryLine> = Vec::with_capacity(scrollback + usize::from(rows));
+        lines.extend(self.history.iter());
+        lines.extend(self.staged.iter());
+        let visible = self.visible_lines();
+        lines.extend(visible.iter());
+        let start = scrollback.saturating_sub(offset);
+        let end = (start + usize::from(rows)).min(lines.len());
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        for (index, line) in lines[start..end].iter().enumerate() {
+            let cup = format!("\x1b[{};1H", index + 1);
+            parser.process(cup.as_bytes());
+            parser.process(&line.bytes);
+        }
+        parser.screen().clone()
+    }
+
+    fn visible_lines(&self) -> Vec<HistoryLine> {
+        let screen = self.parser.screen();
+        let cols = screen.size().1;
+        screen
+            .rows_formatted(0, cols)
+            .enumerate()
+            .map(|(index, bytes)| HistoryLine {
+                bytes,
+                wrapped: screen.row_wrapped(index as u16),
+            })
+            .collect()
+    }
+
+    /// Scrollback plus the live rows, oldest first. What a frozen browse
+    /// session scrolls through once the parser has let the older lines go.
+    pub(crate) fn frozen_lines(&self) -> Vec<HistoryLine> {
+        let mut lines = Vec::with_capacity(self.history.len() + self.staged.len());
+        lines.extend(self.history.iter().cloned());
+        lines.extend(self.staged.iter().cloned());
+        lines.extend(self.visible_lines());
+        lines
     }
 
     /// Compatibility helper for callers that need the newest window.
@@ -665,17 +736,192 @@ impl HostScreen {
     }
 }
 
-/// Retained scrollback rows, read by clamping the scrollback offset and restoring it.
+/// Feed `bytes` to the parser and remember every line it scrolls off.
 ///
-/// `set_scrollback` clamps to the retained length and both it and `scrollback` are O(1)
-/// field accesses, so this reads the same number the old `screen.clone()` did without
-/// copying the row buffer.
-fn retained_scrollback_len(screen: &mut vt100::Screen) -> usize {
+/// Split into short pieces first. The parser only keeps [`PARSER_SCROLLBACK`]
+/// rows, so a single batch longer than that would scroll lines off that this
+/// had never stored. An alternate screen has no history of its own; its bytes
+/// are parsed and forgotten, and the primary history is left where it was.
+fn ingest(host: &mut HostScreen, bytes: &[u8]) {
+    if host.parser.screen().alternate_screen() {
+        host.parser.screen_mut().set_scrollback(0);
+        host.parser.process(bytes);
+        return;
+    }
+    let cols = usize::from(host.parser.screen().size().1).max(1);
+    // One line at a time once a newline shows up. A longer piece can scroll
+    // more rows off the parser's short buffer than this has stored, and one
+    // newline can scroll at most one row.
+    let max_newlines = 1;
+    let max_bytes = (PARSER_SCROLLBACK / 2).max(1) * cols;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let mut end = rest.len();
+        let mut newlines = 0_usize;
+        for (index, byte) in rest.iter().enumerate() {
+            if *byte == b'\n' {
+                newlines += 1;
+                if newlines >= max_newlines {
+                    end = index + 1;
+                    break;
+                }
+            }
+            if index + 1 >= max_bytes {
+                end = index + 1;
+                break;
+            }
+        }
+        let chunk = &rest[..end];
+        rest = &rest[end..];
+        host.parser.screen_mut().set_scrollback(0);
+        host.parser.process(chunk);
+        if host.parser.screen().alternate_screen() {
+            // The offset now refers to the other grid. Syncing here would
+            // read that grid and throw away the primary history.
+            if !rest.is_empty() {
+                host.parser.process(rest);
+            }
+            return;
+        }
+        sync_history(host, newlines);
+    }
+}
+
+impl HostScreen {
+    fn ingest(&mut self, bytes: &[u8]) {
+        ingest(self, bytes);
+    }
+}
+
+fn sync_history(host: &mut HostScreen, newlines: usize) {
+    let depth = scrollback_depth(host);
+    let before = host.staged.len();
+    if depth < PARSER_SCROLLBACK {
+        if depth < before {
+            host.staged = read_newest(host, depth);
+        } else if depth > before {
+            let added = read_newest(host, depth - before);
+            host.staged.extend(added);
+        }
+    } else if before < PARSER_SCROLLBACK {
+        // This chunk is the one that filled the parser's buffer. Re-read it
+        // and keep whatever prefix of the old mirror is no longer there.
+        let now = read_newest(host, depth);
+        remember_dropped(host, &now);
+        host.staged = now;
+    } else if newlines > 0 {
+        let newest = read_newest(host, newlines.min(depth));
+        let unchanged = host.staged.len() >= newest.len()
+            && host.staged[host.staged.len() - newest.len()..]
+                .iter()
+                .zip(&newest)
+                .all(|(left, right)| left == right);
+        if !unchanged {
+            let dropped = newlines.min(host.staged.len());
+            for line in host.staged.drain(..dropped) {
+                host.history.push_back(line);
+            }
+            host.staged.extend(newest);
+        }
+    } else {
+        let now = read_newest(host, depth);
+        if lines_dropped(&host.staged, &now) > 0 {
+            remember_dropped(host, &now);
+            host.staged = now;
+        }
+    }
+    if host.staged.len() > depth {
+        let extra = host.staged.len() - depth;
+        for line in host.staged.drain(..extra) {
+            host.history.push_back(line);
+        }
+    }
+    while host.history.len() + host.staged.len() > SCROLLBACK_LINES {
+        host.history.pop_front();
+    }
+    host.retained_scrollback = host.history.len() + host.staged.len();
+}
+
+fn remember_dropped(host: &mut HostScreen, now: &[HistoryLine]) {
+    let dropped = lines_dropped(&host.staged, now).min(host.staged.len());
+    for line in host.staged.drain(..dropped) {
+        host.history.push_back(line);
+    }
+}
+
+/// How many leading `old` lines are gone from `new`.
+///
+/// The parser drops from the front and appends at the back, so the longest
+/// suffix of `old` that is a prefix of `new` is the part still retained.
+fn lines_dropped(old: &[HistoryLine], new: &[HistoryLine]) -> usize {
+    if old.is_empty() {
+        return 0;
+    }
+    let max = old.len().min(new.len());
+    for overlap in (0..=max).rev() {
+        if old[old.len() - overlap..]
+            .iter()
+            .zip(&new[..overlap])
+            .all(|(left, right)| left == right)
+        {
+            return old.len() - overlap;
+        }
+    }
+    old.len()
+}
+
+fn scrollback_depth(host: &mut HostScreen) -> usize {
+    let screen = host.parser.screen_mut();
     let restore = screen.scrollback();
-    screen.set_scrollback(SCROLLBACK_LINES);
-    let retained = screen.scrollback();
+    screen.set_scrollback(PARSER_SCROLLBACK);
+    let depth = screen.scrollback();
     screen.set_scrollback(restore);
-    retained
+    depth
+}
+
+/// The newest `count` scrollback rows, oldest first.
+fn read_newest(host: &mut HostScreen, count: usize) -> Vec<HistoryLine> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let screen = host.parser.screen_mut();
+    let cols = screen.size().1;
+    let mut lines = Vec::with_capacity(count);
+    for offset in (1..=count).rev() {
+        screen.set_scrollback(offset);
+        let bytes = screen.rows_formatted(0, cols).next().unwrap_or_default();
+        let wrapped = screen.row_wrapped(0);
+        lines.push(HistoryLine { bytes, wrapped });
+    }
+    screen.set_scrollback(0);
+    lines
+}
+
+/// A viewport of stored lines, for a browse offset the live parser no longer reaches.
+///
+/// `lines` is scrollback and then the live rows, oldest first. `offset` skips
+/// that many rows back from the live edge, the same count `set_scrollback` takes.
+pub(crate) fn snapshot_history_viewport(
+    lines: &[HistoryLine],
+    scrollback_rows: u64,
+    rows: u16,
+    cols: u16,
+    offset: u64,
+) -> Vec<u8> {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let scrollback = scrollback_rows.min(lines.len() as u64) as usize;
+    let start = scrollback.saturating_sub(offset as usize);
+    let end = (start + usize::from(rows)).min(lines.len());
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    for (index, line) in lines[start..end].iter().enumerate() {
+        let cup = format!("\x1b[{};1H", index + 1);
+        parser.process(cup.as_bytes());
+        parser.process(&line.bytes);
+    }
+    snapshot_payload(parser.screen())
+        .map(|snapshot| snapshot.as_ref().to_vec())
+        .unwrap_or_default()
 }
 
 /// One logical line of the visible grid, joined back across the soft wraps the
@@ -1290,27 +1536,53 @@ mod tests {
     }
 
     #[test]
-    /// Locks `retained_scrollback` to the clone-and-clamp reading the wheel handler used
-    /// to do, across the two paths that touch the parser: output and resize.
-    fn retained_scrollback_matches_a_clone_and_clamp_reading() {
-        let clone_and_clamp = |screen: &vt100::Screen| {
-            let mut screen = screen.clone();
-            screen.set_scrollback(super::SCROLLBACK_LINES);
-            screen.scrollback()
-        };
+    /// The count a scroll can reach is the count `retained_scrollback` reports,
+    /// including lines the parser itself has already dropped.
+    fn retained_scrollback_matches_what_a_scroll_can_reach() {
         let mut host = HostScreen::new(24, 80).expect("valid dimensions");
         assert_eq!(host.retained_scrollback(), 0);
         for (index, batch) in agent_like_batches(400).into_iter().enumerate() {
             host.process_pty(&batch).expect("processed");
+            let (total, _) = host.visual_scrollback(1, 64);
             assert_eq!(
                 host.retained_scrollback(),
-                clone_and_clamp(host.screen()),
+                total,
                 "retained rows diverged at batch {index}",
             );
         }
-        assert!(host.retained_scrollback() > 0, "expected retained history");
+        assert!(
+            host.retained_scrollback() > super::PARSER_SCROLLBACK,
+            "expected history past the parser's own buffer, got {}",
+            host.retained_scrollback()
+        );
+        let before = host.retained_scrollback();
         host.resize(30, 100).expect("valid dimensions");
-        assert_eq!(host.retained_scrollback(), clone_and_clamp(host.screen()));
+        let (total, _) = host.visual_scrollback(1, 64);
+        assert_eq!(host.retained_scrollback(), total);
+        assert!(host.retained_scrollback() >= before);
+    }
+
+    #[test]
+    fn lines_older_than_the_parser_buffer_stay_readable() {
+        let mut host = HostScreen::new(2, 40).expect("valid dimensions");
+        for index in 0..300 {
+            host.process_pty(format!("line-{index}\r\n").as_bytes())
+                .expect("processed");
+        }
+        let (total, _) = host.history_metadata();
+        assert!(total > super::PARSER_SCROLLBACK as u64);
+        let (_, oldest) = host.visual_scrollback_window(total.saturating_sub(1), 1, 4096);
+        let text = String::from_utf8_lossy(oldest.first().expect("oldest line"));
+        assert!(
+            text.contains("line-0"),
+            "the first line was dropped with the parser buffer: {text}"
+        );
+        let deep = host.view_at(total as usize);
+        assert!(
+            deep.contents().contains("line-0"),
+            "scrolling back to it lost the text: {}",
+            deep.contents()
+        );
     }
 
     /// The visible grid read back with its soft wraps joined away.

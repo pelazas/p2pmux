@@ -19,6 +19,11 @@ use p2pmux::{
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_p2pmux"))
         .args(args)
+        // A developer running this from inside a pane has these set, and the
+        // binary then refuses to open a session. The tests that want that
+        // refusal set the variable themselves.
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
         .output()
         .expect("p2pmux binary should run")
 }
@@ -36,6 +41,8 @@ fn run_with_home(home: &Path, args: &[&str]) -> std::process::Output {
         .env("HOME", home)
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CONFIG_HOME")
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
         .output()
         .expect("p2pmux binary should run")
 }
@@ -74,6 +81,8 @@ fn join_reports_an_unreachable_rendezvous_without_echoing_the_code() {
     let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
         .args(["join", code])
         .env("P2PMUX_RENDEZVOUS_URL", "https://127.0.0.1:1")
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
         .output()
         .expect("p2pmux binary should run");
 
@@ -578,6 +587,73 @@ impl Drop for FakeSession {
 }
 
 static TEMPORARY_CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn a_session_inside_a_pane_is_refused() {
+    for args in [
+        &[][..],
+        &["local"],
+        &["create"],
+        &["join", "not-a-ticket"],
+        &["attach"],
+        &["--resume"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+            .args(args)
+            .env("P2PMUX_PANE_ID", "1")
+            .output()
+            .expect("p2pmux binary should run");
+        assert!(!output.status.success(), "{args:?} opened a nested session");
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+        assert!(
+            stderr.contains("Unset P2PMUX_PANE_ID"),
+            "{args:?} stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn commands_meant_to_run_inside_a_pane_still_do() {
+    let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(["list"])
+        .env("P2PMUX_PANE_ID", "1")
+        .output()
+        .expect("p2pmux binary should run");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(
+        !stderr.contains("Unset P2PMUX_PANE_ID"),
+        "list was treated as opening a session: {stderr}"
+    );
+}
+
+#[test]
+fn version_is_a_command_and_trailing_arguments_are_rejected() {
+    let version = run(&["version"]);
+    assert!(version.status.success());
+    let text = String::from_utf8(version.stdout).expect("stdout should be UTF-8");
+    assert!(text.starts_with("p2pmux "), "{text}");
+
+    let flag = run(&["--version"]);
+    assert!(flag.status.success());
+    let flag_text = String::from_utf8(flag.stdout).expect("stdout should be UTF-8");
+    assert_eq!(flag_text, text);
+
+    let extra = run(&["--version", "extra"]);
+    assert!(!extra.status.success());
+}
+
+#[test]
+fn completions_and_the_man_page_print_without_a_runtime() {
+    let completions = run(&["completions", "zsh"]);
+    assert!(completions.status.success());
+    let script = String::from_utf8(completions.stdout).expect("stdout should be UTF-8");
+    assert!(script.contains("p2pmux"), "{script}");
+
+    let manual = run(&["man"]);
+    assert!(manual.status.success());
+    let page = String::from_utf8(manual.stdout).expect("stdout should be UTF-8");
+    assert!(page.contains(".TH"), "{page}");
+}
 
 fn temporary_cache_home() -> PathBuf {
     let nonce = SystemTime::now()

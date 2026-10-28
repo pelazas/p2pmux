@@ -32,7 +32,7 @@ use crate::{
     screen::{ApplyDelta, GuestScreen},
     session_store::SessionDescriptor,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, KeyHandling, MultiPaneTui,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, ChordMode, KeyHandling, MultiPaneTui,
         PaneMouseProtocol, PaneViewState, QuitAction, ShareView, clear_before_first_frame,
         copy_selection_to_clipboard, keep_attributes_through_no_color,
         render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
@@ -42,30 +42,89 @@ use crate::{
 
 const IPC_BATCH_PER_WAKE: usize = 32;
 const DETACH_ACK_TIMEOUT: Duration = Duration::from_millis(500);
-const EARLY_KEY_CAPACITY: usize = 8;
+/// How long the client sleeps when nothing on screen is moving. Keys still
+/// arrive immediately: the terminal thread is blocked in `poll`, not on this.
+const IDLE_WAIT: Duration = Duration::from_millis(500);
+const EARLY_INPUT_CAPACITY: usize = 4096;
 
-fn queue_early_key(queued: &mut VecDeque<crossterm::event::KeyEvent>, event: Event) {
-    let Event::Key(key) = event else {
-        return;
-    };
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return;
-    }
-    if queued.len() == EARLY_KEY_CAPACITY {
-        queued.pop_front();
-    }
-    queued.push_back(key);
+enum EarlyInput {
+    Key(crossterm::event::KeyEvent),
+    Paste(String),
 }
 
-fn replay_early_key(
-    pending_wake: &mut Option<WakeEvent>,
-    queued: &mut VecDeque<crossterm::event::KeyEvent>,
-) {
-    if pending_wake.is_none()
-        && let Some(key) = queued.pop_front()
-    {
-        *pending_wake = Some(WakeEvent::Terminal(Event::Key(key)));
+/// Holds a key or a paste that arrived before the first frame.
+///
+/// A full queue drops the newest event. Dropping the oldest is what turned
+/// `echo` into `cho`: the first letters of a fast line were the ones that
+/// fell off an eight-deep queue.
+fn queue_early_input(queued: &mut VecDeque<EarlyInput>, event: Event) -> bool {
+    let item = match event {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            EarlyInput::Key(key)
+        }
+        Event::Paste(text) => EarlyInput::Paste(text),
+        _ => return false,
+    };
+    if queued.len() < EARLY_INPUT_CAPACITY {
+        queued.push_back(item);
     }
+    true
+}
+
+/// Puts `event` behind input that is already waiting, so a key that arrives
+/// while the first frame is still on its way cannot jump the queue.
+///
+/// Resize and anything that is not itself input is returned even then. Those
+/// events have no place in the queue, and dropping one would leave the panes
+/// the wrong size.
+fn defer_terminal_event(queued: &mut VecDeque<EarlyInput>, event: Event) -> Option<Event> {
+    if queued.is_empty() {
+        return Some(event);
+    }
+    match event {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            queue_early_input(queued, Event::Key(key));
+            None
+        }
+        Event::Paste(text) => {
+            queue_early_input(queued, Event::Paste(text));
+            None
+        }
+        other => Some(other),
+    }
+}
+
+fn replay_early_input(pending_wake: &mut Option<WakeEvent>, queued: &mut VecDeque<EarlyInput>) {
+    if pending_wake.is_some() {
+        return;
+    }
+    let Some(item) = queued.pop_front() else {
+        return;
+    };
+    *pending_wake = Some(WakeEvent::Terminal(match item {
+        EarlyInput::Key(key) => Event::Key(key),
+        EarlyInput::Paste(text) => Event::Paste(text),
+    }));
+}
+
+fn attached_wait(tui: Option<&MultiPaneTui>, detaching: bool) -> Duration {
+    let mut wait = IDLE_WAIT;
+    if detaching {
+        wait = wait.min(Duration::from_millis(50));
+    }
+    let Some(tui) = tui else {
+        return wait;
+    };
+    if tui.selection_autoscroll_pane().is_some() {
+        wait = wait.min(Duration::from_millis(60));
+    }
+    if tui.home_has_working_rows() {
+        wait = wait.min(AGENT_OVERLAY_ANIMATION_INTERVAL);
+    }
+    if tui.chord_mode() != ChordMode::None {
+        wait = wait.min(Duration::from_millis(100));
+    }
+    wait
 }
 
 #[derive(Default)]
@@ -429,7 +488,7 @@ pub fn run_on(
     let mut share_code: Option<String> = None;
     let mut share_notice: Option<String> = None;
     let mut pending_wake = None;
-    let mut early_keys = VecDeque::new();
+    let mut early_input = VecDeque::new();
     let mut next_perf_id = 1_u64;
     let mut draw_perf_id = None;
     // The viewport is fixed, so what is drawn only follows the window because
@@ -757,7 +816,9 @@ pub fn run_on(
                     break 'attached;
                 }
                 Ok(WakeEvent::Terminal(event)) => {
-                    pending_wake = Some(WakeEvent::Terminal(event));
+                    if let Some(event) = defer_terminal_event(&mut early_input, event) {
+                        pending_wake = Some(WakeEvent::Terminal(event));
+                    }
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -870,7 +931,7 @@ pub fn run_on(
             dirty = false;
         }
         if tui.is_some() {
-            replay_early_key(&mut pending_wake, &mut early_keys);
+            replay_early_input(&mut pending_wake, &mut early_input);
         }
         if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
             last_size_check = Some(Instant::now());
@@ -889,8 +950,16 @@ pub fn run_on(
                 pending_wake = Some(wake);
                 continue;
             }
-            None => match wakes.recv_timeout(Duration::from_millis(16)) {
-                Ok(WakeEvent::Terminal(event)) => event,
+            None => match wakes
+                .recv_timeout(attached_wait(tui.as_ref(), detach_requested_at.is_some()))
+            {
+                Ok(WakeEvent::Terminal(event)) => {
+                    if let Some(event) = defer_terminal_event(&mut early_input, event) {
+                        event
+                    } else {
+                        continue;
+                    }
+                }
                 Ok(wake) => {
                     pending_wake = Some(wake);
                     continue;
@@ -900,7 +969,7 @@ pub fn run_on(
             },
         };
         let Some(tui) = tui.as_mut() else {
-            queue_early_key(&mut early_keys, event);
+            queue_early_input(&mut early_input, event);
             continue;
         };
         // Zoom lives entirely in this client -- it never becomes a layout
@@ -1627,7 +1696,7 @@ fn spawn_terminal_reader(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Acquire) {
-            match event::poll(Duration::from_millis(50)) {
+            match event::poll(IDLE_WAIT) {
                 Ok(true) => match event::read() {
                     Ok(event) => {
                         if sender.send(WakeEvent::Terminal(event)).is_err() {
@@ -1864,9 +1933,9 @@ mod tests {
     #[test]
     fn ctrl_s_before_the_first_snapshot_opens_share() {
         let mut tui = None;
-        let mut early_keys = VecDeque::new();
-        queue_early_key(
-            &mut early_keys,
+        let mut early_input = VecDeque::new();
+        queue_early_input(
+            &mut early_input,
             Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
         );
         assert!(tui.is_none());
@@ -1874,7 +1943,7 @@ mod tests {
         apply_rows(&mut tui, &[1], vec![]);
 
         let mut pending_wake = None;
-        replay_early_key(&mut pending_wake, &mut early_keys);
+        replay_early_input(&mut pending_wake, &mut early_input);
         let event = match pending_wake.take() {
             Some(WakeEvent::Terminal(event)) => event,
             _ => panic!("the queued key replays through the terminal event path"),
@@ -1885,6 +1954,45 @@ mod tests {
         let tui = tui.as_mut().expect("the snapshot built the tui");
         let _ = tui.handle_key(key, Rect::new(0, 0, 80, 24));
         assert!(tui.share_open());
+    }
+
+    #[test]
+    fn keys_waiting_for_the_first_frame_stay_in_order() {
+        let mut queued = VecDeque::new();
+        let press =
+            |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        assert!(queue_early_input(&mut queued, press('e')));
+        assert!(queue_early_input(&mut queued, press('c')));
+        // Arrives while the first two are still waiting, so it goes to the back
+        // rather than being handled on the spot.
+        assert!(defer_terminal_event(&mut queued, press('h')).is_none());
+        assert!(defer_terminal_event(&mut queued, Event::Paste(String::from("o"))).is_none());
+        // A resize is not input. It is returned so the panes can still be sized.
+        assert!(matches!(
+            defer_terminal_event(&mut queued, Event::Resize(80, 24)),
+            Some(Event::Resize(80, 24))
+        ));
+
+        let mut letters = String::new();
+        let mut pending = None;
+        for _ in 0..4 {
+            replay_early_input(&mut pending, &mut queued);
+            let Some(WakeEvent::Terminal(event)) = pending.take() else {
+                panic!("every queued input replays");
+            };
+            match event {
+                Event::Key(key) => {
+                    let KeyCode::Char(character) = key.code else {
+                        panic!("queued key");
+                    };
+                    letters.push(character);
+                }
+                Event::Paste(text) => letters.push_str(&text),
+                _ => panic!("queued input is a key or a paste"),
+            }
+        }
+        assert_eq!(letters, "echo");
+        assert!(queued.is_empty());
     }
 
     fn apply_focus_snapshot(

@@ -65,6 +65,9 @@ impl PtyHost {
                         if output_tx.send(Ok(buffer[..count].to_vec())).is_err() {
                             break;
                         }
+                        // The node sleeps while nothing is happening. This is
+                        // what wakes it, instead of a timer.
+                        crate::io_wait::pulse();
                     }
                     Err(error) => {
                         let _ = output_tx.send(Err(error));

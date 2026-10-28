@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::{layout::PaneId, screen::ScreenFrame};
+use crate::{
+    layout::PaneId,
+    screen::{HistoryLine, ScreenFrame},
+};
 
 pub(crate) enum NodeScreenSnapshot {
     Local {
@@ -22,6 +25,9 @@ pub(crate) type NodeLeaseSnapshots = BTreeMap<PaneId, (bool, Option<Vec<u8>>, bo
 pub(crate) struct LocalScrollbackWindow {
     pub total_rows: u64,
     pub screen: vt100::Screen,
+    /// Scrollback and the live rows, oldest first. The screen above only still
+    /// holds the parser's short buffer; this is the rest of the history.
+    pub lines: Vec<HistoryLine>,
 }
 
 /// Why a node did or did not hand over a pane's history.
