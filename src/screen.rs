@@ -998,7 +998,23 @@ fn validate_dimensions(rows: u16, cols: u16) -> Result<(), ScreenError> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+    use super::{GuestScreen, HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+
+    #[test]
+    fn bracketed_paste_survives_the_snapshot_a_client_renders() {
+        let mut host = HostScreen::new(2, 8).unwrap();
+        host.process_pty(b"\x1b[?2004h").unwrap();
+        assert!(host.parser.screen().bracketed_paste());
+
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(host.current.sequence, &host.current.snapshot)
+            .unwrap();
+        assert!(
+            guest.screen().unwrap().bracketed_paste(),
+            "a pane that enabled ?2004h has to still say so after the snapshot"
+        );
+    }
 
     #[test]
     fn hvp_becomes_cup_and_nothing_else_does() {

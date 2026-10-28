@@ -991,9 +991,17 @@ pub fn run_on(
                     if let Some(perf_id) = perf_id {
                         crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
                     }
+                    let bracketed_paste = screens
+                        .get(&tui.focused_pane())
+                        .and_then(GuestScreen::screen)
+                        .is_some_and(|screen| screen.bracketed_paste());
                     write_message(
                         &mut stream,
-                        &pane_input(tui.focused_pane(), text.into_bytes(), perf_id),
+                        &pane_input(
+                            tui.focused_pane(),
+                            client_paste_bytes(&text, bracketed_paste),
+                            perf_id,
+                        ),
                     )?;
                     history.remove(&tui.focused_pane());
                     pending_scroll.remove(&tui.focused_pane());
@@ -1630,6 +1638,12 @@ fn spawn_terminal_reader(
     })
 }
 
+/// Bytes for one paste. A pane that enabled bracketed paste has to see the
+/// markers, or a multi-line paste runs as typed commands.
+fn client_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    crate::tui::encode_paste(text, bracketed_paste)
+}
+
 fn client_key_bytes(
     code: KeyCode,
     modifiers: KeyModifiers,
@@ -1900,6 +1914,15 @@ mod tests {
         assert_eq!(
             client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn paste_keeps_bracketed_markers_when_the_pane_enabled_them() {
+        assert_eq!(client_paste_bytes("PASTE_ONE", false), b"PASTE_ONE");
+        assert_eq!(
+            client_paste_bytes("PASTE_ONE", true),
+            b"\x1b[200~PASTE_ONE\x1b[201~"
         );
     }
 

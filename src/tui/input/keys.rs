@@ -265,7 +265,7 @@ fn function_key(number: u8) -> Option<Vec<u8>> {
     };
     Some(bytes.to_vec())
 }
-pub(in crate::tui) fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
+pub(crate) fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     if bracketed_paste {
         [
             b"\x1b[200~".as_slice(),
