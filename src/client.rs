@@ -850,6 +850,11 @@ pub fn run_on(
                         link_summary.as_deref(),
                     );
                 })?;
+                let style = screens
+                    .get(&tui.focused_pane())
+                    .map(GuestScreen::cursor_style)
+                    .unwrap_or(0);
+                execute!(io::stdout(), crate::screen::terminal_cursor_style(style))?;
                 let draw_elapsed = draw_started.elapsed();
                 if crate::perf::enabled() && draw_elapsed >= Duration::from_millis(5) {
                     crate::perf::log(&format!(
