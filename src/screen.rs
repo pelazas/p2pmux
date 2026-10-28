@@ -619,7 +619,7 @@ impl HostScreen {
         max_rows: usize,
         max_bytes: usize,
     ) -> (u64, Vec<Vec<u8>>) {
-        let (total_rows, history_end) = self.history_metadata();
+        let (total_rows, _) = self.history_metadata();
         if total_rows == 0 {
             return (0, Vec::new());
         }

@@ -42,7 +42,10 @@ pub fn pulse() {
     let Some(pipe) = PIPE.get() else {
         return;
     };
-    let mut write = pipe.write.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut write = pipe
+        .write
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let _ = write.write_all(&[1]);
 }
 

@@ -286,9 +286,7 @@ enum Command {
     /// Print the version and exit. Same answer as `--version`.
     Version,
     /// Print a completion script for `bash`, `zsh`, or `fish`.
-    Completions {
-        shell: CompletionShell,
-    },
+    Completions { shell: CompletionShell },
     /// Print a manual page. The installer writes it where `man` looks.
     #[command(hide = true)]
     Man,
@@ -491,8 +489,8 @@ pub fn command() -> clap::Command {
 
 fn complete_sessions(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
     let prefix = current.to_string_lossy();
-    let Ok(sessions) = crate::session_store::SessionStore::for_current_user()
-        .and_then(|store| store.list_live())
+    let Ok(sessions) =
+        crate::session_store::SessionStore::for_current_user().and_then(|store| store.list_live())
     else {
         return Vec::new();
     };

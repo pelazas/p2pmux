@@ -482,14 +482,14 @@ fn dont_hold_proc_fds() {
     });
 }
 
-/// Names that can be an agent, or the runtime an agent is launched under.
+/// Names whose command line can change what the scan reports.
 ///
 /// A loose agent is not a child of any pane, so the pane-tree walk never
-/// reaches it. Hermes is `python`, OpenClaw and pi are `node`, and `exec -a
-/// claude` is a shell whose name is `claude`. Their command lines are the
-/// only thing that distinguishes them, so those names are read and nothing
-/// else's is. Shells are deliberately absent: a pane's own shell is a root,
-/// and every other shell on the machine is not this session's business.
+/// reaches it. Hermes is `python` and OpenClaw is `node`, so those runtimes
+/// are read. `exec -a claude /bin/sh` does not show up under the name
+/// `claude`: the sampler's name is the interpreter (`sh`, `bash`, `dash`),
+/// and `claude` is only argv0. Shells are read for that argv0 and nothing
+/// else on the machine is.
 fn interesting_name(name: &str) -> bool {
     matches!(
         name,
@@ -505,6 +505,10 @@ fn interesting_name(name: &str) -> bool {
             | "node"
             | "python"
             | "python3"
+            | "sh"
+            | "bash"
+            | "dash"
+            | "zsh"
     ) || name.starts_with("python")
 }
 
@@ -1218,15 +1222,19 @@ mod tests {
     };
 
     #[test]
-    fn command_lines_are_read_for_agent_runtimes_and_not_for_shells() {
+    fn command_lines_are_read_for_agent_runtimes_and_their_shells() {
         assert!(interesting_name("claude"));
         assert!(interesting_name("cursor-agent"));
         assert!(interesting_name("python3.12"));
         assert!(interesting_name("node"));
         assert!(interesting_name("p2pmux"));
-        assert!(!interesting_name("bash"));
-        assert!(!interesting_name("zsh"));
-        assert!(!interesting_name("sh"));
+        // `exec -a claude /bin/sh` is named for the interpreter, not argv0.
+        assert!(interesting_name("bash"));
+        assert!(interesting_name("zsh"));
+        assert!(interesting_name("sh"));
+        assert!(interesting_name("dash"));
+        assert!(!interesting_name("sleep"));
+        assert!(!interesting_name("launchd"));
     }
 
     #[test]

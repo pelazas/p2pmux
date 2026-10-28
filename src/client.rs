@@ -945,7 +945,8 @@ pub fn run_on(
                 pending_wake = Some(wake);
                 continue;
             }
-            None => match wakes.recv_timeout(attached_wait(tui.as_ref(), detach_requested_at.is_some()))
+            None => match wakes
+                .recv_timeout(attached_wait(tui.as_ref(), detach_requested_at.is_some()))
             {
                 Ok(WakeEvent::Terminal(event)) => {
                     if let Some(event) = defer_terminal_event(&mut early_input, event) {
@@ -1948,7 +1949,8 @@ mod tests {
     #[test]
     fn keys_waiting_for_the_first_frame_stay_in_order() {
         let mut queued = VecDeque::new();
-        let press = |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        let press =
+            |character| Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         assert!(queue_early_input(&mut queued, press('e')));
         assert!(queue_early_input(&mut queued, press('c')));
         // Arrives while the first two are still waiting, so it goes to the back
