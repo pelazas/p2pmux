@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use crate::{
     hosted_rendezvous::{HostedRendezvous, JoinCode},
@@ -23,14 +23,67 @@ use crate::{
 
 const BARE_FLEET_BUDGET: Duration = Duration::from_millis(750);
 
+/// A second p2pmux inside a pane. The outer one owns Ctrl+Q and Ctrl+P, so the
+/// inner one starts and then cannot be driven. Same rule tmux states, and the
+/// same way out: unset the variable that says we are already inside one.
+fn refuse_nested_session(cli: &Cli) -> Result<(), Box<dyn Error>> {
+    if std::env::var_os(crate::pty_host::PANE_ID_ENV).is_none() {
+        return Ok(());
+    }
+    let opens_a_session = cli.resume
+        || matches!(
+            cli.command,
+            None | Some(
+                Command::Local
+                    | Command::Create { .. }
+                    | Command::Join { .. }
+                    | Command::Attach { .. }
+            )
+        );
+    if !opens_a_session {
+        return Ok(());
+    }
+    Err(concat!(
+        "sessions should be nested with care: this is already a p2pmux pane, ",
+        "and the outer session would take its keys. ",
+        "Unset P2PMUX_PANE_ID to run one here anyway."
+    )
+    .into())
+}
+
+fn print_completions(shell: CompletionShell) -> Result<(), Box<dyn Error>> {
+    let clap_shell = match shell {
+        CompletionShell::Bash => clap_complete::Shell::Bash,
+        CompletionShell::Zsh => clap_complete::Shell::Zsh,
+        CompletionShell::Fish => clap_complete::Shell::Fish,
+    };
+    let mut command = Cli::command();
+    clap_complete::generate(clap_shell, &mut command, "p2pmux", &mut io::stdout());
+    Ok(())
+}
+
+fn print_man_page() -> Result<(), Box<dyn Error>> {
+    let command = Cli::command();
+    let manual = clap_mangen::Man::new(command);
+    manual.render(&mut io::stdout())?;
+    Ok(())
+}
+
 /// The temporary p2pmux command-line interface.
 #[derive(Debug, Parser)]
 #[command(
     name = "p2pmux",
-    version,
+    disable_version_flag = true,
     about = "Peer-to-peer multiplayer terminal multiplexer"
 )]
 pub struct Cli {
+    /// Print the version and exit.
+    ///
+    /// A real flag rather than clap's built-in one, which prints the version
+    /// and exits before it has decided whether the rest of the command line
+    /// means anything. `p2pmux --version extra` has to be an error.
+    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue, global = true)]
+    version: bool,
     #[arg(long)]
     resume: bool,
     #[command(subcommand)]
@@ -117,12 +170,14 @@ enum Command {
     Ticket {
         /// The memorable session name, as listed by `p2pmux list`. Omit it when one session
         /// is hosted here.
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         session: Option<String>,
     },
     /// Print the short join code for a session hosted on this machine.
     Code {
         /// The memorable session name, as listed by `p2pmux list`. Omit it when one session
         /// is hosted here.
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         session: Option<String>,
     },
     /// Go back to a session already running on this machine.
@@ -133,16 +188,22 @@ enum Command {
     Attach {
         /// The memorable session name, as listed by `p2pmux list`. Omit it to
         /// take the most recently started one.
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         name: Option<String>,
     },
     /// Gracefully stop a live local session.
     Kill {
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         name: String,
         #[arg(long)]
         yes: bool,
     },
     /// Rename a live local session finder record.
-    Rename { old: String, new: String },
+    Rename {
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_sessions))]
+        old: String,
+        new: String,
+    },
     /// Read or write local configuration.
     Config {
         #[command(subcommand)]
@@ -222,6 +283,20 @@ enum Command {
         #[arg(long)]
         bootstrap: std::path::PathBuf,
     },
+    /// Print the version and exit. Same answer as `--version`.
+    Version,
+    /// Print a completion script for `bash`, `zsh`, or `fish`.
+    Completions { shell: CompletionShell },
+    /// Print a manual page. The installer writes it where `man` looks.
+    #[command(hide = true)]
+    Man,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Debug, Subcommand)]
@@ -407,6 +482,25 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
+/// The command definition, for the shell-completion hook in `main`.
+pub fn command() -> clap::Command {
+    Cli::command()
+}
+
+fn complete_sessions(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Ok(sessions) =
+        crate::session_store::SessionStore::for_current_user().and_then(|store| store.list_live())
+    else {
+        return Vec::new();
+    };
+    sessions
+        .into_iter()
+        .filter(|session| prefix.is_empty() || session.name.starts_with(prefix.as_ref()))
+        .map(|session| clap_complete::CompletionCandidate::new(session.name))
+        .collect()
+}
+
 /// Run the commands that must not pay for an async runtime, returning `None`
 /// for everything else.
 ///
@@ -415,6 +509,19 @@ pub fn parse() -> Cli {
 /// Tokio runtime — a thread per core, created and torn down — to do that would
 /// cost more than the work, on the agent's own critical path.
 pub fn run_without_runtime(cli: &Cli) -> Option<Result<(), Box<dyn Error>>> {
+    if cli.version {
+        println!("p2pmux {}", env!("CARGO_PKG_VERSION"));
+        return Some(Ok(()));
+    }
+    match &cli.command {
+        Some(Command::Version) => {
+            println!("p2pmux {}", env!("CARGO_PKG_VERSION"));
+            return Some(Ok(()));
+        }
+        Some(Command::Completions { shell }) => return Some(print_completions(*shell)),
+        Some(Command::Man) => return Some(print_man_page()),
+        _ => {}
+    }
     match &cli.command {
         Some(Command::Notify { agent }) => Some(match agent {
             NotifyAgent::Claude { status } => {
@@ -617,6 +724,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if let Some(result) = run_without_runtime(&cli) {
         return result;
     }
+    refuse_nested_session(&cli)?;
     // Before anything opens the alternate screen, so the question is never
     // competing with a TUI for the same rows, and after the commands above --
     // `notify` fires on every agent tool call and must stay a socket write and
@@ -628,6 +736,9 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
     match cli.command {
         None => open_home().await,
+        // Answered before the runtime exists. Reaching here means the process
+        // was asked to do both, which `run_without_runtime` already did.
+        Some(Command::Version | Command::Completions { .. } | Command::Man) => Ok(()),
         Some(Command::Node { bootstrap }) => {
             // This process has no terminal, so a failure would otherwise be invisible and
             // the launcher could only report that the socket never appeared. Leave the

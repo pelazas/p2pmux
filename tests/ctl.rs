@@ -409,8 +409,15 @@ fn events_stream_without_a_tui() {
     let mut saw_needs_you = false;
     while Instant::now() < deadline {
         match ctl::receive_json::<CtlToClient>(&mut reader) {
-            Ok(Some(CtlToClient::Event { state, message, .. })) => {
-                if state == "needs_you" {
+            Ok(Some(CtlToClient::Event {
+                pane_id: event_pane,
+                state,
+                message,
+                ..
+            })) => {
+                // A machine that already has an agent waiting would stream that
+                // row too. This test only wrote a status for its own pane.
+                if event_pane == pane_id && state == "needs_you" {
                     assert_eq!(message, "shall I continue?");
                     saw_needs_you = true;
                     break;

@@ -454,7 +454,11 @@ impl SharedLayoutRuntime {
             .get(&selection.pane_id)
             .and_then(|pane| {
                 selection_text(selection, |offset| {
-                    Some(viewed_screen(pane.screen.screen(), offset))
+                    if offset == 0 {
+                        Some(viewed_screen(pane.screen.screen(), 0))
+                    } else {
+                        Some(std::borrow::Cow::Owned(pane.screen.view_at(offset)))
+                    }
                 })
             })
             .or_else(|| {
@@ -521,6 +525,13 @@ impl SharedLayoutRuntime {
             }
         }
         self.send_pending_exit_marks()?;
+        let mut pane_roots = Vec::new();
+        for pane in self.local.values() {
+            if !pane.exited {
+                pane_roots.extend(pane.session_child_pid());
+            }
+        }
+        self.agent_sampler.set_roots(pane_roots);
         if let Some(snapshot) = self.agent_sampler.latest_snapshot() {
             let now = Instant::now();
             // One scan for the whole session, not one per pane.
