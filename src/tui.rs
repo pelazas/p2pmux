@@ -47,6 +47,7 @@ pub(crate) use geometry::{
 pub use home::MachineRow;
 pub(crate) use home::update_copy_result;
 pub use host::HostPaneRuntime;
+pub(crate) use input::keys::encode_key;
 pub use input::mouse::PaneMouseProtocol;
 pub use multi_pane::MultiPaneTui;
 pub use pane::local::SharedLocalPane;

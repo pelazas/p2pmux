@@ -144,7 +144,7 @@ pub(in crate::tui) fn is_chord_navigation(mode: ChordMode, key: KeyEvent) -> boo
 pub(in crate::tui) fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL
 }
-pub(in crate::tui) fn encode_key(
+pub(crate) fn encode_key(
     key: KeyEvent,
     screen: &vt100::Screen,
     kitty_keyboard_active: bool,
@@ -155,6 +155,17 @@ pub(in crate::tui) fn encode_key(
 
     let modifiers = modifier_parameter(key.modifiers)?;
     let bytes = match key.code {
+        // Ctrl+Space is NUL. A space is not a letter, and dropping it here is
+        // what made the pane see a plain space instead.
+        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let mut bytes = Vec::new();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                bytes.push(0x1b);
+            }
+            bytes.push(0);
+            bytes
+        }
+        KeyCode::Null => vec![0],
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let character = character.to_ascii_lowercase();
             if !character.is_ascii_lowercase() {
@@ -175,17 +186,21 @@ pub(in crate::tui) fn encode_key(
             bytes.extend(character.to_string().bytes());
             bytes
         }
-        KeyCode::Enter if modifiers == 1 => b"\r".to_vec(),
-        // Use kitty CSI-u when the child opted in; otherwise LF is the newline fallback.
-        KeyCode::Enter if modifiers == 2 => {
+        // Shift+Enter is the only Enter that is not a carriage return. Alt+Enter
+        // and Ctrl+Enter still submit a line; terminals disagree about the
+        // modifier bits, and withholding the key made the line impossible to send.
+        KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => {
             if kitty_keyboard_active {
                 b"\x1b[13;2u".to_vec()
             } else {
                 b"\n".to_vec()
             }
         }
+        KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab if modifiers == 1 => b"\t".to_vec(),
-        KeyCode::BackTab if modifiers == 2 => b"\x1b[Z".to_vec(),
+        // Shift+Tab. Some terminals omit SHIFT on a key whose identity is the
+        // shift, so the modifier bits are not part of the match.
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if modifiers == 1 => b"\x7f".to_vec(),
         KeyCode::Esc if modifiers == 1 => b"\x1b".to_vec(),
         KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => {
@@ -428,7 +443,31 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                 None,
             ),
-            (KeyEvent::new(KeyCode::Null, KeyModifiers::NONE), None),
+            (
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
+                Some("\0"),
+            ),
+            (KeyEvent::new(KeyCode::Null, KeyModifiers::NONE), Some("\0")),
+            (
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+                Some("\x1bb"),
+            ),
+            (
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+                Some("\x1b[1;2A"),
+            ),
+            (
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::ALT),
+                Some("\x1b[1;7D"),
+            ),
+            (
+                KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+                Some("\x1b[15~"),
+            ),
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+                Some("\x1b[Z"),
+            ),
         ];
 
         for (event, expected) in cases {
