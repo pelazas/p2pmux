@@ -19,6 +19,7 @@ pub(in crate::tui) struct TerminalGuard {
     pub(in crate::tui) alternate_screen: bool,
     pub(in crate::tui) bracketed_paste: bool,
     pub(in crate::tui) mouse_capture: bool,
+    pub(in crate::tui) focus_events: bool,
 }
 impl TerminalGuard {
     pub(in crate::tui) fn new() -> Self {
@@ -28,7 +29,23 @@ impl TerminalGuard {
             alternate_screen: false,
             bracketed_paste: false,
             mouse_capture: false,
+            focus_events: false,
         }
+    }
+
+    /// `DECSET 1004` on the outer terminal, so a pane that asked can hear
+    /// `ESC [ I` and `ESC [ O` when this window gains and loses focus.
+    pub(in crate::tui) fn set_focus_events(&mut self, enabled: bool) -> io::Result<()> {
+        if self.focus_events == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(io::stdout(), crossterm::event::EnableFocusChange)?;
+        } else {
+            execute!(io::stdout(), crossterm::event::DisableFocusChange)?;
+        }
+        self.focus_events = enabled;
+        Ok(())
     }
 }
 impl Drop for TerminalGuard {
@@ -44,6 +61,9 @@ impl Drop for TerminalGuard {
         }
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
+        }
+        if self.focus_events {
+            let _ = execute!(stdout, crossterm::event::DisableFocusChange);
         }
         if self.mouse_capture {
             let _ = execute!(stdout, DisableMouseCapture);

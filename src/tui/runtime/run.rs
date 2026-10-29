@@ -269,6 +269,10 @@ impl SharedLayoutRuntime {
                     )?;
                 }
             }
+            let focus_reports = self
+                .pane_vt_screen(self.tui.focused_pane())
+                .is_some_and(|screen| screen.focus_event_mode());
+            guard.set_focus_events(focus_reports)?;
             if !event::poll(event_poll_timeout(dirty, last_draw))? {
                 continue;
             }
@@ -285,6 +289,7 @@ impl SharedLayoutRuntime {
                     break;
                 }
             }
+            self.deliver_focus_report()?;
             if quit {
                 break;
             }
@@ -329,6 +334,12 @@ impl SharedLayoutRuntime {
                     self.forward_paste(&text)?;
                 }
                 *dirty = true;
+            }
+            Event::FocusGained => {
+                self.send_focus_event(self.tui.focused_pane(), b"\x1b[I")?;
+            }
+            Event::FocusLost => {
+                self.send_focus_event(self.tui.focused_pane(), b"\x1b[O")?;
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
                 if !self.tui.home_open() && !self.tui.modal_open() {

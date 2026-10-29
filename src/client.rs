@@ -928,6 +928,13 @@ pub fn run_on(
         if tui.is_some() {
             replay_early_input(&mut pending_wake, &mut early_input);
         }
+        if let Some(view) = tui.as_ref() {
+            let reports = screens
+                .get(&view.focused_pane())
+                .and_then(GuestScreen::screen)
+                .is_some_and(|screen| screen.focus_event_mode());
+            guard.set_focus_events(reports)?;
+        }
         if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
             last_size_check = Some(Instant::now());
             if let Some((cols, rows)) = stale_node_size(
@@ -1186,8 +1193,15 @@ pub fn run_on(
                 }
                 dirty = true;
             }
+            Event::FocusGained => {
+                forward_focus_event(&mut stream, tui, &screens, b"\x1b[I")?;
+            }
+            Event::FocusLost => {
+                forward_focus_event(&mut stream, tui, &screens, b"\x1b[O")?;
+            }
             _ => {}
         }
+        deliver_focus_report(&mut stream, tui, &screens)?;
         if tui.zoomed_pane() != zoom_before {
             let (cols, rows) = node_viewport;
             write_message(
@@ -1286,6 +1300,43 @@ fn refresh_tui_timers(
 /// mode, its xterm mouse mode -- so it names that pane rather than letting the
 /// node re-decide from its own focus, which lags this one by a round trip after
 /// every pane the session creates.
+fn forward_focus_event(
+    stream: &mut UnixStream,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let pane_id = tui.focused_pane();
+    let wants = screens
+        .get(&pane_id)
+        .and_then(GuestScreen::screen)
+        .is_some_and(|screen| screen.focus_event_mode());
+    if wants {
+        write_message(stream, &pane_input(pane_id, bytes.to_vec(), None))?;
+    }
+    Ok(())
+}
+
+fn deliver_focus_report(
+    stream: &mut UnixStream,
+    tui: &mut MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+) -> io::Result<()> {
+    let Some((left, entered)) = tui.take_focus_report() else {
+        return Ok(());
+    };
+    for (pane_id, bytes) in [(left, &b"\x1b[O"[..]), (entered, &b"\x1b[I"[..])] {
+        let wants = screens
+            .get(&pane_id)
+            .and_then(GuestScreen::screen)
+            .is_some_and(|screen| screen.focus_event_mode());
+        if wants {
+            write_message(stream, &pane_input(pane_id, bytes.to_vec(), None))?;
+        }
+    }
+    Ok(())
+}
+
 fn pane_input(pane_id: u64, bytes: Vec<u8>, perf_id: Option<u64>) -> ClientMessage {
     ClientMessage::Input {
         bytes,
@@ -1735,6 +1786,7 @@ struct ClientTerminalGuard {
     alternate: bool,
     paste: bool,
     mouse: bool,
+    focus_events: bool,
 }
 impl ClientTerminalGuard {
     fn enter(name: &str) -> io::Result<Self> {
@@ -1745,6 +1797,7 @@ impl ClientTerminalGuard {
             alternate: false,
             paste: false,
             mouse: false,
+            focus_events: false,
         };
         terminal::enable_raw_mode()?;
         guard.raw = true;
@@ -1763,6 +1816,10 @@ impl ClientTerminalGuard {
         Ok(guard)
     }
     fn leave(&mut self) -> io::Result<()> {
+        if self.focus_events {
+            execute!(self.stdout, crossterm::event::DisableFocusChange)?;
+            self.focus_events = false;
+        }
         if self.mouse {
             execute!(self.stdout, DisableMouseCapture)?;
             self.mouse = false;
@@ -1784,6 +1841,19 @@ impl ClientTerminalGuard {
             terminal::disable_raw_mode()?;
             self.raw = false;
         }
+        Ok(())
+    }
+
+    fn set_focus_events(&mut self, enabled: bool) -> io::Result<()> {
+        if self.focus_events == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(self.stdout, crossterm::event::EnableFocusChange)?;
+        } else {
+            execute!(self.stdout, crossterm::event::DisableFocusChange)?;
+        }
+        self.focus_events = enabled;
         Ok(())
     }
 }
