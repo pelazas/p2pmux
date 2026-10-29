@@ -312,9 +312,7 @@ fn named_send_key(arg: &str) -> Option<String> {
 
 fn modified_send_key(rest: &str, control: bool, meta: bool) -> Option<String> {
     let mut chars = rest.chars();
-    let Some(character) = chars.next() else {
-        return None;
-    };
+    let character = chars.next()?;
     if chars.next().is_some() {
         return None;
     }
