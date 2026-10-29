@@ -30,6 +30,7 @@ use crate::{
                 end_synchronized_output, event_poll_timeout, frame_due,
             },
             keys::PendingEscape,
+            mouse::alternate_scroll_bytes,
         },
         keep_attributes_through_no_color, missed_resize,
         pane::remote::{RemotePaneDrain, SharedRemotePane},
@@ -407,17 +408,31 @@ impl SharedLayoutRuntime {
                     );
                     return Ok(false);
                 }
-                // A child that reports mouse scrolls its own buffer; local scrollback
-                // would otherwise hide the wheel from it.
-                let protocol = self.focused_pane_mouse_protocol();
-                if protocol.reports_mouse()
-                    && let Some(bytes) = self.tui.handle_mouse(mouse, area, protocol).forward_bytes
+                // The pane under the pointer, not the focused one. A wheel notch
+                // aimed at `less` has to reach `less` even when the caret is
+                // next door, and a mouse-mode app keeps the notch when the
+                // pointer is over it.
+                let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                let protocol = self.pane_mouse_protocol(pane_id);
+                if let Some(bytes) = self
+                    .tui
+                    .wheel_bytes_for_pane(mouse, area, protocol, pane_id)
                 {
-                    self.forward_mouse(bytes)?;
+                    self.forward_bytes(pane_id, bytes)?;
                     *dirty = true;
                     return Ok(false);
                 }
-                let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.tui.scrollback_offset(pane_id) == 0
+                    && let Some(screen) = self.pane_vt_screen(pane_id)
+                    && let Some(bytes) = alternate_scroll_bytes(screen, up)
+                {
+                    self.forward_bytes(pane_id, bytes.to_vec())?;
+                    self.tui.reset_scrollback(pane_id);
+                    *dirty = true;
+                    return Ok(false);
+                }
                 let scrollback_len = self
                     .local
                     .get(&pane_id)

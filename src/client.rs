@@ -34,9 +34,9 @@ use crate::{
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, ChordMode, KeyHandling, MultiPaneTui,
         PaneBackend, PaneMouseProtocol, PaneViewState, QuitAction, ShareView,
-        clear_before_first_frame, copy_selection_to_clipboard, keep_attributes_through_no_color,
-        render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
-        stale_node_size,
+        alternate_scroll_bytes, clear_before_first_frame, copy_selection_to_clipboard,
+        keep_attributes_through_no_color, render_multi_pane_with_copy_feedback, resize_recheck_due,
+        share_copy_result, stale_node_size,
     },
 };
 
@@ -1103,7 +1103,22 @@ pub fn run_on(
                     let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
                     let protocol = pane_mouse_protocol(tui, &screens, &local_peer_id, pane_id);
                     let forwarded = tui.wheel_bytes_for_pane(mouse, area, protocol, pane_id);
-                    if let Some(bytes) = forwarded {
+                    let alternate = (!mouse.modifiers.contains(KeyModifiers::SHIFT)
+                        && tui.scrollback_offset(pane_id) == 0)
+                        .then(|| {
+                            screens
+                                .get(&pane_id)
+                                .and_then(GuestScreen::screen)
+                                .and_then(|screen| {
+                                    alternate_scroll_bytes(
+                                        screen,
+                                        matches!(mouse.kind, MouseEventKind::ScrollUp),
+                                    )
+                                })
+                        })
+                        .flatten();
+                    if let Some(bytes) = forwarded.or_else(|| alternate.map(|bytes| bytes.to_vec()))
+                    {
                         let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
                         write_message(&mut stream, &pane_input(pane_id, bytes, perf_id))?;
                     } else {

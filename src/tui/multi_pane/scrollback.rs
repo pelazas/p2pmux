@@ -7,7 +7,7 @@ use crate::{layout::PaneId, tui::MultiPaneTui};
 const PANE_SCROLL_WHEEL_STEP: usize = 3;
 
 impl MultiPaneTui {
-    pub(in crate::tui) fn scrollback_offset(&self, pane_id: PaneId) -> usize {
+    pub(crate) fn scrollback_offset(&self, pane_id: PaneId) -> usize {
         self.pane_views
             .get(&pane_id)
             .map_or(0, |view| view.scrollback)

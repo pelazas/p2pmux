@@ -15,9 +15,8 @@ use crate::{
 use super::SharedLayoutRuntime;
 
 impl SharedLayoutRuntime {
-    /// The mouse reporting the focused pane's child has turned on, if any.
-    pub(in crate::tui) fn focused_pane_mouse_protocol(&self) -> PaneMouseProtocol {
-        let pane_id = self.tui.focused_pane();
+    /// The mouse reporting a pane's child has turned on, if any.
+    pub(in crate::tui) fn pane_mouse_protocol(&self, pane_id: PaneId) -> PaneMouseProtocol {
         if !self.input_allowed(pane_id) {
             return PaneMouseProtocol::default();
         }
@@ -31,6 +30,11 @@ impl SharedLayoutRuntime {
                     .map(PaneMouseProtocol::from_screen)
             })
             .unwrap_or_default()
+    }
+
+    /// The mouse reporting the focused pane's child has turned on, if any.
+    pub(in crate::tui) fn focused_pane_mouse_protocol(&self) -> PaneMouseProtocol {
+        self.pane_mouse_protocol(self.tui.focused_pane())
     }
 
     pub(in crate::tui) fn forward_mouse(&mut self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {

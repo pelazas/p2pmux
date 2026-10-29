@@ -48,6 +48,7 @@ pub use home::MachineRow;
 pub(crate) use home::update_copy_result;
 pub use host::HostPaneRuntime;
 pub use input::mouse::PaneMouseProtocol;
+pub(crate) use input::mouse::alternate_scroll_bytes;
 pub use multi_pane::MultiPaneTui;
 pub use pane::local::SharedLocalPane;
 pub use render::home::machine_line;
