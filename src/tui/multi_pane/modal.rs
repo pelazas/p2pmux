@@ -69,6 +69,10 @@ impl MultiPaneTui {
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
+                if prompt.value.chars().count() >= crate::layout::MAX_TITLE_CHARS {
+                    prompt.error = Some(String::from("Max 32 characters; no controls"));
+                    return KeyHandling::Consumed(vec![]);
+                }
                 prompt.value.push(character);
                 prompt.error = None;
                 KeyHandling::Consumed(vec![])
@@ -465,11 +469,14 @@ mod tests {
                 area,
             );
         }
-        assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![])
-        );
-        assert!(matches!(tui.modal, super::ModalState::Rename(_)));
+        let (count, has_error) = match &tui.modal {
+            super::ModalState::Rename(prompt) => {
+                (prompt.value.chars().count(), prompt.error.is_some())
+            }
+            _ => panic!("the prompt should still be open"),
+        };
+        assert_eq!(count, 32, "the 33rd character is refused");
+        assert!(has_error, "the limit is said while typing");
         assert_eq!(
             tui.handle_key(
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
