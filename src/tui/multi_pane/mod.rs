@@ -159,6 +159,13 @@ pub struct MultiPaneTui {
     pub(in crate::tui) resize_drag: Option<ResizeDrag>,
     /// Set while a press forwarded to a child owns the drag and release that follow.
     pub(in crate::tui) mouse_forwarding: bool,
+    /// A user-driven focus move waiting to be told to the panes that asked.
+    ///
+    /// `(left, entered)`. Collapsed if focus moves twice before the run loop
+    /// drains it, so a pane that was only passed through does not hear both.
+    /// Node sync and snapshot repair do not record one: those are echoes of a
+    /// move whose bytes were already sent by whoever made it.
+    pub(in crate::tui) focus_report: Option<(PaneId, PaneId)>,
     /// A share-modal copy request. Invite material lives in the node's rendezvous record
     /// rather than in the layout, so the attached client resolves and copies it.
     pub(in crate::tui) pending_share_copy: Option<ShareCopy>,
@@ -256,6 +263,7 @@ impl MultiPaneTui {
             resize_drag: None,
             session_locked: false,
             mouse_forwarding: false,
+            focus_report: None,
             pending_share_copy: None,
             pending_update_copy: false,
             pending_pair_offer: false,
@@ -799,6 +807,9 @@ impl MultiPaneTui {
             // gesture -- a peer's layout change, a pane created elsewhere --
             // ends it: the release belongs to that child, not to the next one.
             self.mouse_forwarding = false;
+            if matches!(reason, "key" | "mouse" | "tab_switch" | "home_enter") {
+                self.note_focus_report(old_pane, pane_id);
+            }
         }
         self.current_tab = tab_id;
         self.focused_pane = pane_id;
@@ -809,6 +820,19 @@ impl MultiPaneTui {
         let answered = self.answer_focused_agent();
         self.log_selection_change(reason, old_tab, old_pane, tab_id, pane_id);
         old_tab != tab_id || old_pane != pane_id || unread_cleared || answered
+    }
+
+    fn note_focus_report(&mut self, left: PaneId, entered: PaneId) {
+        self.focus_report = match self.focus_report {
+            Some((origin, _)) if origin == entered => None,
+            Some((origin, _)) => Some((origin, entered)),
+            None => Some((left, entered)),
+        };
+    }
+
+    /// The focus move a run loop still has to announce, if the user made one.
+    pub(crate) fn take_focus_report(&mut self) -> Option<(PaneId, PaneId)> {
+        self.focus_report.take()
     }
 
     pub(in crate::tui) fn log_selection_change(

@@ -48,6 +48,7 @@ pub use home::MachineRow;
 pub(crate) use home::update_copy_result;
 pub use host::HostPaneRuntime;
 pub use input::mouse::PaneMouseProtocol;
+pub(crate) use input::mouse::alternate_scroll_bytes;
 pub use multi_pane::MultiPaneTui;
 pub use pane::local::SharedLocalPane;
 pub use render::home::machine_line;
@@ -68,6 +69,7 @@ pub use state::{
     AgentOverlayRow, ChordMode, HomeRowId, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
     PaneViewState, QuitAction, ShareCopy, ShareView, UiIntent,
 };
+pub(crate) use terminal::PaneBackend;
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
 pub(crate) use terminal::{clear_before_first_frame, keep_attributes_through_no_color};
 

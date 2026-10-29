@@ -2,7 +2,7 @@
 
 use std::{
     error::Error,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
     str::FromStr,
@@ -315,10 +315,29 @@ enum CtlCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Write bytes into a pane as if they were typed.
+    /// Type into a pane.
+    ///
+    /// PANE is an id from `p2pmux ctl agents`. KEYS are named keys (`Enter`,
+    /// `Escape`, `Tab`, `Up`, `C-c`) or text; `\n` and `\xNN` are escapes.
+    /// Words of text are joined with a space and a key name is not. `--literal`
+    /// types KEYS unchanged. With no KEYS, stdin is read when it is not a
+    /// terminal, or use `--file`. Put flags before the pane id.
     Send {
+        /// Type KEYS unchanged: key names stay words and backslash escapes stay backslashes.
+        #[arg(long)]
+        literal: bool,
+        /// Read the bytes to send from PATH.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Pane id from `p2pmux ctl agents`.
+        #[arg(value_name = "PANE", allow_hyphen_values = true)]
         pane: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Named keys or text. Flags belong before the pane id.
+        #[arg(
+            value_name = "KEYS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
         keys: Vec<String>,
     },
     /// Move this node's focus to an agent that already has a pane.
@@ -608,6 +627,23 @@ fn run_telemetry(command: Option<&TelemetryCommand>) -> Result<(), Box<dyn Error
 
 /// Talk to a live node without taking its TUI seat, and without starting one.
 fn run_ctl(session: Option<&str>, action: &CtlCommand) -> Result<(), Box<dyn Error>> {
+    if let CtlCommand::Send { pane, .. } = action
+        && pane.parse::<u64>().is_err()
+    {
+        return Err(crate::ctl::CtlError(String::from("no such pane")).into());
+    }
+    let send = match action {
+        CtlCommand::Send {
+            literal,
+            file,
+            keys,
+            ..
+        } => Some(send_payload(*literal, file.as_deref(), keys)?),
+        _ => None,
+    };
+    if send.as_ref().is_some_and(String::is_empty) {
+        return Err(crate::ctl::CtlError(String::from("nothing to send")).into());
+    }
     let descriptor = resolve_ctl_session(session)?;
     let action = match action {
         CtlCommand::Machines => crate::ctl::CtlAction::Machines,
@@ -621,15 +657,24 @@ fn run_ctl(session: Option<&str>, action: &CtlCommand) -> Result<(), Box<dyn Err
             command: command.clone(),
             new: *new,
         },
-        CtlCommand::Send { pane, keys } => {
+        CtlCommand::Send { pane, .. } => {
             let pane_id = pane
                 .parse::<u64>()
-                .map_err(|_| crate::ctl::CtlError(String::from("pane id must be a number")))?;
-            let keys = match keys.split_first() {
-                Some((first, rest)) if first == "--" => rest.join(" "),
-                _ => keys.join(" "),
-            };
-            crate::ctl::CtlAction::Send { pane_id, keys }
+                .map_err(|_| crate::ctl::CtlError(String::from("no such pane")))?;
+            let keys = send.unwrap_or_default();
+            if keys.is_empty() {
+                return Err(crate::ctl::CtlError(String::from("nothing to send")).into());
+            }
+            for chunk in crate::ctl::chunk_send(&keys) {
+                crate::ctl::run(
+                    &descriptor.socket_path,
+                    crate::ctl::CtlAction::Send {
+                        pane_id,
+                        keys: chunk.to_string(),
+                    },
+                )?;
+            }
+            return Ok(());
         }
         CtlCommand::Focus { agent } => crate::ctl::CtlAction::Focus {
             agent: agent.clone(),
@@ -637,6 +682,33 @@ fn run_ctl(session: Option<&str>, action: &CtlCommand) -> Result<(), Box<dyn Err
         CtlCommand::Events => crate::ctl::CtlAction::Events,
     };
     crate::ctl::run(&descriptor.socket_path, action)
+}
+
+fn send_payload(
+    literal: bool,
+    file: Option<&std::path::Path>,
+    keys: &[String],
+) -> Result<String, Box<dyn Error>> {
+    if file.is_some() && !keys.is_empty() {
+        return Err(crate::ctl::CtlError(String::from("pass keys or --file, not both")).into());
+    }
+    if let Some(path) = file {
+        return std::fs::read_to_string(path).map_err(|error| {
+            crate::ctl::CtlError(format!("could not read {}: {error}", path.display())).into()
+        });
+    }
+    if keys.is_empty() {
+        if io::stdin().is_terminal() {
+            return Err(crate::ctl::CtlError(String::from(
+                "pass keys, --file, or pipe the payload on stdin",
+            ))
+            .into());
+        }
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    Ok(crate::ctl::interpret_send_keys(keys, literal))
 }
 
 fn resolve_ctl_session(

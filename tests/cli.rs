@@ -459,6 +459,26 @@ fn ctl_help_lists_the_six_verbs() {
 }
 
 #[test]
+fn send_help_explains_the_pane_and_the_keys() {
+    let output = run(&["ctl", "send", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(help.contains("ctl agents"), "{help}");
+    assert!(help.contains("Enter"), "{help}");
+    assert!(help.contains("--literal"), "{help}");
+}
+
+#[test]
+fn send_rejects_a_pane_id_that_is_not_a_number() {
+    let session = FakeSession::empty();
+    let output = run_with_home(session.home(), &["ctl", "send", "-1", "x"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("no such pane"), "{stderr}");
+    assert!(!stderr.contains("unexpected argument"), "{stderr}");
+}
+
+#[test]
 fn spawn_help_lists_new() {
     let output = run(&["ctl", "spawn", "--help"]);
     assert!(output.status.success());

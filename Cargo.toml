@@ -33,7 +33,7 @@ iroh = "1.0.3"
 portable-pty = "0.9"
 postcard = { version = "1", features = ["alloc"] }
 reqwest = { version = "0.13", default-features = false, features = ["query", "rustls-no-provider", "system-proxy"] }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "unstable-backend-writer"] }
 prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 nix = { version = "0.28", default-features = false, features = ["poll"] }
@@ -43,5 +43,5 @@ sysinfo = "0.37"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net", "io-util"] }
 toml = "0.8"
 toml_edit = "0.22"
-vt100 = "0.16"
+vt100 = { path = "vendor/vt100", version = "0.16.2" }
 unicode-width = "0.2"

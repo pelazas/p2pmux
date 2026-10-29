@@ -202,6 +202,198 @@ pub fn event_state_name(state: AgentRosterState) -> Option<&'static str> {
     }
 }
 
+/// How much of a `send` payload goes out in one ctl frame.
+///
+/// JSON escapes a NUL as six bytes, and a frame has to stay under `MAX_FRAME`.
+/// Splitting the source string here leaves that margin.
+pub const SEND_CHUNK_BYTES: usize = 32_000;
+
+/// Turn `p2pmux ctl send` arguments into the bytes the pane should see.
+///
+/// Named keys (`Enter`, `C-c`, `Up`) become their sequences and are not padded
+/// with spaces. Everything else is text: consecutive words keep a single space
+/// between them, and `\n`, `\r`, `\t`, `\e`, `\\`, `\xNN` are escapes.
+/// `--literal` joins the words with spaces and leaves them alone.
+pub fn interpret_send_keys(args: &[String], literal: bool) -> String {
+    if literal {
+        return args.join(" ");
+    }
+    let mut out = String::new();
+    let mut separated = false;
+    for arg in args {
+        if let Some(sequence) = named_send_key(arg) {
+            separated = false;
+            out.push_str(&sequence);
+            continue;
+        }
+        if separated {
+            out.push(' ');
+        }
+        out.push_str(&unescape_send_text(arg));
+        separated = true;
+    }
+    out
+}
+
+/// Split a payload on char boundaries so each piece fits in one ctl frame.
+pub fn chunk_send(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = SEND_CHUNK_BYTES.min(rest.len());
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            end = rest
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(rest.len());
+        }
+        let (head, tail) = rest.split_at(end);
+        chunks.push(head);
+        rest = tail;
+    }
+    chunks
+}
+
+fn named_send_key(arg: &str) -> Option<String> {
+    let lower = arg.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("c-m-")
+        .or_else(|| lower.strip_prefix("m-c-"))
+    {
+        return modified_send_key(rest, true, true);
+    }
+    if let Some(rest) = lower.strip_prefix("c-") {
+        return modified_send_key(rest, true, false);
+    }
+    if let Some(rest) = lower.strip_prefix("m-") {
+        return modified_send_key(rest, false, true);
+    }
+    if let Some(rest) = arg.strip_prefix('^')
+        && rest.chars().count() == 1
+    {
+        return modified_send_key(&rest.to_ascii_lowercase(), true, false);
+    }
+    Some(match lower.as_str() {
+        "enter" | "return" | "cr" => "\r".to_string(),
+        "lf" | "linefeed" => "\n".to_string(),
+        "esc" | "escape" => "\u{1b}".to_string(),
+        "tab" => "\t".to_string(),
+        "space" | "sp" => " ".to_string(),
+        "bspace" | "backspace" => "\u{7f}".to_string(),
+        "up" => "\u{1b}[A".to_string(),
+        "down" => "\u{1b}[B".to_string(),
+        "right" => "\u{1b}[C".to_string(),
+        "left" => "\u{1b}[D".to_string(),
+        "home" => "\u{1b}[H".to_string(),
+        "end" => "\u{1b}[F".to_string(),
+        "pgup" | "pageup" => "\u{1b}[5~".to_string(),
+        "pgdn" | "pagedown" => "\u{1b}[6~".to_string(),
+        "insert" | "ic" => "\u{1b}[2~".to_string(),
+        "delete" | "dc" => "\u{1b}[3~".to_string(),
+        "f1" => "\u{1b}OP".to_string(),
+        "f2" => "\u{1b}OQ".to_string(),
+        "f3" => "\u{1b}OR".to_string(),
+        "f4" => "\u{1b}OS".to_string(),
+        "f5" => "\u{1b}[15~".to_string(),
+        "f6" => "\u{1b}[17~".to_string(),
+        "f7" => "\u{1b}[18~".to_string(),
+        "f8" => "\u{1b}[19~".to_string(),
+        "f9" => "\u{1b}[20~".to_string(),
+        "f10" => "\u{1b}[21~".to_string(),
+        "f11" => "\u{1b}[23~".to_string(),
+        "f12" => "\u{1b}[24~".to_string(),
+        _ => return None,
+    })
+}
+
+fn modified_send_key(rest: &str, control: bool, meta: bool) -> Option<String> {
+    let mut chars = rest.chars();
+    let character = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let byte = if control {
+        ctrl_send_byte(character)?
+    } else {
+        let mut encoded = [0; 4];
+        let written = character.encode_utf8(&mut encoded);
+        if written.len() != 1 {
+            return None;
+        }
+        written.as_bytes()[0]
+    };
+    let mut sequence = String::new();
+    if meta {
+        sequence.push('\u{1b}');
+    }
+    sequence.push(char::from(byte));
+    Some(sequence)
+}
+
+fn ctrl_send_byte(character: char) -> Option<u8> {
+    match character {
+        'a'..='z' => Some(character as u8 - b'a' + 1),
+        '@' | ' ' => Some(0),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+fn unescape_send_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('e') => out.push('\u{1b}'),
+            Some('\\') => out.push('\\'),
+            Some('x') => {
+                let high = chars.next();
+                let low = chars.next();
+                match (
+                    high.and_then(|digit| digit.to_digit(16)),
+                    low.and_then(|digit| digit.to_digit(16)),
+                ) {
+                    (Some(high), Some(low)) => {
+                        out.push(char::from_u32(high * 16 + low).unwrap_or('\u{fffd}'));
+                    }
+                    _ => {
+                        out.push('\\');
+                        out.push('x');
+                        if let Some(high) = high {
+                            out.push(high);
+                        }
+                        if let Some(low) = low {
+                            out.push(low);
+                        }
+                    }
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 pub fn is_nested_p2pmux(command: &[String]) -> bool {
     let Some(first) = command.first() else {
         return false;
@@ -487,5 +679,39 @@ mod tests {
     fn ctl_pin_does_not_move_the_wire_pin() {
         assert_eq!(CTL_PROTOCOL_PIN, 1);
         assert_eq!(crate::protocol::PROTOCOL_VERSION, 12);
+    }
+
+    #[test]
+    fn send_keys_become_the_bytes_a_pane_would_see() {
+        let echo = interpret_send_keys(
+            &[
+                String::from("echo"),
+                String::from("hi"),
+                String::from("Enter"),
+            ],
+            false,
+        );
+        assert_eq!(echo, "echo hi\r");
+        assert_eq!(
+            interpret_send_keys(&[String::from("C-c")], false).as_bytes(),
+            &[3]
+        );
+        assert_eq!(
+            interpret_send_keys(&[String::from("echo C_10\\n")], false),
+            "echo C_10\n"
+        );
+        assert_eq!(
+            interpret_send_keys(&[String::from("echo"), String::from("Enter")], true),
+            "echo Enter"
+        );
+    }
+
+    #[test]
+    fn a_long_send_splits_on_a_char_boundary() {
+        let text = "é".repeat(SEND_CHUNK_BYTES);
+        let chunks = chunk_send(&text);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= SEND_CHUNK_BYTES));
     }
 }

@@ -367,7 +367,11 @@ pub(in crate::tui) fn render_rename_prompt(
         lines.push(Line::raw(""));
     }
     lines.push(Line::styled(
-        "Enter save · Esc cancel",
+        format!(
+            "Enter save · Esc cancel · {}/{}",
+            prompt.value.chars().count(),
+            crate::layout::MAX_TITLE_CHARS
+        ),
         Style::default().fg(theme.footer_muted),
     ));
     frame.render_widget(Paragraph::new(lines), inner);

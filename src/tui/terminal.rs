@@ -19,6 +19,7 @@ pub(in crate::tui) struct TerminalGuard {
     pub(in crate::tui) alternate_screen: bool,
     pub(in crate::tui) bracketed_paste: bool,
     pub(in crate::tui) mouse_capture: bool,
+    pub(in crate::tui) focus_events: bool,
 }
 impl TerminalGuard {
     pub(in crate::tui) fn new() -> Self {
@@ -28,7 +29,23 @@ impl TerminalGuard {
             alternate_screen: false,
             bracketed_paste: false,
             mouse_capture: false,
+            focus_events: false,
         }
+    }
+
+    /// `DECSET 1004` on the outer terminal, so a pane that asked can hear
+    /// `ESC [ I` and `ESC [ O` when this window gains and loses focus.
+    pub(in crate::tui) fn set_focus_events(&mut self, enabled: bool) -> io::Result<()> {
+        if self.focus_events == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(io::stdout(), crossterm::event::EnableFocusChange)?;
+        } else {
+            execute!(io::stdout(), crossterm::event::DisableFocusChange)?;
+        }
+        self.focus_events = enabled;
+        Ok(())
     }
 }
 impl Drop for TerminalGuard {
@@ -44,6 +61,9 @@ impl Drop for TerminalGuard {
         }
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
+        }
+        if self.focus_events {
+            let _ = execute!(stdout, crossterm::event::DisableFocusChange);
         }
         if self.mouse_capture {
             let _ = execute!(stdout, DisableMouseCapture);
@@ -100,6 +120,206 @@ pub(crate) fn clear_before_first_frame<B: Backend>(
 /// that was not its to give.
 pub(crate) fn keep_attributes_through_no_color() {
     crossterm::style::Colored::set_ansi_color_disabled(false);
+}
+
+/// The crossterm backend, plus the text attributes ratatui has no flag for.
+///
+/// A pane cell can be struck through, blinking, concealed, overlined, or
+/// underlined with a curl, a double line, dots or dashes, and those have to
+/// reach the outer terminal as the SGR the program asked for. Ratatui's
+/// modifier set covers the first three of those and a plain underline. The
+/// rest travel in bits above that set — see the constants in the vt renderer —
+/// and this is the draw path that turns them back into escapes.
+pub(crate) struct PaneBackend<W: Write> {
+    inner: ratatui::backend::CrosstermBackend<W>,
+}
+
+impl<W: Write> PaneBackend<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            inner: ratatui::backend::CrosstermBackend::new(writer),
+        }
+    }
+}
+
+impl<W: Write> ratatui::backend::Backend for PaneBackend<W> {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        use crossterm::{
+            cursor::MoveTo,
+            queue,
+            style::{Attribute, Color as CtColor, Print, SetAttribute, SetUnderlineColor},
+        };
+        use ratatui::{layout::Position, style::Modifier};
+
+        let writer = self.inner.writer_mut();
+        let mut fg = ratatui::style::Color::Reset;
+        let mut bg = ratatui::style::Color::Reset;
+        let mut underline_color = ratatui::style::Color::Reset;
+        let mut modifier = Modifier::empty();
+        let mut last_pos: Option<Position> = None;
+        for (x, y, cell) in content {
+            if !matches!(last_pos, Some(p) if x == p.x + 1 && y == p.y) {
+                queue!(writer, MoveTo(x, y))?;
+            }
+            last_pos = Some(Position { x, y });
+            if cell.modifier != modifier
+                || cell.fg != fg
+                || cell.bg != bg
+                || cell.underline_color != underline_color
+            {
+                write_cell_style(writer, cell)?;
+                fg = cell.fg;
+                bg = cell.bg;
+                underline_color = cell.underline_color;
+                modifier = cell.modifier;
+            }
+            queue!(writer, Print(cell.symbol()))?;
+        }
+        queue!(
+            writer,
+            SetAttribute(Attribute::Reset),
+            SetUnderlineColor(CtColor::Reset),
+        )?;
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<ratatui::layout::Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+}
+
+fn write_cell_style(writer: &mut impl Write, cell: &ratatui::buffer::Cell) -> io::Result<()> {
+    use crossterm::{
+        queue,
+        style::{Attribute, Colors, SetAttribute, SetColors, SetUnderlineColor},
+    };
+    use ratatui::style::{Color, Modifier};
+
+    use crate::tui::render::vt::{
+        MOD_CURLY_UNDERLINE, MOD_DASHED_UNDERLINE, MOD_DOTTED_UNDERLINE, MOD_DOUBLE_UNDERLINE,
+        MOD_OVERLINE,
+    };
+
+    // SGR 0, then only what this cell wants. A diff against the previous cell
+    // would have to know the off-code for every private bit; a reset does not.
+    queue!(writer, SetAttribute(Attribute::Reset))?;
+    if cell.fg != Color::Reset || cell.bg != Color::Reset {
+        queue!(
+            writer,
+            SetColors(Colors::new(to_crossterm(cell.fg), to_crossterm(cell.bg)))
+        )?;
+    }
+    if cell.underline_color != Color::Reset {
+        queue!(
+            writer,
+            SetUnderlineColor(to_crossterm(cell.underline_color))
+        )?;
+    }
+    let bits = cell.modifier.bits();
+    let public = Modifier::from_bits_truncate(bits);
+    for (flag, attribute) in [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+    ] {
+        if public.contains(flag) {
+            queue!(writer, SetAttribute(attribute))?;
+        }
+    }
+    let underline: &[u8] = if bits & MOD_CURLY_UNDERLINE != 0 {
+        b"\x1b[4:3m"
+    } else if bits & MOD_DOUBLE_UNDERLINE != 0 {
+        b"\x1b[21m"
+    } else if bits & MOD_DOTTED_UNDERLINE != 0 {
+        b"\x1b[4:4m"
+    } else if bits & MOD_DASHED_UNDERLINE != 0 {
+        b"\x1b[4:5m"
+    } else {
+        b""
+    };
+    if !underline.is_empty() {
+        writer.write_all(underline)?;
+    }
+    if bits & MOD_OVERLINE != 0 {
+        queue!(writer, SetAttribute(Attribute::OverLined))?;
+    }
+    Ok(())
+}
+
+fn to_crossterm(color: ratatui::style::Color) -> crossterm::style::Color {
+    use crossterm::style::Color as Ct;
+    use ratatui::style::Color;
+    match color {
+        Color::Reset => Ct::Reset,
+        Color::Black => Ct::Black,
+        Color::Red => Ct::DarkRed,
+        Color::Green => Ct::DarkGreen,
+        Color::Yellow => Ct::DarkYellow,
+        Color::Blue => Ct::DarkBlue,
+        Color::Magenta => Ct::DarkMagenta,
+        Color::Cyan => Ct::DarkCyan,
+        Color::Gray => Ct::Grey,
+        Color::DarkGray => Ct::DarkGrey,
+        Color::LightRed => Ct::Red,
+        Color::LightGreen => Ct::Green,
+        Color::LightYellow => Ct::Yellow,
+        Color::LightBlue => Ct::Blue,
+        Color::LightMagenta => Ct::Magenta,
+        Color::LightCyan => Ct::Cyan,
+        Color::White => Ct::White,
+        Color::Indexed(index) => Ct::AnsiValue(index),
+        Color::Rgb(red, green, blue) => Ct::Rgb {
+            r: red,
+            g: green,
+            b: blue,
+        },
+    }
 }
 
 pub(in crate::tui) fn enable_keyboard_enhancement() -> io::Result<bool> {

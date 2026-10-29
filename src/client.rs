@@ -24,7 +24,7 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 
 use crate::{
     local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
@@ -33,10 +33,10 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, ChordMode, KeyHandling, MultiPaneTui,
-        PaneMouseProtocol, PaneViewState, QuitAction, ShareView, clear_before_first_frame,
-        copy_selection_to_clipboard, keep_attributes_through_no_color,
-        render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
-        stale_node_size,
+        PaneBackend, PaneMouseProtocol, PaneViewState, QuitAction, ShareView,
+        alternate_scroll_bytes, clear_before_first_frame, copy_selection_to_clipboard,
+        keep_attributes_through_no_color, render_multi_pane_with_copy_feedback, resize_recheck_due,
+        share_copy_result, stale_node_size,
     },
 };
 
@@ -428,7 +428,7 @@ pub fn run_on(
     let terminal_stop = Arc::new(AtomicBool::new(false));
     let mut guard = ClientTerminalGuard::enter(&descriptor.name)?;
     keep_attributes_through_no_color();
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PaneBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -928,6 +928,13 @@ pub fn run_on(
         if tui.is_some() {
             replay_early_input(&mut pending_wake, &mut early_input);
         }
+        if let Some(view) = tui.as_ref() {
+            let reports = screens
+                .get(&view.focused_pane())
+                .and_then(GuestScreen::screen)
+                .is_some_and(|screen| screen.focus_event_mode());
+            guard.set_focus_events(reports)?;
+        }
         if pending_wake.is_none() && resize_recheck_due(last_size_check, Instant::now()) {
             last_size_check = Some(Instant::now());
             if let Some((cols, rows)) = stale_node_size(
@@ -1047,7 +1054,7 @@ pub fn run_on(
                 }
             }
             Event::Paste(text) => {
-                if should_forward_paste(tui, &local_peer_id) {
+                if !tui.insert_rename_paste(&text) && should_forward_paste(tui, &local_peer_id) {
                     let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
                     if let Some(perf_id) = perf_id {
                         crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
@@ -1096,7 +1103,22 @@ pub fn run_on(
                     let pane_id = tui.pane_at_or_focused_for_mouse(mouse.column, mouse.row, area);
                     let protocol = pane_mouse_protocol(tui, &screens, &local_peer_id, pane_id);
                     let forwarded = tui.wheel_bytes_for_pane(mouse, area, protocol, pane_id);
-                    if let Some(bytes) = forwarded {
+                    let alternate = (!mouse.modifiers.contains(KeyModifiers::SHIFT)
+                        && tui.scrollback_offset(pane_id) == 0)
+                        .then(|| {
+                            screens
+                                .get(&pane_id)
+                                .and_then(GuestScreen::screen)
+                                .and_then(|screen| {
+                                    alternate_scroll_bytes(
+                                        screen,
+                                        matches!(mouse.kind, MouseEventKind::ScrollUp),
+                                    )
+                                })
+                        })
+                        .flatten();
+                    if let Some(bytes) = forwarded.or_else(|| alternate.map(|bytes| bytes.to_vec()))
+                    {
                         let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
                         write_message(&mut stream, &pane_input(pane_id, bytes, perf_id))?;
                     } else {
@@ -1186,8 +1208,15 @@ pub fn run_on(
                 }
                 dirty = true;
             }
+            Event::FocusGained => {
+                forward_focus_event(&mut stream, tui, &screens, b"\x1b[I")?;
+            }
+            Event::FocusLost => {
+                forward_focus_event(&mut stream, tui, &screens, b"\x1b[O")?;
+            }
             _ => {}
         }
+        deliver_focus_report(&mut stream, tui, &screens)?;
         if tui.zoomed_pane() != zoom_before {
             let (cols, rows) = node_viewport;
             write_message(
@@ -1286,6 +1315,43 @@ fn refresh_tui_timers(
 /// mode, its xterm mouse mode -- so it names that pane rather than letting the
 /// node re-decide from its own focus, which lags this one by a round trip after
 /// every pane the session creates.
+fn forward_focus_event(
+    stream: &mut UnixStream,
+    tui: &MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let pane_id = tui.focused_pane();
+    let wants = screens
+        .get(&pane_id)
+        .and_then(GuestScreen::screen)
+        .is_some_and(|screen| screen.focus_event_mode());
+    if wants {
+        write_message(stream, &pane_input(pane_id, bytes.to_vec(), None))?;
+    }
+    Ok(())
+}
+
+fn deliver_focus_report(
+    stream: &mut UnixStream,
+    tui: &mut MultiPaneTui,
+    screens: &BTreeMap<u64, GuestScreen>,
+) -> io::Result<()> {
+    let Some((left, entered)) = tui.take_focus_report() else {
+        return Ok(());
+    };
+    for (pane_id, bytes) in [(left, &b"\x1b[O"[..]), (entered, &b"\x1b[I"[..])] {
+        let wants = screens
+            .get(&pane_id)
+            .and_then(GuestScreen::screen)
+            .is_some_and(|screen| screen.focus_event_mode());
+        if wants {
+            write_message(stream, &pane_input(pane_id, bytes.to_vec(), None))?;
+        }
+    }
+    Ok(())
+}
+
 fn pane_input(pane_id: u64, bytes: Vec<u8>, perf_id: Option<u64>) -> ClientMessage {
     ClientMessage::Input {
         bytes,
@@ -1735,6 +1801,7 @@ struct ClientTerminalGuard {
     alternate: bool,
     paste: bool,
     mouse: bool,
+    focus_events: bool,
 }
 impl ClientTerminalGuard {
     fn enter(name: &str) -> io::Result<Self> {
@@ -1745,6 +1812,7 @@ impl ClientTerminalGuard {
             alternate: false,
             paste: false,
             mouse: false,
+            focus_events: false,
         };
         terminal::enable_raw_mode()?;
         guard.raw = true;
@@ -1763,6 +1831,10 @@ impl ClientTerminalGuard {
         Ok(guard)
     }
     fn leave(&mut self) -> io::Result<()> {
+        if self.focus_events {
+            execute!(self.stdout, crossterm::event::DisableFocusChange)?;
+            self.focus_events = false;
+        }
         if self.mouse {
             execute!(self.stdout, DisableMouseCapture)?;
             self.mouse = false;
@@ -1784,6 +1856,19 @@ impl ClientTerminalGuard {
             terminal::disable_raw_mode()?;
             self.raw = false;
         }
+        Ok(())
+    }
+
+    fn set_focus_events(&mut self, enabled: bool) -> io::Result<()> {
+        if self.focus_events == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(self.stdout, crossterm::event::EnableFocusChange)?;
+        } else {
+            execute!(self.stdout, crossterm::event::DisableFocusChange)?;
+        }
+        self.focus_events = enabled;
         Ok(())
     }
 }

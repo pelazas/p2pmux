@@ -38,6 +38,25 @@ impl PaneMouseProtocol {
         self.mode != vt100::MouseProtocolMode::None
     }
 }
+
+/// Wheel notches over a full-screen program that did not ask for the mouse.
+///
+/// `less`, `man` and `git log` live on the alternate screen and never turn on
+/// mouse reporting, so the wheel has nowhere to go unless it becomes the arrow
+/// keys those programs already understand. xterm calls this alternate scroll.
+/// One notch, one arrow: application cursor mode uses `SS3`, otherwise CSI.
+pub(crate) fn alternate_scroll_bytes(screen: &vt100::Screen, up: bool) -> Option<&'static [u8]> {
+    if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None || !screen.alternate_screen()
+    {
+        return None;
+    }
+    Some(match (up, screen.application_cursor()) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    })
+}
 fn mouse_button_code(button: MouseButton) -> u8 {
     match button {
         MouseButton::Left => MOUSE_BUTTON_LEFT,
@@ -148,7 +167,29 @@ mod tests {
         test_support::{mouse_protocol, sgr_protocol},
     };
 
-    use super::{PaneMouseProtocol, encode_mouse};
+    use super::{PaneMouseProtocol, alternate_scroll_bytes, encode_mouse};
+
+    #[test]
+    fn alternate_scroll_is_arrows_on_the_alt_screen_and_nothing_in_mouse_mode() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        assert_eq!(alternate_scroll_bytes(parser.screen(), true), None);
+        parser.process(b"\x1b[?1049h");
+        assert_eq!(
+            alternate_scroll_bytes(parser.screen(), true),
+            Some(&b"\x1b[A"[..])
+        );
+        assert_eq!(
+            alternate_scroll_bytes(parser.screen(), false),
+            Some(&b"\x1b[B"[..])
+        );
+        parser.process(b"\x1b[?1h");
+        assert_eq!(
+            alternate_scroll_bytes(parser.screen(), true),
+            Some(&b"\x1bOA"[..])
+        );
+        parser.process(b"\x1b[?1000h");
+        assert_eq!(alternate_scroll_bytes(parser.screen(), true), None);
+    }
 
     #[test]
     fn encode_mouse_skips_panes_without_mouse_reporting() {

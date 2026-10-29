@@ -1555,12 +1555,15 @@ fn validate_display_name(display_name: &str) -> Result<(), LayoutError> {
     Ok(())
 }
 
+/// Pane and tab titles, after trimming. The rename prompt stops here too.
+pub const MAX_TITLE_CHARS: usize = 32;
+
 pub fn normalize_title(title: &str) -> Result<Option<String>, LayoutError> {
     let normalized = title.trim();
     if normalized.is_empty() {
         return Ok(None);
     }
-    if normalized.chars().count() > 32 || normalized.chars().any(char::is_control) {
+    if normalized.chars().count() > MAX_TITLE_CHARS || normalized.chars().any(char::is_control) {
         return Err(LayoutError::InvalidTitle);
     }
     Ok(Some(normalized.to_owned()))

@@ -13,7 +13,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, SetTitle, enable_raw_mode},
 };
 use portable_pty::PtySize;
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 
 use ratatui::style::Color;
 
@@ -25,7 +25,7 @@ use crate::{
     screen::{GuestScreen, OuterResetRecognizer, SyncGate},
     session::{GuestEvent, GuestPane, HostControlEvent},
     tui::{
-        HostPaneRuntime,
+        HostPaneRuntime, PaneBackend,
         input::{
             events::{
                 MAX_EVENTS_PER_CYCLE, begin_synchronized_output, collect_pending_events,
@@ -68,7 +68,7 @@ pub fn run_local() -> Result<(), Box<dyn Error>> {
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     guard.keyboard_enhancement = enable_keyboard_enhancement()?;
 
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PaneBackend::new(io::stdout());
     let fixed_area = Rect::new(0, 0, cols, rows);
     let mut terminal = Terminal::with_options(
         backend,
@@ -183,7 +183,7 @@ pub fn run_host(mut runtime: HostPaneRuntime) -> Result<(), Box<dyn Error>> {
     guard.bracketed_paste = true;
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     guard.keyboard_enhancement = enable_keyboard_enhancement()?;
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PaneBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -376,7 +376,7 @@ pub fn run_guest(mut pane: GuestPane) -> Result<(), Box<dyn Error>> {
     execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     guard.keyboard_enhancement = enable_keyboard_enhancement()?;
 
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PaneBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {

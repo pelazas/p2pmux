@@ -15,14 +15,14 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, SetTitle, enable_raw_mode},
 };
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 
 use crate::{
     agent_detect::AgentScan,
     layout::PaneId,
     session::GuestPane,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, KeyHandling, ShareView, TerminalGuard,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, KeyHandling, PaneBackend, ShareView, TerminalGuard,
         clear_before_first_frame, enable_keyboard_enhancement,
         input::{
             events::{
@@ -30,6 +30,7 @@ use crate::{
                 end_synchronized_output, event_poll_timeout, frame_due,
             },
             keys::PendingEscape,
+            mouse::alternate_scroll_bytes,
         },
         keep_attributes_through_no_color, missed_resize,
         pane::remote::{RemotePaneDrain, SharedRemotePane},
@@ -135,7 +136,7 @@ impl SharedLayoutRuntime {
         execute!(io::stdout(), EnableMouseCapture)?;
         guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         keep_attributes_through_no_color();
-        let backend = CrosstermBackend::new(io::stdout());
+        let backend = PaneBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -269,6 +270,10 @@ impl SharedLayoutRuntime {
                     )?;
                 }
             }
+            let focus_reports = self
+                .pane_vt_screen(self.tui.focused_pane())
+                .is_some_and(|screen| screen.focus_event_mode());
+            guard.set_focus_events(focus_reports)?;
             if !event::poll(event_poll_timeout(dirty, last_draw))? {
                 continue;
             }
@@ -285,6 +290,7 @@ impl SharedLayoutRuntime {
                     break;
                 }
             }
+            self.deliver_focus_report()?;
             if quit {
                 break;
             }
@@ -324,11 +330,19 @@ impl SharedLayoutRuntime {
                 *dirty = true;
             }
             Event::Paste(text) => {
-                if !self.tui.home_open() && !self.tui.modal_open() {
+                if self.tui.insert_rename_paste(&text) {
+                    *dirty = true;
+                } else if !self.tui.home_open() && !self.tui.modal_open() {
                     self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
+                    *dirty = true;
                 }
-                *dirty = true;
+            }
+            Event::FocusGained => {
+                self.send_focus_event(self.tui.focused_pane(), b"\x1b[I")?;
+            }
+            Event::FocusLost => {
+                self.send_focus_event(self.tui.focused_pane(), b"\x1b[O")?;
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
                 if !self.tui.home_open() && !self.tui.modal_open() {
@@ -396,17 +410,31 @@ impl SharedLayoutRuntime {
                     );
                     return Ok(false);
                 }
-                // A child that reports mouse scrolls its own buffer; local scrollback
-                // would otherwise hide the wheel from it.
-                let protocol = self.focused_pane_mouse_protocol();
-                if protocol.reports_mouse()
-                    && let Some(bytes) = self.tui.handle_mouse(mouse, area, protocol).forward_bytes
+                // The pane under the pointer, not the focused one. A wheel notch
+                // aimed at `less` has to reach `less` even when the caret is
+                // next door, and a mouse-mode app keeps the notch when the
+                // pointer is over it.
+                let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                let protocol = self.pane_mouse_protocol(pane_id);
+                if let Some(bytes) = self
+                    .tui
+                    .wheel_bytes_for_pane(mouse, area, protocol, pane_id)
                 {
-                    self.forward_mouse(bytes)?;
+                    self.forward_bytes(pane_id, bytes)?;
                     *dirty = true;
                     return Ok(false);
                 }
-                let pane_id = self.tui.pane_at_or_focused(mouse.column, mouse.row, area);
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.tui.scrollback_offset(pane_id) == 0
+                    && let Some(screen) = self.pane_vt_screen(pane_id)
+                    && let Some(bytes) = alternate_scroll_bytes(screen, up)
+                {
+                    self.forward_bytes(pane_id, bytes.to_vec())?;
+                    self.tui.reset_scrollback(pane_id);
+                    *dirty = true;
+                    return Ok(false);
+                }
                 let scrollback_len = self
                     .local
                     .get(&pane_id)

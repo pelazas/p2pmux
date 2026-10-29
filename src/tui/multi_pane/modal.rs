@@ -69,12 +69,35 @@ impl MultiPaneTui {
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
+                if prompt.value.chars().count() >= crate::layout::MAX_TITLE_CHARS {
+                    prompt.error = Some(String::from("Max 32 characters; no controls"));
+                    return KeyHandling::Consumed(vec![]);
+                }
                 prompt.value.push(character);
                 prompt.error = None;
                 KeyHandling::Consumed(vec![])
             }
             _ => KeyHandling::Consumed(vec![]),
         }
+    }
+
+    /// A paste into the rename prompt. Bracketed paste arrives as one event,
+    /// and dropping it left the field empty. Controls are stripped — a title
+    /// cannot hold them — and the field stops at 32 characters.
+    pub(crate) fn insert_rename_paste(&mut self, text: &str) -> bool {
+        let ModalState::Rename(prompt) = &mut self.modal else {
+            return false;
+        };
+        let mut overflow = false;
+        for character in text.chars().filter(|character| !character.is_control()) {
+            if prompt.value.chars().count() >= crate::layout::MAX_TITLE_CHARS {
+                overflow = true;
+                break;
+            }
+            prompt.value.push(character);
+        }
+        prompt.error = overflow.then(|| String::from("Max 32 characters; no controls"));
+        true
     }
 
     /// Keys for the share modal.
@@ -290,6 +313,41 @@ mod tests {
         },
     };
 
+    #[test]
+    fn a_key_focus_move_is_reported_and_a_sync_is_not() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        assert!(tui.select_pane(1, 2, "key"));
+        assert_eq!(tui.take_focus_report(), Some((1, 2)));
+        assert!(tui.take_focus_report().is_none());
+        assert!(tui.select_pane(1, 3, "node_sync"));
+        assert!(tui.take_focus_report().is_none());
+        assert!(tui.select_pane(1, 1, "snapshot_repair"));
+        assert!(tui.take_focus_report().is_none());
+    }
+
+    #[test]
+    fn a_paste_fills_the_rename_prompt_and_stops_at_32() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        tui.open_rename(super::RenameTarget::Pane(1));
+        assert!(tui.insert_rename_paste("hello\nworld"));
+        let value = match &tui.modal {
+            super::ModalState::Rename(prompt) => prompt.value.clone(),
+            _ => panic!("prompt stays open"),
+        };
+        assert_eq!(value, "helloworld");
+        assert!(tui.insert_rename_paste(&"y".repeat(40)));
+        let (count, has_error) = match &tui.modal {
+            super::ModalState::Rename(prompt) => {
+                (prompt.value.chars().count(), prompt.error.is_some())
+            }
+            _ => panic!("prompt stays open"),
+        };
+        assert_eq!(count, 32);
+        assert!(has_error);
+        let _ = area;
+    }
+
     /// Ctrl+A is the legacy way to Home, and it keeps the doubled-press escape
     /// hatch a decade of screen and tmux users expect: a second press inside
     /// the window sends a literal Ctrl+A to the pane instead.
@@ -453,11 +511,14 @@ mod tests {
                 area,
             );
         }
-        assert_eq!(
-            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), area),
-            KeyHandling::Consumed(vec![])
-        );
-        assert!(matches!(tui.modal, super::ModalState::Rename(_)));
+        let (count, has_error) = match &tui.modal {
+            super::ModalState::Rename(prompt) => {
+                (prompt.value.chars().count(), prompt.error.is_some())
+            }
+            _ => panic!("the prompt should still be open"),
+        };
+        assert_eq!(count, 32, "the 33rd character is refused");
+        assert!(has_error, "the limit is said while typing");
         assert_eq!(
             tui.handle_key(
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
