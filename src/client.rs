@@ -18,8 +18,8 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
@@ -911,6 +911,11 @@ pub fn run_on(
                         link_summary.as_deref(),
                     );
                 })?;
+                let style = screens
+                    .get(&tui.focused_pane())
+                    .map(GuestScreen::cursor_style)
+                    .unwrap_or(0);
+                execute!(io::stdout(), crate::screen::terminal_cursor_style(style))?;
                 let draw_elapsed = draw_started.elapsed();
                 if crate::perf::enabled() && draw_elapsed >= Duration::from_millis(5) {
                     crate::perf::log(&format!(
@@ -1032,9 +1037,17 @@ pub fn run_on(
                         let kitty_keyboard_active = screens
                             .get(&tui.focused_pane())
                             .is_some_and(GuestScreen::kitty_keyboard_active);
+                        let application_cursor = screens
+                            .get(&tui.focused_pane())
+                            .and_then(GuestScreen::screen)
+                            .is_some_and(|screen| screen.application_cursor());
                         if input_allowed(tui, &local_peer_id, tui.focused_pane())
-                            && let Some(bytes) =
-                                client_key_bytes(key.code, key.modifiers, kitty_keyboard_active)
+                            && let Some(bytes) = client_key_bytes(
+                                key.code,
+                                key.modifiers,
+                                kitty_keyboard_active,
+                                application_cursor,
+                            )
                         {
                             let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
                             if let Some(perf_id) = perf_id {
@@ -1059,9 +1072,17 @@ pub fn run_on(
                     if let Some(perf_id) = perf_id {
                         crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
                     }
+                    let bracketed_paste = screens
+                        .get(&tui.focused_pane())
+                        .and_then(GuestScreen::screen)
+                        .is_some_and(|screen| screen.bracketed_paste());
                     write_message(
                         &mut stream,
-                        &pane_input(tui.focused_pane(), text.into_bytes(), perf_id),
+                        &pane_input(
+                            tui.focused_pane(),
+                            client_paste_bytes(&text, bracketed_paste),
+                            perf_id,
+                        ),
                     )?;
                     history.remove(&tui.focused_pane());
                     pending_scroll.remove(&tui.focused_pane());
@@ -1757,41 +1778,30 @@ fn spawn_terminal_reader(
     })
 }
 
+/// Bytes for one paste. A pane that enabled bracketed paste has to see the
+/// markers, or a multi-line paste runs as typed commands.
+fn client_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    crate::tui::encode_paste(text, bracketed_paste)
+}
+
 fn client_key_bytes(
     code: KeyCode,
     modifiers: KeyModifiers,
     kitty_keyboard_active: bool,
+    application_cursor: bool,
 ) -> Option<Vec<u8>> {
-    match code {
-        KeyCode::Char(character)
-            if modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii_alphabetic() =>
-        {
-            Some(vec![character.to_ascii_lowercase() as u8 - b'a' + 1])
-        }
-        KeyCode::Char(character) => Some(character.to_string().into_bytes()),
-        KeyCode::Enter if modifiers == KeyModifiers::SHIFT => {
-            if kitty_keyboard_active {
-                Some(b"\x1b[13;2u".to_vec())
-            } else {
-                Some(b"\n".to_vec())
-            }
-        }
-        KeyCode::Enter => Some(b"\r".to_vec()),
-        KeyCode::Backspace => Some(b"\x7f".to_vec()),
-        KeyCode::Tab => Some(b"\t".to_vec()),
-        // Shift+Tab, which crossterm reports as its own code rather than as a
-        // modified Tab. Matched whatever the modifiers say: terminals disagree
-        // about whether to set SHIFT on a key whose whole identity is the
-        // shift. Without this arm the key encoded to nothing and never left the
-        // client, so the mode switch it drives in a child never happened.
-        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Esc => Some(b"\x1b".to_vec()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        _ => None,
+    let mut parser = vt100::Parser::new(1, 1, 0);
+    if application_cursor {
+        parser.process(b"\x1b[?1h");
     }
+    // The attached client used to keep a shorter encoder than the runtime, so
+    // Home, End, Delete, Page Up, the function keys, and every modifier but a
+    // bare Ctrl+letter never left this process. One encoder serves both.
+    crate::tui::encode_key(
+        KeyEvent::new(code, modifiers),
+        parser.screen(),
+        kitty_keyboard_active,
+    )
 }
 
 struct ClientTerminalGuard {
@@ -2096,12 +2106,65 @@ mod tests {
     #[test]
     fn ctrl_q_is_reserved_for_detach() {
         assert_eq!(
-            client_key_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL, false),
+            client_key_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL, false, false),
             Some(vec![3])
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL, false),
-            Some(vec![17])
+            client_key_bytes(KeyCode::Char('q'), KeyModifiers::CONTROL, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn paste_keeps_bracketed_markers_when_the_pane_enabled_them() {
+        assert_eq!(client_paste_bytes("PASTE_ONE", false), b"PASTE_ONE");
+        assert_eq!(
+            client_paste_bytes("PASTE_ONE", true),
+            b"\x1b[200~PASTE_ONE\x1b[201~"
+        );
+    }
+
+    /// Home, the function keys, and modified chords have to arrive encoded the
+    /// way xterm would send them. The client used to drop the first group and
+    /// strip the modifiers off the second.
+    #[test]
+    fn editing_keys_and_modifiers_reach_the_pane() {
+        assert_eq!(
+            client_key_bytes(KeyCode::Home, KeyModifiers::NONE, false, false),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Delete, KeyModifiers::NONE, false, false),
+            Some(b"\x1b[3~".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::F(5), KeyModifiers::NONE, false, false),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Char('b'), KeyModifiers::ALT, false, false),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Up, KeyModifiers::SHIFT, false, false),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(
+                KeyCode::Left,
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                false,
+                false
+            ),
+            Some(b"\x1b[1;7D".to_vec())
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Char(' '), KeyModifiers::CONTROL, false, false),
+            Some(vec![0])
+        );
+        assert_eq!(
+            client_key_bytes(KeyCode::Up, KeyModifiers::NONE, false, true),
+            Some(b"\x1bOA".to_vec())
         );
     }
 
@@ -2110,12 +2173,12 @@ mod tests {
     #[test]
     fn shift_tab_reaches_the_pane_as_a_back_tab() {
         assert_eq!(
-            client_key_bytes(KeyCode::BackTab, KeyModifiers::SHIFT, false),
+            client_key_bytes(KeyCode::BackTab, KeyModifiers::SHIFT, false, false),
             Some(b"\x1b[Z".to_vec())
         );
         // Some terminals report the key without naming the modifier.
         assert_eq!(
-            client_key_bytes(KeyCode::BackTab, KeyModifiers::NONE, false),
+            client_key_bytes(KeyCode::BackTab, KeyModifiers::NONE, false, false),
             Some(b"\x1b[Z".to_vec())
         );
         // And the mux does not claim it on the way past.
@@ -2132,27 +2195,27 @@ mod tests {
     #[test]
     fn encodes_shift_enter_for_the_focused_pane_keyboard_mode() {
         assert_eq!(
-            client_key_bytes(KeyCode::Enter, KeyModifiers::NONE, false),
+            client_key_bytes(KeyCode::Enter, KeyModifiers::NONE, false, false),
             Some(b"\r".to_vec())
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false),
+            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false, false),
             Some(b"\n".to_vec())
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, true),
+            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, true, false),
             Some(b"\x1b[13;2u".to_vec())
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Char('j'), KeyModifiers::CONTROL, false),
+            client_key_bytes(KeyCode::Char('j'), KeyModifiers::CONTROL, false, false),
             Some(b"\n".to_vec())
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Enter, KeyModifiers::ALT, true),
+            client_key_bytes(KeyCode::Enter, KeyModifiers::ALT, true, false),
             Some(b"\r".to_vec())
         );
         assert_eq!(
-            client_key_bytes(KeyCode::Enter, KeyModifiers::CONTROL, true),
+            client_key_bytes(KeyCode::Enter, KeyModifiers::CONTROL, true, false),
             Some(b"\r".to_vec())
         );
     }
@@ -2425,7 +2488,7 @@ mod tests {
     #[test]
     fn shift_enter_encodes_as_lf_when_kitty_keyboard_is_inactive() {
         assert_eq!(
-            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false),
+            client_key_bytes(KeyCode::Enter, KeyModifiers::SHIFT, false, false),
             Some(b"\n".to_vec())
         );
     }

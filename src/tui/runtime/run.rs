@@ -255,6 +255,18 @@ impl SharedLayoutRuntime {
                     );
                 })?;
                 end_synchronized_output()?;
+                let focused = self.tui.focused_pane();
+                let style = self
+                    .local
+                    .get(&focused)
+                    .map(|pane| pane.screen.cursor_style())
+                    .or_else(|| {
+                        self.remote
+                            .get(&focused)
+                            .map(|pane| pane.screen.cursor_style())
+                    })
+                    .unwrap_or(0);
+                execute!(io::stdout(), crate::screen::terminal_cursor_style(style))?;
                 dirty = false;
                 last_draw = Some(Instant::now());
             }

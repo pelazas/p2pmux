@@ -9,13 +9,12 @@ use serde::Deserialize;
 
 static CONFIG_WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n#\n# Telemetry is not configured here. It is one file and one command, so that\n# revoking it is one thing to delete rather than a key to find:\n#   p2pmux telemetry show    print the exact line this machine would send\n#   p2pmux telemetry off     stop sending it\n# The answer lives beside this file, in telemetry.json.\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui]\n# Draw the panes nobody is reading dimmed, so a glance finds the one you are in.\n# Off by default: how faint SGR 2 renders is your terminal's choice, not ours.\n# The pane under the pointer, one scrolled back, one a peer is driving and one\n# whose agent wants you are never dimmed -- those are panes somebody is reading.\n# dim_unfocused_panes = false\n\n[ui.theme]\n# Named colors: white, yellow, gray, dark_gray\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane,\n# and coloring the border of any pane that member is driving.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#ff6a13\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n";
+const DEFAULT_CONFIG_TEMPLATE: &str = "# p2pmux local configuration\n#\n# display_name is visible to peers.\n# display_name = \"your-name\"\n#\n# Telemetry is not configured here. It is one file and one command, so that\n# revoking it is one thing to delete rather than a key to find:\n#   p2pmux telemetry show    print the exact line this machine would send\n#   p2pmux telemetry off     stop sending it\n# The answer lives beside this file, in telemetry.json.\n\n# UI chrome is local to this client and is never shared with session peers.\n[ui]\n# Draw the panes nobody is reading dimmed, so a glance finds the one you are in.\n# Off by default: how faint SGR 2 renders is your terminal's choice, not ours.\n# The pane under the pointer, one scrolled back, one a peer is driving and one\n# whose agent wants you are never dimmed -- those are panes somebody is reading.\n# dim_unfocused_panes = false\n\n[ui.theme]\n# Named colors: black, red, green, yellow, blue, magenta, cyan, white, gray, dark_gray, light_red, light_green, light_yellow, light_blue, light_magenta, light_cyan\n# Hex colors: #RRGGBB\n#\n# footer_background = \"#1e1e1e\"\n# footer_muted = \"white\"\n# footer_accent = \"#dc322f\"\n# footer_orange = \"#ff7846\"\n# tab_active_background = \"#dc322f\"\n# tab_foreground = \"white\"\n# tab_separator = \"dark_gray\"\n# copy_feedback_accent = \"#ff4500\"\n# agent_overlay_chrome = \"#ff4500\"\n# agent_overlay_selected_background = \"#2a2a2a\"\n# agent_overlay_muted = \"#919db4\"\n# agent_overlay_warm = \"#ffb84d\"\n# agent_overlay_attention = \"#ffb000\"\n# agent_overlay_error = \"#dc322f\"\n# agent_overlay_foreground = \"white\"\n# agent_overlay_secondary = \"gray\"\n# pane_border_free_focused = \"white\"\n# pane_border_unknown_focused = \"yellow\"\n# pane_border_chord_focused = \"#ff1a1a\"\n# pane_border_hovered = \"gray\"\n# pane_border_idle = \"dark_gray\"\n# pane_border_remote_control = \"#ff4500\"\n#\n# One color per member, in join order, identifying who is watching which tab and pane,\n# and coloring the border of any pane that member is driving.\n# List up to 8; the slots you leave out keep their built-in color.\n# member_colors = [\"#ff6a13\", \"#7ed67e\", \"#f06292\", \"#7986cb\", \"#4db6ac\", \"#ba68c8\", \"#c0ca33\", \"#90a4ae\"]\n";
 
 #[derive(Debug)]
 pub enum ConfigError {
     MissingHome,
     InvalidName(&'static str),
-    InvalidColor { key: &'static str, value: String },
     Io(io::Error),
     Parse(toml::de::Error),
 }
@@ -25,7 +24,6 @@ impl fmt::Display for ConfigError {
         match self {
             Self::MissingHome => f.write_str("could not resolve config directory"),
             Self::InvalidName(message) => f.write_str(message),
-            Self::InvalidColor { key, value } => write!(f, "invalid color for {key}: {value}"),
             Self::Io(error) => error.fmt(f),
             Self::Parse(error) => error.fmt(f),
         }
@@ -223,9 +221,24 @@ pub fn load_from(path: &Path) -> Result<Option<String>, ConfigError> {
 }
 
 pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
+    let (config, warnings) = load_config_reporting(path)?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(config)
+}
+
+/// Theme problems a bad `[ui.theme]` value produced, each naming the file.
+///
+/// A bad colour used to fail every command, including `config get`, so the file
+/// could not be fixed from the CLI. The value falls back to the built-in colour
+/// and the warning is what `doctor` repeats.
+pub(crate) fn load_config_reporting(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Config::default(), Vec::new()));
+        }
         Err(error) => return Err(error.into()),
     };
     let config: ConfigFile = toml::from_str(&text).map_err(ConfigError::Parse)?;
@@ -233,136 +246,164 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         .display_name
         .map(|name| validate_display_name(&name))
         .transpose()?;
+    let mut warnings = Vec::new();
     let mut theme = UiTheme::default();
-    apply_color(
+    let mut apply = |color: &mut Color, value: Option<String>, key: &'static str| {
+        apply_color(color, value, key, path, &mut warnings);
+    };
+    apply(
         &mut theme.footer_background,
         config.ui.theme.footer_background,
         "footer_background",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.footer_muted,
         config.ui.theme.footer_muted,
         "footer_muted",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.footer_accent,
         config.ui.theme.footer_accent,
         "footer_accent",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.footer_orange,
         config.ui.theme.footer_orange,
         "footer_orange",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.tab_active_background,
         config.ui.theme.tab_active_background,
         "tab_active_background",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.tab_foreground,
         config.ui.theme.tab_foreground,
         "tab_foreground",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.tab_separator,
         config.ui.theme.tab_separator,
         "tab_separator",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.copy_feedback_accent,
         config.ui.theme.copy_feedback_accent,
         "copy_feedback_accent",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_chrome,
         config.ui.theme.agent_overlay_chrome,
         "agent_overlay_chrome",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_selected_background,
         config.ui.theme.agent_overlay_selected_background,
         "agent_overlay_selected_background",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_muted,
         config.ui.theme.agent_overlay_muted,
         "agent_overlay_muted",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_warm,
         config.ui.theme.agent_overlay_warm,
         "agent_overlay_warm",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_attention,
         config.ui.theme.agent_overlay_attention,
         "agent_overlay_attention",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_error,
         config.ui.theme.agent_overlay_error,
         "agent_overlay_error",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_foreground,
         config.ui.theme.agent_overlay_foreground,
         "agent_overlay_foreground",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.agent_overlay_secondary,
         config.ui.theme.agent_overlay_secondary,
         "agent_overlay_secondary",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.pane_border_free_focused,
         config.ui.theme.pane_border_free_focused,
         "pane_border_free_focused",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.pane_border_unknown_focused,
         config.ui.theme.pane_border_unknown_focused,
         "pane_border_unknown_focused",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.pane_border_chord_focused,
         config.ui.theme.pane_border_chord_focused,
         "pane_border_chord_focused",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.pane_border_hovered,
         config.ui.theme.pane_border_hovered,
         "pane_border_hovered",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.pane_border_idle,
         config.ui.theme.pane_border_idle,
         "pane_border_idle",
-    )?;
-    apply_color(
+    );
+    apply(
         &mut theme.pane_border_remote_control,
         config.ui.theme.pane_border_remote_control,
         "pane_border_remote_control",
-    )?;
-    apply_member_colors(&mut theme.member_colors, config.ui.theme.member_colors)?;
-    Ok(Config {
-        display_name,
-        ui: UiConfig {
-            theme,
-            dim_unfocused_panes: config.ui.dim_unfocused_panes.unwrap_or(false),
+    );
+    apply_member_colors(
+        &mut theme.member_colors,
+        config.ui.theme.member_colors,
+        path,
+        &mut warnings,
+    );
+    Ok((
+        Config {
+            display_name,
+            ui: UiConfig {
+                theme,
+                dim_unfocused_panes: config.ui.dim_unfocused_panes.unwrap_or(false),
+            },
         },
-    })
+        warnings,
+    ))
+}
+
+/// Lines `p2pmux doctor` prints for this config file.
+pub(crate) fn doctor_config_lines(path: &Path) -> Vec<String> {
+    match load_config_reporting(path) {
+        Ok((_, warnings)) => warnings,
+        Err(error) => vec![format!("{}: {error}", path.display())],
+    }
 }
 
 fn apply_color(
     color: &mut Color,
     value: Option<String>,
     key: &'static str,
-) -> Result<(), ConfigError> {
-    if let Some(value) = value {
-        *color = parse_color(&value).ok_or(ConfigError::InvalidColor { key, value })?;
+    path: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    match parse_color(&value) {
+        Some(parsed) => *color = parsed,
+        None => warnings.push(format!(
+            "{}: invalid color for {key}: {value}; using the default",
+            path.display()
+        )),
     }
-    Ok(())
 }
 
 /// Override member colors from the front of the list, so a short list keeps the
@@ -371,31 +412,49 @@ fn apply_color(
 fn apply_member_colors(
     colors: &mut [Color; MEMBER_COLOR_SLOTS],
     values: Option<Vec<String>>,
-) -> Result<(), ConfigError> {
+    path: &Path,
+    warnings: &mut Vec<String>,
+) {
     let Some(values) = values else {
-        return Ok(());
+        return;
     };
     if values.len() > MEMBER_COLOR_SLOTS {
-        return Err(ConfigError::InvalidColor {
-            key: "member_colors",
-            value: format!("at most {MEMBER_COLOR_SLOTS} colors, got {}", values.len()),
-        });
+        warnings.push(format!(
+            "{}: invalid color for member_colors: at most {MEMBER_COLOR_SLOTS} colors, got {}; using the default",
+            path.display(),
+            values.len()
+        ));
+        return;
     }
     for (slot, value) in colors.iter_mut().zip(values) {
-        *slot = parse_color(&value).ok_or(ConfigError::InvalidColor {
-            key: "member_colors",
-            value,
-        })?;
+        match parse_color(&value) {
+            Some(parsed) => *slot = parsed,
+            None => warnings.push(format!(
+                "{}: invalid color for member_colors: {value}; using the default",
+                path.display()
+            )),
+        }
     }
-    Ok(())
 }
 
 fn parse_color(value: &str) -> Option<Color> {
     match value {
-        "white" => Some(Color::White),
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
         "yellow" => Some(Color::Yellow),
-        "gray" => Some(Color::Gray),
-        "dark_gray" => Some(Color::DarkGray),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "white" => Some(Color::White),
+        "gray" | "grey" => Some(Color::Gray),
+        "dark_gray" | "dark_grey" => Some(Color::DarkGray),
+        "light_red" => Some(Color::LightRed),
+        "light_green" => Some(Color::LightGreen),
+        "light_yellow" => Some(Color::LightYellow),
+        "light_blue" => Some(Color::LightBlue),
+        "light_magenta" => Some(Color::LightMagenta),
+        "light_cyan" => Some(Color::LightCyan),
         _ => {
             let hex = value.strip_prefix('#')?;
             if hex.len() != 6 {
@@ -589,22 +648,21 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let too_many = ["\"white\""; MEMBER_COLOR_SLOTS + 1].join(", ");
         fs::write(&path, format!("[ui.theme]\nmember_colors = [{too_many}]\n")).unwrap();
-        assert!(matches!(
-            load_config_from(&path),
-            Err(ConfigError::InvalidColor {
-                key: "member_colors",
-                ..
-            })
-        ));
+        let (config, warnings) = super::load_config_reporting(&path).unwrap();
+        assert_eq!(
+            config.ui.theme.member_colors,
+            UiTheme::default().member_colors
+        );
+        assert!(warnings[0].contains("member_colors"));
+        assert!(warnings[0].contains(&path.display().to_string()));
 
         fs::write(&path, "[ui.theme]\nmember_colors = [\"#gggggg\"]\n").unwrap();
-        assert!(matches!(
-            load_config_from(&path),
-            Err(ConfigError::InvalidColor {
-                key: "member_colors",
-                ..
-            })
-        ));
+        let (config, warnings) = super::load_config_reporting(&path).unwrap();
+        assert_eq!(
+            config.ui.theme.member_colors,
+            UiTheme::default().member_colors
+        );
+        assert!(warnings[0].contains("#gggggg"));
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -627,13 +685,33 @@ mod tests {
     }
 
     #[test]
-    fn invalid_color_names_its_key() {
+    fn common_color_names_load_and_a_bad_value_names_the_file() {
         let path = temp_config_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "[ui.theme]\nfooter_background = \"blue\"\n").unwrap();
+        fs::write(
+            &path,
+            "[ui.theme]\nfooter_accent = \"red\"\ntab_foreground = \"green\"\nfooter_background = \"blue\"\n",
+        )
+        .unwrap();
+        let (config, warnings) = super::load_config_reporting(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(config.ui.theme.footer_accent, Color::Red);
+        assert_eq!(config.ui.theme.tab_foreground, Color::Green);
+        assert_eq!(config.ui.theme.footer_background, Color::Blue);
 
-        let error = load_config_from(&path).unwrap_err();
-        assert!(error.to_string().contains("footer_background"));
+        fs::write(&path, "[ui.theme]\ntab_foreground = \"#12345\"\n").unwrap();
+        let (config, warnings) = super::load_config_reporting(&path).unwrap();
+        assert_eq!(
+            config.ui.theme.tab_foreground,
+            UiTheme::default().tab_foreground
+        );
+        let warning = warnings.into_iter().next().expect("a warning");
+        assert!(warning.contains("tab_foreground"));
+        assert!(warning.contains("#12345"));
+        assert!(warning.contains(&path.display().to_string()));
+        assert_eq!(super::doctor_config_lines(&path), vec![warning]);
+        // The command itself still starts. A bad colour used to exit first.
+        assert!(load_config_from(&path).is_ok());
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

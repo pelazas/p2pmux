@@ -755,6 +755,15 @@ pub fn doctor() -> Result<(), Box<dyn Error>> {
     if states.iter().all(|wiring| **wiring == Wiring::Absent) {
         println!("\nNothing to wire up on this machine.");
     }
+    if let Ok(path) = crate::config::config_path() {
+        let lines = crate::config::doctor_config_lines(&path);
+        if !lines.is_empty() {
+            println!();
+            for line in lines {
+                println!("config    {line}");
+            }
+        }
+    }
     // Not just whether one is on PATH, but which one: a machine can hold p2pmux
     // from two install channels, and the one that runs is whichever comes first
     // — routinely the older. Nothing else on this machine will ever say so.

@@ -342,6 +342,8 @@ pub struct PaneCallbacks {
     count: u64,
     /// Replies to feed back into the pane's PTY, in the order they were asked.
     replies: Vec<u8>,
+    /// DECSCUSR parameter last seen, 0 through 6. `vt100` does not track it.
+    cursor_style: u8,
 }
 
 impl PaneCallbacks {
@@ -404,6 +406,14 @@ impl vt100::Callbacks for PaneCallbacks {
             (None, 'c', None | Some(0)) => self.reply(b"\x1b[?1;2c"),
             // Secondary device attributes: terminal id 0, version 10, no options.
             (Some(b'>'), 'c', None | Some(0)) => self.reply(b"\x1b[>0;10;0c"),
+            // DECSCUSR: cursor shape. The space is the intermediate; without it
+            // this is a different command.
+            (Some(b' '), 'q', style) => {
+                let style = style.unwrap_or(0);
+                if style <= 6 {
+                    self.cursor_style = u8::try_from(style).unwrap_or(0);
+                }
+            }
             _ => {}
         }
     }
@@ -495,8 +505,11 @@ impl HostScreen {
             .sequence
             .checked_add(1)
             .ok_or(ScreenError::SequenceExhausted)?;
-        let snapshot = snapshot_payload(self.parser.screen())?;
-        let delta = self.parser.screen().state_diff(self.previous.screen());
+        let style = self.cursor_style();
+        let mut snapshot = snapshot_payload(self.parser.screen())?.to_vec();
+        append_cursor_style(&mut snapshot, style, MAX_SNAPSHOT_BYTES);
+        let mut delta = self.parser.screen().state_diff(self.previous.screen());
+        append_cursor_style(&mut delta, style, MAX_DELTA_BYTES);
         // A large batch can outgrow the wire delta cap; fall back to the
         // snapshot-only frame shape (as resize does) so consumers replace
         // their screen instead of patching it.
@@ -508,7 +521,7 @@ impl HostScreen {
         let frame = ScreenFrame {
             sequence,
             base_sequence,
-            snapshot,
+            snapshot: Arc::from(snapshot),
             delta: Arc::from(delta),
             kitty_keyboard_active: self.kitty_keyboard.active(),
             reset_outer: erased_outer
@@ -562,10 +575,12 @@ impl HostScreen {
         // agent UI, which repaints in place and never scrolls a fresh row in to
         // rebuild what was thrown away. `ingest` already counted whatever the
         // reflow pushed off the top.
+        let mut snapshot = snapshot_payload(self.parser.screen())?.to_vec();
+        append_cursor_style(&mut snapshot, self.cursor_style(), MAX_SNAPSHOT_BYTES);
         let frame = ScreenFrame {
             sequence,
             base_sequence: 0,
-            snapshot: snapshot_payload(self.parser.screen())?,
+            snapshot: Arc::from(snapshot),
             delta: Arc::from([]),
             kitty_keyboard_active: self.current.kitty_keyboard_active,
             reset_outer: false,
@@ -584,6 +599,11 @@ impl HostScreen {
 
     pub fn kitty_keyboard_active(&self) -> bool {
         self.kitty_keyboard.active()
+    }
+
+    /// DECSCUSR parameter the pane last asked for, 0 through 6.
+    pub fn cursor_style(&self) -> u8 {
+        self.parser.callbacks().cursor_style
     }
 
     /// Rows the parser is holding, tracked as output arrives.
@@ -1171,6 +1191,7 @@ pub struct GuestScreen {
     parser: Option<vt100::Parser>,
     sequence: Option<u64>,
     kitty_keyboard_active: bool,
+    cursor_style: u8,
 }
 
 impl Default for GuestScreen {
@@ -1185,6 +1206,7 @@ impl GuestScreen {
             parser: None,
             sequence: None,
             kitty_keyboard_active: false,
+            cursor_style: 0,
         }
     }
 
@@ -1200,6 +1222,7 @@ impl GuestScreen {
         parser.process(state);
         self.parser = Some(parser);
         self.sequence = Some(sequence);
+        self.note_cursor_style(payload);
         Ok(())
     }
 
@@ -1221,7 +1244,19 @@ impl GuestScreen {
         let parser = self.parser.as_mut().ok_or(ScreenError::MalformedSnapshot)?;
         parser.process(payload);
         self.sequence = Some(sequence);
+        self.note_cursor_style(payload);
         Ok(ApplyDelta::Applied)
+    }
+
+    fn note_cursor_style(&mut self, payload: &[u8]) {
+        if let Some(style) = cursor_style_from_suffix(payload) {
+            self.cursor_style = style;
+        }
+    }
+
+    /// DECSCUSR parameter carried on the latest snapshot or delta, 0 through 6.
+    pub fn cursor_style(&self) -> u8 {
+        self.cursor_style
     }
 
     pub fn screen(&self) -> Option<&vt100::Screen> {
@@ -1238,6 +1273,45 @@ impl GuestScreen {
 
     pub fn kitty_keyboard_active(&self) -> bool {
         self.kitty_keyboard_active
+    }
+}
+
+fn cursor_style_suffix(style: u8) -> [u8; 5] {
+    [0x1b, b'[', b'0' + style.min(6), b' ', b'q']
+}
+
+fn append_cursor_style(bytes: &mut Vec<u8>, style: u8, limit: usize) {
+    let suffix = cursor_style_suffix(style);
+    if bytes.len().saturating_add(suffix.len()) <= limit {
+        bytes.extend_from_slice(&suffix);
+    }
+}
+
+fn cursor_style_from_suffix(bytes: &[u8]) -> Option<u8> {
+    let suffix = bytes.get(bytes.len().checked_sub(5)?..)?;
+    if suffix[0] == 0x1b && suffix[1] == b'[' && suffix[3] == b' ' && suffix[4] == b'q' {
+        let style = suffix[2].wrapping_sub(b'0');
+        if style <= 6 {
+            return Some(style);
+        }
+    }
+    None
+}
+
+/// The outer-terminal cursor shape for a DECSCUSR parameter.
+pub(crate) fn terminal_cursor_style(style: u8) -> crossterm::cursor::SetCursorStyle {
+    use crossterm::cursor::SetCursorStyle::{
+        BlinkingBar, BlinkingBlock, BlinkingUnderScore, DefaultUserShape, SteadyBar, SteadyBlock,
+        SteadyUnderScore,
+    };
+    match style {
+        1 => BlinkingBlock,
+        2 => SteadyBlock,
+        3 => BlinkingUnderScore,
+        4 => SteadyUnderScore,
+        5 => BlinkingBar,
+        6 => SteadyBar,
+        _ => DefaultUserShape,
     }
 }
 
@@ -1284,7 +1358,49 @@ fn validate_dimensions(rows: u16, cols: u16) -> Result<(), ScreenError> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+    use super::{GuestScreen, HostScreen, MAX_SYNC_BYTES, MAX_SYNC_HOLD, SyncGate};
+
+    #[test]
+    fn cursor_shape_reaches_a_guest_and_resets() {
+        let mut host = HostScreen::new(2, 8).unwrap();
+        let frame = host.process_pty(b"\x1b[5 q").unwrap();
+        assert_eq!(host.cursor_style(), 5);
+
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(frame.sequence, &frame.snapshot)
+            .unwrap();
+        assert_eq!(guest.cursor_style(), 5);
+        assert_eq!(
+            crate::screen::terminal_cursor_style(guest.cursor_style()),
+            crossterm::cursor::SetCursorStyle::BlinkingBar
+        );
+
+        let frame = host.process_pty(b"\x1b[0 q").unwrap();
+        assert_eq!(
+            guest
+                .apply_delta(frame.base_sequence, frame.sequence, &frame.delta)
+                .unwrap(),
+            super::ApplyDelta::Applied
+        );
+        assert_eq!(guest.cursor_style(), 0);
+    }
+
+    #[test]
+    fn bracketed_paste_survives_the_snapshot_a_client_renders() {
+        let mut host = HostScreen::new(2, 8).unwrap();
+        host.process_pty(b"\x1b[?2004h").unwrap();
+        assert!(host.parser.screen().bracketed_paste());
+
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(host.current.sequence, &host.current.snapshot)
+            .unwrap();
+        assert!(
+            guest.screen().unwrap().bracketed_paste(),
+            "a pane that enabled ?2004h has to still say so after the snapshot"
+        );
+    }
 
     #[test]
     fn hvp_becomes_cup_and_nothing_else_does() {
@@ -1657,8 +1773,13 @@ mod tests {
             reference.process(&batch);
             let expected = reference.screen().state_diff(&reference_previous);
             reference_previous = reference.screen().clone();
+            // The cursor-shape suffix rides on the delta and is not part of the cell diff.
+            let delta = frame.delta.as_ref();
+            let delta = super::cursor_style_from_suffix(delta)
+                .map(|_| &delta[..delta.len() - 5])
+                .unwrap_or(delta);
             assert_eq!(
-                frame.delta.as_ref(),
+                delta,
                 expected.as_slice(),
                 "delta diverged from the cloned baseline at batch {index}",
             );
