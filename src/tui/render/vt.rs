@@ -235,6 +235,15 @@ fn composes_an_emoji(cluster: &str) -> bool {
         .any(|character| matches!(character, '\u{20e3}' | '\u{200d}'))
 }
 
+/// Private modifier bits. Ratatui's [`Modifier`] has no curly underline, double
+/// underline or overline, and the backend that draws a pane reads these bits
+/// back out of the cell. They sit above the flags ratatui itself defines.
+pub(in crate::tui) const MOD_DOUBLE_UNDERLINE: u16 = 1 << 9;
+pub(in crate::tui) const MOD_CURLY_UNDERLINE: u16 = 1 << 10;
+pub(in crate::tui) const MOD_DOTTED_UNDERLINE: u16 = 1 << 11;
+pub(in crate::tui) const MOD_DASHED_UNDERLINE: u16 = 1 << 12;
+pub(in crate::tui) const MOD_OVERLINE: u16 = 1 << 13;
+
 fn vt_style(cell: &vt100::Cell) -> Style {
     let mut modifiers = Modifier::empty();
     if cell.bold() {
@@ -246,15 +255,41 @@ fn vt_style(cell: &vt100::Cell) -> Style {
     if cell.italic() {
         modifiers.insert(Modifier::ITALIC);
     }
-    if cell.underline() {
-        modifiers.insert(Modifier::UNDERLINED);
+    match cell.underline_style() {
+        vt100::Underline::None => {}
+        vt100::Underline::Single => modifiers.insert(Modifier::UNDERLINED),
+        vt100::Underline::Double => {
+            modifiers.insert(Modifier::from_bits_retain(MOD_DOUBLE_UNDERLINE));
+        }
+        vt100::Underline::Curly => {
+            modifiers.insert(Modifier::from_bits_retain(MOD_CURLY_UNDERLINE));
+        }
+        vt100::Underline::Dotted => {
+            modifiers.insert(Modifier::from_bits_retain(MOD_DOTTED_UNDERLINE));
+        }
+        vt100::Underline::Dashed => {
+            modifiers.insert(Modifier::from_bits_retain(MOD_DASHED_UNDERLINE));
+        }
     }
     if cell.inverse() {
         modifiers.insert(Modifier::REVERSED);
     }
+    if cell.blink() {
+        modifiers.insert(Modifier::SLOW_BLINK);
+    }
+    if cell.conceal() {
+        modifiers.insert(Modifier::HIDDEN);
+    }
+    if cell.strikethrough() {
+        modifiers.insert(Modifier::CROSSED_OUT);
+    }
+    if cell.overline() {
+        modifiers.insert(Modifier::from_bits_retain(MOD_OVERLINE));
+    }
     Style::default()
         .fg(vt_color(cell.fgcolor()))
         .bg(vt_color(cell.bgcolor()))
+        .underline_color(vt_color(cell.underline_color()))
         .add_modifier(modifiers)
 }
 fn vt_color(color: vt100::Color) -> Color {
@@ -307,7 +342,7 @@ mod tests {
 
     use crate::{
         screen::{GuestScreen, HostScreen},
-        tui::{PaneTextSelection, ScreenCell, SelectionPoint},
+        tui::{PaneBackend, PaneTextSelection, ScreenCell, SelectionPoint},
     };
 
     use super::{VtScreen, fitted_symbol, render_guest_screen, viewed_screen};
@@ -699,5 +734,36 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), " ");
         assert_eq!(buffer[(2, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn extended_sgr_reaches_the_outer_terminal() {
+        let mut parser = vt100::Parser::new(1, 16, 0);
+        parser
+            .process(b"\x1b[9mS\x1b[4:3mC\x1b[21mD\x1b[58;2;255;0;0;4mU\x1b[5mB\x1b[8mH\x1b[53mO");
+        crate::tui::keep_attributes_through_no_color();
+        let area = Rect::new(0, 0, 16, 1);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| frame.render_widget(VtScreen::new(parser.screen()), frame.area()))
+            .expect("render");
+        let drawn = terminal.backend().buffer().clone();
+        let mut written = Vec::new();
+        PaneBackend::new(&mut written)
+            .draw(Buffer::empty(area).diff(&drawn).into_iter())
+            .expect("write the frame");
+        let text = String::from_utf8(written).expect("ansi is utf-8");
+        for code in [
+            "\u{1b}[9m",
+            "\u{1b}[4:3m",
+            "\u{1b}[21m",
+            "58;2;255;0;0",
+            "\u{1b}[5m",
+            "\u{1b}[8m",
+            "\u{1b}[53m",
+        ] {
+            assert!(text.contains(code), "missing {code:?} in {text:?}");
+        }
     }
 }

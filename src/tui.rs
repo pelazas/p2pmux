@@ -68,6 +68,7 @@ pub use state::{
     AgentOverlayRow, ChordMode, HomeRowId, KeyHandling, MouseHandling, PairedMachine, PaneGeometry,
     PaneViewState, QuitAction, ShareCopy, ShareView, UiIntent,
 };
+pub(crate) use terminal::PaneBackend;
 pub(in crate::tui) use terminal::{TerminalGuard, enable_keyboard_enhancement};
 pub(crate) use terminal::{clear_before_first_frame, keep_attributes_through_no_color};
 

@@ -24,7 +24,7 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 
 use crate::{
     local_ipc::{ClientMessage, NodeMessage, ScreenUpdate},
@@ -33,8 +33,8 @@ use crate::{
     session_store::SessionDescriptor,
     tui::{
         AGENT_OVERLAY_ANIMATION_INTERVAL, AgentOverlayRow, ChordMode, KeyHandling, MultiPaneTui,
-        PaneMouseProtocol, PaneViewState, QuitAction, ShareView, clear_before_first_frame,
-        copy_selection_to_clipboard, keep_attributes_through_no_color,
+        PaneBackend, PaneMouseProtocol, PaneViewState, QuitAction, ShareView,
+        clear_before_first_frame, copy_selection_to_clipboard, keep_attributes_through_no_color,
         render_multi_pane_with_copy_feedback, resize_recheck_due, share_copy_result,
         stale_node_size,
     },
@@ -428,7 +428,7 @@ pub fn run_on(
     let terminal_stop = Arc::new(AtomicBool::new(false));
     let mut guard = ClientTerminalGuard::enter(&descriptor.name)?;
     keep_attributes_through_no_color();
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PaneBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {

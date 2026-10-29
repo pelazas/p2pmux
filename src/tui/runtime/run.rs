@@ -15,14 +15,14 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, SetTitle, enable_raw_mode},
 };
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 
 use crate::{
     agent_detect::AgentScan,
     layout::PaneId,
     session::GuestPane,
     tui::{
-        AGENT_OVERLAY_ANIMATION_INTERVAL, KeyHandling, ShareView, TerminalGuard,
+        AGENT_OVERLAY_ANIMATION_INTERVAL, KeyHandling, PaneBackend, ShareView, TerminalGuard,
         clear_before_first_frame, enable_keyboard_enhancement,
         input::{
             events::{
@@ -135,7 +135,7 @@ impl SharedLayoutRuntime {
         execute!(io::stdout(), EnableMouseCapture)?;
         guard.keyboard_enhancement = enable_keyboard_enhancement()?;
         keep_attributes_through_no_color();
-        let backend = CrosstermBackend::new(io::stdout());
+        let backend = PaneBackend::new(io::stdout());
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
