@@ -81,6 +81,25 @@ impl MultiPaneTui {
         }
     }
 
+    /// A paste into the rename prompt. Bracketed paste arrives as one event,
+    /// and dropping it left the field empty. Controls are stripped — a title
+    /// cannot hold them — and the field stops at 32 characters.
+    pub(crate) fn insert_rename_paste(&mut self, text: &str) -> bool {
+        let ModalState::Rename(prompt) = &mut self.modal else {
+            return false;
+        };
+        let mut overflow = false;
+        for character in text.chars().filter(|character| !character.is_control()) {
+            if prompt.value.chars().count() >= crate::layout::MAX_TITLE_CHARS {
+                overflow = true;
+                break;
+            }
+            prompt.value.push(character);
+        }
+        prompt.error = overflow.then(|| String::from("Max 32 characters; no controls"));
+        true
+    }
+
     /// Keys for the share modal.
     ///
     /// Enter and `c` take the code, `t` takes the ticket; either way the clipboard gets a
@@ -304,6 +323,29 @@ mod tests {
         assert!(tui.take_focus_report().is_none());
         assert!(tui.select_pane(1, 1, "snapshot_repair"));
         assert!(tui.take_focus_report().is_none());
+    }
+
+    #[test]
+    fn a_paste_fills_the_rename_prompt_and_stops_at_32() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        tui.open_rename(super::RenameTarget::Pane(1));
+        assert!(tui.insert_rename_paste("hello\nworld"));
+        let value = match &tui.modal {
+            super::ModalState::Rename(prompt) => prompt.value.clone(),
+            _ => panic!("prompt stays open"),
+        };
+        assert_eq!(value, "helloworld");
+        assert!(tui.insert_rename_paste(&"y".repeat(40)));
+        let (count, has_error) = match &tui.modal {
+            super::ModalState::Rename(prompt) => {
+                (prompt.value.chars().count(), prompt.error.is_some())
+            }
+            _ => panic!("prompt stays open"),
+        };
+        assert_eq!(count, 32);
+        assert!(has_error);
+        let _ = area;
     }
 
     /// Ctrl+A is the legacy way to Home, and it keeps the doubled-press escape

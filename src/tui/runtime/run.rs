@@ -330,11 +330,13 @@ impl SharedLayoutRuntime {
                 *dirty = true;
             }
             Event::Paste(text) => {
-                if !self.tui.home_open() && !self.tui.modal_open() {
+                if self.tui.insert_rename_paste(&text) {
+                    *dirty = true;
+                } else if !self.tui.home_open() && !self.tui.modal_open() {
                     self.tui.exit_chord_mode();
                     self.forward_paste(&text)?;
+                    *dirty = true;
                 }
-                *dirty = true;
             }
             Event::FocusGained => {
                 self.send_focus_event(self.tui.focused_pane(), b"\x1b[I")?;

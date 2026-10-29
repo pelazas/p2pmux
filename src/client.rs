@@ -1054,7 +1054,7 @@ pub fn run_on(
                 }
             }
             Event::Paste(text) => {
-                if should_forward_paste(tui, &local_peer_id) {
+                if !tui.insert_rename_paste(&text) && should_forward_paste(tui, &local_peer_id) {
                     let perf_id = next_perf_id_if_enabled(&mut next_perf_id);
                     if let Some(perf_id) = perf_id {
                         crate::perf::log(&format!("P2PMUX_PERF id={perf_id} client_input"));
