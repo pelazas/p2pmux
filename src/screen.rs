@@ -925,11 +925,16 @@ struct VisibleText {
 struct CellStyle {
     fgcolor: vt100::Color,
     bgcolor: vt100::Color,
+    underline_color: vt100::Color,
     bold: bool,
     dim: bool,
     italic: bool,
-    underline: bool,
+    underline: vt100::Underline,
     inverse: bool,
+    strikethrough: bool,
+    blink: bool,
+    conceal: bool,
+    overline: bool,
 }
 
 impl CellStyle {
@@ -937,11 +942,16 @@ impl CellStyle {
         Self {
             fgcolor: cell.fgcolor(),
             bgcolor: cell.bgcolor(),
+            underline_color: cell.underline_color(),
             bold: cell.bold(),
             dim: cell.dim(),
             italic: cell.italic(),
-            underline: cell.underline(),
+            underline: cell.underline_style(),
             inverse: cell.inverse(),
+            strikethrough: cell.strikethrough(),
+            blink: cell.blink(),
+            conceal: cell.conceal(),
+            overline: cell.overline(),
         }
     }
 
@@ -954,16 +964,32 @@ impl CellStyle {
             (self.bold, "1"),
             (self.dim, "2"),
             (self.italic, "3"),
-            (self.underline, "4"),
             (self.inverse, "7"),
+            (self.blink, "5"),
+            (self.conceal, "8"),
+            (self.strikethrough, "9"),
+            (self.overline, "53"),
         ] {
             if enabled {
                 out.push(b';');
                 out.extend_from_slice(code.as_bytes());
             }
         }
+        let underline = match self.underline {
+            vt100::Underline::None => None,
+            vt100::Underline::Single => Some("4"),
+            vt100::Underline::Double => Some("21"),
+            vt100::Underline::Curly => Some("4:3"),
+            vt100::Underline::Dotted => Some("4:4"),
+            vt100::Underline::Dashed => Some("4:5"),
+        };
+        if let Some(code) = underline {
+            out.push(b';');
+            out.extend_from_slice(code.as_bytes());
+        }
         out.extend_from_slice(color_params(self.fgcolor, 3).as_bytes());
         out.extend_from_slice(color_params(self.bgcolor, 4).as_bytes());
+        out.extend_from_slice(underline_color_params(self.underline_color).as_bytes());
         out.push(b'm');
     }
 }
@@ -979,6 +1005,15 @@ fn color_params(color: vt100::Color, base: u8) -> String {
     }
 }
 
+/// SGR 58 parameters. Empty when the underline keeps the terminal's colour.
+fn underline_color_params(color: vt100::Color) -> String {
+    match color {
+        vt100::Color::Default => String::new(),
+        vt100::Color::Idx(index) => format!(";58;5;{index}"),
+        vt100::Color::Rgb(red, green, blue) => format!(";58;2;{red};{green};{blue}"),
+    }
+}
+
 /// Whether a cell puts anything on screen, and so has to survive a reflow.
 ///
 /// A blank cell still counts when it carries a background or a decoration: that
@@ -988,6 +1023,11 @@ fn cell_is_painted(cell: &vt100::Cell) -> bool {
         || cell.bgcolor() != vt100::Color::Default
         || cell.inverse()
         || cell.underline()
+        || cell.strikethrough()
+        || cell.overline()
+        || cell.blink()
+        || cell.conceal()
+        || cell.underline_color() != vt100::Color::Default
 }
 
 /// One past the last painted column of `row`, so trailing blanks are not replayed.
