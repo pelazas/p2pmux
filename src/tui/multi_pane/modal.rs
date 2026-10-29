@@ -290,6 +290,18 @@ mod tests {
         },
     };
 
+    #[test]
+    fn a_key_focus_move_is_reported_and_a_sync_is_not() {
+        let mut tui = MultiPaneTui::new(split_layout()).expect("layout");
+        assert!(tui.select_pane(1, 2, "key"));
+        assert_eq!(tui.take_focus_report(), Some((1, 2)));
+        assert!(tui.take_focus_report().is_none());
+        assert!(tui.select_pane(1, 3, "node_sync"));
+        assert!(tui.take_focus_report().is_none());
+        assert!(tui.select_pane(1, 1, "snapshot_repair"));
+        assert!(tui.take_focus_report().is_none());
+    }
+
     /// Ctrl+A is the legacy way to Home, and it keeps the doubled-press escape
     /// hatch a decade of screen and tmux users expect: a second press inside
     /// the window sends a literal Ctrl+A to the pane instead.
