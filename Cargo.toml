@@ -43,5 +43,5 @@ sysinfo = "0.37"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net", "io-util"] }
 toml = "0.8"
 toml_edit = "0.22"
-vt100 = "0.16"
+vt100 = { path = "vendor/vt100", version = "0.16.2" }
 unicode-width = "0.2"

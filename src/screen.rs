@@ -1825,4 +1825,39 @@ mod tests {
         assert_eq!(older.len(), 1);
         assert_ne!(newest, older);
     }
+
+    #[test]
+    fn extended_sgr_round_trips_through_a_formatted_screen() {
+        let bytes = b"\x1b[9mS\x1b[0m \x1b[4:3mC\x1b[0m \x1b[21mD\x1b[0m \x1b[58;2;255;0;0;4mU\x1b[0m \x1b[5mB\x1b[0m \x1b[8mH\x1b[0m \x1b[53mO";
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(bytes);
+        let mut replay = vt100::Parser::new(2, 40, 0);
+        replay.process(&parser.screen().contents_formatted());
+        let cell = |column: u16| replay.screen().cell(0, column).expect("cell");
+        assert!(cell(0).strikethrough());
+        assert_eq!(cell(2).underline_style(), vt100::Underline::Curly);
+        assert_eq!(cell(4).underline_style(), vt100::Underline::Double);
+        assert_eq!(cell(6).underline_color(), vt100::Color::Rgb(255, 0, 0));
+        assert!(cell(6).underline());
+        assert!(cell(8).blink());
+        assert!(cell(10).conceal());
+        assert!(cell(12).overline());
+        assert_eq!(cell(0).contents(), "S");
+        assert_eq!(cell(10).contents(), "H");
+    }
+
+    #[test]
+    fn focus_event_mode_is_part_of_the_snapshot() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        assert!(!parser.screen().focus_event_mode());
+        parser.process(b"\x1b[?1004h");
+        assert!(parser.screen().focus_event_mode());
+        let state = parser.screen().state_formatted();
+        assert!(state.windows(8).any(|window| window == b"\x1b[?1004h"));
+        let mut replay = vt100::Parser::new(2, 8, 0);
+        replay.process(&state);
+        assert!(replay.screen().focus_event_mode());
+        parser.process(b"\x1b[?1004l");
+        assert!(!parser.screen().focus_event_mode());
+    }
 }
