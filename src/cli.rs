@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::{
     hosted_rendezvous::{HostedRendezvous, JoinCode},
@@ -586,8 +586,27 @@ impl std::fmt::Display for NodeStartupError {
 impl Error for NodeStartupError {}
 
 /// Parse process arguments.
+///
+/// clap's own exit swallows a failed write and still exits 0, so `--help`
+/// into a full disk looked like success. A write error is the same failure
+/// `list` already reports.
 pub fn parse() -> Cli {
-    Cli::parse()
+    let command = Cli::command();
+    match command.try_get_matches() {
+        Ok(matches) => match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(error) => exit_clap(error),
+        },
+        Err(error) => exit_clap(error),
+    }
+}
+
+fn exit_clap(error: clap::Error) -> ! {
+    if let Err(write) = error.print() {
+        eprintln!("Error: {write}");
+        std::process::exit(1);
+    }
+    std::process::exit(error.exit_code());
 }
 
 /// The command definition, for the shell-completion hook in `main`.

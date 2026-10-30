@@ -830,6 +830,33 @@ fn ctl_help_names_the_machine_the_command_and_the_agent() {
 }
 
 #[test]
+fn help_fails_when_stdout_cannot_take_it() {
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+    for args in [&["--help"][..], &["ctl", "spawn", "--help"][..]] {
+        let full = fs::File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+            .args(args)
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::piped())
+            .env_remove("P2PMUX_PANE_ID")
+            .env_remove("P2PMUX_SOCK")
+            .output()
+            .expect("p2pmux binary should run");
+        assert!(!output.status.success(), "{args:?} {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(
+            stderr.contains("No space left on device"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn version_help_is_user_facing_and_not_on_every_command() {
     let top = run(&["--help"]);
     assert!(top.status.success());
