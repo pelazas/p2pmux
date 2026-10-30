@@ -239,6 +239,7 @@ enum Command {
     /// Forget a paired machine.
     Unpair {
         /// The machine's name, as listed by `p2pmux machines`.
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_paired_machines))]
         name: String,
     },
     /// List the live sessions on this machine.
@@ -355,7 +356,7 @@ enum Command {
     Ctl {
         /// Session name as `p2pmux list` prints it. Omit it for the fleet
         /// session when this machine is paired, otherwise the newest live one.
-        #[arg(long)]
+        #[arg(long, add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         session: Option<String>,
         #[command(subcommand)]
         action: CtlCommand,
@@ -389,7 +390,8 @@ enum CtlCommand {
     Agents,
     /// Start an allowlisted command on a machine you own.
     Spawn {
-        #[arg(long)]
+        /// A machine from `p2pmux ctl machines`, including this one.
+        #[arg(long, add = clap_complete::ArgValueCompleter::new(complete_spawn_machines))]
         machine: String,
         /// Do not reuse a live pane titled `chat: {command}` on that machine.
         #[arg(long)]
@@ -599,6 +601,47 @@ fn complete_sessions(current: &std::ffi::OsStr) -> Vec<clap_complete::Completion
         .into_iter()
         .filter(|session| prefix.is_empty() || session.name.starts_with(prefix.as_ref()))
         .map(|session| clap_complete::CompletionCandidate::new(session.name))
+        .collect()
+}
+
+fn complete_paired_machines(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    complete_matching(current, paired_machine_names())
+}
+
+fn complete_spawn_machines(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    let mut names = paired_machine_names();
+    let here = crate::config::load()
+        .ok()
+        .flatten()
+        .unwrap_or_else(hostname_label);
+    if !here.is_empty() && !names.iter().any(|name| name == &here) {
+        names.push(here);
+    }
+    complete_matching(current, names)
+}
+
+fn paired_machine_names() -> Vec<String> {
+    crate::pairing::load()
+        .map(|pairing| {
+            pairing
+                .machines
+                .into_iter()
+                .map(|machine| machine.name)
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn complete_matching(
+    current: &std::ffi::OsStr,
+    names: Vec<String>,
+) -> Vec<clap_complete::CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    names
+        .into_iter()
+        .filter(|name| prefix.is_empty() || name.starts_with(prefix.as_ref()))
+        .map(clap_complete::CompletionCandidate::new)
         .collect()
 }
 
