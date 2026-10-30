@@ -1578,8 +1578,8 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         }
         LayoutError::NotPaneHost { .. } | LayoutError::NotMember => LayoutRejectReason::NotHost,
         LayoutError::NotTabHost { .. } => LayoutRejectReason::MixedTab,
+        LayoutError::TabLimit => LayoutRejectReason::TabLimit,
         LayoutError::MemberLimit
-        | LayoutError::TabLimit
         | LayoutError::PaneLimit
         | LayoutError::SplitDepthLimit
         | LayoutError::IdExhausted => LayoutRejectReason::Limit,
