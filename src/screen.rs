@@ -1315,6 +1315,22 @@ pub(crate) fn terminal_cursor_style(style: u8) -> crossterm::cursor::SetCursorSt
     }
 }
 
+/// A remote pane's screen, rebuilt for the client attached to this node.
+///
+/// `snapshot_payload` is the parser's own dump, which never carried the cursor
+/// shape: that rides on the end of the bytes the host sent. A guest that
+/// applied those bytes has the shape, and drops it the moment it asks the
+/// parser for a fresh dump. Put it back, or only the host's own terminal
+/// changes shape.
+pub(crate) fn republish_snapshot(
+    screen: &vt100::Screen,
+    cursor_style: u8,
+) -> Result<Vec<u8>, ScreenError> {
+    let mut snapshot = snapshot_payload(screen)?.to_vec();
+    append_cursor_style(&mut snapshot, cursor_style, MAX_SNAPSHOT_BYTES);
+    Ok(snapshot)
+}
+
 /// Encodes a complete fixed-grid screen for a fresh local or remote renderer.
 pub fn snapshot_payload(screen: &vt100::Screen) -> Result<Arc<[u8]>, ScreenError> {
     let (rows, cols) = screen.size();
@@ -1384,6 +1400,29 @@ mod tests {
             super::ApplyDelta::Applied
         );
         assert_eq!(guest.cursor_style(), 0);
+    }
+
+    #[test]
+    fn a_republished_remote_snapshot_keeps_the_cursor_shape() {
+        let mut host = HostScreen::new(2, 8).unwrap();
+        let frame = host.process_pty(b"\x1b[5 q").unwrap();
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(frame.sequence, &frame.snapshot)
+            .unwrap();
+        assert_eq!(guest.cursor_style(), 5);
+
+        // The parser dump the guest would otherwise hand its client has no shape.
+        let bare = super::snapshot_payload(guest.screen().unwrap()).unwrap();
+        let mut dropped = GuestScreen::new();
+        dropped.apply_snapshot(1, &bare).unwrap();
+        assert_eq!(dropped.cursor_style(), 0);
+
+        let rebuilt =
+            super::republish_snapshot(guest.screen().unwrap(), guest.cursor_style()).unwrap();
+        let mut client = GuestScreen::new();
+        client.apply_snapshot(1, &rebuilt).unwrap();
+        assert_eq!(client.cursor_style(), 5);
     }
 
     #[test]
