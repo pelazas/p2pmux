@@ -396,6 +396,8 @@ enum CtlCommand {
         /// Do not reuse a live pane titled `chat: {command}` on that machine.
         #[arg(long)]
         new: bool,
+        /// Allowlisted command and its arguments, as `p2pmux work` would name
+        /// it. Omit it for a login shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -425,7 +427,10 @@ enum CtlCommand {
         keys: Vec<String>,
     },
     /// Move this node's focus to an agent that already has a pane.
-    Focus { agent: String },
+    Focus {
+        /// Pane id from `p2pmux ctl agents`.
+        agent: String,
+    },
     /// Stream needs_you / done / error as JSON lines.
     Events,
 }

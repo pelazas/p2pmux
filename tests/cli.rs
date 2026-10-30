@@ -816,6 +816,20 @@ fn complete_with_home(home: &Path, words: &[&str], index: usize) -> String {
 }
 
 #[test]
+fn ctl_help_names_the_machine_the_command_and_the_agent() {
+    let spawn = run(&["ctl", "spawn", "--help"]);
+    assert!(spawn.status.success());
+    let spawn = String::from_utf8(spawn.stdout).expect("utf-8");
+    assert!(spawn.contains("ctl machines"), "{spawn}");
+    assert!(spawn.contains("login shell"), "{spawn}");
+
+    let focus = run(&["ctl", "focus", "--help"]);
+    assert!(focus.status.success());
+    let focus = String::from_utf8(focus.stdout).expect("utf-8");
+    assert!(focus.contains("ctl agents"), "{focus}");
+}
+
+#[test]
 fn version_help_is_user_facing_and_not_on_every_command() {
     let top = run(&["--help"]);
     assert!(top.status.success());
