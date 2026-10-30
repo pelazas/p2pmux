@@ -486,7 +486,9 @@ fn dont_hold_proc_fds() {
 ///
 /// A loose agent is not a child of any pane, so the pane-tree walk never
 /// reaches it. Hermes is `python` and OpenClaw is `node`, so those runtimes
-/// are read. `exec -a claude /bin/sh` does not show up under the name
+/// are read. Cursor's app-bundle launcher is named `agent`, and the
+/// `cursor-agent` path is only in its arguments, so that name is read too.
+/// `exec -a claude /bin/sh` does not show up under the name
 /// `claude`: the sampler's name is the interpreter (`sh`, `bash`, `dash`),
 /// and `claude` is only argv0. Shells are read for that argv0 and nothing
 /// else on the machine is.
@@ -497,6 +499,7 @@ fn interesting_name(name: &str) -> bool {
             | "claude"
             | "codex"
             | "cursor-agent"
+            | "agent"
             | "pi"
             | "opencode"
             | "hermes"
@@ -1225,6 +1228,8 @@ mod tests {
     fn command_lines_are_read_for_agent_runtimes_and_their_shells() {
         assert!(interesting_name("claude"));
         assert!(interesting_name("cursor-agent"));
+        // Cursor.app launches its agent as `bin/agent`, not `cursor-agent`.
+        assert!(interesting_name("agent"));
         assert!(interesting_name("python3.12"));
         assert!(interesting_name("node"));
         assert!(interesting_name("p2pmux"));

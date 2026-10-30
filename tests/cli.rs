@@ -663,16 +663,121 @@ fn version_is_a_command_and_trailing_arguments_are_rejected() {
 }
 
 #[test]
+fn a_closed_stdout_exits_without_a_panic() {
+    // Isolated home: `list` reads the session store, and the real one is not
+    // this test's to sweep.
+    let home = temporary_cache_home();
+    fs::create_dir_all(&home).expect("temp home");
+    for args in [
+        &["--version"][..],
+        &["version"],
+        &["completions", "bash"],
+        &["list"],
+        &["man"],
+    ] {
+        let (read, write) = std::io::pipe().expect("pipe");
+        drop(read);
+        let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+            .args(args)
+            .stdout(write)
+            .stderr(Stdio::piped())
+            .env("HOME", &home)
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("P2PMUX_PANE_ID")
+            .env_remove("P2PMUX_SOCK")
+            .output()
+            .expect("p2pmux binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked") && output.status.code() != Some(101),
+            "{args:?} status {:?} stderr {stderr}",
+            output.status
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn completions_and_the_man_page_print_without_a_runtime() {
     let completions = run(&["completions", "zsh"]);
     assert!(completions.status.success());
     let script = String::from_utf8(completions.stdout).expect("stdout should be UTF-8");
     assert!(script.contains("p2pmux"), "{script}");
+    assert!(script.contains("COMPLETE=\"zsh\""), "{script}");
 
     let manual = run(&["man"]);
     assert!(manual.status.success());
     let page = String::from_utf8(manual.stdout).expect("stdout should be UTF-8");
     assert!(page.contains(".TH"), "{page}");
+    assert!(
+        page.contains(&format!("p2pmux {}", env!("CARGO_PKG_VERSION"))),
+        "{page}"
+    );
+    assert!(!page.contains("Spike"), "{page}");
+    assert!(!page.contains("p2pmux-attach(1)"), "{page}");
+    assert!(page.contains(".SH KEYS"), "{page}");
+    assert!(page.contains("P2PMUX_PANE_ID"), "{page}");
+    assert!(page.contains("config.toml"), "{page}");
+    assert!(page.contains("p2pmux attach"), "{page}");
+}
+
+#[test]
+fn create_rejects_a_bad_session_name_before_the_trust_warning() {
+    for name in ["MyProj", "my_proj", "with space", "café"] {
+        let output = run(&["create", "--name", "box", "--session-name", name]);
+        assert!(!output.status.success(), "{name}");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(!stdout.contains("TRUST WARNING"), "{name}: {stdout}");
+        assert!(
+            stderr.contains(&format!("invalid session name '{name}'")),
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains("lowercase"), "{name}: {stderr}");
+    }
+}
+
+#[test]
+fn completions_hide_internal_commands() {
+    let home = temporary_cache_home();
+    fs::create_dir_all(&home).expect("temp home");
+    let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(["--", "p2pmux", ""])
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "1")
+        .env("_CLAP_IFS", "\n")
+        .env("HOME", &home)
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
+        .output()
+        .expect("p2pmux binary should run");
+    let _ = fs::remove_dir_all(&home);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).expect("utf-8");
+    let words: Vec<&str> = text.lines().collect();
+    assert!(words.contains(&"attach"), "{words:?}");
+    assert!(words.contains(&"list"), "{words:?}");
+    assert!(!words.contains(&"__node"), "{words:?}");
+    assert!(!words.contains(&"enroll"), "{words:?}");
+    assert!(!words.contains(&"man"), "{words:?}");
+}
+
+#[test]
+fn version_help_is_user_facing_and_not_on_every_command() {
+    let top = run(&["--help"]);
+    assert!(top.status.success());
+    let top = String::from_utf8(top.stdout).expect("utf-8");
+    assert!(top.contains("Print version"), "{top}");
+    assert!(!top.contains("built-in"), "{top}");
+
+    let attach = run(&["attach", "--help"]);
+    assert!(attach.status.success());
+    let attach = String::from_utf8(attach.stdout).expect("utf-8");
+    assert!(!attach.contains("--version"), "{attach}");
+    assert!(!attach.contains("Spike"), "{attach}");
 }
 
 fn temporary_cache_home() -> PathBuf {

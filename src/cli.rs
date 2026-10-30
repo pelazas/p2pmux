@@ -52,37 +52,118 @@ fn refuse_nested_session(cli: &Cli) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_completions(shell: CompletionShell) -> Result<(), Box<dyn Error>> {
-    let clap_shell = match shell {
-        CompletionShell::Bash => clap_complete::Shell::Bash,
-        CompletionShell::Zsh => clap_complete::Shell::Zsh,
-        CompletionShell::Fish => clap_complete::Shell::Fish,
+    // The static generator lists hidden commands (`__node`, `enroll`, `man`)
+    // and never asks which sessions are live. This script calls back into
+    // p2pmux, which already hides those commands and completes session names.
+    let completer: &dyn clap_complete::env::EnvCompleter = match shell {
+        CompletionShell::Bash => &clap_complete::env::Bash,
+        CompletionShell::Zsh => &clap_complete::env::Zsh,
+        CompletionShell::Fish => &clap_complete::env::Fish,
     };
-    let mut command = Cli::command();
-    clap_complete::generate(clap_shell, &mut command, "p2pmux", &mut io::stdout());
+    completer.write_registration("COMPLETE", "p2pmux", "p2pmux", "p2pmux", &mut io::stdout())?;
     Ok(())
 }
 
 fn print_man_page() -> Result<(), Box<dyn Error>> {
-    let command = Cli::command();
-    let manual = clap_mangen::Man::new(command);
-    manual.render(&mut io::stdout())?;
+    let mut command = Cli::command();
+    command.build();
+    let names: Vec<String> = command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+        .map(|subcommand| subcommand.get_name().to_owned())
+        .collect();
+    let mut page = Vec::new();
+    clap_mangen::Man::new(command).render(&mut page)?;
+    let mut page = String::from_utf8(page).map_err(|error| io::Error::other(error.to_string()))?;
+    // clap_mangen points each subcommand at a page we never install.
+    for name in &names {
+        let shown = format!("p2pmux {name}");
+        page = page.replace(&format!("p2pmux-{name}(1)"), &shown);
+        page = page.replace(&format!("p2pmux\\-{name}(1)"), &shown);
+    }
+    page.push_str(MAN_PAGE_APPENDIX);
+    io::stdout().write_all(page.as_bytes())?;
     Ok(())
 }
+
+/// What clap_mangen does not know: the keys, the variables, and where the
+/// files are. Kept here so `p2pmux --help` stays the short form.
+const MAN_PAGE_APPENDIX: &str = r#"
+.SH KEYS
+.TP
+.B Ctrl+Q
+Leave. \fBd\fP detaches this client and leaves the session running; \fBk\fP ends it on this machine. Enter detaches.
+.TP
+.B Ctrl+P
+Pane commands. \fBn\fP splits; \fBr\fP, \fBl\fP, \fBd\fP, and \fBu\fP place the new pane; \fBX\fP closes; \fBz\fP zooms; \fBe\fP renames; \fBk\fP locks.
+.TP
+.B Ctrl+T
+Tab commands. \fBN\fP opens a tab, \fBX\fP closes it, \fBe\fP renames it, and the left and right arrows switch tabs.
+.TP
+.B Ctrl+O
+Open the inbox.
+.TP
+.B Ctrl+S
+Show the command a guest runs to join this session.
+.SH ENVIRONMENT
+.TP
+.B P2PMUX_PANE_ID
+Set inside a pane. p2pmux will not open another session there until this is unset.
+.TP
+.B P2PMUX_SOCK
+Session socket for the pane this process is running in.
+.TP
+.B P2PMUX_TELEMETRY
+Set to \fB0\fP to report nothing about this machine's use.
+.TP
+.B P2PMUX_RENDEZVOUS_URL
+Join-code service. Unset, the public one is used.
+.TP
+.B P2PMUX_FAILOVER_GRACE_SECS
+Seconds a coordinator may be gone before another machine takes over. The default is 300.
+.TP
+.B P2PMUX_PERF
+Set to \fB1\fP to append timing lines. \fBP2PMUX_PERF_LOG\fP overrides the path; otherwise the file is \fBp2pmux-perf.log\fP in the temporary directory.
+.TP
+.B P2PMUX_INSTALL_DIR
+Directory the install script writes the binary into.
+.TP
+.B P2PMUX_DEBUG_UI
+UI trace. A path is used as given; any other non-empty value appends to \fB/tmp/p2pmux-ui.log\fP.
+.SH FILES
+.TP
+.B ~/.config/p2pmux/config.toml
+Display name and UI settings, or \fB$XDG_CONFIG_HOME/p2pmux/config.toml\fP when that variable is an absolute path.
+.TP
+Session records
+On macOS, \fB~/Library/Application Support/p2pmux/sessions\fP. On Linux, \fB$XDG_STATE_HOME/p2pmux/sessions\fP or \fB~/.local/state/p2pmux/sessions\fP.
+.TP
+Sockets and logs
+\fB/tmp/p2pmux-<uid>/\fP on macOS, and on Linux when \fB$XDG_RUNTIME_DIR\fP is unset. Otherwise \fB$XDG_RUNTIME_DIR/p2pmux/\fP. A session's log sits beside its socket with a \fB.log\fP suffix.
+.SH EXAMPLES
+.nf
+p2pmux
+p2pmux list
+p2pmux attach
+p2pmux join <code>
+.fi
+"#;
 
 /// The temporary p2pmux command-line interface.
 #[derive(Debug, Parser)]
 #[command(
     name = "p2pmux",
+    version = env!("CARGO_PKG_VERSION"),
     disable_version_flag = true,
     about = "Peer-to-peer multiplayer terminal multiplexer"
 )]
 pub struct Cli {
-    /// Print the version and exit.
-    ///
-    /// A real flag rather than clap's built-in one, which prints the version
-    /// and exits before it has decided whether the rest of the command line
-    /// means anything. `p2pmux --version extra` has to be an error.
-    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue, global = true)]
+    /// Print version.
+    // A real flag rather than clap's built-in one, which prints the version
+    // and exits before it has decided whether the rest of the command line
+    // means anything. `p2pmux --version extra` has to be an error. Not global:
+    // `p2pmux attach -V` is not how anyone asks for a version.
+    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue)]
     version: bool,
     #[arg(long)]
     resume: bool,
@@ -92,12 +173,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start one local interactive shell (Spike 1).
+    /// Start one local interactive shell.
     Local,
     /// Create a shared session with a reusable join ticket.
     Create {
         #[arg(long)]
         name: Option<String>,
+        /// Name this session. Lowercase letters, digits, and '-', at most 48 characters.
         #[arg(long = "session-name")]
         session_name: Option<String>,
     },
@@ -885,6 +967,11 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .await
         }
         Some(Command::Create { name, session_name }) => {
+            if let Some(session_name) = session_name.as_deref()
+                && let Some(error) = crate::session_store::session_name_error(session_name)
+            {
+                return Err(error.into());
+            }
             {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{TRUST_WARNING}\n")?;

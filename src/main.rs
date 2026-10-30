@@ -1,6 +1,11 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so a reader that exits early (`| head`, `grep -q`)
+    // turns the next stdout write into a panic and exit 101. The default
+    // disposition kills the process with the signal, which is what every other
+    // Unix tool does and what `set -o pipefail` is written against.
+    reset_sigpipe();
     // A tab completion asks this process for candidates and exits. Anything
     // written before this would land in the script the shell is sourcing.
     clap_complete::CompleteEnv::with_factory(p2pmux::cli::command)
@@ -32,3 +37,15 @@ fn main() -> ExitCode {
     p2pmux::telemetry::ask_for_a_word();
     ExitCode::SUCCESS
 }
+
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: this installs the kernel's default disposition, not a handler,
+    // and it runs once before any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}

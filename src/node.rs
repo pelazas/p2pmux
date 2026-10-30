@@ -1098,13 +1098,13 @@ fn run_socket_loop(
                     client.shutdown_after_ack = true;
                 }
                 Ok(Some(ClientMessage::Rename { name })) => {
-                    if crate::session_store::valid_name(&name) {
+                    if let Some(message) = crate::session_store::session_name_error(&name) {
+                        let _ = client
+                            .writer
+                            .enqueue_control(NodeMessage::Error { message });
+                    } else {
                         let _ = client.writer.enqueue_control(NodeMessage::Update {
                             state: serde_json::json!({"name": name}),
-                        });
-                    } else {
-                        let _ = client.writer.enqueue_control(NodeMessage::Error {
-                            message: "invalid session name".into(),
                         });
                     }
                 }

@@ -631,11 +631,8 @@ impl SessionStore {
     }
 
     pub fn rename(&self, old: &str, new: &str) -> io::Result<SessionDescriptor> {
-        if !valid_name(new) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid session name",
-            ));
+        if let Some(message) = session_name_error(new) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
         let mut descriptor = self.read(old)?;
         descriptor.name = new.to_owned();
@@ -717,6 +714,16 @@ pub fn unique_local_name(preferred: &str, live_names: &HashSet<String>) -> Optio
         }
     }
     unreachable!("a valid suffix is found before the name length limit")
+}
+
+/// Why `name` cannot be a session name, or `None` when [`valid_name`] accepts it.
+pub fn session_name_error(name: &str) -> Option<String> {
+    if valid_name(name) {
+        return None;
+    }
+    Some(format!(
+        "invalid session name '{name}': use lowercase letters, digits and '-' (max 48)"
+    ))
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -1020,6 +1027,10 @@ mod tests {
             0o600
         );
         assert!(!valid_name("Nope") && !valid_name("-nope") && valid_name("good-name-2"));
+        let rejected = session_name_error("MyProj").expect("uppercase is not a session name");
+        assert!(rejected.contains("invalid session name 'MyProj'"));
+        assert!(rejected.contains("lowercase"));
+        assert!(session_name_error("ok-name").is_none());
     }
 
     /// Two p2pmux on one machine in one session, read out of the records they

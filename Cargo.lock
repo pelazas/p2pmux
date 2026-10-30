@@ -2740,6 +2740,7 @@ dependencies = [
  "crossterm",
  "getrandom 0.3.4",
  "iroh",
+ "libc",
  "nix 0.28.0",
  "portable-pty",
  "postcard",
