@@ -742,22 +742,55 @@ impl SharedLayoutRuntime {
 
     pub(in crate::tui) fn send_request(
         &mut self,
-        request: LayoutRequest,
+        mut request: LayoutRequest,
     ) -> Result<(), Box<dyn Error>> {
-        if let Some(response) = self.control.try_request(request)? {
+        // The host's address refresh commits from another task and does not
+        // update this snapshot until the next drain. A request built just
+        // before that lands is rejected as stale. Apply the missed commit and
+        // send the same request again; anything else really was rejected.
+        for attempt in 0..4 {
+            let sent_revision = request.base_revision;
+            let Some(response) = self.control.try_request(request.clone())? else {
+                return Ok(());
+            };
             match response {
                 CoordinatorResponse::Reservation(reservation) => {
-                    self.accept_reservation(reservation)?
+                    self.accept_reservation(reservation)?;
+                    return Ok(());
                 }
                 CoordinatorResponse::Commit(commit) => {
-                    self.handle_control_event(LayoutControlEvent::Commit(commit))?
+                    self.handle_control_event(LayoutControlEvent::Commit(commit))?;
+                    return Ok(());
                 }
                 CoordinatorResponse::Reject(reject) => {
-                    self.reject_request_with_reason(reject.request_id, reject.reason)
+                    if reject.reason == LayoutRejectReason::Stale as i32
+                        && attempt < 3
+                        && self.adopt_newer_host_layout()?
+                        && self.tui.snapshot().revision != sent_revision
+                    {
+                        request.base_revision = self.tui.snapshot().revision;
+                        continue;
+                    }
+                    self.reject_request_with_reason(reject.request_id, reject.reason);
+                    return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    /// Apply a host commit this runtime has not seen yet. `false` when there is none.
+    fn adopt_newer_host_layout(&mut self) -> Result<bool, Box<dyn Error>> {
+        let Some(state) = self
+            .control
+            .newer_layout_state(self.tui.snapshot().revision)
+        else {
+            return Ok(false);
+        };
+        self.handle_control_event(LayoutControlEvent::Snapshot(
+            crate::protocol::SessionSnapshot { state: Some(state) },
+        ))?;
+        Ok(true)
     }
 
     pub(in crate::tui) fn accept_reservation(

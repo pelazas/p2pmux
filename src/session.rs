@@ -629,6 +629,10 @@ impl LayoutCoordinator {
         .map(Some)
     }
 
+    fn reservation_in_flight(&self) -> bool {
+        !self.reservations.is_empty()
+    }
+
     pub fn update_member_endpoint(
         &mut self,
         authenticated_peer_id: &[u8],
@@ -3177,11 +3181,35 @@ impl SharedLayoutHost {
             return Ok(None);
         };
         let peer_id = ticket.endpoint_addr().id.as_bytes().to_vec();
-        let change = self
-            .coordinator
-            .lock()
-            .map_err(|_| SessionError::PeerTask)?
-            .update_member_endpoint(&peer_id, ticket.endpoint_addr().clone())?;
+        // The address is discovered on this task while a pane reservation is
+        // held on another, across the pty spawn. Committing here cancels that
+        // reservation, and the spawn comes back as "did not answer". The
+        // address can wait; the reservation cannot. Checked and committed
+        // under the same lock so a reservation that starts between the two
+        // cannot be cancelled either.
+        let deadline = Instant::now() + DEFAULT_RESERVATION_TIMEOUT;
+        let change = loop {
+            // The guard must not be live across the sleep: this future is spawned.
+            let outcome = {
+                let mut coordinator = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| SessionError::PeerTask)?;
+                if coordinator.reservation_in_flight() && Instant::now() < deadline {
+                    None
+                } else {
+                    Some(
+                        coordinator
+                            .update_member_endpoint(&peer_id, ticket.endpoint_addr().clone())?,
+                    )
+                }
+            };
+            let Some(change) = outcome else {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            break change;
+        };
         broadcast_envelope(
             &self.peers,
             coordinator_envelope(&peer_id, envelope::Body::LayoutCommit(change.commit)),

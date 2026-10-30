@@ -196,6 +196,26 @@ impl SharedControl {
         }
     }
 
+    /// Layout state the coordinator has committed that this host has not applied yet.
+    ///
+    /// A member hears those commits on its control stream. The host does not
+    /// receive its own broadcasts, so a commit made on another task — the
+    /// address refresh is the one that races a spawn — is visible here before
+    /// the next drain.
+    pub(in crate::tui) fn newer_layout_state(
+        &self,
+        current_revision: u64,
+    ) -> Option<crate::protocol::LayoutState> {
+        let Self::Host(host) = self else {
+            return None;
+        };
+        host.session_snapshot().ok().and_then(|snapshot| {
+            snapshot
+                .state
+                .filter(|state| state.revision > current_revision)
+        })
+    }
+
     pub(in crate::tui) async fn shutdown(self) {
         match self {
             Self::Host(host) => host.close().await,
