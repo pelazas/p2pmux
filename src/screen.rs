@@ -1918,10 +1918,14 @@ mod tests {
             reference.process(&batch);
             let expected = reference.screen().state_diff(&reference_previous);
             reference_previous = reference.screen().clone();
-            // The cursor-shape suffix rides on the delta and is not part of the cell diff.
+            // The cursor shape and the alternate-screen bit ride on the delta
+            // and are not part of the cell diff.
             let delta = frame.delta.as_ref();
             let delta = super::cursor_style_from_suffix(delta)
                 .map(|_| &delta[..delta.len() - 5])
+                .unwrap_or(delta);
+            let delta = super::alternate_from_suffix(delta)
+                .map(|_| &delta[..delta.len() - super::ALTERNATE_ON.len()])
                 .unwrap_or(delta);
             assert_eq!(
                 delta,
