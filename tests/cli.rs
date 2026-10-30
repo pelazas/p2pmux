@@ -663,6 +663,42 @@ fn version_is_a_command_and_trailing_arguments_are_rejected() {
 }
 
 #[test]
+fn a_closed_stdout_exits_without_a_panic() {
+    // Isolated home: `list` reads the session store, and the real one is not
+    // this test's to sweep.
+    let home = temporary_cache_home();
+    fs::create_dir_all(&home).expect("temp home");
+    for args in [
+        &["--version"][..],
+        &["version"],
+        &["completions", "bash"],
+        &["list"],
+        &["man"],
+    ] {
+        let (read, write) = std::io::pipe().expect("pipe");
+        drop(read);
+        let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+            .args(args)
+            .stdout(write)
+            .stderr(Stdio::piped())
+            .env("HOME", &home)
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("P2PMUX_PANE_ID")
+            .env_remove("P2PMUX_SOCK")
+            .output()
+            .expect("p2pmux binary should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked") && output.status.code() != Some(101),
+            "{args:?} status {:?} stderr {stderr}",
+            output.status
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn completions_and_the_man_page_print_without_a_runtime() {
     let completions = run(&["completions", "zsh"]);
     assert!(completions.status.success());
