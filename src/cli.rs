@@ -98,6 +98,7 @@ enum Command {
     Create {
         #[arg(long)]
         name: Option<String>,
+        /// Name this session. Lowercase letters, digits, and '-', at most 48 characters.
         #[arg(long = "session-name")]
         session_name: Option<String>,
     },
@@ -885,6 +886,11 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .await
         }
         Some(Command::Create { name, session_name }) => {
+            if let Some(session_name) = session_name.as_deref()
+                && let Some(error) = crate::session_store::session_name_error(session_name)
+            {
+                return Err(error.into());
+            }
             {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{TRUST_WARNING}\n")?;

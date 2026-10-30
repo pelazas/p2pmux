@@ -711,6 +711,22 @@ fn completions_and_the_man_page_print_without_a_runtime() {
     assert!(page.contains(".TH"), "{page}");
 }
 
+#[test]
+fn create_rejects_a_bad_session_name_before_the_trust_warning() {
+    for name in ["MyProj", "my_proj", "with space", "café"] {
+        let output = run(&["create", "--name", "box", "--session-name", name]);
+        assert!(!output.status.success(), "{name}");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(!stdout.contains("TRUST WARNING"), "{name}: {stdout}");
+        assert!(
+            stderr.contains(&format!("invalid session name '{name}'")),
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains("lowercase"), "{name}: {stderr}");
+    }
+}
+
 fn temporary_cache_home() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
