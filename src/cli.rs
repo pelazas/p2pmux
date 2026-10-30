@@ -75,16 +75,17 @@ fn print_man_page() -> Result<(), Box<dyn Error>> {
 #[derive(Debug, Parser)]
 #[command(
     name = "p2pmux",
+    version = env!("CARGO_PKG_VERSION"),
     disable_version_flag = true,
     about = "Peer-to-peer multiplayer terminal multiplexer"
 )]
 pub struct Cli {
-    /// Print the version and exit.
-    ///
-    /// A real flag rather than clap's built-in one, which prints the version
-    /// and exits before it has decided whether the rest of the command line
-    /// means anything. `p2pmux --version extra` has to be an error.
-    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue, global = true)]
+    /// Print version.
+    // A real flag rather than clap's built-in one, which prints the version
+    // and exits before it has decided whether the rest of the command line
+    // means anything. `p2pmux --version extra` has to be an error. Not global:
+    // `p2pmux attach -V` is not how anyone asks for a version.
+    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue)]
     version: bool,
     #[arg(long)]
     resume: bool,
@@ -94,7 +95,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start one local interactive shell (Spike 1).
+    /// Start one local interactive shell.
     Local,
     /// Create a shared session with a reusable join ticket.
     Create {

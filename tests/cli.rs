@@ -755,6 +755,21 @@ fn completions_hide_internal_commands() {
     assert!(!words.contains(&"man"), "{words:?}");
 }
 
+#[test]
+fn version_help_is_user_facing_and_not_on_every_command() {
+    let top = run(&["--help"]);
+    assert!(top.status.success());
+    let top = String::from_utf8(top.stdout).expect("utf-8");
+    assert!(top.contains("Print version"), "{top}");
+    assert!(!top.contains("built-in"), "{top}");
+
+    let attach = run(&["attach", "--help"]);
+    assert!(attach.status.success());
+    let attach = String::from_utf8(attach.stdout).expect("utf-8");
+    assert!(!attach.contains("--version"), "{attach}");
+    assert!(!attach.contains("Spike"), "{attach}");
+}
+
 fn temporary_cache_home() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
