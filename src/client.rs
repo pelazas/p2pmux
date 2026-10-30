@@ -1127,15 +1127,16 @@ pub fn run_on(
                     let alternate = (!mouse.modifiers.contains(KeyModifiers::SHIFT)
                         && tui.scrollback_offset(pane_id) == 0)
                         .then(|| {
-                            screens
-                                .get(&pane_id)
-                                .and_then(GuestScreen::screen)
-                                .and_then(|screen| {
+                            screens.get(&pane_id).and_then(|guest| {
+                                let alternate = guest.alternate_screen();
+                                guest.screen().and_then(|screen| {
                                     alternate_scroll_bytes(
                                         screen,
+                                        alternate,
                                         matches!(mouse.kind, MouseEventKind::ScrollUp),
                                     )
                                 })
+                            })
                         })
                         .flatten();
                     if let Some(bytes) = forwarded.or_else(|| alternate.map(|bytes| bytes.to_vec()))

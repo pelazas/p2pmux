@@ -440,7 +440,8 @@ impl SharedLayoutRuntime {
                 if !mouse.modifiers.contains(KeyModifiers::SHIFT)
                     && self.tui.scrollback_offset(pane_id) == 0
                     && let Some(screen) = self.pane_vt_screen(pane_id)
-                    && let Some(bytes) = alternate_scroll_bytes(screen, up)
+                    && let Some(bytes) =
+                        alternate_scroll_bytes(screen, screen.alternate_screen(), up)
                 {
                     self.forward_bytes(pane_id, bytes.to_vec())?;
                     self.tui.reset_scrollback(pane_id);

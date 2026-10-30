@@ -328,9 +328,10 @@ impl SharedLayoutRuntime {
 
     pub(crate) fn node_remote_snapshot(&self, pane_id: PaneId) -> Option<Vec<u8>> {
         let guest = &self.remote.get(&pane_id)?.screen;
+        let alternate = guest.alternate_screen();
         let cursor_style = guest.cursor_style();
         let screen = guest.screen()?;
-        crate::screen::republish_snapshot(screen, cursor_style).ok()
+        crate::screen::republish_snapshot(screen, alternate, cursor_style).ok()
     }
 
     pub fn node_resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
