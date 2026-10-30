@@ -52,13 +52,15 @@ fn refuse_nested_session(cli: &Cli) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_completions(shell: CompletionShell) -> Result<(), Box<dyn Error>> {
-    let clap_shell = match shell {
-        CompletionShell::Bash => clap_complete::Shell::Bash,
-        CompletionShell::Zsh => clap_complete::Shell::Zsh,
-        CompletionShell::Fish => clap_complete::Shell::Fish,
+    // The static generator lists hidden commands (`__node`, `enroll`, `man`)
+    // and never asks which sessions are live. This script calls back into
+    // p2pmux, which already hides those commands and completes session names.
+    let completer: &dyn clap_complete::env::EnvCompleter = match shell {
+        CompletionShell::Bash => &clap_complete::env::Bash,
+        CompletionShell::Zsh => &clap_complete::env::Zsh,
+        CompletionShell::Fish => &clap_complete::env::Fish,
     };
-    let mut command = Cli::command();
-    clap_complete::generate(clap_shell, &mut command, "p2pmux", &mut io::stdout());
+    completer.write_registration("COMPLETE", "p2pmux", "p2pmux", "p2pmux", &mut io::stdout())?;
     Ok(())
 }
 

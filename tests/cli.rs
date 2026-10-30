@@ -704,6 +704,7 @@ fn completions_and_the_man_page_print_without_a_runtime() {
     assert!(completions.status.success());
     let script = String::from_utf8(completions.stdout).expect("stdout should be UTF-8");
     assert!(script.contains("p2pmux"), "{script}");
+    assert!(script.contains("COMPLETE=\"zsh\""), "{script}");
 
     let manual = run(&["man"]);
     assert!(manual.status.success());
@@ -725,6 +726,33 @@ fn create_rejects_a_bad_session_name_before_the_trust_warning() {
         );
         assert!(stderr.contains("lowercase"), "{name}: {stderr}");
     }
+}
+
+#[test]
+fn completions_hide_internal_commands() {
+    let home = temporary_cache_home();
+    fs::create_dir_all(&home).expect("temp home");
+    let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(["--", "p2pmux", ""])
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "1")
+        .env("_CLAP_IFS", "\n")
+        .env("HOME", &home)
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
+        .output()
+        .expect("p2pmux binary should run");
+    let _ = fs::remove_dir_all(&home);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).expect("utf-8");
+    let words: Vec<&str> = text.lines().collect();
+    assert!(words.contains(&"attach"), "{words:?}");
+    assert!(words.contains(&"list"), "{words:?}");
+    assert!(!words.contains(&"__node"), "{words:?}");
+    assert!(!words.contains(&"enroll"), "{words:?}");
+    assert!(!words.contains(&"man"), "{words:?}");
 }
 
 fn temporary_cache_home() -> PathBuf {
