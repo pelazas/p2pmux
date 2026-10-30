@@ -45,9 +45,15 @@ impl PaneMouseProtocol {
 /// mouse reporting, so the wheel has nowhere to go unless it becomes the arrow
 /// keys those programs already understand. xterm calls this alternate scroll.
 /// One notch, one arrow: application cursor mode uses `SS3`, otherwise CSI.
-pub(crate) fn alternate_scroll_bytes(screen: &vt100::Screen, up: bool) -> Option<&'static [u8]> {
-    if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None || !screen.alternate_screen()
-    {
+pub(crate) fn alternate_scroll_bytes(
+    screen: &vt100::Screen,
+    alternate: bool,
+    up: bool,
+) -> Option<&'static [u8]> {
+    // `alternate` is not `screen.alternate_screen()`. A guest rebuilds the grid
+    // from a dump that omits that mode, and the caller passes the bit the host
+    // sent beside it.
+    if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None || !alternate {
         return None;
     }
     Some(match (up, screen.application_cursor()) {
@@ -172,23 +178,24 @@ mod tests {
     #[test]
     fn alternate_scroll_is_arrows_on_the_alt_screen_and_nothing_in_mouse_mode() {
         let mut parser = vt100::Parser::new(2, 8, 0);
-        assert_eq!(alternate_scroll_bytes(parser.screen(), true), None);
+        let scroll = |screen: &vt100::Screen, up: bool| {
+            alternate_scroll_bytes(screen, screen.alternate_screen(), up)
+        };
+        assert_eq!(scroll(parser.screen(), true), None);
         parser.process(b"\x1b[?1049h");
+        assert_eq!(scroll(parser.screen(), true), Some(&b"\x1b[A"[..]));
+        assert_eq!(scroll(parser.screen(), false), Some(&b"\x1b[B"[..]));
+        parser.process(b"\x1b[?1h");
+        assert_eq!(scroll(parser.screen(), true), Some(&b"\x1bOA"[..]));
+        parser.process(b"\x1b[?1000h");
+        assert_eq!(scroll(parser.screen(), true), None);
+        // The guest's parser never has the mode bit. The side flag is the bit.
+        let plain = vt100::Parser::new(2, 8, 0);
         assert_eq!(
-            alternate_scroll_bytes(parser.screen(), true),
+            alternate_scroll_bytes(plain.screen(), true, true),
             Some(&b"\x1b[A"[..])
         );
-        assert_eq!(
-            alternate_scroll_bytes(parser.screen(), false),
-            Some(&b"\x1b[B"[..])
-        );
-        parser.process(b"\x1b[?1h");
-        assert_eq!(
-            alternate_scroll_bytes(parser.screen(), true),
-            Some(&b"\x1bOA"[..])
-        );
-        parser.process(b"\x1b[?1000h");
-        assert_eq!(alternate_scroll_bytes(parser.screen(), true), None);
+        assert_eq!(alternate_scroll_bytes(plain.screen(), false, true), None);
     }
 
     #[test]

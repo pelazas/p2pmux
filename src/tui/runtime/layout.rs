@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 
 use crate::{
     agent_detect::cwd_for_pid,
-    layout::{Axis, NewPanePosition, PaneId},
+    layout::{Axis, MAX_TABS, NewPanePosition, PaneId},
     protocol::{
         CreatePane, CreateTab, DeletePane, DeleteTab, LayoutRejectReason, LayoutRequest,
         MarkPaneExited, NewPanePosition as ProtocolNewPanePosition, PaneDescriptor, PaneFailed,
@@ -1099,6 +1099,9 @@ fn rejection_sentence(reason: i32, request_id: u64, machine: &str, command: &[St
         Ok(LayoutRejectReason::ReservationFailure) => {
             format!("{machine} did not answer in time")
         }
+        Ok(LayoutRejectReason::TabLimit) => {
+            format!("tab limit ({MAX_TABS}) reached: close a tab")
+        }
         _ => format!("layout request {request_id} rejected"),
     }
 }
@@ -1130,6 +1133,10 @@ mod tests {
         assert!(
             rejection_sentence(LayoutRejectReason::UnknownTarget as i32, 7, "droplet", &[])
                 .contains("not in this session")
+        );
+        assert_eq!(
+            rejection_sentence(LayoutRejectReason::TabLimit as i32, 7, "droplet", &[]),
+            "tab limit (9) reached: close a tab"
         );
         assert_eq!(
             rejection_sentence(99, 7, "droplet", &[]),

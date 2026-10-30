@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::{
     hosted_rendezvous::{HostedRendezvous, JoinCode},
@@ -239,6 +239,7 @@ enum Command {
     /// Forget a paired machine.
     Unpair {
         /// The machine's name, as listed by `p2pmux machines`.
+        #[arg(add = clap_complete::ArgValueCompleter::new(complete_paired_machines))]
         name: String,
     },
     /// List the live sessions on this machine.
@@ -355,7 +356,7 @@ enum Command {
     Ctl {
         /// Session name as `p2pmux list` prints it. Omit it for the fleet
         /// session when this machine is paired, otherwise the newest live one.
-        #[arg(long)]
+        #[arg(long, add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         session: Option<String>,
         #[command(subcommand)]
         action: CtlCommand,
@@ -389,11 +390,14 @@ enum CtlCommand {
     Agents,
     /// Start an allowlisted command on a machine you own.
     Spawn {
-        #[arg(long)]
+        /// A machine from `p2pmux ctl machines`, including this one.
+        #[arg(long, add = clap_complete::ArgValueCompleter::new(complete_spawn_machines))]
         machine: String,
         /// Do not reuse a live pane titled `chat: {command}` on that machine.
         #[arg(long)]
         new: bool,
+        /// Allowlisted command and its arguments, as `p2pmux work` would name
+        /// it. Omit it for a login shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -423,7 +427,10 @@ enum CtlCommand {
         keys: Vec<String>,
     },
     /// Move this node's focus to an agent that already has a pane.
-    Focus { agent: String },
+    Focus {
+        /// Pane id from `p2pmux ctl agents`.
+        agent: String,
+    },
     /// Stream needs_you / done / error as JSON lines.
     Events,
 }
@@ -579,8 +586,27 @@ impl std::fmt::Display for NodeStartupError {
 impl Error for NodeStartupError {}
 
 /// Parse process arguments.
+///
+/// clap's own exit swallows a failed write and still exits 0, so `--help`
+/// into a full disk looked like success. A write error is the same failure
+/// `list` already reports.
 pub fn parse() -> Cli {
-    Cli::parse()
+    let command = Cli::command();
+    match command.try_get_matches() {
+        Ok(matches) => match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(error) => exit_clap(error),
+        },
+        Err(error) => exit_clap(error),
+    }
+}
+
+fn exit_clap(error: clap::Error) -> ! {
+    if let Err(write) = error.print() {
+        eprintln!("Error: {write}");
+        std::process::exit(1);
+    }
+    std::process::exit(error.exit_code());
 }
 
 /// The command definition, for the shell-completion hook in `main`.
@@ -599,6 +625,47 @@ fn complete_sessions(current: &std::ffi::OsStr) -> Vec<clap_complete::Completion
         .into_iter()
         .filter(|session| prefix.is_empty() || session.name.starts_with(prefix.as_ref()))
         .map(|session| clap_complete::CompletionCandidate::new(session.name))
+        .collect()
+}
+
+fn complete_paired_machines(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    complete_matching(current, paired_machine_names())
+}
+
+fn complete_spawn_machines(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    let mut names = paired_machine_names();
+    let here = crate::config::load()
+        .ok()
+        .flatten()
+        .unwrap_or_else(hostname_label);
+    if !here.is_empty() && !names.iter().any(|name| name == &here) {
+        names.push(here);
+    }
+    complete_matching(current, names)
+}
+
+fn paired_machine_names() -> Vec<String> {
+    crate::pairing::load()
+        .map(|pairing| {
+            pairing
+                .machines
+                .into_iter()
+                .map(|machine| machine.name)
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn complete_matching(
+    current: &std::ffi::OsStr,
+    names: Vec<String>,
+) -> Vec<clap_complete::CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    names
+        .into_iter()
+        .filter(|name| prefix.is_empty() || name.starts_with(prefix.as_ref()))
+        .map(clap_complete::CompletionCandidate::new)
         .collect()
 }
 

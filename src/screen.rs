@@ -505,11 +505,12 @@ impl HostScreen {
             .sequence
             .checked_add(1)
             .ok_or(ScreenError::SequenceExhausted)?;
+        let alternate = self.parser.screen().alternate_screen();
         let style = self.cursor_style();
         let mut snapshot = snapshot_payload(self.parser.screen())?.to_vec();
-        append_cursor_style(&mut snapshot, style, MAX_SNAPSHOT_BYTES);
+        append_carried(&mut snapshot, alternate, style, MAX_SNAPSHOT_BYTES);
         let mut delta = self.parser.screen().state_diff(self.previous.screen());
-        append_cursor_style(&mut delta, style, MAX_DELTA_BYTES);
+        append_carried(&mut delta, alternate, style, MAX_DELTA_BYTES);
         // A large batch can outgrow the wire delta cap; fall back to the
         // snapshot-only frame shape (as resize does) so consumers replace
         // their screen instead of patching it.
@@ -576,7 +577,12 @@ impl HostScreen {
         // rebuild what was thrown away. `ingest` already counted whatever the
         // reflow pushed off the top.
         let mut snapshot = snapshot_payload(self.parser.screen())?.to_vec();
-        append_cursor_style(&mut snapshot, self.cursor_style(), MAX_SNAPSHOT_BYTES);
+        append_carried(
+            &mut snapshot,
+            self.parser.screen().alternate_screen(),
+            self.cursor_style(),
+            MAX_SNAPSHOT_BYTES,
+        );
         let frame = ScreenFrame {
             sequence,
             base_sequence: 0,
@@ -1192,6 +1198,7 @@ pub struct GuestScreen {
     sequence: Option<u64>,
     kitty_keyboard_active: bool,
     cursor_style: u8,
+    alternate_screen: bool,
 }
 
 impl Default for GuestScreen {
@@ -1207,6 +1214,7 @@ impl GuestScreen {
             sequence: None,
             kitty_keyboard_active: false,
             cursor_style: 0,
+            alternate_screen: false,
         }
     }
 
@@ -1222,7 +1230,7 @@ impl GuestScreen {
         parser.process(state);
         self.parser = Some(parser);
         self.sequence = Some(sequence);
-        self.note_cursor_style(payload);
+        self.note_carried(payload, true);
         Ok(())
     }
 
@@ -1244,19 +1252,36 @@ impl GuestScreen {
         let parser = self.parser.as_mut().ok_or(ScreenError::MalformedSnapshot)?;
         parser.process(payload);
         self.sequence = Some(sequence);
-        self.note_cursor_style(payload);
+        self.note_carried(payload, false);
         Ok(ApplyDelta::Applied)
     }
 
-    fn note_cursor_style(&mut self, payload: &[u8]) {
-        if let Some(style) = cursor_style_from_suffix(payload) {
+    fn note_carried(&mut self, payload: &[u8], snapshot: bool) {
+        let body = if let Some(style) = cursor_style_from_suffix(payload) {
             self.cursor_style = style;
+            &payload[..payload.len() - 5]
+        } else {
+            payload
+        };
+        if let Some(on) = alternate_from_suffix(body) {
+            self.alternate_screen = on;
+        } else if snapshot {
+            self.alternate_screen = false;
         }
     }
 
     /// DECSCUSR parameter carried on the latest snapshot or delta, 0 through 6.
     pub fn cursor_style(&self) -> u8 {
         self.cursor_style
+    }
+
+    /// Whether the pane's program is on the alternate screen.
+    ///
+    /// The parser dump does not say, and feeding `?1049` into this parser would
+    /// clear the grid it just restored. The host appends a private mode the
+    /// parser ignores, and this is that bit.
+    pub fn alternate_screen(&self) -> bool {
+        self.alternate_screen
     }
 
     pub fn screen(&self) -> Option<&vt100::Screen> {
@@ -1273,6 +1298,45 @@ impl GuestScreen {
 
     pub fn kitty_keyboard_active(&self) -> bool {
         self.kitty_keyboard_active
+    }
+}
+
+/// Private mode parked after the screen bytes. Unknown to vt100, so a guest
+/// that does not know it leaves the grid alone. `?1049` is the mode we mean,
+/// and it is exactly the one this parser must not execute: its handler clears
+/// the alternate grid.
+const ALTERNATE_ON: &[u8] = b"\x1b[?7766h";
+const ALTERNATE_OFF: &[u8] = b"\x1b[?7766l";
+
+fn append_carried(bytes: &mut Vec<u8>, alternate: bool, style: u8, limit: usize) {
+    let alt = if alternate {
+        ALTERNATE_ON
+    } else {
+        ALTERNATE_OFF
+    };
+    let style_suffix = cursor_style_suffix(style);
+    if bytes
+        .len()
+        .saturating_add(alt.len())
+        .saturating_add(style_suffix.len())
+        <= limit
+    {
+        bytes.extend_from_slice(alt);
+        bytes.extend_from_slice(&style_suffix);
+    } else {
+        append_cursor_style(bytes, style, limit);
+    }
+}
+
+fn alternate_from_suffix(bytes: &[u8]) -> Option<bool> {
+    let start = bytes.len().checked_sub(ALTERNATE_ON.len())?;
+    let suffix = bytes.get(start..)?;
+    if suffix == ALTERNATE_ON {
+        Some(true)
+    } else if suffix == ALTERNATE_OFF {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1313,6 +1377,21 @@ pub(crate) fn terminal_cursor_style(style: u8) -> crossterm::cursor::SetCursorSt
         6 => SteadyBar,
         _ => DefaultUserShape,
     }
+}
+
+/// A remote pane's screen, rebuilt for the client attached to this node.
+///
+/// `snapshot_payload` is the parser's own dump. The cursor shape and the
+/// alternate-screen bit ride on the end of the bytes the host sent, and a
+/// guest that asks the parser for a fresh dump drops both. Put them back.
+pub(crate) fn republish_snapshot(
+    screen: &vt100::Screen,
+    alternate: bool,
+    cursor_style: u8,
+) -> Result<Vec<u8>, ScreenError> {
+    let mut snapshot = snapshot_payload(screen)?.to_vec();
+    append_carried(&mut snapshot, alternate, cursor_style, MAX_SNAPSHOT_BYTES);
+    Ok(snapshot)
 }
 
 /// Encodes a complete fixed-grid screen for a fresh local or remote renderer.
@@ -1384,6 +1463,72 @@ mod tests {
             super::ApplyDelta::Applied
         );
         assert_eq!(guest.cursor_style(), 0);
+    }
+
+    #[test]
+    fn a_republished_remote_snapshot_keeps_the_cursor_shape() {
+        let mut host = HostScreen::new(2, 8).unwrap();
+        let frame = host.process_pty(b"\x1b[5 q").unwrap();
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(frame.sequence, &frame.snapshot)
+            .unwrap();
+        assert_eq!(guest.cursor_style(), 5);
+
+        // The parser dump the guest would otherwise hand its client has no shape.
+        let bare = super::snapshot_payload(guest.screen().unwrap()).unwrap();
+        let mut dropped = GuestScreen::new();
+        dropped.apply_snapshot(1, &bare).unwrap();
+        assert_eq!(dropped.cursor_style(), 0);
+
+        let rebuilt = super::republish_snapshot(
+            guest.screen().unwrap(),
+            guest.alternate_screen(),
+            guest.cursor_style(),
+        )
+        .unwrap();
+        let mut client = GuestScreen::new();
+        client.apply_snapshot(1, &rebuilt).unwrap();
+        assert_eq!(client.cursor_style(), 5);
+    }
+
+    #[test]
+    fn alternate_screen_reaches_a_guest_without_wiping_it() {
+        let mut host = HostScreen::new(4, 20).unwrap();
+        let frame = host.process_pty(b"hello\x1b[?1049hworld").unwrap();
+        assert!(host.parser.screen().alternate_screen());
+
+        let mut guest = GuestScreen::new();
+        guest
+            .apply_snapshot(frame.sequence, &frame.snapshot)
+            .unwrap();
+        assert!(guest.alternate_screen());
+        assert!(
+            guest.screen().unwrap().contents().contains("world"),
+            "the marker must not be executed as ?1049, which clears the grid"
+        );
+        // The dump itself still has no mode bit. The side flag is the whole record.
+        assert!(!guest.screen().unwrap().alternate_screen());
+
+        let rebuilt = super::republish_snapshot(
+            guest.screen().unwrap(),
+            guest.alternate_screen(),
+            guest.cursor_style(),
+        )
+        .unwrap();
+        let mut client = GuestScreen::new();
+        client.apply_snapshot(1, &rebuilt).unwrap();
+        assert!(client.alternate_screen());
+        assert!(client.screen().unwrap().contents().contains("world"));
+
+        let frame = host.process_pty(b"\x1b[?1049l").unwrap();
+        assert_eq!(
+            guest
+                .apply_delta(frame.base_sequence, frame.sequence, &frame.delta)
+                .unwrap(),
+            super::ApplyDelta::Applied
+        );
+        assert!(!guest.alternate_screen());
     }
 
     #[test]
@@ -1773,10 +1918,14 @@ mod tests {
             reference.process(&batch);
             let expected = reference.screen().state_diff(&reference_previous);
             reference_previous = reference.screen().clone();
-            // The cursor-shape suffix rides on the delta and is not part of the cell diff.
+            // The cursor shape and the alternate-screen bit ride on the delta
+            // and are not part of the cell diff.
             let delta = frame.delta.as_ref();
             let delta = super::cursor_style_from_suffix(delta)
                 .map(|_| &delta[..delta.len() - 5])
+                .unwrap_or(delta);
+            let delta = super::alternate_from_suffix(delta)
+                .map(|_| &delta[..delta.len() - super::ALTERNATE_ON.len()])
                 .unwrap_or(delta);
             assert_eq!(
                 delta,

@@ -1578,8 +1578,8 @@ fn reject_reason(error: &LayoutError) -> LayoutRejectReason {
         }
         LayoutError::NotPaneHost { .. } | LayoutError::NotMember => LayoutRejectReason::NotHost,
         LayoutError::NotTabHost { .. } => LayoutRejectReason::MixedTab,
+        LayoutError::TabLimit => LayoutRejectReason::TabLimit,
         LayoutError::MemberLimit
-        | LayoutError::TabLimit
         | LayoutError::PaneLimit
         | LayoutError::SplitDepthLimit
         | LayoutError::IdExhausted => LayoutRejectReason::Limit,
@@ -4811,6 +4811,13 @@ async fn serve_direct_pane_streams(
     result
 }
 
+/// How often a caught-up guest is handed a full snapshot anyway.
+///
+/// A missed delta is not asked for again, so this is the resync. The screen
+/// itself is pushed as it changes. Half a second of full frames, in both
+/// directions, was several UDP packets a second from a pane sitting at a prompt.
+const SCREEN_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
+
 async fn screen_writer_task(
     mut writer: crate::transport::FrameWriter,
     mut screen_rx: watch::Receiver<ScreenFrame>,
@@ -4820,7 +4827,7 @@ async fn screen_writer_task(
     let initial = screen_rx.borrow().clone();
     write_snapshot(&mut writer, &pane_id, &host_peer_id, &initial).await?;
     let mut last_sent_sequence = initial.sequence;
-    let mut heartbeat = interval(Duration::from_millis(500));
+    let mut heartbeat = interval(SCREEN_RESYNC_INTERVAL);
     heartbeat.tick().await;
     loop {
         tokio::select! {

@@ -766,6 +766,97 @@ fn completions_hide_internal_commands() {
 }
 
 #[test]
+fn completions_offer_sessions_and_machines() {
+    let sessions = FakeSession::hosted("alpha-one");
+    let config = sessions.home().join(".config/p2pmux");
+    fs::create_dir_all(&config).expect("config dir");
+    fs::write(config.join("config.toml"), "display_name = \"laptop\"\n").expect("config");
+    fs::write(
+        config.join("pairing.toml"),
+        "[[machine]]\nname = \"droplet\"\n",
+    )
+    .expect("pairing");
+
+    let session_names = complete_with_home(sessions.home(), &["p2pmux", "ctl", "--session", ""], 3);
+    assert!(
+        session_names.lines().any(|line| line == "alpha-one"),
+        "{session_names}"
+    );
+
+    let machines = complete_with_home(
+        sessions.home(),
+        &["p2pmux", "ctl", "spawn", "--machine", ""],
+        4,
+    );
+    assert!(machines.lines().any(|line| line == "laptop"), "{machines}");
+    assert!(machines.lines().any(|line| line == "droplet"), "{machines}");
+
+    let unpaired = complete_with_home(sessions.home(), &["p2pmux", "unpair", ""], 2);
+    assert!(unpaired.lines().any(|line| line == "droplet"), "{unpaired}");
+    assert!(!unpaired.lines().any(|line| line == "laptop"), "{unpaired}");
+}
+
+fn complete_with_home(home: &Path, words: &[&str], index: usize) -> String {
+    let mut args = vec!["--"];
+    args.extend_from_slice(words);
+    let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(&args)
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", index.to_string())
+        .env("_CLAP_IFS", "\n")
+        .env("HOME", home)
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("P2PMUX_PANE_ID")
+        .env_remove("P2PMUX_SOCK")
+        .output()
+        .expect("p2pmux binary should run");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).expect("utf-8")
+}
+
+#[test]
+fn ctl_help_names_the_machine_the_command_and_the_agent() {
+    let spawn = run(&["ctl", "spawn", "--help"]);
+    assert!(spawn.status.success());
+    let spawn = String::from_utf8(spawn.stdout).expect("utf-8");
+    assert!(spawn.contains("ctl machines"), "{spawn}");
+    assert!(spawn.contains("login shell"), "{spawn}");
+
+    let focus = run(&["ctl", "focus", "--help"]);
+    assert!(focus.status.success());
+    let focus = String::from_utf8(focus.stdout).expect("utf-8");
+    assert!(focus.contains("ctl agents"), "{focus}");
+}
+
+#[test]
+fn help_fails_when_stdout_cannot_take_it() {
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+    for args in [&["--help"][..], &["ctl", "spawn", "--help"][..]] {
+        let full = fs::File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let output = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+            .args(args)
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::piped())
+            .env_remove("P2PMUX_PANE_ID")
+            .env_remove("P2PMUX_SOCK")
+            .output()
+            .expect("p2pmux binary should run");
+        assert!(!output.status.success(), "{args:?} {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(
+            stderr.contains("No space left on device"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn version_help_is_user_facing_and_not_on_every_command() {
     let top = run(&["--help"]);
     assert!(top.status.success());

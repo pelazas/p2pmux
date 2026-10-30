@@ -787,7 +787,7 @@ fn limits_are_rejected_without_creating_visible_layout() {
     });
 
     let rejection = reject(coordinator.ask(&host_a(), one_too_many));
-    assert_eq!(rejection.reason, LayoutRejectReason::Limit as i32);
+    assert_eq!(rejection.reason, LayoutRejectReason::TabLimit as i32);
     assert_eq!(
         coordinator
             .session_snapshot()

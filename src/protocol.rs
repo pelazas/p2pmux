@@ -829,6 +829,12 @@ pub enum LayoutRejectReason {
     /// `UnknownTarget` because the machine answered: it is awake, and it said
     /// no.
     TargetRefused = 13,
+    /// A new tab would pass the tab limit.
+    ///
+    /// Distinct from `Limit`, which also covers panes, split depth and members.
+    /// A `ctl spawn` that opened one tab per command hits this one, and the
+    /// sentence has to say which limit and what to close.
+    TabLimit = 14,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
