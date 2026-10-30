@@ -710,6 +710,16 @@ fn completions_and_the_man_page_print_without_a_runtime() {
     assert!(manual.status.success());
     let page = String::from_utf8(manual.stdout).expect("stdout should be UTF-8");
     assert!(page.contains(".TH"), "{page}");
+    assert!(
+        page.contains(&format!("p2pmux {}", env!("CARGO_PKG_VERSION"))),
+        "{page}"
+    );
+    assert!(!page.contains("Spike"), "{page}");
+    assert!(!page.contains("p2pmux-attach(1)"), "{page}");
+    assert!(page.contains(".SH KEYS"), "{page}");
+    assert!(page.contains("P2PMUX_PANE_ID"), "{page}");
+    assert!(page.contains("config.toml"), "{page}");
+    assert!(page.contains("p2pmux attach"), "{page}");
 }
 
 #[test]
