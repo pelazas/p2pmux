@@ -105,9 +105,11 @@ machine need. The JSON includes `visible_to_guests` when someone unpaired is in 
 pane still opens, and anyone holding the join code can see it. Omit `--session` so ctl talks to
 the fleet session; a runner that wanted a private fleet skips the spawn when that flag is true.
 
-`send` writes the keys as PTY bytes, with no extra newline and no key names. It fails if someone
-else holds the pane's input lease. It is typing, not a way to hand work from one agent to
-another. `focus` only moves to an agent that already has a pane — `p2pmux ctl spawn` is how one
+`send` writes the keys as PTY bytes, with no extra newline and no key names. However long the
+payload, the command prints one JSON object, `{"pane_id":N}`. A long payload goes out in pieces;
+if a later piece cannot be delivered, the error says how many bytes already reached the pane. It
+fails if someone else holds the pane's input lease. It is typing, not a way to hand work from one
+agent to another. `focus` only moves to an agent that already has a pane — `p2pmux ctl spawn` is how one
 gets there. `events` prints `needs_you` / `done` / `error` as JSON lines: a snapshot first, then
 each change. The `message` field is present only when this node already has it, so a laptop
 watching a droplet sees the state and not the sentence.

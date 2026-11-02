@@ -403,7 +403,8 @@ enum CtlCommand {
     /// `Escape`, `Tab`, `Up`, `C-c`) or text; `\n` and `\xNN` are escapes.
     /// Words of text are joined with a space and a key name is not. `--literal`
     /// types KEYS unchanged. With no KEYS, stdin is read when it is not a
-    /// terminal, or use `--file`. Put flags before the pane id.
+    /// terminal, or use `--file`. Put flags before the pane id. One command
+    /// prints one JSON object, however long the payload is.
     Send {
         /// Type KEYS unchanged: key names stay words and backslash escapes stay backslashes.
         #[arg(long)]
@@ -747,16 +748,7 @@ fn run_ctl(session: Option<&str>, action: &CtlCommand) -> Result<(), Box<dyn Err
             if keys.is_empty() {
                 return Err(crate::ctl::CtlError(String::from("nothing to send")).into());
             }
-            for chunk in crate::ctl::chunk_send(&keys) {
-                crate::ctl::run(
-                    &descriptor.socket_path,
-                    crate::ctl::CtlAction::Send {
-                        pane_id,
-                        keys: chunk.to_string(),
-                    },
-                )?;
-            }
-            return Ok(());
+            return crate::ctl::send_all(&descriptor.socket_path, pane_id, &keys);
         }
         CtlCommand::Focus { agent } => crate::ctl::CtlAction::Focus {
             agent: agent.clone(),

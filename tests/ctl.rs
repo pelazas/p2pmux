@@ -161,6 +161,34 @@ fn ctl_cli(fixture: &Fixture, args: &[&str]) -> std::process::Output {
         .expect("p2pmux binary should run")
 }
 
+fn ctl_send_bytes(fixture: &Fixture, pane: &str, payload: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_p2pmux"))
+        .args(["ctl", "send", pane])
+        .env("HOME", fixture.home())
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("p2pmux binary should run");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(payload).expect("write payload");
+    }
+    child.wait_with_output().expect("ctl send")
+}
+
+fn one_send_object(output: &std::process::Output, pane_id: u64) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "send failed: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let json: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+    assert_eq!(json["pane_id"], pane_id, "{stdout}");
+}
+
 fn connect_ctl(socket: &Path) -> (UnixStream, BufReader<UnixStream>) {
     let stream = UnixStream::connect(socket).unwrap();
     stream
@@ -373,6 +401,55 @@ fn spawn_send_and_focus_drive_a_local_pane() {
     );
     assert!(agents_out.contains("agents"), "{agents_out}");
 
+    assert!(fixture.running());
+}
+
+#[test]
+fn a_long_send_prints_one_json_object() {
+    let mut fixture = Fixture::start("ctl-send-long");
+    fixture.wait_until_ctl_answers();
+    let spawned = ctl_cli(
+        &fixture,
+        &[
+            "ctl",
+            "spawn",
+            "--machine",
+            "Test User",
+            "--",
+            "sleep",
+            "120",
+        ],
+    );
+    let spawned_err = String::from_utf8_lossy(&spawned.stderr);
+    assert!(spawned.status.success(), "spawn failed: {spawned_err}");
+    let spawned_json: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&spawned.stdout).unwrap().trim()).unwrap();
+    let pane_id = spawned_json["pane_id"].as_u64().expect("pane_id");
+
+    one_send_object(
+        &ctl_send_bytes(&fixture, &pane_id.to_string(), b"hi"),
+        pane_id,
+    );
+    let long = "a".repeat(ctl::SEND_CHUNK_BYTES + 1);
+    one_send_object(
+        &ctl_send_bytes(&fixture, &pane_id.to_string(), long.as_bytes()),
+        pane_id,
+    );
+    let file = fixture.root.join("payload");
+    std::fs::write(&file, "b".repeat(ctl::SEND_CHUNK_BYTES * 2 + 5)).unwrap();
+    one_send_object(
+        &ctl_cli(
+            &fixture,
+            &[
+                "ctl",
+                "send",
+                "--file",
+                file.to_str().expect("path"),
+                &pane_id.to_string(),
+            ],
+        ),
+        pane_id,
+    );
     assert!(fixture.running());
 }
 
