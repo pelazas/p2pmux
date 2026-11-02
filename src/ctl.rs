@@ -407,6 +407,51 @@ pub fn is_nested_p2pmux(command: &[String]) -> bool {
 
 /// Talk to a live node. Stdout is JSON; errors are sentences.
 pub fn run(socket: &Path, action: CtlAction) -> Result<(), Box<dyn Error>> {
+    transact(socket, action, true)
+}
+
+/// Deliver `keys` to a pane and print one JSON result for the whole command.
+///
+/// A payload longer than one ctl frame goes out as several requests. Each of
+/// those used to print its own `{"pane_id":N}`, so anything that reads one
+/// JSON value broke once the payload passed 32 KB. The bytes still go out in
+/// those frames. A frame that fails after an earlier one succeeded names how
+/// many bytes already reached the pane.
+pub fn send_all(socket: &Path, pane_id: u64, keys: &str) -> Result<(), Box<dyn Error>> {
+    if keys.is_empty() {
+        return Err(CtlError(String::from("nothing to send")).into());
+    }
+    let mut delivered = 0usize;
+    for chunk in chunk_send(keys) {
+        if let Err(error) = transact(
+            socket,
+            CtlAction::Send {
+                pane_id,
+                keys: chunk.to_string(),
+            },
+            false,
+        ) {
+            return Err(CtlError(partial_send_message(&error.to_string(), delivered)).into());
+        }
+        delivered += chunk.len();
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({ "pane_id": pane_id }))?
+    );
+    Ok(())
+}
+
+/// A send that fails on a later frame has to say what already landed.
+fn partial_send_message(error: &str, delivered: usize) -> String {
+    if delivered == 0 {
+        error.to_string()
+    } else {
+        format!("{error} ({delivered} bytes were already delivered)")
+    }
+}
+
+fn transact(socket: &Path, action: CtlAction, announce: bool) -> Result<(), Box<dyn Error>> {
     let stream = UnixStream::connect(socket).map_err(|_| {
         CtlError(String::from(
             "could not reach the session node; is it still running?",
@@ -483,44 +528,35 @@ pub fn run(socket: &Path, action: CtlAction) -> Result<(), Box<dyn Error>> {
     if matches!(action, CtlAction::Spawn { .. }) {
         reader.get_mut().set_read_timeout(Some(SPAWN_TIMEOUT))?;
     }
+    let report = |value: serde_json::Value| -> Result<(), Box<dyn Error>> {
+        if announce {
+            println!("{}", serde_json::to_string(&value)?);
+        }
+        Ok(())
+    };
     match receive_json::<CtlToClient>(&mut reader)? {
         Some(CtlToClient::Machines { machines }) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({ "machines": machines }))?
-            );
+            report(serde_json::json!({ "machines": machines }))?;
         }
         Some(CtlToClient::Agents { agents }) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({ "agents": agents }))?
-            );
+            report(serde_json::json!({ "agents": agents }))?;
         }
         Some(CtlToClient::Spawned {
             pane_id,
             reused,
             visible_to_guests,
         }) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "pane_id": pane_id,
-                    "reused": reused,
-                    "visible_to_guests": visible_to_guests,
-                }))?
-            );
+            report(serde_json::json!({
+                "pane_id": pane_id,
+                "reused": reused,
+                "visible_to_guests": visible_to_guests,
+            }))?;
         }
         Some(CtlToClient::Sent { pane_id }) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({ "pane_id": pane_id }))?
-            );
+            report(serde_json::json!({ "pane_id": pane_id }))?;
         }
         Some(CtlToClient::Focused { pane_id }) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({ "pane_id": pane_id }))?
-            );
+            report(serde_json::json!({ "pane_id": pane_id }))?;
         }
         Some(CtlToClient::Error { message }) => return Err(CtlError(message).into()),
         Some(_) => return Err(CtlError(String::from("unexpected ctl reply")).into()),
@@ -703,6 +739,20 @@ mod tests {
         assert_eq!(
             interpret_send_keys(&[String::from("echo"), String::from("Enter")], true),
             "echo Enter"
+        );
+    }
+
+    #[test]
+    fn a_failed_later_chunk_names_how_much_arrived() {
+        assert_eq!(
+            partial_send_message("someone else is controlling that pane", 0),
+            "someone else is controlling that pane"
+        );
+        assert_eq!(
+            partial_send_message("someone else is controlling that pane", SEND_CHUNK_BYTES),
+            format!(
+                "someone else is controlling that pane ({SEND_CHUNK_BYTES} bytes were already delivered)"
+            )
         );
     }
 
