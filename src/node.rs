@@ -1065,19 +1065,11 @@ fn run_socket_loop(
                     client.publish.reannounce_focus();
                     changed = true;
                 }
-                Ok(Some(ClientMessage::Zoom {
-                    pane_id,
-                    cols,
-                    rows,
-                })) => {
-                    node.zoom(pane_id, cols, rows)
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    // A reflow rewrites every pane it touches, so a frozen
-                    // history window taken against the old grid no longer
-                    // describes the pane it came from -- the same reason a
-                    // resize clears them.
-                    frozen_scrollback.clear();
-                    changed = true;
+                Ok(Some(ClientMessage::Zoom { .. })) => {
+                    // Older clients asked for the hosted PTY to grow to the
+                    // zoomed box. That size is the one every guest draws, so
+                    // the host's zoom clipped their lines. Zoom stays on the
+                    // client that asked for it.
                 }
                 Ok(Some(ClientMessage::Detach {
                     generation: requested,
@@ -2398,14 +2390,6 @@ impl SharedLayoutNode {
     }
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Box<dyn Error>> {
         self.runtime.node_resize(cols, rows)
-    }
-    pub fn zoom(
-        &mut self,
-        pane_id: Option<u64>,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(), Box<dyn Error>> {
-        self.runtime.node_zoom(pane_id, cols, rows)
     }
     pub fn focus(&mut self, tab_id: u64, pane_id: u64) -> Result<(), Box<dyn Error>> {
         self.runtime.node_focus(tab_id, pane_id)

@@ -42,9 +42,9 @@ fn agent_status_is_tagged_and_tolerates_a_producer_that_omits_cwd() {
     );
 }
 
-/// Zoom never becomes a layout request, so this message is the only way the
-/// node learns that the pane it hosts is now alone on a full screen and its PTY
-/// has to grow to match. `None` is the way back out.
+/// Older clients still send this when a zoom changes. The node ignores it —
+/// growing the PTY would resize the grid every guest is watching — and `None`
+/// is the way those clients said the zoom had ended.
 #[test]
 fn zoom_carries_the_pane_and_the_size_to_reflow_against() {
     let zoomed = ClientMessage::Zoom {

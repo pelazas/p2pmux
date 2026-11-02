@@ -97,7 +97,9 @@ p2pmux ctl [--session NAME] events
 
 `machines` is the pairing-owned list, including this machine. `agents` is the same roster Ctrl+O
 shows. `spawn` starts an allowlisted command on a machine you own, or a login shell when the
-command is empty. Nested `p2pmux` is refused. The command waits until the pane exists.
+command is empty. Nested `p2pmux` is refused. The command waits until the pane exists. A spawn
+on this machine starts in the focused pane's cwd when that pane is hosted locally and its cwd is
+available; otherwise, and on any other machine, it starts in that machine's p2pmux process cwd.
 
 Without `--new`, a live pane already titled `chat: {command}` on that host is reused; a pane that
 has exited or finished is not. `--new` always starts a pane, which is what two jobs on one
@@ -263,6 +265,8 @@ arrow never leaves sideways when there is somewhere it should have gone.
   same effect, which is how people used to find their way out.
 - `Ctrl+P`, then arrows: move focus.
 - `Ctrl+T`, then `N`: create a tab with a local PTY on the requester's machine.
+  Its shell inherits the focused pane's cwd when that pane is hosted locally and its cwd is
+  available; otherwise it starts in the p2pmux process cwd, the same rule a split follows.
 - `Ctrl+T`, then `X`: delete the current tab only when the requester hosts every pane in it.
 - `Ctrl+T`, then `e`: rename the current tab for every admitted member. Enter saves; Esc cancels;
   a blank title restores `Tab #N`.
@@ -343,10 +347,11 @@ and so does closing its tab. For locally hosted panes, mouse-wheel scrollback is
 scroll up, then cached while you browse it. Starting a scroll freezes a host-authored viewport for
 that browse session, so output can continue at the live edge without changing what is being read.
 
-A resize, a split, a zoom or a reconnect ends that browse session because a reflow rewrites the grid the
+A resize, a split or a reconnect ends that browse session because a reflow rewrites the grid the
 frozen window was taken against. It does not touch the pane's history. The next notch of the
-wheel starts a fresh browse session over the rows that were always there. Retained rows keep the
-width they were written at, so a pane that got narrower clips them rather than losing them.
+wheel starts a fresh browse session over the rows that were always there. A zoom leaves the browse
+where it is: the pane keeps its grid, so the rows on screen are still the ones being read. Retained
+rows keep the width they were written at, so a pane that got narrower clips them rather than losing them.
 
 Alternate-screen applications have no scrollback to browse at all, and remote-hosted panes return
 an empty scrollback window in this v1 implementation.

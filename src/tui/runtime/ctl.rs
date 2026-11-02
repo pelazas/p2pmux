@@ -104,6 +104,7 @@ impl SharedLayoutRuntime {
             return Ok(CtlSpawn::Busy);
         }
         let (grid_rows, grid_cols) = self.ctl_spawn_grid();
+        let cwd = self.cwd_for_local_target(&peer_id);
         // Watch before the layout call: a local coordinator answers inside
         // `begin_create_on`, clears `pending_create`, and would otherwise look
         // like a spawn that never started.
@@ -113,7 +114,7 @@ impl SharedLayoutRuntime {
             None,
             grid_rows,
             grid_cols,
-            None,
+            cwd,
             peer_id,
             command,
             machine.to_owned(),

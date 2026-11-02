@@ -1120,13 +1120,14 @@ mod tests {
         assert!(zoomed.contains(" zoom "), "{zoomed}");
     }
 
-    /// A zoom is only a zoom if the terminal inside the pane grew with the box.
+    /// Draw the grid the screen actually has, not the one the pane descriptor
+    /// still records.
     ///
-    /// The PTY is resized by the node the moment the zoom lands, but the pane
-    /// descriptor only carries the new grid once the coordinator has accepted
-    /// it. Drawing against the descriptor in the meantime leaves a full-screen
-    /// box with a split-sized terminal in the corner of it — the bug this
-    /// asserts against.
+    /// A reflow resizes the PTY immediately, and the descriptor catches up only
+    /// once the coordinator has accepted the new grid. Drawing against the
+    /// descriptor in that gap leaves the grown terminal in the corner of a box
+    /// it already fills. Zoom is not such a reflow — it keeps the session grid
+    /// — and this uses a zoomed box only to make the gap visible.
     #[test]
     fn a_zoomed_pane_draws_the_grid_its_pty_actually_has() {
         let mut tui = MultiPaneTui::new(split_layout()).expect("layout");

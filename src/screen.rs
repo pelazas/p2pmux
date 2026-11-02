@@ -571,7 +571,7 @@ impl HostScreen {
         // The retained rows outlive the resize: `set_size` reflows the visible grid
         // and leaves the scrollback deque alone, so history stays readable at its
         // own width. Dropping it here is what made a pane unscrollable after every
-        // window resize, split, or zoom -- and permanently so for a full-frame
+        // window resize or split -- and permanently so for a full-frame
         // agent UI, which repaints in place and never scrolls a fresh row in to
         // rebuild what was thrown away. `ingest` already counted whatever the
         // reflow pushed off the top.
