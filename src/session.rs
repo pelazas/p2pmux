@@ -61,6 +61,10 @@ pub struct LayoutCoordinator {
     agent_rosters: BTreeMap<Vec<u8>, AgentRoster>,
     presence: BTreeMap<Vec<u8>, Presence>,
     presence_epoch: u64,
+    /// What welcomes and presence rosters call this session. Empty until the
+    /// host that owns this coordinator has a name, and updated when that name
+    /// changes so a roster published under this lock cannot carry an older one.
+    session_name: String,
     reservation_timeout: Duration,
     locked: bool,
     roster: MemberRoster,
@@ -295,6 +299,7 @@ impl LayoutCoordinator {
             agent_rosters: BTreeMap::new(),
             presence: BTreeMap::new(),
             presence_epoch: 0,
+            session_name: String::new(),
             reservation_timeout,
             locked: false,
             roster: MemberRoster::default(),
@@ -343,6 +348,7 @@ impl LayoutCoordinator {
             agent_rosters: BTreeMap::new(),
             presence: BTreeMap::new(),
             presence_epoch: 0,
+            session_name: String::new(),
             reservation_timeout,
             locked: false,
             roster,
@@ -483,6 +489,26 @@ impl LayoutCoordinator {
     /// broadcasts, so its renderer polls this to notice that somebody else moved.
     pub fn presence_epoch(&self) -> u64 {
         self.presence_epoch
+    }
+
+    pub fn session_name(&self) -> &str {
+        &self.session_name
+    }
+
+    pub fn set_session_name(&mut self, name: &str) {
+        self.session_name = name.to_owned();
+    }
+
+    /// Every member's presence plus the session name, read together.
+    ///
+    /// The name has to come from the same lock as the entries. A roster built
+    /// from an earlier read can be published after a rename and put the old
+    /// name back in the latest-wins presence slot.
+    pub fn presence_roster(&self) -> PresenceRoster {
+        PresenceRoster {
+            entries: self.presence(),
+            session_name: self.session_name.clone(),
+        }
     }
 
     /// Accept a member's latest focus after checking it against the authoritative layout.
@@ -2286,6 +2312,14 @@ impl HostSession {
         })
     }
 
+    pub fn session_name(&self) -> &str {
+        &self.session_name
+    }
+
+    pub fn set_session_name(&mut self, name: &str) {
+        self.session_name = name.to_owned();
+    }
+
     pub fn ticket(&self) -> &JoinTicket {
         &self.ticket
     }
@@ -3062,7 +3096,7 @@ impl SharedLayoutHost {
             host.ticket().session_id().to_vec(),
             host.transport.secret_key(),
         );
-        let coordinator = LayoutCoordinator::with_reservation_timeout_and_display_name(
+        let mut coordinator = LayoutCoordinator::with_reservation_timeout_and_display_name(
             coordinator_peer_id,
             host.ticket().endpoint_addr().clone(),
             ledger,
@@ -3072,6 +3106,7 @@ impl SharedLayoutHost {
             reservation_timeout,
             Instant::now(),
         )?;
+        coordinator.set_session_name(host.session_name());
         let signer = IntentSigner::new(
             host.ticket().session_id().to_vec(),
             host.transport.secret_key(),
@@ -3114,8 +3149,9 @@ impl SharedLayoutHost {
             prev_hash,
             host.coordinator_epoch(),
         );
-        let coordinator =
+        let mut coordinator =
             LayoutCoordinator::restore(coordinator_peer_id, snapshot, ledger, reservation_timeout)?;
+        coordinator.set_session_name(host.session_name());
         let signer = IntentSigner::new(session_id, host.transport.secret_key());
         Ok(Self {
             host,
@@ -3307,14 +3343,7 @@ impl SharedLayoutHost {
     pub fn presence_if_newer(&self, seen_epoch: u64) -> Option<(u64, PresenceRoster)> {
         let coordinator = self.coordinator.lock().ok()?;
         let epoch = coordinator.presence_epoch();
-        (epoch > seen_epoch).then(|| {
-            (
-                epoch,
-                PresenceRoster {
-                    entries: coordinator.presence(),
-                },
-            )
-        })
+        (epoch > seen_epoch).then(|| (epoch, coordinator.presence_roster()))
     }
 
     /// Publish the coordinator host's own focus through the same relay path.
@@ -3333,15 +3362,38 @@ impl SharedLayoutHost {
         let Some(_) = coordinator.accept_presence(&peer_id, presence) else {
             return Ok(None);
         };
-        let roster = PresenceRoster {
-            entries: coordinator.presence(),
-        };
-        drop(coordinator);
+        // Still holding the coordinator: the roster's session name is whatever
+        // the lock says now, not whatever it said when this focus arrived.
+        let roster = coordinator.presence_roster();
         broadcast_presence(
             &self.peers,
             coordinator_envelope(&peer_id, envelope::Body::PresenceRoster(roster.clone())),
         );
         Ok(Some(roster))
+    }
+
+    /// The session is going by `name` now.
+    ///
+    /// Welcomes after this tell new joiners. Members already in the session
+    /// hear it on the next presence roster, published before this lock is
+    /// released so a focus update cannot overwrite it with the previous name.
+    pub fn rename_session(&mut self, name: &str) {
+        let host_changed = self.host.session_name() != name;
+        self.host.set_session_name(name);
+        let Ok(mut coordinator) = self.coordinator.lock() else {
+            return;
+        };
+        let coordinator_changed = coordinator.session_name() != name;
+        coordinator.set_session_name(name);
+        if !host_changed && !coordinator_changed {
+            return;
+        }
+        let roster = coordinator.presence_roster();
+        let peer_id = self.host.ticket().endpoint_addr().id.as_bytes().to_vec();
+        broadcast_presence(
+            &self.peers,
+            coordinator_envelope(&peer_id, envelope::Body::PresenceRoster(roster)),
+        );
     }
 
     /// Applies a request made by the coordinator process itself. Remote peers receive the same
@@ -3779,7 +3831,10 @@ impl SharedLayoutHost {
                 mailbox
                     .enqueue_initial(coordinator_envelope(
                         self.host.ticket().endpoint_addr().id.as_bytes(),
-                        envelope::Body::PresenceRoster(PresenceRoster { entries: presence }),
+                        envelope::Body::PresenceRoster(PresenceRoster {
+                            entries: presence,
+                            session_name: self.host.session_name().to_owned(),
+                        }),
                     ))
                     .then_some(())
                     .ok_or(SessionError::PeerTask)?;
@@ -4651,17 +4706,13 @@ async fn layout_host_reader_task(
                 // Re-broadcast the whole set rather than the one entry that moved, so a
                 // peer whose writer is behind can drop all but the newest message and
                 // still be correct about everybody.
-                let roster = match coordinator.lock() {
-                    Ok(mut coordinator) => {
-                        coordinator
-                            .accept_presence(&peer_id, presence)
-                            .map(|_| PresenceRoster {
-                                entries: coordinator.presence(),
-                            })
-                    }
-                    Err(_) => break,
+                let Ok(mut coordinator) = coordinator.lock() else {
+                    break;
                 };
-                if let Some(roster) = roster {
+                if coordinator.accept_presence(&peer_id, presence).is_some() {
+                    // Under the same lock as `rename_session`, so this roster
+                    // cannot carry a name that rename has already replaced.
+                    let roster = coordinator.presence_roster();
                     broadcast_presence(
                         &peers,
                         coordinator_envelope(
@@ -5494,6 +5545,7 @@ mod control_queue_tests {
                     pane_id,
                     attached: true,
                 }],
+                session_name: String::new(),
             }),
         )
     }

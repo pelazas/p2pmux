@@ -25,7 +25,9 @@ destroys work. Detaching prints the exact `--resume`, `attach`, and `kill` comma
 return. Use `p2pmux --resume` for the
 live-session picker, `p2pmux attach [name]` to attach directly, `p2pmux rename <old> <new>` to
 rename a session, and `p2pmux kill <name>` to shut it down gracefully. Killing a coordinator asks
-for confirmation; use `--yes` for non-interactive scripts.
+for confirmation; use `--yes` for non-interactive scripts. A rename updates the name the running
+session is showing, including guests already in it; a guest whose machine already has that name
+locally keeps a `-2` suffix, the same way joining does.
 
 `p2pmux list` prints the live sessions on this machine and the names each command takes:
 

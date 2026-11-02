@@ -280,7 +280,11 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Rename a live local session finder record.
+    /// Rename a live session, including the name its clients are showing.
+    ///
+    /// On the machine coordinating the session, guests already in it follow.
+    /// The tab bar updates with the record, so it does not keep a name
+    /// `attach` no longer accepts.
     Rename {
         #[arg(add = clap_complete::ArgValueCompleter::new(complete_sessions))]
         old: String,
@@ -1255,10 +1259,12 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Some(Command::Rename { old, new }) => {
-            let store = crate::session_store::SessionStore::for_current_user()?;
+            if let Some(message) = crate::session_store::session_name_error(&new) {
+                return Err(io::Error::other(message).into());
+            }
             let descriptor = find_live(&old)?;
-            let renamed = store.rename(&descriptor.id, &new)?;
-            println!("Renamed {} to {}", old, renamed.name);
+            let renamed = crate::client::rename_session(&descriptor, &new)?;
+            println!("Renamed {} to {}", old, renamed);
             Ok(())
         }
     }

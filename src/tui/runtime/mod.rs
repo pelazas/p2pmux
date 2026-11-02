@@ -165,6 +165,10 @@ pub struct SharedLayoutRuntime {
     /// that never reached it leaves the machine advertising a ticket for an endpoint that
     /// stopped answering and a role that is no longer true.
     pub(in crate::tui) pending_role_persist: Option<RolePersist>,
+    /// A session name learned from the coordinator that the node has not yet
+    /// written into the finder record. The node owns that record; this only
+    /// remembers that it changed.
+    pub(in crate::tui) pending_session_name: Option<String>,
 }
 
 /// What the durable session record has to be updated to after a role change.
@@ -322,6 +326,7 @@ impl SharedLayoutRuntime {
             code_tx,
             code_rx,
             pending_role_persist: None,
+            pending_session_name: None,
         };
         value.refresh_local_views();
         Ok(value)
@@ -361,6 +366,18 @@ impl SharedLayoutRuntime {
     /// A role change the durable session record still has to be told about, once.
     pub fn take_role_persist(&mut self) -> Option<RolePersist> {
         self.pending_role_persist.take()
+    }
+
+    /// The coordinating session announced a new name. Applied by the node,
+    /// which is what writes the finder record and the snapshot clients draw.
+    pub fn rename_session(&mut self, name: &str) {
+        if let SharedControl::Host(host) = &mut self.control {
+            host.rename_session(name);
+        }
+    }
+
+    pub fn take_pending_session_name(&mut self) -> Option<String> {
+        self.pending_session_name.take()
     }
 
     pub fn local_focus(&self) -> (u64, u64) {

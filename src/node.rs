@@ -591,6 +591,78 @@ fn configure_accepted(stream: UnixStream) -> Option<UnixStream> {
     Some(stream)
 }
 
+/// Tell the running session it has a new name, and remember that name where
+/// the next membership write will not put the old one back.
+///
+/// Editing only the finder record leaves the snapshot — which is what the tab
+/// bar draws — on the name this node started with. A later write of that
+/// record, which this loop does whenever the membership changes, saves the
+/// old name over the new one. Both copies move together, and a coordinator
+/// tells guests who titled themselves from the name in the welcome.
+fn rename_running_session(
+    store: &SessionStore,
+    descriptor: &mut SessionDescriptor,
+    node: &mut SharedLayoutNode,
+    name: &str,
+) -> Result<String, String> {
+    if let Some(message) = crate::session_store::session_name_error(name) {
+        return Err(message);
+    }
+    let taken = other_session_names(store, &descriptor.id).map_err(|error| error.to_string())?;
+    if taken.contains(name) {
+        return Err(format!(
+            "a session named '{name}' is already on this machine"
+        ));
+    }
+    if descriptor.name != name {
+        let previous = descriptor.name.clone();
+        descriptor.name = name.to_owned();
+        if let Err(error) = store.write(descriptor) {
+            descriptor.name = previous;
+            return Err(error.to_string());
+        }
+    }
+    node.rename_session(name);
+    Ok(name.to_owned())
+}
+
+/// A guest's local record follows the coordinator's session name, with the
+/// same `-2` suffix joining already uses when that name is taken here.
+fn adopt_shared_session_name(
+    store: &SessionStore,
+    descriptor: &mut SessionDescriptor,
+    name: &str,
+) -> io::Result<bool> {
+    let taken = other_session_names(store, &descriptor.id)?;
+    let Some(local) = crate::session_store::unique_local_name(name, &taken) else {
+        return Ok(false);
+    };
+    if descriptor.name == local {
+        return Ok(false);
+    }
+    let previous = descriptor.name.clone();
+    descriptor.name = local;
+    if let Err(error) = store.write(descriptor) {
+        descriptor.name = previous;
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn other_session_names(
+    store: &SessionStore,
+    id: &str,
+) -> io::Result<std::collections::HashSet<String>> {
+    // `list_live` probes every socket, including this node's, and the probe
+    // would be answered by the loop that is blocked sending it.
+    Ok(store
+        .list_recorded()?
+        .into_iter()
+        .filter(|session| session.id != id)
+        .map(|session| session.name)
+        .collect())
+}
+
 fn run_socket_loop(
     node: &mut SharedLayoutNode,
     listener: UnixListener,
@@ -623,6 +695,10 @@ fn run_socket_loop(
     loop {
         let mut shutdown = false;
         let mut did_work = false;
+        // Set when the name clients are drawing changed, so this turn's snapshot
+        // carries it. A later one would not: room name is published with the
+        // full snapshot, and an unchanged layout does not send one.
+        let mut republish_name = false;
         // This belongs on the socket loop rather than the slow self-check: an
         // interactive launcher that dies before attaching has no session to
         // leave behind.
@@ -734,6 +810,29 @@ fn run_socket_loop(
                                         }
                                     }
                                 }
+                                // A one-shot, like shutdown: `p2pmux rename` is another
+                                // process, and it must not take the attachment slot
+                                // from the client that is looking at the old name.
+                                Ok(ClientMessage::Rename { name }) => {
+                                    match rename_running_session(store, descriptor, node, &name) {
+                                        Ok(applied) => {
+                                            republish_name = true;
+                                            did_work = true;
+                                            let _ = write_message(
+                                                reader.get_mut(),
+                                                &NodeMessage::Update {
+                                                    state: serde_json::json!({ "name": applied }),
+                                                },
+                                            );
+                                        }
+                                        Err(message) => {
+                                            let _ = write_message(
+                                                reader.get_mut(),
+                                                &NodeMessage::Error { message },
+                                            );
+                                        }
+                                    }
+                                }
                                 Ok(_) | Err(_) => {}
                             },
                         },
@@ -786,6 +885,21 @@ fn run_socket_loop(
         // A takeover or a step-down changes what this machine is advertising about itself.
         // `p2pmux ls` and `p2pmux ticket <name>` read the record out of process, so until it
         // is rewritten they hand out a ticket for an endpoint that stopped answering.
+        // A guest learned the coordinator's new name. The record has to follow,
+        // or the tab bar keeps a name `attach` on this machine no longer finds
+        // — the same split `p2pmux rename` used to leave on the coordinator.
+        if let Some(name) = node.take_pending_session_name() {
+            match adopt_shared_session_name(store, descriptor, &name) {
+                Ok(true) => {
+                    republish_name = true;
+                    did_work = true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("p2pmux node: failed to record the session's new name: {error}");
+                }
+            }
+        }
         if let Some(role) = node.take_role_persist() {
             descriptor.role = if role.coordinating {
                 SessionRole::Coordinator
@@ -904,7 +1018,7 @@ fn run_socket_loop(
         }
         did_work |= changed;
         let mut detached = false;
-        let mut full_snapshot = false;
+        let mut full_snapshot = republish_name;
         if !shutdown && let Some(client) = client.as_mut() {
             match read_message(&mut client.reader) {
                 Ok(Some(ClientMessage::Input {
@@ -1098,14 +1212,13 @@ fn run_socket_loop(
                     client.shutdown_after_ack = true;
                 }
                 Ok(Some(ClientMessage::Rename { name })) => {
-                    if let Some(message) = crate::session_store::session_name_error(&name) {
-                        let _ = client
-                            .writer
-                            .enqueue_control(NodeMessage::Error { message });
-                    } else {
-                        let _ = client.writer.enqueue_control(NodeMessage::Update {
-                            state: serde_json::json!({"name": name}),
-                        });
+                    match rename_running_session(store, descriptor, node, &name) {
+                        Ok(_) => full_snapshot = true,
+                        Err(message) => {
+                            let _ = client
+                                .writer
+                                .enqueue_control(NodeMessage::Error { message });
+                        }
                     }
                 }
                 Ok(Some(_)) => {}
@@ -2432,6 +2545,14 @@ impl SharedLayoutNode {
     /// A role change the durable session record still has to be told about, once.
     pub fn take_role_persist(&mut self) -> Option<crate::tui::RolePersist> {
         self.runtime.take_role_persist()
+    }
+
+    pub fn rename_session(&mut self, name: &str) {
+        self.runtime.rename_session(name);
+    }
+
+    pub fn take_pending_session_name(&mut self) -> Option<String> {
+        self.runtime.take_pending_session_name()
     }
 
     pub fn publish_initial_code_after_online(&mut self) {

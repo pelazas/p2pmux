@@ -56,7 +56,10 @@ impl SharedLayoutRuntime {
                 self.agent_rosters
                     .insert(roster.host_peer_id.clone(), roster);
             }
-            LayoutControlEvent::Presence(roster) => self.presence = roster.entries,
+            LayoutControlEvent::Presence(roster) => {
+                self.note_shared_session_name(&roster.session_name);
+                self.presence = roster.entries;
+            }
             LayoutControlEvent::Commit(commit) => {
                 self.apply_layout_state(commit.state.as_ref().ok_or("missing layout state")?)?;
             }
@@ -71,6 +74,29 @@ impl SharedLayoutRuntime {
             LayoutControlEvent::Disconnected => self.note_coordinator_lost(),
         }
         Ok(())
+    }
+
+    /// The coordinator renamed the session. Remember it for the node, which is
+    /// what the tab bar and `attach` both read.
+    ///
+    /// Empty is not a rename. A coordinator with no name, and a peer from before
+    /// the field existed, both send that, and the presence slot keeps only the
+    /// newest roster — so an empty one can arrive after the rename and must not
+    /// wipe the name the welcome already set. The same name we already adopted
+    /// is not a rename either: a guest may have titled its own record, and a
+    /// repeated announcement of the session name must leave that alone.
+    fn note_shared_session_name(&mut self, announced: &str) {
+        if announced.is_empty() {
+            return;
+        }
+        let SharedControl::Member(member) = &mut self.control else {
+            return;
+        };
+        if member.session_name == announced {
+            return;
+        }
+        member.session_name = announced.to_owned();
+        self.pending_session_name = Some(announced.to_owned());
     }
 
     /// Decide whether to follow a machine into a session it has started.
