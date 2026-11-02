@@ -389,6 +389,10 @@ enum CtlCommand {
     /// The same agent list Ctrl+O would show.
     Agents,
     /// Start an allowlisted command on a machine you own.
+    ///
+    /// On this machine the pane starts in the focused local pane's directory
+    /// when that directory is known. On another machine it starts in the
+    /// directory p2pmux was launched from there.
     Spawn {
         /// A machine from `p2pmux ctl machines`, including this one.
         #[arg(long, add = clap_complete::ArgValueCompleter::new(complete_spawn_machines))]

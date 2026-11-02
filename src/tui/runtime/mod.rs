@@ -942,6 +942,119 @@ mod tests {
         assert_eq!(runtime.tui.snapshot().panes.len(), 2);
         assert_eq!(runtime.tui.focused_pane(), 2);
 
+        let area = Rect::new(0, 0, 120, 40);
+        runtime.reflow_local_panes(area).expect("reflow the split");
+        let focused = runtime.tui.focused_pane();
+        let split_size = runtime
+            .local
+            .get(&focused)
+            .expect("focused pane")
+            .screen
+            .screen()
+            .size();
+        assert!(runtime.tui.toggle_zoom(), "a split can be zoomed");
+        runtime
+            .reflow_local_panes(area)
+            .expect("reflow while zoomed");
+        assert_eq!(
+            runtime
+                .local
+                .get(&focused)
+                .expect("focused pane")
+                .screen
+                .screen()
+                .size(),
+            split_size,
+            "zoom keeps the grid the session gave the pane"
+        );
+        runtime.tui.clear_zoom();
+
+        let host_tab = runtime.tui.current_tab();
+        let panes_before: Vec<u64> = runtime.local.keys().copied().collect();
+        runtime
+            .handle_intent(UiIntent::CreateTab {
+                grid_rows: 2,
+                grid_cols: 8,
+            })
+            .expect("new tab");
+        let tab_pane = runtime
+            .local
+            .keys()
+            .copied()
+            .find(|pane_id| !panes_before.contains(pane_id))
+            .expect("tab pane");
+        assert_eq!(
+            cwd_for_pid(
+                runtime
+                    .local
+                    .get(&tab_pane)
+                    .and_then(|pane| pane.host.process_id())
+                    .expect("tab PTY")
+            )
+            .as_ref()
+            .and_then(|cwd| fs::canonicalize(cwd).ok()),
+            Some(expected_cwd.clone()),
+            "a new tab inherits the focused pane's cwd"
+        );
+        let tab_id = runtime
+            .tui
+            .snapshot()
+            .tabs
+            .iter()
+            .find(|tab| crate::tui::geometry::contains_leaf(&tab.root, tab_pane))
+            .map(|tab| tab.tab_id)
+            .expect("tab");
+        runtime
+            .handle_intent(UiIntent::DeleteTab { tab_id })
+            .expect("delete tab");
+
+        runtime.tui.select_pane(host_tab, 2, "test");
+        let machine =
+            crate::tui::member_label(&runtime.control.peer_id(), &runtime.tui.snapshot().members);
+        let panes_before: Vec<u64> = runtime.local.keys().copied().collect();
+        match runtime
+            .ctl_try_spawn(&machine, vec![String::from("bash")], true)
+            .expect("ctl spawn")
+        {
+            crate::ctl::CtlSpawn::Started(_) => {}
+            crate::ctl::CtlSpawn::Reused(_) | crate::ctl::CtlSpawn::Busy => {
+                panic!("ctl spawn should start a pane");
+            }
+        }
+        let spawned_pane = runtime
+            .local
+            .keys()
+            .copied()
+            .find(|pane_id| !panes_before.contains(pane_id))
+            .expect("ctl pane");
+        assert_eq!(
+            cwd_for_pid(
+                runtime
+                    .local
+                    .get(&spawned_pane)
+                    .and_then(|pane| pane.host.process_id())
+                    .expect("ctl PTY")
+            )
+            .as_ref()
+            .and_then(|cwd| fs::canonicalize(cwd).ok()),
+            Some(expected_cwd.clone()),
+            "ctl spawn inherits the focused pane's cwd"
+        );
+        let spawned_tab = runtime
+            .tui
+            .snapshot()
+            .tabs
+            .iter()
+            .find(|tab| crate::tui::geometry::contains_leaf(&tab.root, spawned_pane))
+            .map(|tab| tab.tab_id)
+            .expect("ctl tab");
+        runtime
+            .handle_intent(UiIntent::DeleteTab {
+                tab_id: spawned_tab,
+            })
+            .expect("delete ctl tab");
+        runtime.tui.select_pane(host_tab, 2, "test");
+
         runtime.footer_notice = Some(String::from("layout request 5 rejected"));
         let peer_id = runtime.control.peer_id();
         let pane = runtime.local.get_mut(&2).expect("created local pane");

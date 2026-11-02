@@ -50,13 +50,11 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
-    /// The attached client zoomed a pane, or gave the zoom back.
+    /// An older client announcing that it zoomed a pane.
     ///
-    /// Zoom is a local view choice — it never reaches the shared layout — but it
-    /// decides how much screen the pane is being drawn in, and the node is the
-    /// one that sizes the PTYs it hosts. So it travels like a resize rather than
-    /// like an intent: the client's terminal size rides along, because the node
-    /// is detached and has no terminal of its own to measure.
+    /// Kept so a client from that era still parses. The node ignores it: zoom
+    /// is a local view, and resizing the hosted PTY to the zoomed box changed
+    /// the grid every guest was drawing.
     Zoom {
         pane_id: Option<u64>,
         cols: u16,

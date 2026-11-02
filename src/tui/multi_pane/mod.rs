@@ -559,12 +559,33 @@ impl MultiPaneTui {
             area.height
                 .saturating_sub(tab_bar.height + tab_bar_gap + footer_height),
         );
+        self.finish_geometry(tab_bar, content, footer, true)
+    }
+
+    /// The shared split, which is the grid a PTY is sized to.
+    ///
+    /// Zoom hides the siblings on this screen only. Folding that into the
+    /// rectangle the PTY is resized to makes the host's zoom the session's
+    /// new grid, and every guest still drawing the split clips the lines that
+    /// no longer fit.
+    pub(in crate::tui) fn layout_geometry(&self, area: Rect) -> PaneGeometry {
+        let drawn = self.geometry(area);
+        self.finish_geometry(drawn.tab_bar, drawn.content, drawn.footer, false)
+    }
+
+    fn finish_geometry(
+        &self,
+        tab_bar: Rect,
+        content: Rect,
+        footer: Rect,
+        honor_zoom: bool,
+    ) -> PaneGeometry {
         let mut panes = BTreeMap::new();
         // A zoomed pane gets the whole content area to itself. This is a local
         // view choice and never reaches the layout, so the pane keeps the fixed
         // grid the shared layout gave it and simply stops sharing the screen
         // with its siblings.
-        if let Some(pane_id) = self.zoomed_pane() {
+        if honor_zoom && let Some(pane_id) = self.zoomed_pane() {
             panes.insert(pane_id, content);
         } else if let Some(tab) = self.current_tab_layout() {
             allocate_node_with_preview(

@@ -263,7 +263,11 @@ impl MultiPaneTui {
                 None
             }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
-                let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
+                let rect = self
+                    .layout_geometry(area)
+                    .panes
+                    .get(&self.focused_pane)
+                    .copied()?;
                 self.create_pane(
                     if rect.width > rect.height {
                         Axis::LeftRight
@@ -331,7 +335,13 @@ impl MultiPaneTui {
         position: NewPanePosition,
         area: Rect,
     ) -> Option<UiIntent> {
-        let rect = self.geometry(area).panes.get(&self.focused_pane).copied()?;
+        // The shared split, not the zoomed box: the new pane joins the layout
+        // everyone has, and a zoom is only this screen's way of looking at it.
+        let rect = self
+            .layout_geometry(area)
+            .panes
+            .get(&self.focused_pane)
+            .copied()?;
         let (grid_rows, grid_cols) = grid_for_pane(rect);
         Some(UiIntent::CreatePane {
             target_pane_id: self.focused_pane,
@@ -1308,6 +1318,7 @@ mod tests {
         let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
 
         assert_eq!(tui.geometry(area).panes.len(), 3);
+        let split_rect = tui.geometry(area).panes[&tui.focused_pane()];
 
         let _ = tui.handle_key(ctrl_p, area);
         assert_eq!(tui.handle_key(z, area), KeyHandling::Consumed(vec![]));
@@ -1321,6 +1332,16 @@ mod tests {
             tui.geometry(area).panes[&tui.focused_pane()],
             tui.geometry(area).content,
             "and the zoomed pane gets the whole content area"
+        );
+        assert_eq!(
+            tui.layout_geometry(area).panes.len(),
+            3,
+            "the session grid still has the siblings"
+        );
+        assert_eq!(
+            tui.layout_geometry(area).panes[&tui.focused_pane()],
+            split_rect,
+            "zoom does not change the grid the pane was given"
         );
 
         let _ = tui.handle_key(ctrl_p, area);

@@ -303,7 +303,9 @@ impl SharedLayoutRuntime {
     }
 
     pub(in crate::tui) fn reflow_local_panes(&mut self, area: Rect) -> Result<(), Box<dyn Error>> {
-        let geometry = self.tui.geometry(area);
+        // `layout_geometry`, not `geometry`: a zoom is drawn full-screen on
+        // this client and must not become the size of the PTY everyone shares.
+        let geometry = self.tui.layout_geometry(area);
         let mut updates = Vec::new();
         for (pane_id, rect) in geometry.panes {
             let Some(pane) = self.local.get_mut(&pane_id) else {
@@ -457,7 +459,8 @@ impl SharedLayoutRuntime {
                 grid_rows,
                 grid_cols,
             } => {
-                self.begin_create(None, grid_rows, grid_cols, None)?;
+                let cwd = self.focused_local_cwd();
+                self.begin_create(None, grid_rows, grid_cols, cwd)?;
             }
             UiIntent::AnswerRemoteWork { approved } => self.answer_remote_work(approved)?,
             UiIntent::CreateTabOn {
@@ -467,7 +470,8 @@ impl SharedLayoutRuntime {
                 grid_rows,
                 grid_cols,
             } => {
-                self.begin_create_on(None, grid_rows, grid_cols, None, peer_id, command, name)?;
+                let cwd = self.cwd_for_local_target(&peer_id);
+                self.begin_create_on(None, grid_rows, grid_cols, cwd, peer_id, command, name)?;
             }
             UiIntent::DeletePane { pane_id } => {
                 let request_id = self.next_id();
@@ -601,6 +605,31 @@ impl SharedLayoutRuntime {
             "session unlocked — anyone with the ticket can join"
         });
         Ok(())
+    }
+
+    /// Cwd of the focused pane when this process hosts it.
+    ///
+    /// A new tab and a local spawn start there, the same way a split starts in
+    /// the pane it was taken from. A remote focused pane has no directory this
+    /// machine can see, and the shell starts in the process cwd instead.
+    pub(in crate::tui) fn focused_local_cwd(&self) -> Option<PathBuf> {
+        let pane_id = self.tui.focused_pane();
+        self.local
+            .get(&pane_id)
+            .and_then(|pane| pane.host.process_id())
+            .and_then(cwd_for_pid)
+    }
+
+    /// Inherit the focused cwd only when the new pane will be hosted here.
+    ///
+    /// A directory on this machine is meaningless on another one, and the peer
+    /// that serves the reservation starts the pane in its own process cwd.
+    pub(in crate::tui) fn cwd_for_local_target(&self, target: &[u8]) -> Option<PathBuf> {
+        if target.is_empty() || target == self.control.peer_id() {
+            self.focused_local_cwd()
+        } else {
+            None
+        }
     }
 
     pub(in crate::tui) fn begin_create(
