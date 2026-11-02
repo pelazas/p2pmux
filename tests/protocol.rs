@@ -6,11 +6,11 @@ use p2pmux::protocol::{
     MAX_AGENT_KIND_BYTES, MAX_AGENT_ROSTER_ENTRIES, MAX_DELTA_BYTES, MAX_ENDPOINT_ADDR_BYTES,
     MAX_ENVELOPE_BYTES, MAX_FLEET_TICKET_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
     MAX_LEDGER_PAYLOAD_BYTES, MAX_PANE_ID_BYTES, MAX_PEER_ID_BYTES, MAX_PRESENCE_ENTRIES,
-    MAX_SESSION_ID_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited, MemberDescriptor, MemberKind,
-    NewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed, PaneGrid, PaneReady,
-    PaneReservation, PaneSubscribe, Presence, PresenceRoster, ProtocolError, SessionSnapshot,
-    SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl, UpdatePaneGrids,
-    Welcome, decode_frame, encode_frame, envelope,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_NAME_BYTES, MAX_SNAPSHOT_BYTES, MarkPaneExited,
+    MemberDescriptor, MemberKind, NewPanePosition, PROTOCOL_VERSION, PaneDescriptor, PaneFailed,
+    PaneGrid, PaneReady, PaneReservation, PaneSubscribe, Presence, PresenceRoster, ProtocolError,
+    SessionSnapshot, SetPaneLock, SetSplitRatio, Snapshot, SplitAxis, TabDescriptor, TakeControl,
+    UpdatePaneGrids, Welcome, decode_frame, encode_frame, envelope,
 };
 use prost::Message;
 
@@ -541,6 +541,7 @@ fn presence_roster_uses_tag_28_and_round_trips() {
                 attached: false,
             },
         ],
+        session_name: String::new(),
     }));
     let wire = original.encode_to_vec();
     assert_eq!(
@@ -552,6 +553,31 @@ fn presence_roster_uses_tag_28_and_round_trips() {
         decode_frame(&frame).expect("valid presence roster decodes"),
         original
     );
+}
+
+#[test]
+fn presence_roster_carries_a_session_rename_and_rejects_one_that_does_not_fit() {
+    let original = envelope(envelope::Body::PresenceRoster(PresenceRoster {
+        entries: vec![presence(b"peer-a", 1, 1)],
+        session_name: String::from("zurich"),
+    }));
+    let frame = encode_frame(&original).expect("named roster encodes");
+    assert_eq!(
+        decode_frame(&frame).expect("named roster decodes"),
+        original
+    );
+
+    let oversized = PresenceRoster {
+        entries: vec![presence(b"peer-a", 1, 1)],
+        session_name: "n".repeat(MAX_SESSION_NAME_BYTES + 1),
+    };
+    assert!(matches!(
+        encode_frame(&envelope(envelope::Body::PresenceRoster(oversized))),
+        Err(ProtocolError::FieldTooLarge {
+            field: "presence_roster.session_name",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -590,6 +616,7 @@ fn presence_validation_rejects_bad_shapes() {
 fn presence_roster_rejects_duplicate_members_and_an_oversized_set() {
     let duplicated = PresenceRoster {
         entries: vec![presence(b"peer-a", 1, 1), presence(b"peer-a", 1, 2)],
+        session_name: String::new(),
     };
     assert!(matches!(
         encode_frame(&envelope(envelope::Body::PresenceRoster(duplicated))),
@@ -608,6 +635,7 @@ fn presence_roster_rejects_duplicate_members_and_an_oversized_set() {
                 attached: true,
             })
             .collect(),
+        session_name: String::new(),
     };
     assert!(matches!(
         encode_frame(&envelope(envelope::Body::PresenceRoster(too_many))),

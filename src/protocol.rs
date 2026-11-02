@@ -1033,6 +1033,17 @@ pub struct Presence {
 pub struct PresenceRoster {
     #[prost(message, repeated, tag = "1")]
     pub entries: Vec<Presence>,
+    /// The name the session is going by, so a rename reaches members already in it.
+    ///
+    /// A new envelope would be a message an older member does not know, and the
+    /// control reader treats that as a broken coordinator and leaves the session.
+    /// An extra field on a roster that member already accepts is ignored there
+    /// and read here. Empty means this coordinator has no name to give, which is
+    /// also what a roster from before this field decodes as — and what a member
+    /// must not treat as a rename, because this slot keeps only the newest roster
+    /// and an older empty one can arrive after the rename.
+    #[prost(string, tag = "2")]
+    pub session_name: String,
 }
 
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, ProtocolError> {
@@ -1425,6 +1436,11 @@ fn validate_presence(presence: &Presence) -> Result<(), ProtocolError> {
 }
 
 fn validate_presence_roster(roster: &PresenceRoster) -> Result<(), ProtocolError> {
+    validate_field_size(
+        "presence_roster.session_name",
+        roster.session_name.len(),
+        MAX_SESSION_NAME_BYTES,
+    )?;
     if roster.entries.len() > MAX_PRESENCE_ENTRIES {
         return Err(ProtocolError::FieldTooLarge {
             field: "presence_roster.entries",

@@ -541,6 +541,9 @@ pub fn run_on(
                             room_name,
                             *layout,
                         )?;
+                        // Set at attach from the finder record. A rename while
+                        // this client is up arrives only as a later snapshot.
+                        let _ = execute!(guard.stdout, SetTitle(view.title().to_owned()));
                         let (resync, reset_outer) = apply_screens(
                             view,
                             &mut screens,
@@ -1642,6 +1645,54 @@ fn request_scrollback(
         },
     )?;
     Ok(())
+}
+
+/// Ask the live node to rename the session, so the snapshot it is already
+/// publishing starts using the new name.
+///
+/// A node that does not answer still gets the finder record updated. That is
+/// all a build from before this request can do, and it is what `rename` did
+/// on its own — `list` follows the record even when the tab bar cannot.
+pub fn rename_session(
+    descriptor: &SessionDescriptor,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stream = UnixStream::connect(&descriptor.socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    write_message(
+        &mut stream,
+        &ClientMessage::Rename {
+            name: name.to_owned(),
+        },
+    )?;
+    loop {
+        match read_message(&mut reader) {
+            Ok(Some(NodeMessage::Update { state })) => {
+                let renamed = state
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(name);
+                return Ok(renamed.to_owned());
+            }
+            Ok(Some(NodeMessage::Error { message })) => {
+                return Err(io::Error::other(message).into());
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let renamed =
+        crate::session_store::SessionStore::for_current_user()?.rename(&descriptor.id, name)?;
+    Ok(renamed.name)
 }
 
 pub fn shutdown(descriptor: &SessionDescriptor) -> Result<(), Box<dyn std::error::Error>> {
