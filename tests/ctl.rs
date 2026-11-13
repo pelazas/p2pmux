@@ -548,3 +548,53 @@ fn an_old_node_is_reported_when_hello_is_ignored() {
     );
     assert!(fixture.running());
 }
+
+#[test]
+fn rename_updates_the_name_an_attached_client_is_showing() {
+    let mut fixture = Fixture::start("rename-live");
+    fixture.wait_until_ctl_answers();
+    let (_stream, mut reader, _generation) = attach(&fixture.socket);
+    match receive_node(&mut reader) {
+        NodeMessage::Snapshot { room_name, .. } => assert_eq!(room_name, "lisbon"),
+        message => panic!("expected the attachment snapshot, got {message:?}"),
+    }
+
+    let rejected = ctl_cli(&fixture, &["rename", "lisbon", "Zurich"]);
+    assert!(
+        !rejected.status.success(),
+        "uppercase is not a session name: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+
+    let renamed = ctl_cli(&fixture, &["rename", "lisbon", "zurich"]);
+    let stderr = String::from_utf8_lossy(&renamed.stderr);
+    assert!(renamed.status.success(), "rename failed: {stderr}");
+    let stdout = String::from_utf8_lossy(&renamed.stdout);
+    assert!(stdout.contains("Renamed lisbon to zurich"), "{stdout}");
+
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    loop {
+        match client::read_message(&mut reader) {
+            Ok(Some(NodeMessage::Snapshot { room_name, .. })) if room_name == "zurich" => break,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the node closed the attached client"),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("reading the attached client failed: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the attached client kept the name from before the rename"
+        );
+    }
+
+    let listed = ctl_cli(&fixture, &["list"]);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("zurich"), "{listed}");
+    assert!(
+        !listed.contains("lisbon"),
+        "attach by the old name has to fail, so list must not keep it: {listed}"
+    );
+    assert!(fixture.running());
+}
